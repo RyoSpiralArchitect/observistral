@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import difflib
 import json
 import os
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -54,7 +56,19 @@ LOCAL_TOOL_PROMPT = (
     "{\"name\":\"mkdir\",\"arguments\":{\"path\":\"myproj\"}}\n"
     "{\"name\":\"write_file\",\"arguments\":{\"path\":\"myproj/README.md\",\"content\":\"...\"}}\n"
     "```\n"
-    "Only JSON is allowed inside the obstral-tool block."
+    "Only JSON is allowed inside the obstral-tool block.\n\n"
+    "Fallback (no tool calling AND you cannot emit obstral-tool JSON):\n"
+    "- For files: print a file path on its own line, then a fenced code block. OBSTRAL will write it.\n"
+    "  Example:\n"
+    "  src/main.py\n"
+    "  ```python\n"
+    "  print('hi')\n"
+    "  ```\n"
+    "- For commands: use a fenced block with language bash/powershell/cmd. OBSTRAL will convert it to run_command.\n"
+    "  Example:\n"
+    "  ```powershell\n"
+    "  git status --porcelain\n"
+    "  ```"
 )
 
 LONGRUN_AUTONOMY_PROMPT = (
@@ -244,27 +258,82 @@ def _set_workspace_root(raw_root: str) -> None:
         raise RuntimeError(f"workspace root is not a directory: {p}")
     WORKSPACE_ROOT = p
 
+
+_VIBE_DOTENV_CACHE: dict[str, str] | None = None
+
+
+def _load_vibe_dotenv() -> dict[str, str]:
+    """Load VIBE CLI dotenv (~/.vibe/.env) if present.
+
+    This lets OBSTRAL reuse the same keys without requiring global env var exports.
+    """
+    global _VIBE_DOTENV_CACHE
+    if _VIBE_DOTENV_CACHE is not None:
+        return _VIBE_DOTENV_CACHE
+
+    out: dict[str, str] = {}
+    try:
+        p = Path.home() / ".vibe" / ".env"
+        if p.exists() and p.is_file():
+            raw = p.read_text(encoding="utf-8", errors="replace")
+            for line in raw.splitlines():
+                s = str(line or "").strip()
+                if not s or s.startswith("#"):
+                    continue
+                if s.lower().startswith("export "):
+                    s = s[7:].strip()
+                if "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                key = k.strip()
+                val = v.strip().strip(";").strip()
+                if (val.startswith("'") and val.endswith("'")) or (
+                    val.startswith('"') and val.endswith('"')
+                ):
+                    val = val[1:-1]
+                if key:
+                    out[key] = val
+    except Exception:
+        out = {}
+
+    _VIBE_DOTENV_CACHE = out
+    return out
+
+
 def _provider_key_from_env(provider: str) -> str:
+    vibe_env = _load_vibe_dotenv()
     if provider == "codestral":
         return (
             os.environ.get("CODESTRAL_API_KEY", "").strip()
             or os.environ.get("MISTRAL_API_KEY", "").strip()
+            or str(vibe_env.get("CODESTRAL_API_KEY") or "").strip()
+            or str(vibe_env.get("MISTRAL_API_KEY") or "").strip()
             or os.environ.get("OBS_API_KEY", "").strip()
         )
     if provider == "mistral":
-        return os.environ.get("MISTRAL_API_KEY", "").strip() or os.environ.get(
-            "OBS_API_KEY", ""
-        ).strip()
+        return (
+            os.environ.get("MISTRAL_API_KEY", "").strip()
+            or str(vibe_env.get("MISTRAL_API_KEY") or "").strip()
+            or os.environ.get("OBS_API_KEY", "").strip()
+        )
     if provider == "openai-compatible":
-        return os.environ.get("OBS_API_KEY", "").strip() or os.environ.get(
-            "OPENAI_API_KEY", ""
-        ).strip()
+        return (
+            os.environ.get("OBS_API_KEY", "").strip()
+            or os.environ.get("OPENAI_API_KEY", "").strip()
+            or str(vibe_env.get("OBS_API_KEY") or "").strip()
+            or str(vibe_env.get("OPENAI_API_KEY") or "").strip()
+        )
     if provider == "gemini":
-        return os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get(
-            "GOOGLE_API_KEY", ""
-        ).strip()
+        return (
+            os.environ.get("GEMINI_API_KEY", "").strip()
+            or os.environ.get("GOOGLE_API_KEY", "").strip()
+            or str(vibe_env.get("GEMINI_API_KEY") or "").strip()
+            or str(vibe_env.get("GOOGLE_API_KEY") or "").strip()
+        )
     if provider == "anthropic":
-        return os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        return os.environ.get("ANTHROPIC_API_KEY", "").strip() or str(
+            vibe_env.get("ANTHROPIC_API_KEY") or ""
+        ).strip()
     return ""
 
 
@@ -333,12 +402,11 @@ def _force_tool_use(req: dict[str, Any]) -> bool:
 _MATERIAL_INTENT_RE = re.compile(
     r"(repo|repository|scaffold|bootstrap|init|setup|create|generate|implement|"
     r"install|build|test|run|git|winget|bash|powershell|cmd|command|"
-    r"リポ|リポジトリ|雛形|ひな形|プロジェクト|実装|ファイル|作成|作ろ|作って|生成|追加|組み込|"
-    r"コマンド|実行|インストール|セットアップ|ビルド|テスト)",
+    r"\u30ea\u30dd|\u30ea\u30dd\u30b8\u30c8\u30ea|\u96db\u5f62|\u3072\u306a\u5f62|\u30d7\u30ed\u30b8\u30a7\u30af\u30c8|"
+    r"\u5b9f\u88c5|\u30d5\u30a1\u30a4\u30eb|\u4f5c\u6210|\u4f5c\u308d|\u4f5c\u3063\u3066|\u751f\u6210|\u8ffd\u52a0|\u7d44\u307f\u8fbc|"
+    r"\u30b3\u30de\u30f3\u30c9|\u5b9f\u884c|\u30a4\u30f3\u30b9\u30c8\u30fc\u30eb|\u30bb\u30c3\u30c8\u30a2\u30c3\u30d7|\u30d3\u30eb\u30c9|\u30c6\u30b9\u30c8)",
     re.IGNORECASE,
 )
-
-
 def _wants_material_change(req: dict[str, Any]) -> bool:
     """Heuristic: user intent implies we should actually touch files/commands."""
     s = str(req.get("input") or "").strip()
@@ -350,11 +418,9 @@ def _wants_material_change(req: dict[str, Any]) -> bool:
 _COMMAND_INTENT_RE = re.compile(
     r"(\bgit\b|\bwinget\b|\bpip\b|\buv\b|\bnpm\b|\bpnpm\b|\byarn\b|\bcargo\b|"
     r"\bpytest\b|\bmake\b|\bcmake\b|\bbash\b|\bpowershell\b|\bcmd\b|"
-    r"コマンド|実行|インストール|セットアップ)",
+    r"\u30b3\u30de\u30f3\u30c9|\u5b9f\u884c)",
     re.IGNORECASE,
 )
-
-
 def _wants_command_action(req: dict[str, Any]) -> bool:
     """Heuristic: user intent implies we should run terminal commands (git/winget/bash/etc.)."""
     s = str(req.get("input") or "").strip()
@@ -692,6 +758,179 @@ def _extract_obstral_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     return cleaned, calls
 
 
+_FILE_LINE_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:#{1,6}\s*)?(?:file|path|filename)?\s*[:\-]?\s*`?"
+    r"([A-Za-z]:\\[^\s`]+|(?:\.\.?/)?[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\.[A-Za-z0-9]{1,8})"
+    r"`?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_implied_write_file_calls(text: str, *, max_files: int = 12) -> list[dict[str, Any]]:
+    """Extract file writes from common LLM output patterns:
+
+    src/main.py
+    ```python
+    ...
+    ```
+    """
+    s = str(text or "")
+    if not s.strip():
+        return []
+    lines = s.splitlines()
+    calls: list[dict[str, Any]] = []
+    i = 0
+    while i < len(lines) and len(calls) < max_files:
+        m = _FILE_LINE_RE.match(lines[i] or "")
+        if not m:
+            i += 1
+            continue
+        raw_path = str(m.group(1) or "").strip()
+        if not raw_path:
+            i += 1
+            continue
+
+        j = i + 1
+        while j < len(lines) and not str(lines[j] or "").strip():
+            j += 1
+        if j >= len(lines):
+            break
+        fence = str(lines[j] or "")
+        if not fence.lstrip().startswith("```"):
+            i += 1
+            continue
+
+        k = j + 1
+        buf: list[str] = []
+        while k < len(lines):
+            if str(lines[k] or "").strip().startswith("```"):
+                break
+            buf.append(str(lines[k] or ""))
+            k += 1
+        if k >= len(lines):
+            break
+
+        content = "\n".join(buf).rstrip() + "\n"
+        if content.strip():
+            calls.append(
+                {
+                    "name": "write_file",
+                    "arguments": {
+                        "path": raw_path.replace("\\", "/"),
+                        "content": content,
+                    },
+                }
+            )
+        i = k + 1
+    return calls
+
+
+_FENCE_START_RE = re.compile(r"^\s*```([A-Za-z0-9_-]+)?\s*$")
+_PS_PROMPT_RE = re.compile(r"^\s*PS [^>]*>\s*")
+_ALLOWED_COMMAND_FENCES = {
+    "bash",
+    "sh",
+    "shell",
+    "powershell",
+    "pwsh",
+    "ps1",
+    "cmd",
+    "bat",
+}
+
+
+def _strip_shell_prompt_line(line: str) -> str:
+    s = str(line or "").rstrip("\r\n")
+    ls = s.lstrip()
+    if ls.startswith("$ "):
+        return ls[2:]
+    if ls.startswith("> "):
+        return ls[2:]
+    m = _PS_PROMPT_RE.match(ls)
+    if m:
+        return ls[m.end() :]
+    return s
+
+
+def _script_to_local_command(lang: str, script: str) -> str:
+    l = str(lang or "").strip().lower()
+    s = str(script or "").strip()
+    if not s:
+        return ""
+    if len(s) > 12000:
+        s = s[:12000] + "\n"
+
+    if l in ("powershell", "pwsh", "ps1"):
+        # Avoid quoting/encoding headaches: UTF-16LE base64 for -EncodedCommand.
+        enc = base64.b64encode(s.encode("utf-16le")).decode("ascii")
+        return f"powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {enc}"
+
+    if l in ("bash", "sh", "shell"):
+        # Use bash -lc for multi-line scripts. This will fail if bash isn't installed.
+        one = "; ".join([ln.strip() for ln in s.splitlines() if ln.strip()])
+        one = one.replace('"', '\\"')
+        return f'bash -lc \"set -e; {one}\"'
+
+    if l in ("cmd", "bat"):
+        parts = [ln.strip() for ln in s.splitlines() if ln.strip()]
+        return " && ".join(parts)
+
+    return s
+
+
+def _extract_implied_run_command_calls(text: str, *, max_commands: int = 6) -> list[dict[str, Any]]:
+    """Extract commands from fenced blocks like ```powershell / ```bash / ```cmd.
+
+    Safety: we skip fences that look like file contents (a file path line directly above).
+    """
+    s = str(text or "")
+    if not s.strip():
+        return []
+    lines = s.splitlines()
+    calls: list[dict[str, Any]] = []
+    i = 0
+    while i < len(lines) and len(calls) < max_commands:
+        m = _FENCE_START_RE.match(lines[i] or "")
+        if not m:
+            i += 1
+            continue
+        lang = str(m.group(1) or "").strip().lower()
+        if lang == "obstral-tool":
+            # Tool blocks are handled elsewhere.
+            i += 1
+            while i < len(lines) and not str(lines[i] or "").strip().startswith("```"):
+                i += 1
+            i += 1
+            continue
+
+        j = i + 1
+        buf: list[str] = []
+        while j < len(lines):
+            if str(lines[j] or "").strip().startswith("```"):
+                break
+            buf.append(str(lines[j] or ""))
+            j += 1
+        if j >= len(lines):
+            break
+
+        prev = i - 1
+        while prev >= 0 and not str(lines[prev] or "").strip():
+            prev -= 1
+        if prev >= 0 and _FILE_LINE_RE.match(lines[prev] or ""):
+            # It's a file content fence, not a command.
+            i = j + 1
+            continue
+
+        if lang in _ALLOWED_COMMAND_FENCES:
+            cleaned = "\n".join(_strip_shell_prompt_line(ln) for ln in buf).strip()
+            cmd = _script_to_local_command(lang, cleaned)
+            if cmd.strip():
+                calls.append({"name": "run_command", "arguments": {"command": cmd}})
+
+        i = j + 1
+    return calls
+
+
 def _swap_max_tokens_to_max_completion_tokens(payload: dict[str, Any]) -> dict[str, Any]:
     """Some OpenAI-compatible models reject max_tokens in favor of max_completion_tokens."""
     if "max_tokens" not in payload:
@@ -870,6 +1109,17 @@ def _http_json(
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         req_headers.setdefault("Content-Type", "application/json")
+
+    # urllib/http.client encodes headers as latin-1. Catch misconfigured keys early (common with pasted non-ASCII).
+    for hk, hv in req_headers.items():
+        try:
+            str(hk).encode("ascii")
+            str(hv).encode("latin-1")
+        except UnicodeEncodeError:
+            raise RuntimeError(
+                f"request header is not latin-1 encodable: {hk}. "
+                "Check API key/settings (no non-ASCII characters)."
+            ) from None
 
     req = urlrequest.Request(url=url, data=data, headers=req_headers, method=method)
     try:
@@ -1500,6 +1750,30 @@ def _chat_openai_compat(
         text_tool_calls: list[dict[str, Any]] = []
         if tools_enabled:
             clean_content, text_tool_calls = _extract_obstral_tool_calls(clean_content)
+            if needs_material:
+                # Some models refuse tool-calling and instead print file blocks / shell blocks.
+                implied: list[dict[str, Any]] = []
+                implied.extend(_extract_implied_write_file_calls(clean_content))
+                implied.extend(_extract_implied_run_command_calls(clean_content))
+                if implied:
+                    merged: list[dict[str, Any]] = []
+                    seen: set[tuple[str, str]] = set()
+                    for c in (text_tool_calls + implied):
+                        if not isinstance(c, dict):
+                            continue
+                        name = str(c.get("name") or "")
+                        args = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
+                        key = ""
+                        if name in ("write_file", "mkdir"):
+                            key = str(args.get("path") or "")
+                        elif name == "run_command":
+                            key = str(args.get("command") or "")
+                        sig = (name, key)
+                        if sig in seen:
+                            continue
+                        seen.add(sig)
+                        merged.append(c)
+                    text_tool_calls = merged
 
         if not tools_enabled:
             return {"content": str(clean_content), "model": model}
@@ -1559,7 +1833,10 @@ def _chat_openai_compat(
                             "role": "system",
                             "content": (
                                 "You must actually create/edit files now (not just describe steps).\n"
-                                "Call mkdir/write_file/run_command, or emit an ```obstral-tool``` block.\n"
+                                "Call mkdir/write_file/run_command, emit an ```obstral-tool``` block, or use fallback blocks.\n"
+                                "Fallback:\n"
+                                "- file: <path> line then a fenced code block\n"
+                                "- command: ```powershell```/```cmd```/```bash```\n"
                                 "Example:\n"
                                 "```obstral-tool\n"
                                 "{\"name\":\"mkdir\",\"arguments\":{\"path\":\"projects/maze-game\"}}\n"
@@ -1583,7 +1860,10 @@ def _chat_openai_compat(
                             "role": "system",
                             "content": (
                                 "Tool use is REQUIRED. Do not reply with steps only.\n"
-                                "Call a tool, or emit an ```obstral-tool``` block of JSON.\n"
+                                "Call a tool, emit an ```obstral-tool``` block of JSON, or use fallback blocks.\n"
+                                "Fallback:\n"
+                                "- file: <path> line then a fenced code block\n"
+                                "- command: ```powershell```/```cmd```/```bash```\n"
                                 "If unsure, start with:\n"
                                 "```obstral-tool\n"
                                 "{\"name\":\"list_files\",\"arguments\":{\"pattern\":\"**/*\",\"max_results\":200}}\n"
@@ -2079,14 +2359,20 @@ class LiteHandler(BaseHTTPRequestHandler):
             try:
                 self._send_json(200, _models_impl(payload))
             except Exception as e:
-                self._send_json(502, {"error": str(e)})
+                out = {"error": str(e)}
+                if _as_bool(os.environ.get("OBS_DEBUG"), False):
+                    out["trace"] = traceback.format_exc()
+                self._send_json(502, out)
             return
 
         if self.path == "/api/chat":
             try:
                 self._send_json(200, _chat_impl(payload))
             except Exception as e:
-                self._send_json(502, {"error": str(e)})
+                out = {"error": str(e)}
+                if _as_bool(os.environ.get("OBS_DEBUG"), False):
+                    out["trace"] = traceback.format_exc()
+                self._send_json(502, out)
             return
 
         if self.path == "/api/chat_stream":
@@ -2101,7 +2387,10 @@ class LiteHandler(BaseHTTPRequestHandler):
                 item = _approve_pending_edit(edit_id)
                 self._send_json(200, {"ok": True, "item": item})
             except Exception as e:
-                self._send_json(400, {"error": str(e)})
+                out = {"error": str(e)}
+                if _as_bool(os.environ.get("OBS_DEBUG"), False):
+                    out["trace"] = traceback.format_exc()
+                self._send_json(400, out)
             return
 
         if self.path == "/api/reject_edit":
@@ -2112,7 +2401,10 @@ class LiteHandler(BaseHTTPRequestHandler):
                 item = _reject_pending_edit(edit_id)
                 self._send_json(200, {"ok": True, "item": item})
             except Exception as e:
-                self._send_json(400, {"error": str(e)})
+                out = {"error": str(e)}
+                if _as_bool(os.environ.get("OBS_DEBUG"), False):
+                    out["trace"] = traceback.format_exc()
+                self._send_json(400, out)
             return
 
         self._send_text(404, "not found\n")
@@ -2135,7 +2427,10 @@ class LiteHandler(BaseHTTPRequestHandler):
                 self._write_sse("delta", {"delta": content[i : i + chunk_size]})
             self._write_sse("done", {})
         except Exception as e:
-            self._write_sse("error", {"error": str(e)})
+            out = {"error": str(e)}
+            if _as_bool(os.environ.get("OBS_DEBUG"), False):
+                out["trace"] = traceback.format_exc()
+            self._write_sse("error", out)
             self._write_sse("done", {})
         except BrokenPipeError:
             return
