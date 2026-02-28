@@ -41,6 +41,13 @@ LOCAL_TOOL_PROMPT = (
     " Do not claim lack of permission. Use tools first, then summarize results.\n"
     "If the user asks to create a repository/project/app/game, you must actually create "
     "folders/files (mkdir/write_file) and then report what was created.\n\n"
+    "Use run_command to act locally (git, tests, package managers, winget, etc.).\n"
+    "Examples:\n"
+    "```obstral-tool\n"
+    "{\"name\":\"run_command\",\"arguments\":{\"command\":\"git status --porcelain\"}}\n"
+    "{\"name\":\"run_command\",\"arguments\":{\"command\":\"powershell -NoProfile -Command \\\"winget --version\\\"\"}}\n"
+    "{\"name\":\"run_command\",\"arguments\":{\"command\":\"bash -lc \\\"ls -la\\\"\"}}\n"
+    "```\n\n"
     "If your provider/model does not support tool calling, you MUST emit tool intents "
     "in this exact format so OBSTRAL can execute them:\n"
     "```obstral-tool\n"
@@ -55,6 +62,8 @@ LONGRUN_AUTONOMY_PROMPT = (
     "- Decompose work into modules and execute step-by-step.\n"
     "- Continue working without unnecessary confirmation until done.\n"
     "- Reuse tools repeatedly for inspect/edit/verify loops.\n"
+    "- For implementation/scaffolding: batch related mkdir/write_file calls (create multiple files) before summarizing.\n"
+    "- After edits, prefer a quick local check via run_command (git status / build / tests) when useful.\n"
     "- If blocked, clearly state blocker and best next action.\n"
 )
 
@@ -323,7 +332,9 @@ def _force_tool_use(req: dict[str, Any]) -> bool:
 
 _MATERIAL_INTENT_RE = re.compile(
     r"(repo|repository|scaffold|bootstrap|init|setup|create|generate|implement|"
-    r"リポ|リポジトリ|雛形|ひな形|プロジェクト|実装|ファイル|作成|作ろ|作って|生成|追加|組み込)",
+    r"install|build|test|run|git|winget|bash|powershell|cmd|command|"
+    r"リポ|リポジトリ|雛形|ひな形|プロジェクト|実装|ファイル|作成|作ろ|作って|生成|追加|組み込|"
+    r"コマンド|実行|インストール|セットアップ|ビルド|テスト)",
     re.IGNORECASE,
 )
 
@@ -334,6 +345,22 @@ def _wants_material_change(req: dict[str, Any]) -> bool:
     if not s:
         return False
     return bool(_MATERIAL_INTENT_RE.search(s))
+
+
+_COMMAND_INTENT_RE = re.compile(
+    r"(\bgit\b|\bwinget\b|\bpip\b|\buv\b|\bnpm\b|\bpnpm\b|\byarn\b|\bcargo\b|"
+    r"\bpytest\b|\bmake\b|\bcmake\b|\bbash\b|\bpowershell\b|\bcmd\b|"
+    r"コマンド|実行|インストール|セットアップ)",
+    re.IGNORECASE,
+)
+
+
+def _wants_command_action(req: dict[str, Any]) -> bool:
+    """Heuristic: user intent implies we should run terminal commands (git/winget/bash/etc.)."""
+    s = str(req.get("input") or "").strip()
+    if not s:
+        return False
+    return bool(_COMMAND_INTENT_RE.search(s))
 
 
 def _requires_edit_approval(req: dict[str, Any] | None) -> bool:
@@ -1254,6 +1281,8 @@ def _chat_openai_compat(
     needs_material = force_tools and _wants_material_change(req)
     made_material_change = False
     tool_refusals = 0
+    material_refusals = 0
+    prefer_command = needs_material and _wants_command_action(req)
     use_completions = False
 
     for _ in range(max_tool_steps):
@@ -1275,11 +1304,17 @@ def _chat_openai_compat(
                     "function": {"name": "list_files"},
                 }
             elif needs_material and not made_material_change:
-                # If user asked to "create/scaffold/implement", do not stop at advice.
-                payload["tool_choice"] = {
-                    "type": "function",
-                    "function": {"name": "write_file"},
-                }
+                # If user asked to "create/scaffold/implement/run commands", do not stop at advice.
+                # Start permissive (any tool) but escalate to a specific tool if the model keeps avoiding
+                # material actions (mkdir/write_file/run_command).
+                if material_refusals >= 2:
+                    force_name = "run_command" if prefer_command else "write_file"
+                    payload["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": force_name},
+                    }
+                else:
+                    payload["tool_choice"] = "required"
             else:
                 payload["tool_choice"] = "auto"
 
@@ -1382,6 +1417,29 @@ def _chat_openai_compat(
                         except RuntimeError:
                             pass
 
+                    # Some providers reject string tool_choice="required". Fall back to auto in that case.
+                    if (
+                        tools_enabled
+                        and payload.get("tool_choice") == "required"
+                        and "HTTP 400" in msg
+                        and ("tool_choice" in msg or "tool choice" in msg)
+                    ):
+                        payload4 = dict(payload)
+                        payload4["tool_choice"] = "auto"
+                        try:
+                            res = _http_json(
+                                "POST",
+                                f"{base_url}{path}",
+                                headers=headers,
+                                body=payload4,
+                                timeout_seconds=timeout,
+                                error_context={"provider": provider, "model": model},
+                            )
+                            last_err = None
+                            break
+                        except RuntimeError:
+                            pass
+
                     last_err = e
                     # Endpoint variants differ across providers.
                     if ("HTTP 404" in msg or "HTTP 405" in msg) and idx < (len(paths) - 1):
@@ -1451,6 +1509,7 @@ def _chat_openai_compat(
                 made_any_tool_call = True
                 msg_list.append({"role": "assistant", "content": clean_content or ""})
                 pending: list[dict[str, str]] = []
+                material_this_round = False
                 for c in text_tool_calls:
                     name = str(c.get("name") or "")
                     args = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
@@ -1458,6 +1517,7 @@ def _chat_openai_compat(
                         tool_out = _tool_dispatch(name, args, req=req)
                         if name in ("write_file", "mkdir", "run_command"):
                             made_material_change = True
+                            material_this_round = True
                         result = {"ok": True, "result": tool_out}
                         if isinstance(tool_out, dict) and tool_out.get("needs_approval"):
                             pending.append(
@@ -1479,6 +1539,8 @@ def _chat_openai_compat(
                             ),
                         }
                     )
+                if needs_material and not made_material_change and not material_this_round:
+                    material_refusals += 1
                 if pending:
                     lines = ["[pending approval]"]
                     for it in pending:
@@ -1548,6 +1610,7 @@ def _chat_openai_compat(
         )
 
         pending2: list[dict[str, str]] = []
+        material_this_round2 = False
         for tc in tool_calls:
             if not isinstance(tc, dict):
                 continue
@@ -1559,6 +1622,7 @@ def _chat_openai_compat(
                 tool_out = _tool_dispatch(name, args_json, req=req)
                 if name in ("write_file", "mkdir", "run_command"):
                     made_material_change = True
+                    material_this_round2 = True
                 result = {"ok": True, "result": tool_out}
                 if isinstance(tool_out, dict) and tool_out.get("needs_approval"):
                     pending2.append(
@@ -1587,6 +1651,9 @@ def _chat_openai_compat(
                 lines.append(f"- {it.get('action')} {it.get('path')} id={it.get('id')}")
             lines.append("Approve/reject in UI: Pending edits.")
             return {"content": "\n".join(lines), "model": model}
+
+        if needs_material and not made_material_change and not material_this_round2:
+            material_refusals += 1
 
     raise RuntimeError("tool loop exceeded max steps")
 
@@ -1794,7 +1861,7 @@ def _chat_impl(req: dict[str, Any]) -> dict[str, Any]:
     if provider in ("mistral", "codestral", "openai-compatible", "gemini"):
         tools_enabled = provider in ("openai-compatible", "codestral", "mistral", "gemini") and _local_tools_enabled(req)
         autonomy = _autonomy_level(req)
-        max_tool_steps = 30 if autonomy == "longrun" else LOCAL_TOOL_MAX_STEPS
+        max_tool_steps = 60 if autonomy == "longrun" else LOCAL_TOOL_MAX_STEPS
         return _chat_openai_compat(
             req=req,
             provider=provider,
