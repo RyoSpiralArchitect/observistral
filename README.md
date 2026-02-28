@@ -1,9 +1,18 @@
 # OBSTRAL
 
-プロバイダ抽象化付きチャット実行基盤。**Rust 製シングルバイナリ**で CLI・REPL・ローカル Web UI をすべて提供します。
+![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
+![Version](https://img.shields.io/badge/version-0.1.0-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Providers](https://img.shields.io/badge/providers-Mistral%20%7C%20OpenAI%20%7C%20Anthropic%20%7C%20HF-purple)
 
-- **プロバイダ**: OpenAI-compatible / Mistral / Anthropic
-- **モード**: `実況` / `壁打ち` / `diff批評` / `VIBE`
+> `OBSTRAL` は `observistral`（Mistral 向けログ解析プロトタイプ）から発展した Rust 実装です。
+> Python 版 `observistral` はレガシー実装として `src/observistral/` に併存しています。
+
+**複数の LLM プロバイダを同じ操作感で扱える、Rust 製シングルバイナリのチャット実行基盤。**
+CLI・REPL・ローカル Web UI をひとつに統合し、モード・ペルソナ・diff レビュー・ストリーミングを共通の UX で提供します。
+
+- **プロバイダ**: OpenAI-compatible / Mistral / Anthropic / HF（Python subprocess）
+- **モード**: `実況` / `壁打ち` / `diff批評` / `VIBE` / `ログ解析`
 - **ペルソナ**: `default` / `novelist` / `cynical` / `cheerful` / `thoughtful`
 - **ストリーミング**: OpenAI・Mistral は SSE ストリーミング対応
 
@@ -11,38 +20,67 @@
 
 ## クイックスタート
 
-### Web UI（デフォルト）
+> **デフォルトプロバイダは `mistral`（モデル: `devstral-2`）です。**
+> `MISTRAL_API_KEY` を設定すれば `cargo run` だけで起動します。
 
+### Web UI — Mistral（デフォルト）
+
+**bash:**
+```bash
+export MISTRAL_API_KEY="your-key"
+cargo run -- serve --provider mistral
+# → http://127.0.0.1:8080 をブラウザで開く
+```
+
+**PowerShell:**
 ```powershell
 cd C:\Users\user\observistral
 $env:MISTRAL_API_KEY = "your-key"
 
-cargo run
+# 開発用: build + UI起動（cargo を隠蔽）
+.\scripts\run-ui.ps1
 # → http://127.0.0.1:8080 をブラウザで開く
+```
+
+`obstral` コマンドが見つからない場合は、インストール:
+
+```powershell
+.\scripts\install.ps1
 ```
 
 ポートを変えたい場合:
 
 ```powershell
-cargo run -- serve --host 127.0.0.1 --port 3000
+.\scripts\run-ui.ps1 -Host 127.0.0.1 -Port 3000
+# または（install 後）
+obstral serve --host 127.0.0.1 --port 3000
+```
+
+### Web UI — OpenAI-compatible で起動する場合
+
+```bash
+export OBS_API_KEY="your-openai-key"
+cargo run -- serve --provider openai-compatible
+# → openai-compatible + gpt-4o-mini
 ```
 
 ### ワンショット
 
-```powershell
-# 短縮形
-cargo run -- "この設計どう思う？" --vibe
+```bash
+# VIBE プリセット（Mistral devstral-2 + VIBE モードを自動設定）
+export MISTRAL_API_KEY="your-key"
+obstral "この設計どう思う？" --vibe
 
-# 明示形
-cargo run -- chat "Hello" --provider openai-compatible --model gpt-4o-mini
+# プロバイダを明示（デフォルトは openai-compatible + gpt-4o-mini）
+obstral chat "Hello" --provider openai-compatible --model gpt-4o-mini
 ```
 
 ### REPL（対話セッション）
 
-```powershell
-cargo run -- repl
+```bash
+obstral repl --provider mistral
 # または
-cargo run -- --repl
+obstral --repl
 ```
 
 ---
@@ -56,11 +94,38 @@ cargo run -- --repl
 | Mistral | `MISTRAL_API_KEY` | 必須 |
 | Anthropic | `ANTHROPIC_API_KEY` | 必須 |
 | OpenAI-compatible | `OBS_API_KEY` または `OPENAI_API_KEY` | ローカルエンドポイントは不要 |
+| HF | (不要) | `scripts/hf_infer.py` 経由 |
 
+**bash:**
+```bash
+export MISTRAL_API_KEY="..."
+export ANTHROPIC_API_KEY="..."
+export OBS_API_KEY="..."   # OpenAI / vLLM / LM Studio など
+```
+
+**PowerShell:**
 ```powershell
 $env:MISTRAL_API_KEY    = "..."
 $env:ANTHROPIC_API_KEY  = "..."
-$env:OBS_API_KEY        = "..."   # OpenAI / vLLM / LM Studio など
+$env:OBS_API_KEY        = "..."
+```
+
+---
+
+## 例
+
+### ログ解析
+
+```bash
+obstral chat "重要ポイントだけ教えて" --mode ログ解析 --log-file ./sample.log --provider mistral --model mistral-large-latest
+```
+
+### HF（ローカル推論）
+
+```bash
+obstral chat "要約して" --provider hf --model gpt2 --device cpu
+# ローカルファイルのみ
+obstral chat "要約して" --provider hf --model gpt2 --hf-local-only
 ```
 
 ---
@@ -102,9 +167,9 @@ obstral list <providers|modes|personas>
 
 | オプション | デフォルト | 説明 |
 |-----------|-----------|------|
-| `--vibe` | — | Mistral devstral-2 + VIBE モードのプリセット |
-| `--provider` | `openai-compatible` | プロバイダ選択 |
-| `--model` | `gpt-4o-mini` | モデル名 |
+| `--vibe` | — | Mistral devstral-2 + VIBE モードのプリセット（下記参照） |
+| `--provider` | `mistral` | プロバイダ選択 |
+| `--model` | `devstral-2` | モデル名（プロバイダごとに異なる） |
 | `--api-key` | — | APIキー（env var 推奨） |
 | `--base-url` | — | カスタムエンドポイント |
 | `--mode` | `壁打ち` | モード選択 |
@@ -115,18 +180,37 @@ obstral list <providers|modes|personas>
 | `--diff-file <PATH>` | — | diff ファイルを読み込みプロンプトに注入 |
 | `--stdin` | — | 標準入力をプロンプトに追加 |
 
+### `--vibe` の優先順位
+
+`--vibe` は **未指定の項目のみ** を補完するプリセットです。
+
+- `--vibe` 単体: `provider=mistral`・`model=devstral-2`・`mode=VIBE` を自動設定
+- `--vibe` と `--provider anthropic` を同時指定: **明示した `--provider` が優先**（`--vibe` は `model` と `mode` のみ補完）
+- `--vibe` と `--mode diff批評` を同時指定: **明示した `--mode` が優先**
+
+```bash
+# すべて vibe 任せ
+obstral "認証周りのリファクタ案" --vibe
+
+# provider だけ上書き（mode と model は vibe が補完）
+obstral "コードレビューして" --vibe --provider anthropic
+
+# mode だけ上書き（provider と model は vibe が補完）
+obstral "この差分見て" --vibe --mode diff批評
+```
+
 ### 利用例
 
-```powershell
+```bash
 # VIBE プリセット（Mistral devstral-2）
-$env:MISTRAL_API_KEY = "..."
+export MISTRAL_API_KEY="..."
 cargo run -- "認証周りのリファクタ案を出して" --vibe
 
 # Anthropic
-$env:ANTHROPIC_API_KEY = "..."
+export ANTHROPIC_API_KEY="..."
 cargo run -- chat "コードレビューして" --provider anthropic --model claude-opus-4-6 --mode diff批評
 
-# ローカル vLLM / LM Studio
+# ローカル vLLM / LM Studio（APIキー不要）
 cargo run -- chat "Hello" --provider openai-compatible --model local-model --base-url http://localhost:8000/v1
 
 # diff ファイルを使ったコードレビュー
@@ -172,6 +256,15 @@ obstral[VIBE|default|mistral]>
 
 ---
 
+## セキュリティ / ローカル保存
+
+- **`.obstral_history`**: REPL の入力履歴のみ保存。会話内容は保存されません。
+- **`/config`**: APIキーは `****` で伏せて表示されます。
+- **Web UI バインド**: デフォルトは `127.0.0.1`（ローカルホストのみ）。`0.0.0.0` にしない限り外部から到達できません。
+- **送信先**: 入力内容は選択したプロバイダの API エンドポイントに送信されます。HF（ローカル推論）は外部送信なし。
+
+---
+
 ## Windows セットアップ
 
 ```powershell
@@ -193,26 +286,6 @@ winget install Microsoft.WindowsSDK.10.0.18362
 
 ---
 
-## Python 版（レガシー）
-
-Python 実装 (`observistral`) は Hugging Face ローカル推論対応など一部機能を含みます。
-
-```bash
-pip install -e .
-pip install -e .[hf]   # HuggingFace ローカル推論
-
-observistral "プロンプト" --provider mistral --model devstral-2
-observistral --repl
-```
-
-HF ローカル:
-
-```bash
-OBS_HF_LOCAL_ONLY=1 observistral "要約して" --provider hf --model mistralai/Mistral-7B-Instruct-v0.2
-```
-
----
-
 ## 環境変数一覧
 
 | 変数 | 説明 |
@@ -221,11 +294,11 @@ OBS_HF_LOCAL_ONLY=1 observistral "要約して" --provider hf --model mistralai/
 | `ANTHROPIC_API_KEY` | Anthropic APIキー |
 | `OBS_API_KEY` | OpenAI-compatible APIキー |
 | `OPENAI_API_KEY` | OpenAI APIキー（フォールバック） |
-| `OBS_PROVIDER` | デフォルトプロバイダ（Python版） |
-| `OBS_MODEL` | デフォルトモデル（Python版） |
-| `OBS_PERSONA` | デフォルトペルソナ（Python版） |
-| `OBS_BASE_URL` | デフォルトエンドポイント（Python版） |
-| `OBS_TIMEOUT_SECONDS` | タイムアウト秒数（Python版） |
+| `OBS_PROVIDER` | デフォルトプロバイダ |
+| `OBS_MODEL` | デフォルトモデル |
+| `OBS_PERSONA` | デフォルトペルソナ |
+| `OBS_BASE_URL` | デフォルトエンドポイント |
+| `OBS_TIMEOUT_SECONDS` | タイムアウト秒数 |
 | `OBS_HF_DEVICE` | HFデバイス: `auto` / `cpu` / `cuda` |
 | `OBS_HF_LOCAL_ONLY` | `1` でオフラインモード（HF） |
 
@@ -234,14 +307,24 @@ OBS_HF_LOCAL_ONLY=1 observistral "要約して" --provider hf --model mistralai/
 ## Français (FR)
 
 OBSTRAL est un runtime de chatbot avec abstraction de fournisseurs — CLI, REPL et UI web locale dans un seul binaire Rust.
+Issu du prototype `observistral` (analyse de logs Mistral), OBSTRAL supporte désormais OpenAI, Anthropic et HF en plus de Mistral.
 
 **Démarrage rapide :**
 
-```powershell
-$env:MISTRAL_API_KEY = "..."
-cargo run
+```bash
+# Avec Mistral (recommandé)
+export MISTRAL_API_KEY="..."
+cargo run -- serve --provider mistral
 # → ouvrir http://127.0.0.1:8080
 ```
+
+```powershell
+# PowerShell
+$env:MISTRAL_API_KEY = "..."
+.\scripts\run-ui.ps1
+```
+
+> Par défaut (`cargo run` sans options) : provider `mistral` + modèle `devstral-2`.
 
 **Modes :** `実況` (narration) · `壁打ち` (idéation) · `diff批評` (revue de code) · `VIBE` (vibe coding)
 
@@ -249,6 +332,6 @@ cargo run
 
 **Revue de patch :**
 
-```powershell
+```bash
 cargo run -- "Critique ce diff" --mode diff批評 --persona cynical --diff-file ./changes.diff --provider anthropic --model claude-opus-4-6
 ```

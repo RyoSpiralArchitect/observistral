@@ -6,8 +6,12 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::prompts::{Mode, Persona};
-use crate::providers::{self, ChatMessage, PartialConfig, ProviderKind};
+use crate::chatbot::ChatBot;
+use crate::config::{PartialConfig, ProviderKind};
+use crate::modes::Mode;
+use crate::personas;
+use crate::providers;
+use crate::types::ChatMessage;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
@@ -177,6 +181,12 @@ async fn api_chat(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Resul
         if req.model.is_none() {
             partial.model = None;
         }
+        if req.chat_model.is_none() {
+            partial.chat_model = None;
+        }
+        if req.code_model.is_none() {
+            partial.code_model = None;
+        }
         if req.base_url.is_none() {
             partial.base_url = None;
         }
@@ -187,6 +197,12 @@ async fn api_chat(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Resul
 
     if let Some(model) = req.model {
         partial.model = Some(model);
+    }
+    if let Some(chat_model) = req.chat_model {
+        partial.chat_model = Some(chat_model);
+    }
+    if let Some(code_model) = req.code_model {
+        partial.code_model = Some(code_model);
     }
     if let Some(api_key) = req.api_key {
         partial.api_key = Some(api_key);
@@ -241,16 +257,23 @@ async fn api_chat(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Resul
         })
         .collect::<Vec<_>>();
 
-    let content = match providers::chat(
-        &state.client,
-        &cfg,
-        &history,
-        &req.input,
-        req.diff.as_deref(),
-    )
-    .await
+    let provider = providers::build_provider(state.client.clone(), &cfg);
+    let bot = ChatBot::new(provider);
+
+    let resp = match bot
+        .run(
+            &req.input,
+            &history,
+            &cfg.mode,
+            &cfg.persona,
+            cfg.temperature,
+            cfg.max_tokens,
+            req.diff.as_deref(),
+            None,
+        )
+        .await
     {
-        Ok(content) => content,
+        Ok(resp) => resp,
         Err(err) => {
             let msg = anyhow!(err).to_string();
             return write_json(stream, 502, "Bad Gateway", &ApiError { error: msg }).await;
@@ -262,8 +285,8 @@ async fn api_chat(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Resul
         200,
         "OK",
         &ApiChatResponse {
-            content,
-            model: cfg.model,
+            content: resp.content,
+            model: resp.model,
         },
     )
     .await
@@ -291,9 +314,14 @@ async fn api_chat_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -
 
     write_sse_header(stream, 200, "OK").await?;
 
-    let system_text = crate::prompts::build_system_prompt(&cfg.mode, &cfg.persona);
+    let persona_def = personas::resolve_persona(&cfg.persona)?;
+    let system_text = format!(
+        "{}\n\n[Persona]\n{}",
+        crate::modes::mode_prompt(&cfg.mode),
+        persona_def.prompt
+    );
     let user_text =
-        crate::prompts::compose_user_text(&history.user_input, &cfg.mode, diff.as_deref());
+        crate::modes::compose_user_text(&history.user_input, &cfg.mode, diff.as_deref(), None);
 
     // Stream the response as SSE deltas.
     let result = match cfg.provider {
@@ -309,17 +337,35 @@ async fn api_chat_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -
             .await
         }
         ProviderKind::Anthropic => {
-            // Fallback: non-streaming request, then emit deltas in chunks so the UI can render progressively.
-            let content = providers::chat(
+            stream_anthropic(
+                stream,
                 &state.client,
                 &cfg,
+                &system_text,
                 &history.messages,
-                &history.user_input,
-                diff.as_deref(),
+                &user_text,
             )
-            .await;
-            match content {
-                Ok(text) => {
+            .await
+        }
+        ProviderKind::Hf => {
+            // Fallback: non-streaming request, then emit deltas in chunks so the UI can render progressively.
+            let provider = providers::build_provider(state.client.clone(), &cfg);
+            let bot = ChatBot::new(provider);
+            match bot
+                .run(
+                    &history.user_input,
+                    &history.messages,
+                    &cfg.mode,
+                    &cfg.persona,
+                    cfg.temperature,
+                    cfg.max_tokens,
+                    diff.as_deref(),
+                    None,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    let text = resp.content;
                     stream_text_in_chunks(stream, &text, 96, Duration::from_millis(6)).await
                 }
                 Err(err) => Err(err),
@@ -344,10 +390,12 @@ struct ApiChatRequest {
     vibe: Option<bool>,
     provider: Option<ProviderKind>,
     model: Option<String>,
+    chat_model: Option<String>,
+    code_model: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
     mode: Option<Mode>,
-    persona: Option<Persona>,
+    persona: Option<String>,
     temperature: Option<f64>,
     max_tokens: Option<u32>,
     timeout_seconds: Option<u64>,
@@ -402,7 +450,7 @@ struct BuiltHistory {
 fn build_chat_request(
     defaults: PartialConfig,
     req: ApiChatRequest,
-) -> Result<(providers::RunConfig, BuiltHistory, Option<String>)> {
+) -> Result<(crate::config::RunConfig, BuiltHistory, Option<String>)> {
     let mut partial = defaults;
 
     if req.vibe.unwrap_or(false) {
@@ -414,6 +462,12 @@ fn build_chat_request(
         if req.model.is_none() {
             partial.model = None;
         }
+        if req.chat_model.is_none() {
+            partial.chat_model = None;
+        }
+        if req.code_model.is_none() {
+            partial.code_model = None;
+        }
         if req.base_url.is_none() {
             partial.base_url = None;
         }
@@ -424,6 +478,12 @@ fn build_chat_request(
 
     if let Some(model) = req.model {
         partial.model = Some(model);
+    }
+    if let Some(chat_model) = req.chat_model {
+        partial.chat_model = Some(chat_model);
+    }
+    if let Some(code_model) = req.code_model {
+        partial.code_model = Some(code_model);
     }
     if let Some(api_key) = req.api_key {
         partial.api_key = Some(api_key);
@@ -521,7 +581,7 @@ async fn stream_text_in_chunks(
 async fn stream_openai_compat(
     stream: &mut TcpStream,
     client: &reqwest::Client,
-    cfg: &providers::RunConfig,
+    cfg: &crate::config::RunConfig,
     system_text: &str,
     history: &[ChatMessage],
     user_text: &str,
@@ -613,6 +673,106 @@ async fn stream_openai_compat(
 
             if !delta.is_empty() {
                 let data = serde_json::to_string(&Delta { delta })?;
+                write_sse_event(stream, "delta", &data).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn stream_anthropic(
+    stream: &mut TcpStream,
+    client: &reqwest::Client,
+    cfg: &crate::config::RunConfig,
+    system_text: &str,
+    history: &[ChatMessage],
+    user_text: &str,
+) -> Result<()> {
+    use serde_json::json;
+
+    #[derive(Serialize)]
+    struct Delta<'a> {
+        delta: &'a str,
+    }
+
+    let url = format!("{}/messages", cfg.base_url);
+
+    let api_key = cfg
+        .api_key
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing API key for Anthropic"))?;
+
+    let mut messages: Vec<serde_json::Value> = Vec::with_capacity(history.len() + 1);
+    for m in history {
+        messages.push(json!({"role": m.role, "content": m.content}));
+    }
+    messages.push(json!({"role": "user", "content": user_text}));
+
+    let payload = json!({
+        "model": cfg.model,
+        "system": system_text,
+        "messages": messages,
+        "temperature": cfg.temperature,
+        "max_tokens": cfg.max_tokens,
+        "stream": true,
+    });
+
+    let mut resp = client
+        .post(url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", crate::providers::anthropic::ANTHROPIC_VERSION)
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(cfg.timeout_seconds))
+        .json(&payload)
+        .send()
+        .await
+        .context("request failed")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Anthropic API error (HTTP {status})\n{body}"));
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        buf.extend_from_slice(&chunk);
+
+        while let Some(frame) = take_next_sse_frame(&mut buf) {
+            let frame_str = String::from_utf8_lossy(&frame);
+            let mut event_type = "";
+            let mut data_str = "";
+
+            for line in frame_str.split('\n') {
+                let line = line.trim_end_matches('\r');
+                if let Some(rest) = line.strip_prefix("event:") {
+                    event_type = rest.trim();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    data_str = rest.trim();
+                }
+            }
+
+            if event_type == "message_stop" || data_str == "[DONE]" {
+                return Ok(());
+            }
+
+            if event_type != "content_block_delta" {
+                continue;
+            }
+
+            let v: serde_json::Value = match serde_json::from_str(data_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let text = v
+                .pointer("/delta/text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+
+            if !text.is_empty() {
+                let data = serde_json::to_string(&Delta { delta: text })?;
                 write_sse_event(stream, "delta", &data).await?;
             }
         }
