@@ -34,6 +34,7 @@
       insertCliTemplate: "CLI template",
       editApproval: "Edit approval",
       commandApproval: "Command approval",
+      autoObserve: "Auto-observe",
       forceAgent: "Agent mode",
       toolRoot: "作業ルート",
       pendingEdits: "Pending edits",
@@ -131,6 +132,7 @@
       cot: "CoT",
       brief: "簡易",
       structured: "構造化",
+      autoObserve: "自動実況",
       forceAgent: "エージェント常時ON",
       toolRoot: "Tool root",
       on: "ON",
@@ -221,6 +223,7 @@
       polite: "poli",
       critical: "critique",
       brutal: "brutal",
+      autoObserve: "Auto-commenter",
       forceAgent: "Mode agent (toujours)",
       serverOutdated: "Serveur obsolète",
     },
@@ -371,6 +374,7 @@
     autonomy: "longrun",
     requireEditApproval: true,
     requireCommandApproval: true,
+    autoObserve: false,
     forceAgent: true,
     toolRoot: "",
     codeProvider: "",
@@ -948,6 +952,7 @@
       if (typeof cfg.includeCoderContext !== "boolean") cfg.includeCoderContext = !!DEFAULT_CONFIG.includeCoderContext;
       if (typeof cfg.requireEditApproval !== "boolean") cfg.requireEditApproval = !!DEFAULT_CONFIG.requireEditApproval;
       if (typeof cfg.requireCommandApproval !== "boolean") cfg.requireCommandApproval = !!DEFAULT_CONFIG.requireCommandApproval;
+      if (typeof cfg.autoObserve !== "boolean") cfg.autoObserve = !!DEFAULT_CONFIG.autoObserve;
       if (typeof cfg.forceAgent !== "boolean") cfg.forceAgent = !!DEFAULT_CONFIG.forceAgent;
       if (typeof cfg.toolRoot !== "string") cfg.toolRoot = String(cfg.toolRoot || "");
       if (typeof cfg.codeProvider !== "string") cfg.codeProvider = String(cfg.codeProvider || "");
@@ -1036,6 +1041,7 @@
     const abortCoderRef = useRef(null);
     const abortObserverRef = useRef(null);
     const loopRef = useRef({ lastChecked: "", depth: 0 });
+    const lastAutoObserveMsgRef = useRef(null);
     const saveTimer = useRef(null);
     const coderBodyRef = useRef(null);
     const observerBodyRef = useRef(null);
@@ -1068,6 +1074,7 @@
 
     useEffect(() => {
       loopRef.current = { lastChecked: "", depth: 0 };
+      lastAutoObserveMsgRef.current = null;
       setLoopInfo({ active: false, score: 0, depth: 0 });
     }, [threadState.activeId]);
 
@@ -1097,6 +1104,26 @@
 
       setLoopInfo({ active: detected, score: maxSim, depth });
     }, [threadState]);
+
+    // Auto-observe: fire Observer automatically when Coder finishes a response.
+    useEffect(() => {
+      if (!config.autoObserve) return;
+      if (sendingObserver || sendingCoder) return;
+      const coderMsgs = paneMessages("coder");
+      // Find latest completed (non-streaming, non-empty) Coder assistant message.
+      const lastAsst = [...coderMsgs].reverse().find(
+        (m) => m.role === "assistant" && !m.streaming && String(m.content || "").trim().length > 40
+      );
+      if (!lastAsst) return;
+      const key = (activeThread && activeThread.id ? activeThread.id : "") + ":" + lastAsst.id;
+      if (lastAutoObserveMsgRef.current === key) return;
+      lastAutoObserveMsgRef.current = key;
+      // Slight delay to let React settle after streaming ends.
+      const timer = setTimeout(() => {
+        sendObserver("[AUTO-OBSERVE] コーダーが新しいアウトプットを生成した。実況しながら批評せよ。何が起きたかを一文で述べてから、5軸でリスクを洗い出し、proposalsブロックを出力せよ。");
+      }, 700);
+      return () => clearTimeout(timer);
+    }, [threadState, config.autoObserve, sendingCoder, sendingObserver]);
 
     useEffect(() => {
       const d = Number(loopInfo.depth) || 0;
@@ -1656,10 +1683,12 @@
         type: "function",
         function: {
           name: "exec",
-          description: "Execute a shell command on the local machine.",
+          description: isWindows
+            ? "Execute a PowerShell command on the user's Windows machine. Use for ALL local operations: create directories (New-Item -ItemType Directory -Force), write files (Set-Content -Encoding UTF8), run programs, git commands, etc. Check exit_code in the result — non-zero means failure, diagnose and retry."
+            : "Execute a shell command on the user's local machine. Use for ALL local operations: create directories (mkdir -p), write files (tee/printf), run programs, git commands, etc. Check exit_code in the result — non-zero means failure, diagnose and retry.",
           parameters: {
             type: "object",
-            properties: { command: { type: "string", description: "Shell command to execute" } },
+            properties: { command: { type: "string", description: "The exact command to run" } },
             required: ["command"],
           },
         },
@@ -1748,8 +1777,11 @@
               const stdout = String(execRes.stdout || "").trim();
               const stderr = String(execRes.stderr || "").trim();
               const exitCode = execRes.exit_code;
+              const failed = exitCode !== 0 || (stderr && !stdout);
 
-              toolResult = `exit_code: ${exitCode}\nstdout: ${stdout || "(empty)"}\nstderr: ${stderr || "(empty)"}`;
+              toolResult = failed
+                ? `FAILED (exit_code: ${exitCode}).\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}\n⚠ The command failed. Diagnose the error above and call exec again with the fix. Do NOT continue to the next step until this succeeds.`
+                : `OK (exit_code: 0)\nstdout: ${stdout || "(empty)"}`;
 
               if (stdout) display += "\n" + stdout;
               if (stderr) display += "\nstderr: " + stderr;
@@ -1867,9 +1899,9 @@
       }
     };
 
-    const sendObserver = async () => {
+    const sendObserver = async (overrideText) => {
       if (sendingObserver) return;
-      const text = String(observerInput || "").trim();
+      const text = overrideText != null ? String(overrideText) : String(observerInput || "").trim();
       if (!text) return;
 
       const threadId = activeThread.id;
@@ -1884,7 +1916,7 @@
           t.id === threadId ? { ...t, updatedAt: Date.now(), messages: [...(t.messages || []), userMsg, asstMsg] } : t
         ),
       }));
-      setObserverInput("");
+      if (overrideText == null) setObserverInput("");
       setSendingObserver(true);
       requestAnimationFrame(() => scrollBottom(observerBodyRef));
 
@@ -1909,20 +1941,27 @@
       const intensity = intensity0 === "polite" || intensity0 === "critical" || intensity0 === "brutal" ? intensity0 : "critical";
       let intensityInstr = "";
       if (intensity === "polite") {
-        intensityInstr =
-          "Intensity policy: polite. Be supportive and friendly. Still point out concrete issues and propose next steps.\n" +
-          "Anti-loop: avoid repeating your last critique. Only add NEW info or mark what is still UNRESOLVED.";
+        intensityInstr = [
+          "Intensity: polite. Be constructive and encouraging.",
+          "Still flag concrete issues across all five dimensions (correctness/security/reliability/performance/maintainability).",
+          "Every proposal must include a specific, actionable to_coder message.",
+          "Anti-loop: flag NEW issues only. If nothing new, summarise still-open items from prior critiques as [OPEN].",
+        ].join("\n");
       } else if (intensity === "brutal") {
-        intensityInstr =
-          "Intensity policy: brutal. Be blunt and uncompromising. Prioritize flaws/risks. Stay accurate and avoid personal attacks. Propose concrete fixes.\n" +
-          "Hard constraint: identify at least ONE concrete architectural flaw or failure mode.\n" +
-          "Anti-loop: only mention NEW findings or still-UNRESOLVED items. Do not rehash generic advice.";
+        intensityInstr = [
+          "Intensity: brutal. Assume this code ships to 10,000 users at midnight. Find every failure mode.",
+          "Required: identify at least TWO failure modes — one correctness/data bug and one operational risk (monitoring, rollback, config drift).",
+          "Required: every proposal must include a specific to_coder message and realistic impact estimate.",
+          "Forbidden: 'looks good', 'nice work', 'could consider'. Only concrete flaws with concrete fixes.",
+          "Anti-loop: if a prior issue is still unresolved, escalate its score by 10 and mark [ESCALATED]. New findings only otherwise.",
+        ].join("\n");
       } else {
-        intensityInstr =
-          "Intensity policy: critical. Treat this as a shipping review: prioritize risks, tradeoffs, and concrete next steps.\n" +
-          "Hard constraint: identify at least ONE concrete architectural flaw or failure mode.\n" +
-          "Anti-loop: only mention NEW findings or still-UNRESOLVED items from prior critique. Do not repeat yourself.\n" +
-          "If there is no new signal, reply with: [Observer] No new critique. Loop detected.";
+        intensityInstr = [
+          "Intensity: critical. Treat this as a pre-merge review for a production service.",
+          "Required: identify at least ONE concrete bug, security risk, or architectural weakness with a specific to_coder message.",
+          "Check for: missing input validation, unhandled errors, hardcoded values, and missing test coverage.",
+          "Anti-loop: if you raised this issue before, mark it [UNRESOLVED] and move on. No new signal → reply exactly: [Observer] No new critique. Loop detected.",
+        ].join("\n");
       }
       const loopLine =
         loopInfo && loopInfo.depth > 0
@@ -1933,9 +1972,9 @@
         `observer_intensity: ${intensity}`,
         loopLine,
         intensityInstr,
-        "You are reviewing the coder's work artifacts.",
-        "Use coder_context and code snippets to find bugs, risks, and missing tests.",
-        "When you have actionable guidance, append a proposals block.",
+        "Review the coder's artifacts below. Check each dimension: CORRECTNESS, SECURITY, RELIABILITY, PERFORMANCE, MAINTAINABILITY.",
+        "Cite specific function names, data structures, or code patterns. No generic advice.",
+        "Append a proposals block with all actionable findings.",
       ].filter(Boolean).join("\n");
       const sendText = config.includeCoderContext
         ? (text + "\n\n" + observerBridge + "\n\n" + coderContextPacket())
@@ -2536,6 +2575,33 @@
                     {
                       className: "seg-btn " + (!config.requireCommandApproval ? "active" : ""),
                       onClick: () => setConfig({ ...config, requireCommandApproval: false }),
+                      type: "button",
+                    },
+                    tr(lang, "off")
+                  )
+                )
+              ),
+              e(
+                "div",
+                { className: "field", style: { marginTop: "10px" } },
+                e("label", null, tr(lang, "autoObserve")),
+                e(
+                  "div",
+                  { className: "seg" },
+                  e(
+                    "button",
+                    {
+                      className: "seg-btn " + (config.autoObserve ? "active" : ""),
+                      onClick: () => setConfig({ ...config, autoObserve: true }),
+                      type: "button",
+                    },
+                    tr(lang, "on")
+                  ),
+                  e(
+                    "button",
+                    {
+                      className: "seg-btn " + (!config.autoObserve ? "active" : ""),
+                      onClick: () => setConfig({ ...config, autoObserve: false }),
                       type: "button",
                     },
                     tr(lang, "off")

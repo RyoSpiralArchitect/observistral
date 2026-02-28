@@ -614,12 +614,14 @@ async fn api_chat(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Resul
     let provider = providers::build_provider(state.client.clone(), &cfg);
     let bot = ChatBot::new(provider);
 
+    let cot_str = req.cot.as_deref().unwrap_or("brief");
     let resp = match bot
         .run(
             &req.input,
             &history,
             &cfg.mode,
             &cfg.persona,
+            cot_str,
             cfg.temperature,
             cfg.max_tokens,
             req.diff.as_deref(),
@@ -650,7 +652,7 @@ async fn api_chat_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -
     let req: ApiChatRequest =
         serde_json::from_slice(body).context("invalid JSON body (expected ApiChatRequest)")?;
 
-    let (cfg, history, diff) = match build_chat_request(state.defaults.clone(), req) {
+    let (cfg, history, diff, cot) = match build_chat_request(state.defaults.clone(), req) {
         Ok(v) => v,
         Err(err) => {
             // Even for stream endpoint, return JSON error with 400 for easier debugging.
@@ -669,9 +671,12 @@ async fn api_chat_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -
     write_sse_header(stream, 200, "OK").await?;
 
     let persona_def = personas::resolve_persona(&cfg.persona)?;
+    let cot_str = cot.as_deref().unwrap_or("brief");
+    let cot_instr = crate::modes::cot_instruction(cot_str, &cfg.mode);
     let system_text = format!(
-        "{}\n\n[Persona]\n{}",
+        "{}{}\n\n[Persona]\n{}",
         crate::modes::mode_prompt(&cfg.mode),
+        cot_instr,
         persona_def.prompt
     );
     let user_text =
@@ -729,6 +734,7 @@ struct ApiChatRequest {
     base_url: Option<String>,
     mode: Option<Mode>,
     persona: Option<String>,
+    cot: Option<String>,
     temperature: Option<f64>,
     max_tokens: Option<u32>,
     timeout_seconds: Option<u64>,
@@ -791,7 +797,7 @@ struct BuiltHistory {
 fn build_chat_request(
     defaults: PartialConfig,
     req: ApiChatRequest,
-) -> Result<(crate::config::RunConfig, BuiltHistory, Option<String>)> {
+) -> Result<(crate::config::RunConfig, BuiltHistory, Option<String>, Option<String>)> {
     let mut partial = defaults;
 
     if req.vibe.unwrap_or(false) {
@@ -873,6 +879,7 @@ fn build_chat_request(
             messages: history,
         },
         req.diff,
+        req.cot,
     ))
 }
 

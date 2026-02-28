@@ -21,13 +21,15 @@ impl ChatBot {
         history: &[ChatMessage],
         mode: &Mode,
         persona: &str,
+        cot: &str,
         temperature: f64,
         max_tokens: u32,
         diff_text: Option<&str>,
         log_text: Option<&str>,
     ) -> Result<ChatResponse> {
         let persona_def = personas::resolve_persona(persona)?;
-        let system_text = format!("{}\n\n[Persona]\n{}", mode_prompt(mode), persona_def.prompt);
+        let cot_instr = crate::modes::cot_instruction(cot, mode);
+        let system_text = format!("{}{}\n\n[Persona]\n{}", mode_prompt(mode), cot_instr, persona_def.prompt);
 
         let user_text = compose_user_text(user_input, mode, diff_text, log_text);
 

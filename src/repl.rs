@@ -68,6 +68,7 @@ pub async fn run(mut partial: PartialConfig) -> Result<()> {
                 &history,
                 &cfg.mode,
                 &cfg.persona,
+                "brief",
                 cfg.temperature,
                 cfg.max_tokens,
                 None,
