@@ -267,6 +267,7 @@ a {
   padding: 14px;
   overflow: auto;
   flex: 1;
+  min-height: 0; /* allow flex item to shrink below content size */
 }
 
 .msg {
@@ -624,7 +625,6 @@ body.looping .bubble.assistant {
   background: rgba(0, 0, 0, 0.10);
   max-height: 35vh;
   overflow-y: auto;
-  flex-shrink: 0;
 }
 
 .proposal-list {
