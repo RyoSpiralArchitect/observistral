@@ -1401,6 +1401,7 @@
     };
 
     const renderMessage = (m) => {
+      const canExec = !!(status && status.features && status.features.exec);
       const s = String(m && m.content ? m.content : "");
       const streamingNode = s
         ? s
@@ -1421,7 +1422,7 @@
           e("div", { className: "content" }, m.streaming ? streamingNode : parseMarkdown(
             String(m.content || ""),
             execResults[m.id] || {},
-            (blockIdx, langHint, codeText) => runCmd(m.id, blockIdx, langHint, codeText)
+            canExec ? ((blockIdx, langHint, codeText) => runCmd(m.id, blockIdx, langHint, codeText)) : null
           ))
         )
       );
@@ -1808,7 +1809,8 @@
 
       try {
         const supportsTools = resolvedProvider === "openai-compatible" || resolvedProvider === "mistral";
-        if (wantsMaterial && supportsTools) {
+        const serverChatTools = !!(status && status.features && status.features.chat_tools);
+        if (wantsMaterial && supportsTools && serverChatTools) {
           await runCoderAgentic(text, threadId, asstMsg.id, reqCfg, resolvedKey, history, ac);
         } else if (config.stream) {
           await streamChat(
