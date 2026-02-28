@@ -1,110 +1,133 @@
-# observistral 🐈‍⬛
+# observistral
 
-> **AI-powered observability using Mistral AI** — built for Mistral AI's worldwide hackathon.
+プロバイダ抽象化付きチャットbot実行基盤です。以下に対応しています。
 
-`observistral` is a command-line tool that ingests your logs or metrics and uses
-the [Mistral AI](https://mistral.ai/) chat API to surface errors, anomalies,
-root causes, and remediation steps in plain language.
+- OpenAI互換API（OpenAI本家、各種互換エンドポイント）
+- Anthropic Messages API
+- Hugging Face ローカル/オフライン推論（`transformers`）
 
----
-
-## Features
-
-- 📄 **Stdin or file input** — pipe logs directly or point to a file
-- 🤖 **Mistral AI analysis** — powered by `mistral-large-latest` (configurable)
-- 🔍 **Structured insights** — summary, anomalies, root causes, and remediation
-- ✏️  **Custom prompts** — override the default analysis with your own question
-
----
-
-## Requirements
-
-- Rust 1.75+ (uses the 2024 edition)
-- A [Mistral AI API key](https://console.mistral.ai/)
-
----
-
-## Installation
+## インストール
 
 ```bash
-git clone https://github.com/RyoSpiralArchitect/observistral.git
-cd observistral
-cargo build --release
-# binary is at ./target/release/observistral
+pip install -e .
+# HFローカルを使う場合
+pip install -e .[hf]
 ```
+
+## CLI
+
+```bash
+observistral "この機能の設計を壁打ちしたい" \
+  --mode 壁打ち \
+  --persona thoughtful \
+  --provider openai-compatible \
+  --model gpt-4o-mini \
+  --api-key "$OBS_API_KEY"
+```
+
+### モード
+
+- `実況`
+- `壁打ち`
+- `diff批評`
+
+### ペルソナ（切り替えUI / CLI）
+
+- `default` (Balanced)
+- `novelist`
+- `cynical`
+- `cheerful`
+- `thoughtful`
+
+```bash
+# ペルソナ一覧
+observistral --list-personas
+
+# 例: 小説家ペルソナ
+observistral "短い導入文を書いて" --mode 実況 --persona novelist --provider openai-compatible --model gpt-4o-mini --api-key "$OBS_API_KEY"
+```
+
+### さらに進めた実装ポイント
+
+- `--diff-file` でパッチ/差分ファイルを読み込んで `diff批評` に自動注入
+- `--stdin` で標準入力をプロンプトへ追加
+- `--list-providers` で利用可能なプロバイダ別名を表示
+- `--list-personas` で利用可能なペルソナを表示
+- OpenAI互換はAPIキーなしでも利用可能（ローカル推論サーバー向け）
+- AnthropicはAPIキー必須
+- HFローカルは `OBS_HF_LOCAL_ONLY=1` でオフライン優先
+
+### プロバイダ切替例
+
+```bash
+# OpenAI互換
+observistral "こんにちは" --provider openai-compatible --model gpt-4o-mini --api-key "$OBS_API_KEY"
+
+# OpenAI互換（ローカルvLLM/LM Studioなど）
+observistral "こんにちは" --provider openai-compatible --model local-model --base-url "http://localhost:8000/v1"
+
+# Anthropic
+observistral "こんにちは" --provider anthropic --model claude-3-5-sonnet-latest --api-key "$ANTHROPIC_API_KEY"
+
+# HFローカル（オフライン）
+OBS_HF_LOCAL_ONLY=1 observistral "READMEを要約" --provider hf --model mistralai/Mistral-7B-Instruct-v0.2
+
+# diff批評（diffファイル読み込み）
+observistral "この差分をレビューして" --mode diff批評 --persona thoughtful --provider openai-compatible --model gpt-4o-mini --api-key "$OBS_API_KEY" --diff-file ./changes.diff
+```
+
+環境変数でも指定できます。
+
+- `OBS_PROVIDER`
+- `OBS_MODEL`
+- `OBS_API_KEY`
+- `OBS_BASE_URL`
+- `OBS_TIMEOUT_SECONDS`
+- `OBS_HF_DEVICE`
+- `OBS_HF_LOCAL_ONLY`
+- `OBS_PERSONA`
 
 ---
 
-## Usage
+## Français (FR)
 
-### Set your API key
+`observistral` est un runtime de chatbot avec abstraction de fournisseurs.
 
-```bash
-export MISTRAL_API_KEY="your_key_here"
-```
+Fonctionnalités principales :
+- Compatible OpenAI (API `/chat/completions`)
+- Support Anthropic (`/v1/messages`)
+- Support local/offline Hugging Face (`transformers`)
+- Changement de modèle/fournisseur via options CLI ou variables d'environnement
+- Modes prêts à l'emploi : `実況`, `壁打ち`, `diff批評`
+- Personas prêtes à l'emploi : `novelist`, `cynical`, `cheerful`, `thoughtful`
 
-### Analyze logs from stdin
-
-```bash
-journalctl -n 200 | observistral analyze
-```
-
-### Analyze a log file
+Exemple rapide :
 
 ```bash
-observistral analyze --file /var/log/app/error.log
+observistral "Aide-moi à structurer cette idée" \
+  --mode 壁打ち \
+  --persona thoughtful \
+  --provider openai-compatible \
+  --model gpt-4o-mini \
+  --api-key "$OBS_API_KEY"
 ```
 
-### Use a specific model
+Lister les personas :
 
 ```bash
-observistral analyze --file app.log --model mistral-small-latest
+observistral --list-personas
 ```
 
-### Ask a custom question about the logs
+Revue de patch :
 
 ```bash
-observistral analyze --file app.log --prompt "Are there any authentication failures?"
+observistral "Critique ce diff" \
+  --mode diff批評 \
+  --persona cynical \
+  --provider anthropic \
+  --model claude-3-5-sonnet-latest \
+  --api-key "$ANTHROPIC_API_KEY" \
+  --diff-file ./changes.diff
 ```
 
----
-
-## Example output
-
-```
-🔍 Analyzing with mistral-large-latest…
-
-**Summary**
-The application experienced a spike of 5xx errors between 14:32 and 14:47 UTC,
-coinciding with a database connection timeout storm.
-
-**Anomalies detected**
-- 312 occurrences of `connection refused` to postgres:5432 in a 15-minute window
-- Memory usage climbed from 42 % to 94 % before the OOM killer fired
-
-**Potential root causes**
-1. Connection pool exhausted due to long-running queries (several >30 s entries)
-2. Missing index on `events.created_at` causing full table scans under load
-
-**Recommended remediation**
-- Add index: `CREATE INDEX CONCURRENTLY ON events (created_at);`
-- Increase `max_connections` in `pg_hba.conf` or tune the connection pool size
-- Add a query timeout of 10 s to prevent pool starvation
-```
-
----
-
-## Project structure
-
-```
-observistral/
-├── Cargo.toml
-└── src/
-    └── main.rs   # CLI + Mistral API integration
-```
-
----
-
-## License
-
-MIT
+SpiralReality
