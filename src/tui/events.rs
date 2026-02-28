@@ -25,10 +25,6 @@ pub async fn run_event_loop(
     let mut event_stream = EventStream::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
 
-    // Track pending stop signals
-    let mut coder_stop = false;
-    let mut observer_stop = false;
-
     loop {
         terminal.draw(|f| super::ui::render(f, app))?;
 
@@ -47,28 +43,29 @@ pub async fn run_event_loop(
 
         match ev {
             AppEvent::Key(key) => {
-                if handle_key(key, app, &coder_tx, &observer_tx, &mut coder_stop, &mut observer_stop).await? {
+                if handle_key(key, app, &coder_tx, &observer_tx).await? {
                     break;
                 }
             }
-            AppEvent::CoderToken(token) => {
-                handle_coder_token(token, app);
-            }
-            AppEvent::ObserverToken(token) => {
-                handle_observer_token(token, app);
-            }
+            AppEvent::CoderToken(token) => handle_coder_token(token, app),
+            AppEvent::ObserverToken(token) => handle_observer_token(token, app),
             AppEvent::Tick => {
+                app.tick_count = app.tick_count.wrapping_add(1);
                 maybe_auto_observe(app, &observer_tx).await;
             }
         }
 
-        if app.quit {
-            break;
-        }
+        if app.quit { break; }
     }
+
+    // Abort any in-flight tasks on clean exit.
+    if let Some(t) = app.coder_task.take() { t.abort(); }
+    if let Some(t) = app.observer_task.take() { t.abort(); }
 
     Ok(())
 }
+
+// ── Key handler ───────────────────────────────────────────────────────────────
 
 /// Returns true if the app should quit.
 async fn handle_key(
@@ -76,84 +73,108 @@ async fn handle_key(
     app: &mut App,
     coder_tx: &mpsc::Sender<StreamToken>,
     observer_tx: &mpsc::Sender<StreamToken>,
-    _coder_stop: &mut bool,
-    _observer_stop: &mut bool,
 ) -> anyhow::Result<bool> {
     use crossterm::event::KeyEventKind;
-    // Only react on press (not release) to avoid double-firing on some terminals.
-    if key.kind == KeyEventKind::Release {
-        return Ok(false);
-    }
+    if key.kind == KeyEventKind::Release { return Ok(false); }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     match key.code {
+        // Quit
         KeyCode::Char('c') if ctrl => return Ok(true),
         KeyCode::Esc => return Ok(true),
 
-        KeyCode::Tab => {
-            app.toggle_focus();
-        }
+        // Switch focus
+        KeyCode::Tab => app.toggle_focus(),
 
-        // Ctrl+A — toggle auto-observe
+        // Toggle auto-observe
         KeyCode::Char('a') if ctrl => {
             app.auto_observe = !app.auto_observe;
         }
 
-        // Ctrl+O — manually trigger observer
+        // Trigger Observer manually
         KeyCode::Char('o') if ctrl => {
             send_observer_message(app, observer_tx, None).await;
         }
 
-        // Ctrl+L — clear current pane history
+        // Clear current pane
         KeyCode::Char('l') if ctrl => {
-            app.focused_pane_mut().messages.clear();
-            app.focused_pane_mut().scroll = 0;
+            let pane = app.focused_pane_mut();
+            pane.messages.clear();
+            pane.scroll = 0;
         }
 
-        // PageUp / PageDown — scroll
-        KeyCode::PageUp => {
-            let s = app.focused_pane_mut().scroll;
-            app.focused_pane_mut().scroll = s.saturating_sub(5);
+        // Stop streaming (Ctrl+K)
+        KeyCode::Char('k') if ctrl => {
+            match app.focus {
+                Focus::Coder => {
+                    if let Some(handle) = app.coder_task.take() {
+                        handle.abort();
+                    }
+                    app.ignore_coder_tokens = true;
+                    app.coder.finish_stream();
+                    app.coder.push_tool("(ストリーミング停止)".to_string());
+                }
+                Focus::Observer => {
+                    if let Some(handle) = app.observer_task.take() {
+                        handle.abort();
+                    }
+                    app.ignore_observer_tokens = true;
+                    app.observer.finish_stream();
+                    app.observer.push_tool("(ストリーミング停止)".to_string());
+                }
+            }
         }
-        KeyCode::PageDown => {
+
+        // Scroll (lines-from-bottom semantics: 0 = pinned, N = above)
+        KeyCode::PageUp => {
             app.focused_pane_mut().scroll = app.focused_pane_mut().scroll.saturating_add(5);
         }
+        KeyCode::PageDown => {
+            app.focused_pane_mut().scroll = app.focused_pane_mut().scroll.saturating_sub(5);
+        }
+        KeyCode::Home => {
+            app.focused_pane_mut().scroll = usize::MAX; // jump to very top
+        }
+        KeyCode::End => {
+            app.focused_pane_mut().scroll = 0; // re-pin to bottom
+        }
 
-        // Enter — send message
+        // Send message
         KeyCode::Enter if !shift => {
-            let focus = app.focus;
-            match focus {
+            match app.focus {
                 Focus::Coder => send_coder_message(app, coder_tx).await,
                 Focus::Observer => send_observer_message(app, observer_tx, None).await,
             }
         }
 
-        // Shift+Enter — insert newline
+        // Insert newline
         KeyCode::Enter if shift => {
-            let pane = app.focused_pane_mut();
-            pane.textarea.insert_newline();
+            app.focused_pane_mut().textarea.insert_newline();
         }
 
-        // All other keys — delegate to tui-textarea
+        // Pass everything else to tui-textarea
         _ => {
-            let pane = app.focused_pane_mut();
-            pane.textarea.input(key);
+            app.focused_pane_mut().textarea.input(key);
         }
     }
 
     Ok(false)
 }
 
+// ── Token handlers ────────────────────────────────────────────────────────────
+
 fn handle_coder_token(token: StreamToken, app: &mut App) {
+    if app.ignore_coder_tokens { return; }
     match token {
         StreamToken::Delta(s) => {
             app.coder.push_delta(&s);
-            // Auto-scroll
-            app.coder.scroll = usize::MAX;
+            // scroll = 0 means pinned; don't disturb if user has scrolled up.
         }
-        StreamToken::ToolCall(_) => {}
+        StreamToken::ToolCall(_) => {
+            app.coder_iter = app.coder_iter.saturating_add(1);
+        }
         StreamToken::Done => {
             app.coder.finish_stream();
         }
@@ -165,10 +186,10 @@ fn handle_coder_token(token: StreamToken, app: &mut App) {
 }
 
 fn handle_observer_token(token: StreamToken, app: &mut App) {
+    if app.ignore_observer_tokens { return; }
     match token {
         StreamToken::Delta(s) => {
             app.observer.push_delta(&s);
-            app.observer.scroll = usize::MAX;
         }
         StreamToken::ToolCall(_) => {}
         StreamToken::Done => {
@@ -181,65 +202,68 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
     }
 }
 
+// ── Send helpers ──────────────────────────────────────────────────────────────
+
 async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
     let lines = app.coder.textarea.lines();
-    let text: String = lines.join("\n");
+    let text = lines.join("\n");
     let text = text.trim().to_string();
-    if text.is_empty() {
-        return;
-    }
-    if app.coder.streaming {
-        return;
-    }
+    if text.is_empty() || app.coder.streaming { return; }
 
-    // Clear textarea
+    // Abort any previous task before starting a new one.
+    if let Some(handle) = app.coder_task.take() { handle.abort(); }
+
+    // Reset state for the new send.
     app.coder.textarea = tui_textarea::TextArea::default();
+    app.coder_iter = 0;
+    app.coder.scroll = 0;         // pin to bottom for new output
+    app.ignore_coder_tokens = false;
+
     app.coder.push_user(text.clone());
     app.coder.streaming = true;
-    // Start streaming message slot
     app.coder.messages.push(Message::new_streaming(Role::Assistant));
 
     let history = app.coder.chat_history();
     let cfg = app.coder_cfg.clone();
     let tool_root = app.tool_root.clone();
 
-    // Build system + history + user message list.
     let system = agent::coder_system(mode_prompt(&cfg.mode));
     let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
-    // Push all history except the last user msg (it's already in history from push_user).
     let hist_len = history.len();
     for m in history.iter().take(hist_len.saturating_sub(1)) {
         messages.push(m.clone());
     }
-    // The last user turn
     messages.push(ChatMessage { role: "user".to_string(), content: text });
 
     let tx = tx.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         if let Err(e) = agent::run_agentic(messages, &cfg, tool_root.as_deref(), tx.clone()).await {
             let _ = tx.send(StreamToken::Error(e.to_string())).await;
         }
     });
+    app.coder_task = Some(handle);
 }
 
-async fn send_observer_message(app: &mut App, tx: &mpsc::Sender<StreamToken>, override_text: Option<String>) {
+async fn send_observer_message(
+    app: &mut App,
+    tx: &mpsc::Sender<StreamToken>,
+    override_text: Option<String>,
+) {
     let text = match override_text {
         Some(t) => t,
         None => {
-            let lines = app.observer.textarea.lines();
-            let t = lines.join("\n").trim().to_string();
-            if t.is_empty() {
-                return;
-            }
+            let t = app.observer.textarea.lines().join("\n").trim().to_string();
+            if t.is_empty() { return; }
             app.observer.textarea = tui_textarea::TextArea::default();
             t
         }
     };
+    if app.observer.streaming { return; }
 
-    if app.observer.streaming {
-        return;
-    }
+    if let Some(handle) = app.observer_task.take() { handle.abort(); }
 
+    app.observer.scroll = 0;
+    app.ignore_observer_tokens = false;
     app.observer.push_user(text.clone());
     app.observer.streaming = true;
     app.observer.messages.push(Message::new_streaming(Role::Assistant));
@@ -248,17 +272,23 @@ async fn send_observer_message(app: &mut App, tx: &mpsc::Sender<StreamToken>, ov
     let coder_history = app.coder.chat_history();
     let cfg = app.observer_cfg.clone();
 
-    // Build context: Observer system + recent coder context + observer history + new msg.
+    // Inject recent Coder context into Observer system prompt.
     let obs_system = mode_prompt(&cfg.mode);
     let coder_context = if !coder_history.is_empty() {
-        let snippet: String = coder_history
+        let snippet = coder_history
             .iter()
             .rev()
             .take(6)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
-            .map(|m| format!("[{}]: {}", m.role, m.content.chars().take(500).collect::<String>()))
+            .map(|m| {
+                format!(
+                    "[{}]: {}",
+                    m.role,
+                    m.content.chars().take(500).collect::<String>()
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         format!("\n\n[Recent Coder activity]\n{snippet}")
@@ -268,16 +298,13 @@ async fn send_observer_message(app: &mut App, tx: &mpsc::Sender<StreamToken>, ov
 
     let system = format!("{obs_system}{coder_context}");
     let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
-    for m in &history {
-        messages.push(m.clone());
-    }
+    for m in &history { messages.push(m.clone()); }
     messages.push(ChatMessage { role: "user".to_string(), content: text });
 
     let tx = tx.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         use crate::config::ProviderKind;
-        use crate::streaming::{stream_openai_compat, stream_anthropic};
-
+        use crate::streaming::{stream_anthropic, stream_openai_compat};
         let client = reqwest::Client::new();
         let result = match cfg.provider {
             ProviderKind::Anthropic => stream_anthropic(&client, &cfg, &messages, tx.clone()).await,
@@ -287,24 +314,17 @@ async fn send_observer_message(app: &mut App, tx: &mpsc::Sender<StreamToken>, ov
             let _ = tx.send(StreamToken::Error(e.to_string())).await;
         }
     });
+    app.observer_task = Some(handle);
 }
 
-async fn maybe_auto_observe(app: &mut App, observer_tx: &mpsc::Sender<StreamToken>) {
-    if let Some(coder_content) = app.auto_observe_trigger() {
-        // Record we've handled this message (find index again).
-        let idx = app.coder.messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, m)| {
-                matches!(m.role, Role::Assistant) && m.complete && m.content.trim().len() > 40
-            })
-            .map(|(i, _)| i);
-        app.last_auto_obs_idx = idx;
+// ── Auto-observe ──────────────────────────────────────────────────────────────
 
+async fn maybe_auto_observe(app: &mut App, observer_tx: &mpsc::Sender<StreamToken>) {
+    if let Some((idx, content)) = app.auto_observe_trigger() {
+        app.last_auto_obs_idx = Some(idx);
         let prompt = format!(
             "[AUTO-OBSERVE] コーダーが新しいアウトプットを生成した。実況しながら批評せよ。\n\n最新のコーダー出力:\n{}",
-            coder_content.chars().take(800).collect::<String>()
+            content.chars().take(800).collect::<String>()
         );
         send_observer_message(app, observer_tx, Some(prompt)).await;
     }

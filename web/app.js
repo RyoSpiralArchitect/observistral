@@ -69,6 +69,7 @@
       cot: "CoT",
       brief: "Brief",
       structured: "Structured",
+      deep: "Deep",
       on: "ON",
       off: "OFF",
       diff: "diff",
@@ -87,6 +88,8 @@
       polite: "polite",
       critical: "critical",
       brutal: "brutal",
+      details: "details",
+      hide: "hide",
       serverOutdated: "Server outdated",
     },
     ja: {
@@ -132,6 +135,7 @@
       cot: "CoT",
       brief: "簡易",
       structured: "構造化",
+      deep: "本格",
       autoObserve: "自動実況",
       forceAgent: "エージェント常時ON",
       toolRoot: "Tool root",
@@ -153,6 +157,8 @@
       polite: "丁寧",
       critical: "批評",
       brutal: "容赦なし",
+      details: "詳細",
+      hide: "隠す",
       serverOutdated: "サーバ古い",
     },
     fr: {
@@ -205,6 +211,7 @@
       cot: "CoT",
       brief: "Bref",
       structured: "Structuré",
+      deep: "Approfondi",
       on: "ON",
       off: "OFF",
       diff: "diff",
@@ -223,6 +230,8 @@
       polite: "poli",
       critical: "critique",
       brutal: "brutal",
+      details: "détails",
+      hide: "masquer",
       autoObserve: "Auto-commenter",
       forceAgent: "Mode agent (toujours)",
       serverOutdated: "Serveur obsolète",
@@ -886,6 +895,42 @@
     return Math.max(1, Math.ceil(String(text || "").length / 4));
   }
 
+  function relativeTime(ts, uiLang) {
+    const l = String(uiLang || "").trim().toLowerCase();
+    const d = Date.now() - (ts || 0);
+    if (d < 60000) return l === "fr" ? "à l'instant" : (l === "en" ? "just now" : "たった今");
+    if (d < 3600000) {
+      const m = Math.max(1, Math.floor(d / 60000));
+      return l === "fr" ? `il y a ${m}m` : (l === "en" ? `${m}m ago` : `${m}分前`);
+    }
+    if (d < 86400000) {
+      const h = Math.max(1, Math.floor(d / 3600000));
+      return l === "fr" ? `il y a ${h}h` : (l === "en" ? `${h}h ago` : `${h}時間前`);
+    }
+    const days = Math.max(1, Math.floor(d / 86400000));
+    return l === "fr" ? `il y a ${days}j` : (l === "en" ? `${days}d ago` : `${days}日前`);
+  }
+
+  // Renders message content with <think>…</think> blocks dimmed separately.
+  function renderWithThink(text, execRes, onRun) {
+    const re = /<think>([\s\S]*?)<\/think>/gi;
+    const parts = [];
+    let last = 0;
+    let k = 0;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > last) {
+        parts.push(...parseMarkdown(text.slice(last, m.index), execRes, onRun));
+      }
+      parts.push(e("div", { key: "think" + k++, className: "think-block" }, m[1].trim()));
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) {
+      parts.push(...parseMarkdown(text.slice(last), execRes, onRun));
+    }
+    return parts;
+  }
+
   function parseProposals(text) {
     const s = String(text || "");
     const m = /---\s*proposals\s*---/i.exec(s);
@@ -1007,6 +1052,7 @@
       const cot0 = String(cfg.cot || "").trim().toLowerCase();
       if (cot0 === "off") cfg.cot = "off";
       else if (cot0 === "structured") cfg.cot = "structured";
+      else if (cot0 === "deep") cfg.cot = "deep";
       else cfg.cot = "brief";
       if (String(cfg.autonomy || "").trim().toLowerCase() === "off") cfg.autonomy = "off";
       else cfg.autonomy = "longrun";
@@ -1081,6 +1127,7 @@
     const [sendingObserver, setSendingObserver] = useState(false);
     const [loopInfo, setLoopInfo] = useState({ active: false, score: 0, depth: 0 });
     const [execResults, setExecResults] = useState({}); // { msgId: { blockIdx: {stdout,stderr,exit_code,running} } }
+    const [expandedProposals, setExpandedProposals] = useState(new Set());
 
     const abortCoderRef = useRef(null);
     const abortObserverRef = useRef(null);
@@ -1216,7 +1263,23 @@
       if (!eid || pendingBusy) return;
       setPendingBusy(true);
       try {
-        await postJson(approve ? "/api/approve_edit" : "/api/reject_edit", { id: eid });
+        const resp = await postJson(approve ? "/api/approve_edit" : "/api/reject_edit", { id: eid });
+        if (approve && resp && resp.item && !sendingCoder) {
+          const it = resp.item;
+          const action = String(it.action || "").trim();
+          const path = String(it.path || "").trim();
+          const result = it.result != null ? JSON.stringify(it.result, null, 2) : "";
+          const preview = result && result.length > 1800 ? (result.slice(0, 1800) + "\n...truncated...") : result;
+          const msg = [
+            "[OBSTRAL] Pending edit approved. Continue without redoing the approved step.",
+            `id: ${eid}`,
+            action ? `action: ${action}` : "",
+            path ? `path: ${path}` : "",
+            preview ? ("result:\n" + preview) : "",
+          ].filter(Boolean).join("\n");
+          // Best-effort: nudge Coder to resume after approval (Lite server pauses tool loops on approvals).
+          sendCoder(msg);
+        }
       } catch (_) {
       } finally {
         setPendingBusy(false);
@@ -1501,9 +1564,10 @@
             "div",
             { className: "msg-meta" },
             e("div", { className: "who" }, m.role),
+            m.ts ? e("span", { className: "msg-ts" }, relativeTime(m.ts, lang)) : null,
             e("div", { className: "mini" }, e("button", { onClick: () => copyText(m.content || "") }, tr(lang, "copy")))
           ),
-          e("div", { className: "content" }, m.streaming ? streamingNode : parseMarkdown(
+          e("div", { className: "content" }, m.streaming ? streamingNode : renderWithThink(
             String(m.content || ""),
             execResults[m.id] || {},
             canExec ? ((blockIdx, langHint, codeText) => runCmd(m.id, blockIdx, langHint, codeText)) : null
@@ -1631,6 +1695,10 @@
         "You are a CLI coding agent.",
         "Work autonomously in long-run mode: decompose into modules, edit files, and verify.",
         "Prioritize concrete file changes over abstract discussion.",
+        "Always operate under tool_root (create a new project dir; do NOT touch OBSTRAL's repo).",
+        "Before each major action, write a 3-line scratchpad: goal / risk / next (keep it short).",
+        "If an action requires approval, STOP and tell the user which pending edit id(s) to approve, then continue after approval.",
+        "Never run destructive cleanup commands (git reset --hard / git clean -fd / git rm ... .) unless the user explicitly asks.",
         "At the end, report: changed files / why / remaining risks.",
       ].join("\n");
     };
@@ -2588,6 +2656,15 @@
                   e(
                     "button",
                     {
+                      className: "seg-btn " + (String(config.cot || "brief") === "deep" ? "active" : ""),
+                      onClick: () => setConfig({ ...config, cot: "deep" }),
+                      type: "button",
+                    },
+                    tr(lang, "deep")
+                  ),
+                  e(
+                    "button",
+                    {
                       className: "seg-btn " + (String(config.cot || "brief") === "off" ? "active" : ""),
                       onClick: () => setConfig({ ...config, cot: "off" }),
                       type: "button",
@@ -3025,7 +3102,7 @@
               "div",
               { className: "statusline" },
               e("span", {
-                className: "dot",
+                className: "dot" + (sendingCoder ? " streaming" : ""),
                 style: {
                   background: sendingCoder
                     ? (PROVIDER_COLORS[coderResolvedProvider(config.mode)] || "rgba(45,212,191,0.85)")
@@ -3126,7 +3203,21 @@
                             }, tr(lang, "sendToCoder"))
                           )
                         ),
-                        p.toCoder ? e("pre", { className: "proposal-body" }, String(p.toCoder || "").trim()) : null
+                        p.toCoder ? e(
+                          "div",
+                          null,
+                          e("button", {
+                            className: "proposal-toggle",
+                            onClick: () => setExpandedProposals((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(p.id)) next.delete(p.id); else next.add(p.id);
+                              return next;
+                            }),
+                          }, (expandedProposals.has(p.id) ? "▼ " + tr(lang, "hide") : "▶ " + tr(lang, "details"))),
+                          expandedProposals.has(p.id)
+                            ? e("pre", { className: "proposal-body" }, String(p.toCoder || "").trim())
+                            : null
+                        ) : null
                       );
                     })
                   )
@@ -3160,7 +3251,7 @@
               "div",
               { className: "statusline" },
               e("span", {
-                className: "dot",
+                className: "dot" + (sendingObserver ? " streaming" : ""),
                 style: {
                   background: PROVIDER_COLORS[observerResolvedProvider()] || (sendingObserver ? "rgba(251, 191, 36, 0.95)" : "rgba(251, 191, 36, 0.85)"),
                   transition: "background 400ms ease",

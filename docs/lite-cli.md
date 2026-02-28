@@ -101,6 +101,12 @@ Stronger CoT formatting:
 python .\scripts\obstral_lite_cli.py chat "hi" --cot structured
 ```
 
+Even deeper CoT formatting:
+
+```powershell
+python .\scripts\obstral_lite_cli.py chat "hi" --cot deep
+```
+
 UI approval endpoints:
 
 - `GET /api/pending_edits`

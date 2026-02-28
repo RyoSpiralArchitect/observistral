@@ -137,6 +137,22 @@ pub fn cot_instruction(cot: &str, mode: &Mode) -> &'static str {
 \n4. IMPLEMENT — Write clean, idiomatic, testable code.\
 \n5. CHECK — Re-read: does the code handle the risk identified in step 2?\
 \nOutput only the final implementation.",
+        ("deep", false) => "\
+\n\n[Reasoning protocol (deep) 窶・follow before every response]\
+\n1. PROBLEM 窶・Core question + constraints (be precise).\
+\n2. PLAN 窶・5窶・10 bullets (concrete steps).\
+\n3. RISKS 窶・3窶・6 bullets (what is most likely to break).\
+\n4. CHECKS 窶・2窶・5 bullets (how you will verify).\
+\n5. ANSWER 窶・Deliver the final response.\
+\nDo not include hidden chain-of-thought.",
+        ("deep", true) => "\
+\n\n[Reasoning protocol (deep, code) 窶・follow before writing any code]\
+\n1. TASK 窶・Inputs, outputs, invariants.\
+\n2. PLAN 窶・5窶・10 bullets (file-level steps).\
+\n3. RISKS 窶・3窶・6 bullets (bugs, edge cases, safety).\
+\n4. CHECKS 窶・2窶・5 bullets (build/tests/manual checks).\
+\n5. IMPLEMENT 窶・Clean, minimal, testable code.\
+\nOutput only the final implementation.",
         _ => "",
     }
 }

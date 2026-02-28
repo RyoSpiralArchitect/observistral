@@ -378,6 +378,8 @@ def _cot_level(req: dict[str, Any]) -> str:
     s = str(v).strip().lower()
     if s in ("off", "false", "0", "none", "disable", "disabled"):
         return "off"
+    if s in ("deep", "pro", "full"):
+        return "deep"
     if s in ("structured", "plan", "detailed"):
         return "structured"
     if s in ("brief", "short", "on", "true", "1", "simple"):
@@ -2111,9 +2113,18 @@ def _build_messages(req: dict[str, Any]) -> list[dict[str, str]]:
                 system_lines.append(
                     "Reasoning format: include these sections:\n"
                     "1) Plan: 3-7 bullets (high-level)\n"
-                    "2) Assumptions: 1-3 bullets\n"
+                    "2) Risks: 2-5 bullets (what is most likely to break)\n"
                     "3) Result: what you did / what to do next\n"
-                    "Keep it concise and do not include hidden chain-of-thought."
+                    "Keep it concise and do not include hidden chain-of-thought. Prefer concrete next actions (tools/files/commands)."
+                )
+            if cot == "deep":
+                system_lines.append(
+                    "Reasoning format: include these sections:\n"
+                    "1) Plan: 5-12 bullets (detailed)\n"
+                    "2) Risks: 3-8 bullets (what is most likely to break)\n"
+                    "3) Checks: 2-6 bullets (how you will verify locally)\n"
+                    "4) Result: what you did / what to do next\n"
+                    "Do not include hidden chain-of-thought. Prefer concrete next actions (tools/files/commands)."
                 )
             if autonomy == "longrun":
                 system_lines.append(LONGRUN_AUTONOMY_PROMPT)

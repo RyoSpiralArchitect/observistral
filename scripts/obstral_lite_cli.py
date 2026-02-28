@@ -466,7 +466,7 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
         help="If set, call a running OBSTRAL Lite server (example: http://127.0.0.1:18080)",
     )
     p.add_argument("--diff-file", default=None)
-    p.add_argument("--cot", choices=["off", "brief", "structured"], default="brief")
+    p.add_argument("--cot", choices=["off", "brief", "structured", "deep"], default="brief")
     p.add_argument("--autonomy", choices=["off", "longrun"], default="longrun")
     p.add_argument(
         "--require-edit-approval",
