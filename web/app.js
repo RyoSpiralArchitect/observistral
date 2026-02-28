@@ -587,7 +587,7 @@
     return parts;
   }
 
-  function parseMarkdown(text) {
+  function parseMarkdown(text, execRes, onRun) {
     const lines = text.split("\n");
     const out = [];
     let i = 0, k = 0;
@@ -599,15 +599,30 @@
         i++;
         while (i < lines.length && !lines[i].startsWith("```")) { code.push(lines[i]); i++; }
         const codeText = code.join("\n");
+        const blockIdx = k;
+        const isRunnable = onRun && /^(bash|sh|shell|zsh|console)$/i.test(lang);
+        const res = execRes && execRes[blockIdx];
         out.push(e("div", { className: "code", key: k++ },
           e("div", { className: "code-head" },
             e("span", null, lang || "code"),
+            isRunnable && e("button", {
+              className: "btn-run",
+              disabled: !!(res && res.running),
+              onClick: () => onRun(blockIdx, codeText),
+            }, res && res.running ? "⏳" : "▶ run"),
             e("button", {
-              style: { marginLeft: "auto", background: "none", border: "none", color: "var(--muted)", cursor: "pointer", fontSize: "11px" },
+              style: { marginLeft: isRunnable ? "0" : "auto", background: "none", border: "none", color: "var(--muted)", cursor: "pointer", fontSize: "11px" },
               onClick: () => navigator.clipboard && navigator.clipboard.writeText(codeText).catch(() => {}),
             }, "⎘ copy"),
           ),
           e("pre", null, codeText),
+          res && !res.running && e("div", {
+              className: "exec-result " + (res.exit_code === 0 ? "exec-ok" : "exec-err"),
+            },
+            res.stdout && e("pre", null, res.stdout),
+            res.stderr && e("pre", { style: { color: "var(--warn)" } }, res.stderr),
+            e("div", { className: "exec-meta" }, "exit " + res.exit_code),
+          ),
         ));
         i++; continue;
       }
@@ -660,16 +675,17 @@
       const title = String(cur.title || "").trim();
       const toCoder = String(cur.toCoder || "").trim();
       const severity = String(cur.severity || "info").trim().toLowerCase();
-      if (!title && !toCoder) {
-        cur = null;
-        lastKey = "";
-        return;
-      }
+      if (!title && !toCoder) { cur = null; lastKey = ""; return; }
+      const rawScore = parseInt(String(cur.score || ""), 10);
       out.push({
         id: `${out.length + 1}:${title || toCoder}`.slice(0, 80),
         title: title || "(untitled)",
         toCoder,
         severity: severity === "crit" || severity === "warn" ? severity : "info",
+        score: Number.isFinite(rawScore) ? Math.min(100, Math.max(0, rawScore)) : 50,
+        phase: String(cur.phase || "any").trim().toLowerCase(),
+        impact: String(cur.impact || "").trim(),
+        cost: String(cur.cost || "").trim().toLowerCase(),
       });
       cur = null;
       lastKey = "";
@@ -677,41 +693,54 @@
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
+      // Stop if we hit another --- block
+      if (/^\s*---/.test(line) && out.length === 0 && !cur) continue;
+      if (/^\s*---/.test(line) && (out.length > 0 || cur)) { finish(); break; }
+
       const start = /^\s*(\d+)\)\s*title\s*:\s*(.*)\s*$/.exec(line);
-      if (start) {
-        finish();
-        cur = { title: start[2], toCoder: "", severity: "info" };
-        lastKey = "title";
-        continue;
-      }
+      if (start) { finish(); cur = { title: start[2], toCoder: "", severity: "info" }; lastKey = "title"; continue; }
 
       if (!cur) continue;
 
       const to = /^\s*to_coder\s*:\s*(.*)\s*$/.exec(line);
-      if (to) {
-        cur.toCoder = to[1];
-        lastKey = "to_coder";
-        continue;
-      }
+      if (to) { cur.toCoder = to[1]; lastKey = "to_coder"; continue; }
 
       const sev = /^\s*severity\s*:\s*(info|warn|crit)\b/i.exec(line);
-      if (sev) {
-        cur.severity = sev[1].toLowerCase();
-        lastKey = "severity";
-        continue;
-      }
+      if (sev) { cur.severity = sev[1].toLowerCase(); lastKey = "severity"; continue; }
 
-      // Continuation lines (indented) for multi-line fields.
+      const sc = /^\s*score\s*:\s*(\d+)/.exec(line);
+      if (sc) { cur.score = sc[1]; lastKey = "score"; continue; }
+
+      const ph = /^\s*phase\s*:\s*(\w+)/.exec(line);
+      if (ph) { cur.phase = ph[1]; lastKey = "phase"; continue; }
+
+      const imp = /^\s*impact\s*:\s*(.+)$/.exec(line);
+      if (imp) { cur.impact = imp[1]; lastKey = "impact"; continue; }
+
+      const co = /^\s*cost\s*:\s*(\w+)/.exec(line);
+      if (co) { cur.cost = co[1]; lastKey = "cost"; continue; }
+
+      // Continuation lines (indented)
       if (/^\s+/.test(line)) {
         const cont = line.trim();
         if (!cont) continue;
         if (lastKey === "to_coder") cur.toCoder = String(cur.toCoder || "") + "\n" + cont;
         if (lastKey === "title") cur.title = String(cur.title || "") + " " + cont;
+        if (lastKey === "impact") cur.impact = String(cur.impact || "") + " " + cont;
       }
     }
 
     finish();
     return out;
+  }
+
+  function parsePhase(text) {
+    const s = String(text || "");
+    const m = /---\s*phase\s*---/i.exec(s);
+    if (!m) return null;
+    const tail = s.slice(m.index + m[0].length).trimStart();
+    const word = tail.split(/[\r\n\s(]/)[0].toLowerCase();
+    return word === "core" || word === "feature" || word === "polish" ? word : null;
   }
 
   // SECTION: app (filled below)
@@ -821,6 +850,7 @@
     const [sendingCoder, setSendingCoder] = useState(false);
     const [sendingObserver, setSendingObserver] = useState(false);
     const [loopInfo, setLoopInfo] = useState({ active: false, score: 0, depth: 0 });
+    const [execResults, setExecResults] = useState({}); // { msgId: { blockIdx: {stdout,stderr,exit_code,running} } }
 
     const abortCoderRef = useRef(null);
     const abortObserverRef = useRef(null);
@@ -1166,6 +1196,33 @@
       window.prompt(tr(lang, "copy"), String(text || ""));
     };
 
+    const runCmd = async (msgId, blockIdx, codeText) => {
+      setExecResults(prev => ({
+        ...prev,
+        [msgId]: { ...(prev[msgId] || {}), [blockIdx]: { stdout: "", stderr: "", exit_code: 0, running: true } },
+      }));
+      try {
+        const cwd = String(config.toolRoot || "").trim() || undefined;
+        const result = await postJson("/api/exec", { command: codeText, cwd });
+        setExecResults(prev => ({
+          ...prev,
+          [msgId]: { ...(prev[msgId] || {}), [blockIdx]: {
+            stdout: String(result.stdout || ""),
+            stderr: String(result.stderr || ""),
+            exit_code: typeof result.exit_code === "number" ? result.exit_code : -1,
+            running: false,
+          }},
+        }));
+      } catch (err) {
+        setExecResults(prev => ({
+          ...prev,
+          [msgId]: { ...(prev[msgId] || {}), [blockIdx]: {
+            stdout: "", stderr: String(err.message || "error"), exit_code: -1, running: false,
+          }},
+        }));
+      }
+    };
+
     const renderMessage = (m) => {
       const s = String(m && m.content ? m.content : "");
       const streamingNode = s
@@ -1184,7 +1241,11 @@
             e("div", { className: "who" }, m.role),
             e("div", { className: "mini" }, e("button", { onClick: () => copyText(m.content || "") }, tr(lang, "copy")))
           ),
-          e("div", { className: "content" }, m.streaming ? streamingNode : parseMarkdown(String(m.content || "")))
+          e("div", { className: "content" }, m.streaming ? streamingNode : parseMarkdown(
+            String(m.content || ""),
+            execResults[m.id] || {},
+            (blockIdx, codeText) => runCmd(m.id, blockIdx, codeText)
+          ))
         )
       );
     };
@@ -1375,6 +1436,126 @@
       return parts.join("\n");
     };
 
+    const runCoderAgentic = async (text, threadId, asstMsgId, reqCfg, resolvedKey, history, ac) => {
+      const MAX_ITERS = 10;
+      const cwd = String(config.toolRoot || "").trim() || undefined;
+
+      const SYSTEM = [
+        "You are an autonomous coding agent running on the user's local machine.",
+        "You have an `exec` tool that runs shell commands. Use it proactively to:",
+        "- Create directories: mkdir -p <dir>",
+        "- Write files: use `tee <file>` with a heredoc, or `python -c` etc.",
+        "- Initialize git repos: git init, git add, git commit",
+        "- Run any commands needed to complete the task end-to-end.",
+        "Execute everything without asking for confirmation. Summarize results at the end.",
+      ].join("\n");
+
+      const execTool = {
+        type: "function",
+        function: {
+          name: "exec",
+          description: "Execute a shell command on the local machine.",
+          parameters: {
+            type: "object",
+            properties: { command: { type: "string", description: "Shell command to execute" } },
+            required: ["command"],
+          },
+        },
+      };
+
+      const messages = [
+        { role: "system", content: SYSTEM },
+        ...history,
+        { role: "user", content: text },
+      ];
+
+      let display = "";
+      const flush = (extra) => {
+        setMsg(threadId, asstMsgId, (display + (extra || "")).trim() || "…", coderBodyRef);
+      };
+
+      for (let iter = 0; iter < MAX_ITERS; iter++) {
+        if (ac.signal.aborted) break;
+
+        let resp;
+        try {
+          resp = await postJson("/api/chat_tools", {
+            messages,
+            tools: [execTool],
+            model: String(reqCfg.codeModel || reqCfg.model || ""),
+            base_url: String(reqCfg.baseUrl || ""),
+            api_key: resolvedKey || undefined,
+            temperature: numOrUndef(reqCfg.temperature),
+            max_tokens: numOrUndef(reqCfg.maxTokens) || 4096,
+            timeout_seconds: numOrUndef(reqCfg.timeoutSeconds),
+          }, ac.signal);
+        } catch (err) {
+          display += (display ? "\n\n" : "") + `[error] ${err.message}`;
+          flush();
+          break;
+        }
+
+        if (resp && resp.error) {
+          display += (display ? "\n\n" : "") + `[error] ${resp.error}`;
+          flush();
+          break;
+        }
+
+        const choice = resp && resp.choices && resp.choices[0];
+        if (!choice) {
+          display += (display ? "\n\n" : "") + "[error] unexpected response from API";
+          flush();
+          break;
+        }
+
+        const msg = choice.message;
+        messages.push(msg);
+
+        if (msg.content) {
+          display += (display ? "\n\n" : "") + msg.content;
+          flush();
+        }
+
+        if (choice.finish_reason === "tool_calls" && msg.tool_calls && msg.tool_calls.length > 0) {
+          for (const tc of msg.tool_calls) {
+            if (ac.signal.aborted) break;
+            if (tc.type !== "function" || tc.function.name !== "exec") continue;
+
+            let args;
+            try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+            const command = String(args.command || "").trim();
+
+            display += (display ? "\n\n" : "") + "```bash\n$ " + command;
+            flush("\n```");
+
+            let toolResult;
+            try {
+              const execRes = await postJson("/api/exec", { command, cwd }, ac.signal);
+              const stdout = String(execRes.stdout || "").trim();
+              const stderr = String(execRes.stderr || "").trim();
+              const exitCode = execRes.exit_code;
+
+              toolResult = `exit_code: ${exitCode}\nstdout: ${stdout || "(empty)"}\nstderr: ${stderr || "(empty)"}`;
+
+              if (stdout) display += "\n" + stdout;
+              if (stderr) display += "\nstderr: " + stderr;
+              display += "\n```\nexit: " + exitCode;
+            } catch (execErr) {
+              toolResult = `error: ${execErr.message}`;
+              display += "\nerror: " + execErr.message + "\n```";
+            }
+            flush();
+
+            messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+          }
+        } else {
+          break; // finish_reason === "stop" — done
+        }
+      }
+
+      finishStreaming(threadId, asstMsgId);
+    };
+
       const sendCoder = async (overrideText) => {
         if (sendingCoder) return;
         const raw = overrideText != null ? String(overrideText) : String(coderInput || "");
@@ -1426,7 +1607,10 @@
       abortCoderRef.current = ac;
 
       try {
-        if (config.stream) {
+        const supportsTools = resolvedProvider === "openai-compatible" || resolvedProvider === "mistral";
+        if (wantsMaterial && supportsTools) {
+          await runCoderAgentic(text, threadId, asstMsg.id, reqCfg, resolvedKey, history, ac);
+        } else if (config.stream) {
           await streamChat(
             reqBody,
             (evt) => {
@@ -1609,6 +1793,26 @@
       }
     }
     const observerProposals = parseProposals(lastObserverAsst ? lastObserverAsst.content : "");
+
+    // Detect current development phase from the latest Observer message that contains one.
+    const observerPhase = (() => {
+      for (let i = observerMsgs.length - 1; i >= 0; i--) {
+        const m = observerMsgs[i];
+        if (m.role === "assistant" && !m.streaming) {
+          const p = parsePhase(String(m.content || ""));
+          if (p) return p;
+        }
+      }
+      return null;
+    })();
+
+    // Sort proposals: phase-match first, then by score descending.
+    const sortedProposals = [...observerProposals].sort((a, b) => {
+      const aOk = !observerPhase || a.phase === "any" || a.phase === observerPhase;
+      const bOk = !observerPhase || b.phase === "any" || b.phase === observerPhase;
+      if (aOk !== bOk) return aOk ? -1 : 1;
+      return (b.score || 50) - (a.score || 50);
+    });
 
     return e(
       "div",
@@ -2496,11 +2700,12 @@
                       },
                       tr(lang, "loopDetected") + " ×" + String(loopInfo.depth)
                     )
-                  : null
+                  : null,
+                observerPhase && e("span", { className: "phase-indicator phase-" + observerPhase }, observerPhase)
               )
             ),
             e("div", { className: "chat-body", ref: observerBodyRef }, observerMsgs.map(renderMessage)),
-            observerProposals && observerProposals.length
+            sortedProposals && sortedProposals.length
               ? e(
                   "div",
                   { className: "proposalbox" },
@@ -2508,27 +2713,45 @@
                   e(
                     "div",
                     { className: "proposal-list" },
-                    observerProposals.map((p) =>
-                      e(
+                    sortedProposals.map((p) => {
+                      const score = typeof p.score === "number" ? p.score : 50;
+                      const phaseMismatch = observerPhase && p.phase && p.phase !== "any" && p.phase !== observerPhase;
+                      const scoreColor = score >= 70 ? "var(--accent)" : score >= 40 ? "var(--accent2)" : "var(--warn)";
+                      const phaseLabel = p.phase && p.phase !== "any" ? p.phase : null;
+                      return e(
                         "div",
-                        { key: p.id, className: "proposal sev-" + p.severity },
+                        { key: p.id, className: "proposal sev-" + p.severity + (phaseMismatch ? " phase-mismatch" : "") },
                         e("div", { className: "proposal-head" },
-                          e("div", { className: "proposal-title" }, p.title),
+                          e("div", { style: { display: "flex", flexDirection: "column", gap: 4, flex: 1, minWidth: 0 } },
+                            e("div", { style: { display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" } },
+                              e("div", { className: "proposal-title" }, p.title),
+                              phaseLabel && e("span", {
+                                className: "proposal-phase-badge " + (phaseMismatch ? "phase-miss" : "phase-match"),
+                                title: phaseMismatch ? `フェーズ外 (現在: ${observerPhase}、提案: ${p.phase})` : p.phase,
+                              }, p.phase),
+                              p.cost && e("span", { className: "cost-badge" }, p.cost),
+                            ),
+                            e("div", { className: "proposal-score-bar" },
+                              e("div", { className: "proposal-score-fill", style: { width: score + "%", background: `linear-gradient(90deg, ${scoreColor}88, ${scoreColor})` } })
+                            ),
+                            e("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
+                              e("span", { className: "proposal-score-text" }, score + "pt"),
+                              p.impact && e("span", { style: { fontSize: 11, color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, p.impact),
+                            ),
+                          ),
                           e("div", { className: "proposal-actions" },
-                            e(
-                              "button",
-                              {
-                                className: "btn btn-primary",
-                                disabled: sendingCoder || !String(p.toCoder || "").trim(),
-                                onClick: () => sendProposalToCoder(p),
-                              },
-                              tr(lang, "sendToCoder")
-                            )
+                            score < 30 && e("span", { style: { fontSize: 10, color: "var(--faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap" } }, "低優先"),
+                            e("button", {
+                              className: "btn btn-primary",
+                              disabled: sendingCoder || !String(p.toCoder || "").trim(),
+                              onClick: () => sendProposalToCoder(p),
+                              title: phaseMismatch ? `フェーズ外 (現在: ${observerPhase}、提案: ${p.phase})` : "",
+                            }, tr(lang, "sendToCoder"))
                           )
                         ),
                         p.toCoder ? e("pre", { className: "proposal-body" }, String(p.toCoder || "").trim()) : null
-                      )
-                    )
+                      );
+                    })
                   )
                 )
               : null,

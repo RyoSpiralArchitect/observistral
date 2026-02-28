@@ -622,6 +622,9 @@ body.looping .bubble.assistant {
   border-top: 1px solid var(--border);
   padding: 12px;
   background: rgba(0, 0, 0, 0.10);
+  max-height: 35vh;
+  overflow-y: auto;
+  flex-shrink: 0;
 }
 
 .proposal-list {
@@ -716,3 +719,60 @@ body.looping .bubble.assistant {
     display: inline-flex;
   }
 }
+
+/* --- phase indicator (Observer header) --- */
+.phase-indicator {
+  font-size: 11px;
+  font-family: var(--mono);
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid;
+  letter-spacing: 0.04em;
+}
+.phase-indicator.phase-core    { color: #fb7185; border-color: rgba(251,113,133,0.5); background: rgba(251,113,133,0.08); }
+.phase-indicator.phase-feature { color: var(--accent2); border-color: rgba(96,165,250,0.5); background: rgba(96,165,250,0.08); }
+.phase-indicator.phase-polish  { color: var(--accent); border-color: rgba(45,212,191,0.5); background: rgba(45,212,191,0.08); }
+
+/* --- proposal score bar --- */
+.proposal-score-bar  { height: 3px; border-radius: 2px; background: rgba(255,255,255,0.08); margin: 4px 0 2px; overflow: hidden; }
+.proposal-score-fill { height: 100%; border-radius: 2px; transition: width 500ms ease; }
+.proposal-score-text { font-size: 10px; font-family: var(--mono); color: var(--faint); }
+
+/* --- proposal phase / cost badges --- */
+.proposal-phase-badge {
+  font-size: 10px; padding: 1px 7px; border-radius: 999px;
+  font-family: var(--mono); border: 1px solid; white-space: nowrap;
+}
+.proposal-phase-badge.phase-match { color: var(--accent); border-color: rgba(45,212,191,0.45); background: rgba(45,212,191,0.10); }
+.proposal-phase-badge.phase-miss  { color: var(--faint);  border-color: rgba(255,255,255,0.12); background: transparent; }
+.cost-badge {
+  font-size: 10px; padding: 1px 7px; border-radius: 999px;
+  font-family: var(--mono); color: var(--muted); border: 1px solid rgba(255,255,255,0.12);
+}
+
+/* --- phase-mismatch dimming --- */
+.proposal.phase-mismatch { opacity: 0.42; transition: opacity 200ms; }
+.proposal.phase-mismatch:hover { opacity: 0.85; }
+
+/* --- run button --- */
+.btn-run {
+  background: rgba(45, 212, 191, 0.10);
+  border: 1px solid rgba(45, 212, 191, 0.40);
+  color: var(--accent);
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms;
+  font-family: var(--mono);
+}
+.btn-run:hover { background: rgba(45, 212, 191, 0.22); border-color: rgba(45, 212, 191, 0.70); }
+.btn-run:disabled { opacity: 0.5; cursor: default; }
+.code-head .btn-run + button { margin-left: 0 !important; }
+
+/* --- exec result --- */
+.exec-result { border-top: 1px solid rgba(255,255,255,0.08); padding: 8px 10px; font-family: var(--mono); font-size: 11px; }
+.exec-result.exec-ok { background: rgba(45,212,191,0.06); border-top-color: rgba(45,212,191,0.20); }
+.exec-result.exec-err { background: rgba(251,113,133,0.07); border-top-color: rgba(251,113,133,0.25); }
+.exec-result pre { margin: 0 0 4px; white-space: pre-wrap; word-break: break-all; color: rgba(255,255,255,0.84); }
+.exec-meta { font-size: 10px; color: var(--faint); }

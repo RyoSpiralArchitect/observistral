@@ -128,6 +128,8 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/models") => api_models(&mut stream, state, &req.body).await,
         ("POST", "/api/chat") => api_chat(&mut stream, state, &req.body).await,
         ("POST", "/api/chat_stream") => api_chat_stream(&mut stream, state, &req.body).await,
+        ("POST", "/api/exec") => api_exec(&mut stream, &req.body).await,
+        ("POST", "/api/chat_tools") => api_chat_tools(&mut stream, state, &req.body).await,
         _ => {
             write_text(
                 &mut stream,
@@ -139,6 +141,143 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
             .await
         }
     }
+}
+
+async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    use serde_json::json;
+
+    #[derive(Deserialize)]
+    struct Req {
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: String,
+        base_url: String,
+        api_key: Option<String>,
+        temperature: Option<f64>,
+        max_tokens: Option<u32>,
+        timeout_seconds: Option<u64>,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            #[derive(Serialize)]
+            struct E { error: String }
+            return write_json(stream, 400, "Bad Request", &E { error: e.to_string() }).await;
+        }
+    };
+
+    let url = format!("{}/chat/completions", req.base_url.trim_end_matches('/'));
+
+    let mut payload = json!({
+        "model": req.model,
+        "messages": req.messages,
+        "temperature": req.temperature.unwrap_or(0.7),
+        "max_tokens": req.max_tokens.unwrap_or(4096),
+    });
+
+    if let Some(tools) = &req.tools {
+        if !tools.is_empty() {
+            payload["tools"] = json!(tools);
+        }
+    }
+
+    let timeout = Duration::from_secs(req.timeout_seconds.unwrap_or(120));
+    let mut http_req = state.client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .timeout(timeout)
+        .json(&payload);
+
+    if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+        http_req = http_req.bearer_auth(key);
+    }
+
+    let resp = match http_req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            #[derive(Serialize)]
+            struct E { error: String }
+            return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+        }
+    };
+
+    let status = resp.status();
+    let resp_text = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        #[derive(Serialize)]
+        struct E { error: String }
+        return write_json(stream, 502, "Bad Gateway",
+            &E { error: format!("API error (HTTP {status}): {resp_text}") }).await;
+    }
+
+    let v: serde_json::Value = match serde_json::from_str(&resp_text) {
+        Ok(v) => v,
+        Err(e) => {
+            #[derive(Serialize)]
+            struct E { error: String }
+            return write_json(stream, 502, "Bad Gateway",
+                &E { error: format!("invalid JSON from API: {e}") }).await;
+        }
+    };
+
+    write_json(stream, 200, "OK", &v).await
+}
+
+async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req { command: String, cwd: Option<String> }
+    #[derive(Serialize)]
+    struct Res { stdout: String, stderr: String, exit_code: i32 }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => {
+            #[derive(Serialize)]
+            struct E { error: String }
+            return write_json(stream, 400, "Bad Request",
+                &E { error: "invalid JSON".into() }).await;
+        }
+    };
+
+    let cmd_str = req.command.trim();
+    if cmd_str.is_empty() {
+        #[derive(Serialize)]
+        struct E { error: String }
+        return write_json(stream, 400, "Bad Request",
+            &E { error: "command is empty".into() }).await;
+    }
+
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut c = Command::new("cmd");
+        c.args(["/C", cmd_str]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", cmd_str]);
+        c
+    };
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(cwd) = req.cwd.as_deref().filter(|s| !s.trim().is_empty()) {
+        cmd.current_dir(cwd);
+    }
+
+    let output = match cmd.output().await {
+        Ok(o) => o,
+        Err(err) => {
+            #[derive(Serialize)]
+            struct E { error: String }
+            return write_json(stream, 500, "Internal Server Error",
+                &E { error: format!("spawn failed: {err}") }).await;
+        }
+    };
+
+    write_json(stream, 200, "OK", &Res {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: output.status.code().unwrap_or(-1),
+    }).await
 }
 
 async fn api_status(stream: &mut TcpStream) -> Result<()> {
