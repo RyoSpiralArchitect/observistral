@@ -8,6 +8,8 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 try:
     from . import serve_lite  # type: ignore
@@ -28,6 +30,39 @@ def _read_optional(path: str | None) -> str | None:
     if not p.exists():
         raise RuntimeError(f"file not found: {p}")
     return p.read_text(encoding="utf-8", errors="replace")
+
+
+def _server_join(base: str, path: str) -> str:
+    b = str(base or "").strip().rstrip("/")
+    p = str(path or "").strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    return b + p
+
+
+def _http_json(method: str, url: str, body: dict[str, Any] | None = None, timeout: int = 30) -> Any:
+    data = None
+    headers: dict[str, str] = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urlrequest.Request(url=url, data=data, headers=headers, method=method)
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urlerror.HTTPError as e:
+        raw = e.read()
+        msg = raw.decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code}\n{msg}") from None
+    except urlerror.URLError as e:
+        raise RuntimeError(f"request failed: {e.reason}") from None
+
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError:
+        return raw.decode("utf-8", errors="replace")
 
 
 def _coerce_provider_defaults(
@@ -179,8 +214,19 @@ def _run_chat(args: argparse.Namespace) -> int:
     # Fail fast for obvious provider/base_url/api-key mismatches.
     _preflight({**req, "api_key": _effective_api_key(req["provider"], req.get("api_key"))[0]})
 
-    out = serve_lite._chat_impl(req)
-    print(str(out.get("content") or ""))
+    if str(args.server or "").strip():
+        url = _server_join(str(args.server), "/api/chat")
+        out = _http_json("POST", url, req, timeout=int(req.get("timeout_seconds") or 120) + 10)
+        if isinstance(out, dict) and out.get("error"):
+            raise RuntimeError(str(out.get("error")))
+        if isinstance(out, dict):
+            print(str(out.get("content") or ""))
+        else:
+            print(str(out))
+        return 0
+
+    out2 = serve_lite._chat_impl(req)
+    print(str(out2.get("content") or ""))
     return 0
 
 
@@ -188,6 +234,8 @@ def _run_repl(args: argparse.Namespace) -> int:
     history: list[dict[str, str]] = []
     diff_text = _read_optional(args.diff_file)
     base_req = _common_req(args)
+    server = str(args.server or "").strip()
+    use_server = bool(server)
     print("OBSTRAL Lite CLI REPL")
     print("  /help  show commands")
     print("  /exit  quit")
@@ -196,6 +244,8 @@ def _run_repl(args: argparse.Namespace) -> int:
             base_req.get("provider"), base_req.get("model"), base_req.get("mode")
         )
     )
+    if use_server:
+        print(f"  server={server}")
     try:
         _preflight(
             {
@@ -265,12 +315,26 @@ def _run_repl(args: argparse.Namespace) -> int:
         req["diff"] = diff_text
 
         try:
-            out = serve_lite._chat_impl(req)
+            if use_server:
+                url = _server_join(server, "/api/chat")
+                out = _http_json(
+                    "POST",
+                    url,
+                    req,
+                    timeout=int(req.get("timeout_seconds") or 120) + 10,
+                )
+                if isinstance(out, dict) and out.get("error"):
+                    raise RuntimeError(str(out.get("error")))
+            else:
+                out = serve_lite._chat_impl(req)
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
             continue
 
-        content = str(out.get("content") or "")
+        if isinstance(out, dict):
+            content = str(out.get("content") or "")
+        else:
+            content = str(out or "")
         print("")
         print(content)
         print("")
@@ -300,6 +364,81 @@ def _run_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_pending(args: argparse.Namespace) -> int:
+    server = str(args.server or "http://127.0.0.1:18080").strip() or "http://127.0.0.1:18080"
+    url = _server_join(server, "/api/pending_edits")
+    out = _http_json("GET", url, None, timeout=10)
+    if not isinstance(out, dict):
+        raise RuntimeError("invalid pending response")
+    items = out.get("pending")
+    items = items if isinstance(items, list) else []
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+
+    if not items:
+        print("(no pending edits)")
+        return 0
+
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        eid = str(it.get("id") or "")
+        status = str(it.get("status") or "")
+        action = str(it.get("action") or "")
+        path = str(it.get("path") or "")
+        preview = str(it.get("preview") or "").strip()
+        if preview:
+            preview = preview.replace("\r\n", "\n").replace("\r", "\n")
+            preview = preview.split("\n", 1)[0]
+            if len(preview) > 120:
+                preview = preview[:120] + "..."
+        line = f"{status}\t{eid}\t{action}\t{path}".rstrip()
+        if preview:
+            line += f"\tpreview={preview}"
+        print(line)
+    return 0
+
+
+def _run_resolve_pending(args: argparse.Namespace, approve: bool) -> int:
+    server = str(args.server or "http://127.0.0.1:18080").strip() or "http://127.0.0.1:18080"
+
+    def resolve_one(edit_id: str) -> Any:
+        path = "/api/approve_edit" if approve else "/api/reject_edit"
+        url = _server_join(server, path)
+        return _http_json("POST", url, {"id": edit_id}, timeout=30)
+
+    if args.all:
+        pending = _http_json("GET", _server_join(server, "/api/pending_edits"), None, timeout=10)
+        items = pending.get("pending") if isinstance(pending, dict) else []
+        items = items if isinstance(items, list) else []
+        targets = [
+            str(it.get("id") or "")
+            for it in items
+            if isinstance(it, dict) and str(it.get("status") or "") == "pending"
+        ]
+        if not targets:
+            print("(no pending edits)")
+            return 0
+        for eid in targets:
+            res = resolve_one(eid)
+            if args.json:
+                print(json.dumps(res, ensure_ascii=False))
+            else:
+                print(f"{'approved' if approve else 'rejected'}\t{eid}")
+        return 0
+
+    edit_id = str(args.id or "").strip()
+    if not edit_id:
+        raise RuntimeError("id is required (or use --all)")
+    res2 = resolve_one(edit_id)
+    if args.json:
+        print(json.dumps(res2, ensure_ascii=False, indent=2))
+    else:
+        print(f"{'approved' if approve else 'rejected'}\t{edit_id}")
+    return 0
+
+
 def _add_common_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--provider", choices=PROVIDERS, default=CLI_DEFAULT_PROVIDER)
     p.add_argument("--model", default=CLI_DEFAULT_MODEL)
@@ -312,6 +451,11 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--temperature", type=float, default=0.4)
     p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--timeout-seconds", type=int, default=120)
+    p.add_argument(
+        "--server",
+        default="",
+        help="If set, call a running OBSTRAL Lite server (example: http://127.0.0.1:18080)",
+    )
     p.add_argument("--diff-file", default=None)
     p.add_argument("--cot", choices=["off", "brief", "structured"], default="brief")
     p.add_argument("--autonomy", choices=["off", "longrun"], default="longrun")
@@ -352,6 +496,22 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=18080)
 
+    pending = sub.add_parser("pending", help="List pending edits from a running server")
+    pending.add_argument("--server", default="http://127.0.0.1:18080")
+    pending.add_argument("--json", action="store_true")
+
+    approve = sub.add_parser("approve", help="Approve a pending edit")
+    approve.add_argument("id", nargs="?", default="")
+    approve.add_argument("--all", action="store_true", help="Approve all pending edits")
+    approve.add_argument("--server", default="http://127.0.0.1:18080")
+    approve.add_argument("--json", action="store_true")
+
+    reject = sub.add_parser("reject", help="Reject a pending edit")
+    reject.add_argument("id", nargs="?", default="")
+    reject.add_argument("--all", action="store_true", help="Reject all pending edits")
+    reject.add_argument("--server", default="http://127.0.0.1:18080")
+    reject.add_argument("--json", action="store_true")
+
     args = parser.parse_args(argv)
 
     if args.cmd == "list-providers":
@@ -372,6 +532,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run_doctor(args)
     if args.cmd == "serve":
         return _run_serve(args)
+    if args.cmd == "pending":
+        return _run_pending(args)
+    if args.cmd == "approve":
+        return _run_resolve_pending(args, approve=True)
+    if args.cmd == "reject":
+        return _run_resolve_pending(args, approve=False)
     raise RuntimeError(f"unknown command: {args.cmd}")
 
 
