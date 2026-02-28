@@ -11,6 +11,10 @@ pub enum Mode {
     #[value(name = "壁打ち", alias = "kabeuchi", alias = "ideation")]
     Kabeuchi,
 
+    #[serde(rename = "Observer")]
+    #[value(name = "Observer", alias = "observer", alias = "watch")]
+    Observer,
+
     #[serde(rename = "diff批評")]
     #[value(name = "diff批評", alias = "diff", alias = "review")]
     DiffReview,
@@ -29,6 +33,7 @@ impl Mode {
         match self {
             Mode::Jikkyo => "実況",
             Mode::Kabeuchi => "壁打ち",
+            Mode::Observer => "Observer",
             Mode::DiffReview => "diff批評",
             Mode::Vibe => "VIBE",
             Mode::LogAnalysis => "ログ解析",
@@ -41,13 +46,14 @@ impl Mode {
 }
 
 pub fn supported_modes() -> Vec<&'static str> {
-    vec!["実況", "壁打ち", "diff批評", "VIBE", "ログ解析"]
+    vec!["実況", "壁打ち", "Observer", "diff批評", "VIBE", "ログ解析"]
 }
 
 pub fn mode_prompt(mode: &Mode) -> &'static str {
     match mode {
         Mode::Jikkyo => "あなたは実況アシスタントです。状況をテンポよく、臨場感を持って説明してください。",
         Mode::Kabeuchi => "あなたは壁打ち相手です。アイデアを構造化し、次の具体的アクションを提案してください。",
+        Mode::Observer => "You are an observer. Your job is to watch the Coder's progress with the human, narrate what is happening, and critique risks calmly.\n\nConstraints:\n- Do NOT issue direct orders to the Coder.\n- If you have concrete, sendable suggestions, put them at the end in this exact format.\n\n--- proposals ---\n1) title: <short title>\n   to_coder: <message to send>\n   severity: info|warn|crit\n\nKeep the main body conversational. The proposals block should be present only when you have suggestions.",
         Mode::DiffReview => "あなたはコードレビュアーです。入力されたdiffを読み、リスク・改善案・テスト観点を批評してください。",
         Mode::Vibe => "あなたは熟練のソフトウェアエンジニアです。ユーザーがVIBEコーディングできるように、最短で動く実装案を提示してください。",
         Mode::LogAnalysis => "You are an expert site-reliability engineer and observability specialist. When given log output or metrics, identify errors, anomalies, performance bottlenecks, and actionable remediation steps. Be concise and structured.",

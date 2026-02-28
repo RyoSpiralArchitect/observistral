@@ -62,7 +62,7 @@ a {
 }
 
 .topbar-inner {
-  max-width: 1200px;
+  max-width: 1440px;
   margin: 0 auto;
   padding: 14px 16px;
   display: flex;
@@ -144,14 +144,20 @@ a {
 }
 
 .main {
-  max-width: 1200px;
+  max-width: 1440px;
   margin: 0 auto;
   width: 100%;
   padding: 16px;
   display: grid;
-  grid-template-columns: 380px 1fr;
+  grid-template-columns: 360px 1fr;
   gap: 14px;
   flex: 1;
+}
+
+.arena {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
 }
 
 .panel {
@@ -567,6 +573,76 @@ a {
   margin-bottom: 10px;
 }
 
+.proposalbox {
+  border-top: 1px solid var(--border);
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.10);
+}
+
+.proposal-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.proposal {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 16px;
+  padding: 10px;
+}
+
+.proposal.sev-info {
+  border-color: rgba(96, 165, 250, 0.40);
+}
+
+.proposal.sev-warn {
+  border-color: rgba(251, 113, 133, 0.55);
+}
+
+.proposal.sev-crit {
+  border-color: rgba(251, 113, 133, 0.85);
+  background: rgba(251, 113, 133, 0.08);
+}
+
+.proposal-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.proposal-title {
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  font-size: 13px;
+}
+
+.proposal-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+.proposal .btn {
+  padding: 7px 11px;
+  font-size: 12px;
+}
+
+.proposal-body {
+  margin: 10px 0 0 0;
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(0, 0, 0, 0.35);
+  color: rgba(255, 255, 255, 0.86);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .file {
   width: 100%;
   color: rgba(255, 255, 255, 0.78);
@@ -580,6 +656,9 @@ a {
 
 @media (max-width: 980px) {
   .main {
+    grid-template-columns: 1fr;
+  }
+  .arena {
     grid-template-columns: 1fr;
   }
   .preset-row {

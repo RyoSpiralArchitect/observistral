@@ -1,6 +1,6 @@
 Param(
   [string]$Host = "127.0.0.1",
-  [int]$Port = 8080
+  [int]$Port = 18080
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,4 +25,3 @@ if (-not (Test-Path $exe)) {
 
 Write-Host "OBSTRAL UI: http://$Host`:$Port/"
 & $exe serve --host $Host --port $Port
-

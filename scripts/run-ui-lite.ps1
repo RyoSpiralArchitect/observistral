@@ -1,7 +1,8 @@
 Param(
   [Alias("Host")]
   [string]$ListenHost = "127.0.0.1",
-  [int]$Port = 8080
+  [int]$Port = 18080,
+  [string]$ApiKey = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,6 +19,10 @@ $env:https_proxy = ""
 $env:all_proxy = ""
 $env:GIT_HTTP_PROXY = ""
 $env:GIT_HTTPS_PROXY = ""
+
+if ($ApiKey -and $ApiKey.Trim()) {
+  $env:OBS_API_KEY = $ApiKey.Trim()
+}
 
 $python = if ($env:OBS_HF_PYTHON -and $env:OBS_HF_PYTHON.Trim()) {
   $env:OBS_HF_PYTHON
