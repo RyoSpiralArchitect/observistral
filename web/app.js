@@ -295,6 +295,26 @@
     return jaccardSim(tokenSetForSim(a), tokenSetForSim(b));
   }
 
+  function autoObservePrompt(uiLang) {
+    const l = String(uiLang || "").trim().toLowerCase();
+    if (l === "fr") {
+      return "[AUTO-OBSERVE] Le Coder vient de produire une nouvelle sortie. Fais une critique en mode commentaire live.\n"
+        + "1) Commence par UNE phrase: qu'est-ce qui vient d'arriver.\n"
+        + "2) Analyse les risques sur 5 axes: exactitude, sécurité, fiabilité, performance, maintenabilité.\n"
+        + "3) Termine par un bloc --- proposals --- avec des actions concrètes.";
+    }
+    if (l === "en") {
+      return "[AUTO-OBSERVE] The Coder produced new output. Commentate and critique live.\n"
+        + "1) Start with ONE sentence: what just happened.\n"
+        + "2) Risk scan across 5 axes: correctness, security, reliability, performance, maintainability.\n"
+        + "3) End with a --- proposals --- block with concrete actions.";
+    }
+    return "[AUTO-OBSERVE] コーダーが新しいアウトプットを生成した。実況しながら批評せよ。\n"
+      + "1) まず一文で「何が起きたか」を述べる。\n"
+      + "2) 5軸（正しさ/セキュリティ/信頼性/性能/保守性）でリスクを洗い出す。\n"
+      + "3) 最後に --- proposals --- ブロックで具体的な手を出す。";
+  }
+
   const PROVIDERS = [
     { k: "mistral", l: { ja: "Mistral", en: "Mistral", fr: "Mistral" } },
     { k: "codestral", l: { ja: "Codestral", en: "Codestral", fr: "Codestral" } },
@@ -619,6 +639,30 @@
       }
     }
     return out.join("\n").trim();
+  }
+
+  function dangerousCommandReason(cmd) {
+    const s0 = String(cmd || "");
+    const s = s0.toLowerCase().replace(/\s+/g, " ").trim();
+    if (!s) return "";
+    if (s.indexOf("git reset --hard") !== -1) return "git reset --hard";
+    if (/\bgit\s+clean\b/.test(s) && /\b-[a-z]*f[a-z]*\b/.test(s) && /\b-[a-z]*d[a-z]*\b/.test(s)) return "git clean -fd";
+    if (/\bgit\s+rm\b/.test(s) && /\b(--cached|-r|--recursive)\b/.test(s) && /(^|\\s)\\.(\\s|$)/.test(s)) return "git rm ... .";
+    if (/\brm\s+-rf\b/.test(s)) return "rm -rf";
+    if (s.indexOf("remove-item") !== -1 && s.indexOf("-recurse") !== -1 && s.indexOf("-force") !== -1) return "Remove-Item -Recurse -Force";
+    return "";
+  }
+
+  function confirmDangerous(uiLang, reason) {
+    const l = String(uiLang || "").trim().toLowerCase();
+    const r = String(reason || "").trim();
+    const msg =
+      l === "fr"
+        ? `Commande dangereuse détectée: ${r}\nExécuter quand même ?`
+        : l === "en"
+          ? `Dangerous command detected: ${r}\nRun anyway?`
+          : `危険なコマンドを検出: ${r}\nそれでも実行しますか？`;
+    try { return window.confirm(msg); } catch (_) { return false; }
   }
 
   function splitArgsSimple(s) {
@@ -1120,7 +1164,7 @@
       lastAutoObserveMsgRef.current = key;
       // Slight delay to let React settle after streaming ends.
       const timer = setTimeout(() => {
-        sendObserver("[AUTO-OBSERVE] コーダーが新しいアウトプットを生成した。実況しながら批評せよ。何が起きたかを一文で述べてから、5軸でリスクを洗い出し、proposalsブロックを出力せよ。");
+        sendObserver(autoObservePrompt(lang));
       }, 700);
       return () => clearTimeout(timer);
     }, [threadState, config.autoObserve, sendingCoder, sendingObserver]);
@@ -1412,6 +1456,14 @@
       try {
         const cwd = String(config.toolRoot || "").trim() || undefined;
         const command = normalizeExecScript(langHint, codeText);
+        const danger = dangerousCommandReason(command);
+        if (danger && !confirmDangerous(lang, danger)) {
+          setExecResults(prev => ({
+            ...prev,
+            [msgId]: { ...(prev[msgId] || {}), [blockIdx]: { stdout: "", stderr: "cancelled", exit_code: -2, running: false } },
+          }));
+          return;
+        }
         const result = await postJson("/api/exec", { command, cwd });
         setExecResults(prev => ({
           ...prev,
@@ -1756,6 +1808,7 @@
             try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
             const command = stripShellTranscript(String(args.command || ""));
             const commandToRun = normalizeExecScript("", command);
+            const danger = dangerousCommandReason(commandToRun);
 
             const win = isWindowsHost();
             const fenceLang = win ? "powershell" : "bash";
@@ -1765,6 +1818,13 @@
 
             let toolResult;
             try {
+              if (danger) {
+                toolResult = `error: blocked dangerous command (${danger}). Ask the user to run it manually if truly intended.`;
+                display += `\n(blocked: ${danger})\n\`\`\`\nexit: -1`;
+                flush();
+                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                continue;
+              }
               if (config.requireCommandApproval && !window.confirm("Run command?\n\n" + commandToRun)) {
                 toolResult = "error: command rejected by user";
                 display += "\n(rejected)\n```\nexit: -1";
@@ -1848,6 +1908,7 @@
       requestAnimationFrame(() => scrollBottom(coderBodyRef));
 
       const reqBody = buildReq(reqCfg, resolvedKey, history, text, diff);
+      reqBody.lang = lang;
       reqBody.force_tools = !!(useCode || wantsMaterial);
       const ac = new AbortController();
       abortCoderRef.current = ac;
@@ -1967,8 +2028,15 @@
         loopInfo && loopInfo.depth > 0
           ? `ui_loop_detected: depth=${loopInfo.depth} sim=${Math.round((loopInfo.score || 0) * 100)}%`
           : "";
+      const outLang = String(lang || "ja").trim().toLowerCase();
+      const langLine = outLang === "fr"
+        ? "Language: French. Write the critique in French. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+        : outLang === "en"
+          ? "Language: English. Write the critique in English. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+          : "Language: Japanese. Write the critique in Japanese. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).";
       const observerBridge = [
         "[Observer bridge]",
+        langLine,
         `observer_intensity: ${intensity}`,
         loopLine,
         intensityInstr,
@@ -1980,6 +2048,7 @@
         ? (text + "\n\n" + observerBridge + "\n\n" + coderContextPacket())
         : (text + "\n\n" + observerBridge);
       const reqBody = buildReq(obsCfg, obsKey, history, sendText, diff);
+      reqBody.lang = lang;
       reqBody.force_tools = false;
       const ac = new AbortController();
       abortObserverRef.current = ac;

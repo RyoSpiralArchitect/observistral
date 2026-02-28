@@ -26,6 +26,7 @@ from urllib import request as urlrequest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = REPO_ROOT / "web"
 WORKSPACE_ROOT = REPO_ROOT.resolve()
+DEFAULT_WORKSPACE_ROOT = (Path.home() / "obstral-work").resolve()
 MAX_BODY_BYTES = 2 * 1024 * 1024
 ANTHROPIC_VERSION = "2023-06-01"
 DIRECT_OPENER = urlrequest.build_opener(urlrequest.ProxyHandler({}))
@@ -43,6 +44,8 @@ LOCAL_TOOL_PROMPT = (
     " Do not claim lack of permission. Use tools first, then summarize results.\n"
     "If the user asks to create a repository/project/app/game, you must actually create "
     "folders/files (mkdir/write_file) and then report what was created.\n\n"
+    "Git safety: NEVER run `git init` at the workspace root. Always create a project directory "
+    "and run git inside it (or use `git -C <dir> ...`). NEVER run `git add .` outside the target repo.\n\n"
     "Use run_command to act locally (git, tests, package managers, winget, etc.).\n"
     "Examples:\n"
     "```obstral-tool\n"
@@ -92,7 +95,6 @@ CODER_IDENTITY_PROMPT = (
 OBSERVER_NOVELIST_PROMPT = (
     "Observer persona (novelist): cynical modern novelist (original voice).\n"
     "- Do NOT imitate any specific living author.\n"
-    "- Language: Japanese by default (a short French phrase is ok).\n"
     "- Stay in-character. No generic encouragement. No 'as an AI' disclaimers.\n"
     "- Evidence first: you MUST quote or paraphrase >=1 concrete fact from coder_context "
     "(error code, file path, model/provider, tool_root, pending approval id, etc.).\n"
@@ -105,18 +107,26 @@ OBSERVER_NOVELIST_PROMPT = (
     "  1) First line: one biting sentence (<= 25 words) about what just happened.\n"
     "  2) Body: 2-6 short paragraphs (1-3 sentences each): narrate + critique with metaphor/irony.\n"
     "  3) Optional: if actionable, append a proposals block exactly as specified.\n"
-    "- Length: <= ~1400 Japanese characters.\n"
+    "- Length: <= ~1400 characters.\n"
 )
 
+def _observer_lang_line(ui_lang: str) -> str:
+    l = str(ui_lang or "").strip().lower()
+    if l == "fr":
+        return "- Language: French.\n"
+    if l == "en":
+        return "- Language: English.\n"
+    return "- Language: Japanese.\n"
 
-def _observer_persona_prompt(persona: str) -> str:
+
+def _observer_persona_prompt(persona: str, *, ui_lang: str = "") -> str:
     p = str(persona or "").strip().lower()
     if p == "novelist":
-        return OBSERVER_NOVELIST_PROMPT
+        return OBSERVER_NOVELIST_PROMPT + _observer_lang_line(ui_lang)
     if p == "cynical":
         return (
             "Observer persona (cynical): direct, critical, unsentimental.\n"
-            "- Language: Japanese.\n"
+            + _observer_lang_line(ui_lang) +
             "- No pep talk. No basics.\n"
             "- You MUST cite >=1 concrete evidence from coder_context.\n"
             "- Prioritize risks, contradictions, and what will break next.\n"
@@ -125,7 +135,7 @@ def _observer_persona_prompt(persona: str) -> str:
     if p == "cheerful":
         return (
             "Observer persona (cheerful): energetic but still evidence-driven.\n"
-            "- Language: Japanese.\n"
+            + _observer_lang_line(ui_lang) +
             "- You MUST cite >=1 concrete evidence from coder_context.\n"
             "- Do not hide risks; make them actionable.\n"
             "- Anti-loop: only mention NEW findings or still-UNRESOLVED items. Do not repeat yourself.\n"
@@ -133,7 +143,7 @@ def _observer_persona_prompt(persona: str) -> str:
     if p == "thoughtful":
         return (
             "Observer persona (thoughtful): calm, analytical, reflective.\n"
-            "- Language: Japanese.\n"
+            + _observer_lang_line(ui_lang) +
             "- You MUST cite >=1 concrete evidence from coder_context.\n"
             "- Emphasize trade-offs, unknowns, and verification.\n"
             "- Anti-loop: only mention NEW findings or still-UNRESOLVED items. Do not repeat yourself.\n"
@@ -260,7 +270,7 @@ def _set_workspace_root(raw_root: str) -> None:
         p = REPO_ROOT / p
     p = p.resolve()
     if not p.exists():
-        raise RuntimeError(f"workspace root does not exist: {p}")
+        p.mkdir(parents=True, exist_ok=True)
     if not p.is_dir():
         raise RuntimeError(f"workspace root is not a directory: {p}")
     WORKSPACE_ROOT = p
@@ -1388,6 +1398,14 @@ def _apply_run_command(command: str, timeout_seconds: int, *, cwd: Path | None =
     if not cmd:
         raise RuntimeError("command is required")
 
+    s = re.sub(r"\s+", " ", cmd.strip().lower())
+    if "git reset --hard" in s:
+        raise RuntimeError("refusing to run dangerous command via OBSTRAL: git reset --hard")
+    if re.search(r"\bgit\s+clean\b", s) and re.search(r"\b-[a-z]*f[a-z]*\b", s) and re.search(r"\b-[a-z]*d[a-z]*\b", s):
+        raise RuntimeError("refusing to run dangerous command via OBSTRAL: git clean -fd")
+    if re.search(r"\bgit\s+rm\b", s) and re.search(r"\b(--cached|-r|--recursive)\b", s) and re.search(r"(^|\\s)\\.(\\s|$)", s):
+        raise RuntimeError("refusing to run dangerous command via OBSTRAL: git rm ... .")
+
     timeout = min(600, max(1, int(timeout_seconds or 120)))
     run_cwd = (cwd or WORKSPACE_ROOT).resolve()
     try:
@@ -1428,6 +1446,51 @@ def _apply_run_command(command: str, timeout_seconds: int, *, cwd: Path | None =
             "exit_code": out["exit_code"],
         },
     )
+    return out
+
+
+def _exec_impl(req: dict[str, Any]) -> dict[str, Any]:
+    cmd = str(req.get("command") or "").strip()
+    if not cmd:
+        raise RuntimeError("command is required")
+
+    cwd = WORKSPACE_ROOT
+    cwd_raw = str(req.get("cwd") or "").strip()
+    if cwd_raw:
+        cwd = _resolve_workspace_path(cwd_raw, root=WORKSPACE_ROOT)
+
+    timeout = min(600, max(1, int(req.get("timeout_seconds") or 120)))
+    if sys.platform.startswith("win"):
+        prelude = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding=[System.Text.Encoding]::UTF8; "
+        cp = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", prelude + cmd],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+        )
+    else:
+        cp = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    out = {
+        "command": cmd,
+        "cwd": cwd.as_posix(),
+        "exit_code": int(cp.returncode),
+        "stdout": str(cp.stdout or ""),
+        "stderr": str(cp.stderr or ""),
+    }
+    _log_change("exec", {"cwd": out["cwd"], "command": out["command"], "exit_code": out["exit_code"]})
     return out
 
 
@@ -2073,7 +2136,7 @@ def _build_messages(req: dict[str, Any]) -> list[dict[str, str]]:
                 "   to_coder: <message to send>\n"
                 "   severity: info|warn|crit"
             )
-            persona_style = _observer_persona_prompt(persona)
+            persona_style = _observer_persona_prompt(persona, ui_lang=str(req.get("lang") or ""))
             if persona_style:
                 system_lines.append(persona_style)
         messages.insert(0, {"role": "system", "content": "\n\n".join(system_lines)})
@@ -2389,6 +2452,9 @@ class LiteHandler(BaseHTTPRequestHandler):
                     "version": "lite",
                     "workspace_root": WORKSPACE_ROOT.as_posix(),
                     "features": {
+                        "exec": True,
+                        "pending_edits": True,
+                        "chat_tools": False,
                         "edit_approval_default": _as_bool(os.environ.get("OBS_REQUIRE_EDIT_APPROVAL"), True),
                         "command_approval_default": _as_bool(os.environ.get("OBS_REQUIRE_COMMAND_APPROVAL"), True),
                     },
@@ -2452,6 +2518,16 @@ class LiteHandler(BaseHTTPRequestHandler):
 
         if self.path == "/api/chat_stream":
             self._serve_chat_stream(payload)
+            return
+
+        if self.path == "/api/exec":
+            try:
+                self._send_json(200, _exec_impl(payload))
+            except Exception as e:
+                out = {"error": str(e)}
+                if _as_bool(os.environ.get("OBS_DEBUG"), False):
+                    out["trace"] = traceback.format_exc()
+                self._send_json(400, out)
             return
 
         if self.path == "/api/approve_edit":
@@ -2526,13 +2602,12 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument(
         "--workspace",
-        default=os.environ.get("OBS_WORKSPACE_ROOT", ""),
-        help="Workspace root for local tools (default: repo root).",
+        default=os.environ.get("OBS_WORKSPACE_ROOT", "").strip() or str(DEFAULT_WORKSPACE_ROOT),
+        help="Workspace root for local tools (default: $OBS_WORKSPACE_ROOT or ~/obstral-work).",
     )
     args = parser.parse_args()
 
-    if str(args.workspace or "").strip():
-        _set_workspace_root(str(args.workspace))
+    _set_workspace_root(str(args.workspace))
 
     server = ThreadingHTTPServer((args.host, args.port), LiteHandler)
     print(f"OBSTRAL Lite UI: http://{args.host}:{args.port}/")

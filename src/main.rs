@@ -1,9 +1,12 @@
 mod chatbot;
 mod config;
+mod exec;
 mod modes;
 mod personas;
 mod repl;
 mod server;
+mod streaming;
+mod tui;
 mod types;
 mod providers;
 
@@ -14,6 +17,7 @@ use std::path::PathBuf;
 use crate::chatbot::ChatBot;
 use crate::config::{PartialConfig, ProviderKind};
 use crate::server::ServeArgs;
+use crate::tui::TuiArgs;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -49,6 +53,9 @@ enum Command {
 
     /// Local web UI (React) + JSON API
     Serve(ServeArgs),
+
+    /// Terminal UI (dual-pane Coder + Observer, like Claude Code / Aider)
+    Tui(TuiArgs),
 
     /// List built-in values
     List {
@@ -157,6 +164,7 @@ async fn main() -> Result<()> {
         Some(Command::Chat { prompt }) => run_chat(prompt, cli.common).await,
         Some(Command::Repl) => repl::run(cli.common.to_partial_config()).await,
         Some(Command::Serve(args)) => server::run(args, cli.common.to_partial_config()).await,
+        Some(Command::Tui(args)) => tui::run(args, cli.common.to_partial_config()).await,
         Some(Command::List { what }) => {
             run_list(what);
             Ok(())

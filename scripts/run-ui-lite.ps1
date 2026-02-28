@@ -2,7 +2,8 @@ Param(
   [Alias("Host")]
   [string]$ListenHost = "127.0.0.1",
   [int]$Port = 18080,
-  [string]$ApiKey = ""
+  [string]$ApiKey = "",
+  [string]$WorkspaceRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +25,17 @@ if ($ApiKey -and $ApiKey.Trim()) {
   $env:OBS_API_KEY = $ApiKey.Trim()
 }
 
+$ws = if ($WorkspaceRoot -and $WorkspaceRoot.Trim()) {
+  $WorkspaceRoot.Trim()
+} elseif ($env:OBS_WORKSPACE_ROOT -and $env:OBS_WORKSPACE_ROOT.Trim()) {
+  $env:OBS_WORKSPACE_ROOT.Trim()
+} else {
+  (Join-Path $HOME "obstral-work")
+}
+
+New-Item -ItemType Directory -Force -Path $ws | Out-Null
+$env:OBS_WORKSPACE_ROOT = $ws
+
 $python = if ($env:OBS_HF_PYTHON -and $env:OBS_HF_PYTHON.Trim()) {
   $env:OBS_HF_PYTHON
 } else {
@@ -31,4 +43,5 @@ $python = if ($env:OBS_HF_PYTHON -and $env:OBS_HF_PYTHON.Trim()) {
 }
 
 Write-Host "OBSTRAL Lite UI: http://$ListenHost`:$Port/"
-& $python ".\scripts\serve_lite.py" --host $ListenHost --port $Port
+Write-Host "Workspace root: $ws"
+& $python ".\scripts\serve_lite.py" --host $ListenHost --port $Port --workspace $ws

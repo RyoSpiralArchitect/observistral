@@ -504,7 +504,11 @@ def main(argv: list[str] | None = None) -> int:
     serve = sub.add_parser("serve", help="Run local OBSTRAL Lite web UI server")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=18080)
-    serve.add_argument("--workspace", default="", help="Override workspace root for local tools")
+    serve.add_argument(
+        "--workspace",
+        default=os.environ.get("OBS_WORKSPACE_ROOT", "").strip() or str(serve_lite.DEFAULT_WORKSPACE_ROOT),
+        help="Override workspace root for local tools (default: $OBS_WORKSPACE_ROOT or ~/obstral-work)",
+    )
 
     pending = sub.add_parser("pending", help="List pending edits from a running server")
     pending.add_argument("--server", default="http://127.0.0.1:18080")
