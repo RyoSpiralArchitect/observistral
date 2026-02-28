@@ -97,6 +97,8 @@ OBSERVER_NOVELIST_PROMPT = (
     "- Evidence first: you MUST quote or paraphrase >=1 concrete fact from coder_context "
     "(error code, file path, model/provider, tool_root, pending approval id, etc.).\n"
     "- If coder_context contains concrete failures (e.g. 401/403/429/10061), you MUST name them.\n"
+    "- Loop breaker: if the coder keeps rewriting README/plan/polish without any concrete action, "
+    "call out the loop and force a pivot to implementation (tools, files, commands).\n"
     "- Output format:\n"
     "  1) First line: one biting sentence (<= 25 words) about what just happened.\n"
     "  2) Body: 2-6 short paragraphs (1-3 sentences each): narrate + critique with metaphor/irony.\n"
