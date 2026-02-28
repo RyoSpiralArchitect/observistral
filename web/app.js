@@ -34,6 +34,7 @@
       insertCliTemplate: "CLI template",
       editApproval: "Edit approval",
       commandApproval: "Command approval",
+      toolRoot: "作業ルート",
       pendingEdits: "Pending edits",
       approve: "Approve",
       reject: "Reject",
@@ -105,6 +106,7 @@
       cot: "CoT",
       brief: "簡易",
       structured: "構造化",
+      toolRoot: "Tool root",
       on: "ON",
       off: "OFF",
       diff: "diff",
@@ -136,6 +138,7 @@
       insertCliTemplate: "Template CLI",
       editApproval: "Approbation édition",
       commandApproval: "Approbation commande",
+      toolRoot: "Racine outils",
       pendingEdits: "Éditions en attente",
       approve: "Approuver",
       reject: "Rejeter",
@@ -259,6 +262,7 @@
     autonomy: "longrun",
     requireEditApproval: true,
     requireCommandApproval: true,
+    toolRoot: "",
     persona: "default",
     observerMode: "Observer",
     observerPersona: "novelist",
@@ -293,6 +297,7 @@
       code_model: strOrUndef(cfg.codeModel || cfg.model),
       base_url: strOrUndef(cfg.baseUrl),
       api_key: strOrUndef(apiKey),
+      tool_root: strOrUndef(cfg.toolRoot),
       mode: strOrUndef(cfg.mode),
       cot: strOrUndef(cfg.cot),
       autonomy: strOrUndef(cfg.autonomy),
@@ -616,6 +621,7 @@
       if (typeof cfg.includeCoderContext !== "boolean") cfg.includeCoderContext = !!DEFAULT_CONFIG.includeCoderContext;
       if (typeof cfg.requireEditApproval !== "boolean") cfg.requireEditApproval = !!DEFAULT_CONFIG.requireEditApproval;
       if (typeof cfg.requireCommandApproval !== "boolean") cfg.requireCommandApproval = !!DEFAULT_CONFIG.requireCommandApproval;
+      if (typeof cfg.toolRoot !== "string") cfg.toolRoot = String(cfg.toolRoot || "");
       const cot0 = String(cfg.cot || "").trim().toLowerCase();
       if (cot0 === "off") cfg.cot = "off";
       else if (cot0 === "structured") cfg.cot = "structured";
@@ -1113,6 +1119,7 @@
       parts.push("observer_view: You can inspect coder outputs and code snippets below.");
       parts.push(`coder_mode: ${String(config.mode || "")}`);
       parts.push(`coder_model: ${coderActiveModel()}`);
+      parts.push(`tool_root: ${String(config.toolRoot || "").trim()}`);
       if (lastUser) parts.push("last_user:\n" + cut(lastUser.content, 1200));
       if (lastAsst) parts.push("last_assistant:\n" + cut(lastAsst.content, 2600));
       if (pathHints.length) parts.push("file_hints:\n- " + pathHints.join("\n- "));
@@ -1218,7 +1225,8 @@
       setSendingObserver(true);
       requestAnimationFrame(() => scrollBottom(observerBodyRef));
 
-      const obsCfg = { ...config, mode: config.observerMode, persona: config.observerPersona };
+      // Keep Observer in-character: do not inherit coder's CoT/autonomy formatting.
+      const obsCfg = { ...config, mode: config.observerMode, persona: config.observerPersona, cot: "off", autonomy: "off" };
       const observerBridge = [
         "[Observer bridge]",
         "You are reviewing the coder's work artifacts.",
@@ -1661,6 +1669,17 @@
               e(
                 "div",
                 { className: "field", style: { marginTop: "10px" } },
+                e("label", null, tr(lang, "toolRoot")),
+                e("input", {
+                  className: "input",
+                  value: String(config.toolRoot || ""),
+                  onChange: (ev) => setConfig({ ...config, toolRoot: ev.target.value }),
+                  placeholder: "(optional) subdir (e.g. myrepo)",
+                })
+              ),
+              e(
+                "div",
+                { className: "field", style: { marginTop: "10px" } },
                 e("label", null, tr(lang, "includeCoderContext")),
                 e(
                   "div",
@@ -1817,7 +1836,11 @@
                               : null
                           ),
                           it.preview
-                            ? e("pre", { style: { marginTop: 6, maxHeight: 100, overflow: "auto" } }, String(it.preview))
+                            ? e(
+                                "pre",
+                                { style: { marginTop: 6, maxHeight: 100, overflow: "auto" } },
+                                String(it.diff || it.preview)
+                              )
                             : null
                         )
                       )

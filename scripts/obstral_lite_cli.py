@@ -106,6 +106,7 @@ def _run_doctor_from_req(req: dict[str, Any], check_models: bool = False) -> int
     provider = str(req.get("provider") or "")
     base_url = str(req.get("base_url") or "")
     model = str(req.get("model") or "")
+    tool_root = str(req.get("tool_root") or "")
     api_key, key_source = _effective_api_key(provider, str(req.get("api_key") or ""))
     needs_key = _provider_needs_api_key(provider)
 
@@ -114,6 +115,8 @@ def _run_doctor_from_req(req: dict[str, Any], check_models: bool = False) -> int
     print(f"  mode:       {req.get('mode')}")
     print(f"  base_url:   {base_url or '(empty)'}")
     print(f"  model:      {model or '(empty)'}")
+    if tool_root.strip():
+        print(f"  tool_root:  {tool_root.strip()}")
     print(f"  api_key:    {'present' if bool(api_key) else 'missing'} ({key_source})")
     print(f"  cot:        {req.get('cot')}")
     print(f"  autonomy:   {req.get('autonomy')}")
@@ -179,6 +182,7 @@ def _common_req(args: argparse.Namespace) -> dict[str, Any]:
         "code_model": args.code_model or model,
         "base_url": base_url,
         "api_key": args.api_key,
+        "tool_root": args.tool_root,
         "mode": args.mode,
         "persona": args.persona,
         "temperature": args.temperature,
@@ -293,6 +297,7 @@ def _run_repl(args: argparse.Namespace) -> int:
                 "chat_model": cfg.get("chat_model"),
                 "code_model": cfg.get("code_model"),
                 "base_url": cfg.get("base_url"),
+                "tool_root": cfg.get("tool_root"),
                 "mode": cfg.get("mode"),
                 "persona": cfg.get("persona"),
                 "temperature": cfg.get("temperature"),
@@ -351,10 +356,13 @@ def _run_doctor(args: argparse.Namespace) -> int:
 
 
 def _run_serve(args: argparse.Namespace) -> int:
+    if getattr(args, "workspace", ""):
+        serve_lite._set_workspace_root(str(args.workspace))
     host = str(args.host or "127.0.0.1").strip() or "127.0.0.1"
     port = int(args.port or 18080)
     server = serve_lite.ThreadingHTTPServer((host, port), serve_lite.LiteHandler)
     print(f"OBSTRAL Lite UI: http://{host}:{port}/")
+    print(f"Workspace root: {serve_lite.WORKSPACE_ROOT.as_posix()}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -451,6 +459,7 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--temperature", type=float, default=0.4)
     p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--timeout-seconds", type=int, default=120)
+    p.add_argument("--tool-root", default="", help="Restrict local tools to a subdir under workspace root")
     p.add_argument(
         "--server",
         default="",
@@ -495,6 +504,7 @@ def main(argv: list[str] | None = None) -> int:
     serve = sub.add_parser("serve", help="Run local OBSTRAL Lite web UI server")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=18080)
+    serve.add_argument("--workspace", default="", help="Override workspace root for local tools")
 
     pending = sub.add_parser("pending", help="List pending edits from a running server")
     pending.add_argument("--server", default="http://127.0.0.1:18080")

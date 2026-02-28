@@ -28,8 +28,9 @@ python .\scripts\obstral_lite_cli.py list-providers
 python .\scripts\obstral_lite_cli.py list-presets
 python .\scripts\obstral_lite_cli.py doctor --provider mistral --check-models
 python .\scripts\obstral_lite_cli.py chat "hello" --provider openai-compatible --api-key "<KEY>"
+python .\scripts\obstral_lite_cli.py chat "scaffold game" --provider openai-compatible --tool-root projects/mygame
 python .\scripts\obstral_lite_cli.py repl --provider openai-compatible --api-key "<KEY>"
-python .\scripts\obstral_lite_cli.py serve --host 127.0.0.1 --port 18080
+python .\scripts\obstral_lite_cli.py serve --host 127.0.0.1 --port 18080 --workspace .
 python .\scripts\obstral_lite_cli.py pending --server http://127.0.0.1:18080
 python .\scripts\obstral_lite_cli.py approve --server http://127.0.0.1:18080 edit_xxx
 python .\scripts\obstral_lite_cli.py reject --server http://127.0.0.1:18080 edit_xxx
@@ -47,6 +48,8 @@ PowerShell wrapper:
 - `serve` command starts local web UI directly from CLI.
 - `chat`/`repl` support `--server http://127.0.0.1:18080` to share pending approvals with the GUI server.
 - `pending`/`approve`/`reject` let you manage approval queue from CLI.
+- `--tool-root subdir` restricts file/command tools under a project folder (useful for multi-repo workspaces).
+- `serve --workspace <path>` sets the workspace root for tools (default: repo root).
 - REPL supports `/doctor` for in-session config diagnostics.
 - If you change `--provider` and keep default CLI values, base URL/model are auto-switched to provider defaults.
 - Coder tools include `run_command` for terminal execution in workspace root.

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -29,10 +30,13 @@ DIRECT_OPENER = urlrequest.build_opener(urlrequest.ProxyHandler({}))
 LOCAL_TOOL_MAX_STEPS = 10
 PENDING_LOCK = threading.Lock()
 PENDING_EDITS: dict[str, dict[str, Any]] = {}
+CHANGE_LOCK = threading.Lock()
+CHANGE_LOG: list[dict[str, Any]] = []
 
 LOCAL_TOOL_PROMPT = (
     "You are a coding agent with local workspace tools.\n"
-    "Workspace root: {workspace}\n\n"
+    "Workspace root: {workspace}\n"
+    "Tool root (if set): {tool_root}\n\n"
     "When the user asks to create/edit/read files, use tool calls."
     " Do not claim lack of permission. Use tools first, then summarize results.\n"
     "If the user asks to create a repository/project/app/game, you must actually create "
@@ -63,11 +67,18 @@ CODER_IDENTITY_PROMPT = (
 )
 
 OBSERVER_NOVELIST_PROMPT = (
-    "Observer persona style (novelist):\n"
-    "- Voice: cynical, literary, slightly dark humor.\n"
-    "- Keep technical facts precise, but narrate them with metaphor and irony.\n"
-    "- Do not be blandly polite; be sharp, memorable, and theatrical.\n"
-    "- Always anchor tone to real evidence from coder_context.\n"
+    "Observer persona (novelist): cynical modern novelist (original voice).\n"
+    "- Do NOT imitate any specific living author.\n"
+    "- Language: Japanese by default (a short French phrase is ok).\n"
+    "- Stay in-character. No generic encouragement. No 'as an AI' disclaimers.\n"
+    "- Evidence first: you MUST quote or paraphrase >=1 concrete fact from coder_context "
+    "(error code, file path, model/provider, tool_root, pending approval id, etc.).\n"
+    "- If coder_context contains concrete failures (e.g. 401/403/429/10061), you MUST name them.\n"
+    "- Output format:\n"
+    "  1) First line: one biting sentence (<= 25 words) about what just happened.\n"
+    "  2) Body: 2-6 short paragraphs (1-3 sentences each): narrate + critique with metaphor/irony.\n"
+    "  3) Optional: if actionable, append a proposals block exactly as specified.\n"
+    "- Length: <= ~1400 Japanese characters.\n"
 )
 
 
@@ -77,18 +88,25 @@ def _observer_persona_prompt(persona: str) -> str:
         return OBSERVER_NOVELIST_PROMPT
     if p == "cynical":
         return (
-            "Observer persona style (cynical): direct, critical, unsentimental. "
-            "Prioritize risks and contradictions."
+            "Observer persona (cynical): direct, critical, unsentimental.\n"
+            "- Language: Japanese.\n"
+            "- No pep talk. No basics.\n"
+            "- You MUST cite >=1 concrete evidence from coder_context.\n"
+            "- Prioritize risks, contradictions, and what will break next.\n"
         )
     if p == "cheerful":
         return (
-            "Observer persona style (cheerful): energetic but still evidence-driven. "
-            "Do not hide risks."
+            "Observer persona (cheerful): energetic but still evidence-driven.\n"
+            "- Language: Japanese.\n"
+            "- You MUST cite >=1 concrete evidence from coder_context.\n"
+            "- Do not hide risks; make them actionable.\n"
         )
     if p == "thoughtful":
         return (
-            "Observer persona style (thoughtful): calm, analytical, and reflective. "
-            "Emphasize trade-offs."
+            "Observer persona (thoughtful): calm, analytical, reflective.\n"
+            "- Language: Japanese.\n"
+            "- You MUST cite >=1 concrete evidence from coder_context.\n"
+            "- Emphasize trade-offs, unknowns, and verification.\n"
         )
     return ""
 
@@ -198,6 +216,22 @@ def _env_present(name: str) -> bool:
     return bool(v)
 
 
+def _set_workspace_root(raw_root: str) -> None:
+    global WORKSPACE_ROOT
+    s = str(raw_root or "").strip()
+    if not s:
+        return
+
+    p = Path(s).expanduser()
+    if not p.is_absolute():
+        p = REPO_ROOT / p
+    p = p.resolve()
+    if not p.exists():
+        raise RuntimeError(f"workspace root does not exist: {p}")
+    if not p.is_dir():
+        raise RuntimeError(f"workspace root is not a directory: {p}")
+    WORKSPACE_ROOT = p
+
 def _provider_key_from_env(provider: str) -> str:
     if provider in ("mistral", "codestral"):
         return os.environ.get("MISTRAL_API_KEY", "").strip() or os.environ.get(
@@ -295,6 +329,7 @@ def _pending_summary(item: dict[str, Any]) -> dict[str, Any]:
     if not path and str(item.get("action") or "") == "run_command":
         path = "<command>"
     preview = str(args.get("content_preview") or args.get("command_preview") or "")
+    diff = str(args.get("diff_preview") or "")
     out = {
         "id": item.get("id"),
         "action": item.get("action"),
@@ -303,6 +338,7 @@ def _pending_summary(item: dict[str, Any]) -> dict[str, Any]:
         "created_at": item.get("created_at"),
         "updated_at": item.get("updated_at"),
         "preview": preview,
+        "diff": diff,
         "error": item.get("error"),
     }
     if item.get("result") is not None:
@@ -326,6 +362,22 @@ def _queue_pending_edit(action: str, args: dict[str, Any]) -> dict[str, Any]:
     with PENDING_LOCK:
         PENDING_EDITS[eid] = item
     return item
+
+
+def _log_change(action: str, payload: dict[str, Any]) -> None:
+    now = int(time.time())
+    item = {"id": "chg_" + uuid.uuid4().hex[:10], "ts": now, "action": action, **payload}
+    with CHANGE_LOCK:
+        CHANGE_LOG.append(item)
+        if len(CHANGE_LOG) > 200:
+            del CHANGE_LOG[:50]
+
+
+def _list_changes() -> list[dict[str, Any]]:
+    with CHANGE_LOCK:
+        items = list(CHANGE_LOG)
+    items.sort(key=lambda x: int(x.get("ts") or 0), reverse=True)
+    return items[:120]
 
 
 def _list_pending_edits() -> list[dict[str, Any]]:
@@ -359,9 +411,19 @@ def _approve_pending_edit(edit_id: str) -> dict[str, Any]:
             path = _resolve_workspace_path(str(args.get("path") or ""))
             result = _apply_mkdir(path=path, parents=bool(args.get("parents", True)))
         elif action == "run_command":
+            cwd = WORKSPACE_ROOT
+            cwd_raw = str(args.get("cwd") or "").strip()
+            if cwd_raw:
+                cwd_path = _resolve_workspace_path(cwd_raw, root=WORKSPACE_ROOT)
+                if not cwd_path.exists():
+                    raise RuntimeError("command cwd does not exist")
+                if not cwd_path.is_dir():
+                    raise RuntimeError("command cwd is not a directory")
+                cwd = cwd_path
             result = _apply_run_command(
                 command=str(args.get("command") or ""),
                 timeout_seconds=int(args.get("timeout_seconds") or 120),
+                cwd=cwd,
             )
         else:
             raise RuntimeError(f"unknown pending action: {action}")
@@ -691,15 +753,45 @@ def _http_json(
         raise RuntimeError("invalid JSON response") from None
 
 
-def _resolve_workspace_path(raw_path: str) -> Path:
+def _tool_root(req: dict[str, Any] | None) -> Path:
+    if req is None:
+        return WORKSPACE_ROOT
+    raw = str(req.get("tool_root") or "").strip()
+    if not raw:
+        return WORKSPACE_ROOT
+
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = WORKSPACE_ROOT / p
+    p = p.resolve()
+
+    try:
+        p.relative_to(WORKSPACE_ROOT)
+    except ValueError:
+        raise RuntimeError("tool_root escapes workspace root") from None
+
+    if not p.exists():
+        raise RuntimeError("tool_root does not exist")
+    if not p.is_dir():
+        raise RuntimeError("tool_root is not a directory")
+    return p
+
+
+def _resolve_workspace_path(raw_path: str, root: Path | None = None) -> Path:
     s = str(raw_path or "").strip()
     if not s:
         raise RuntimeError("path is required")
 
-    p = Path(s)
+    base = (root or WORKSPACE_ROOT).resolve()
+    p = Path(s).expanduser()
     if not p.is_absolute():
-        p = WORKSPACE_ROOT / p
+        p = base / p
     p = p.resolve()
+
+    try:
+        p.relative_to(base)
+    except ValueError:
+        raise RuntimeError("path escapes tool root") from None
 
     try:
         p.relative_to(WORKSPACE_ROOT)
@@ -713,13 +805,14 @@ def _rel_path(p: Path) -> str:
     return p.resolve().relative_to(WORKSPACE_ROOT).as_posix()
 
 
-def _tool_list_files(args: dict[str, Any]) -> dict[str, Any]:
+def _tool_list_files(args: dict[str, Any], req: dict[str, Any] | None = None) -> dict[str, Any]:
     pattern = str(args.get("pattern") or "**/*").strip() or "**/*"
     max_results = int(args.get("max_results") or 200)
     max_results = min(1000, max(1, max_results))
 
+    root = _tool_root(req)
     items: list[dict[str, Any]] = []
-    for p in WORKSPACE_ROOT.glob(pattern):
+    for p in root.glob(pattern):
         if len(items) >= max_results:
             break
         try:
@@ -736,14 +829,18 @@ def _tool_list_files(args: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "workspace_root": WORKSPACE_ROOT.as_posix(),
+        "tool_root": root.relative_to(WORKSPACE_ROOT).as_posix()
+        if root != WORKSPACE_ROOT
+        else "",
         "pattern": pattern,
         "items": items,
         "truncated": len(items) >= max_results,
     }
 
 
-def _tool_read_file(args: dict[str, Any]) -> dict[str, Any]:
-    path = _resolve_workspace_path(str(args.get("path") or ""))
+def _tool_read_file(args: dict[str, Any], req: dict[str, Any] | None = None) -> dict[str, Any]:
+    root = _tool_root(req)
+    path = _resolve_workspace_path(str(args.get("path") or ""), root=root)
     if not path.exists():
         raise RuntimeError("file does not exist")
     if not path.is_file():
@@ -774,29 +871,66 @@ def _apply_write_file(
 
     existed = path.exists()
     written = path.write_bytes(content.encode("utf-8"))
-    return {
+    out = {
         "path": _rel_path(path),
         "bytes_written": written,
         "created": not existed,
         "workspace_root": WORKSPACE_ROOT.as_posix(),
     }
+    _log_change("write_file", {"path": out["path"], "created": out["created"], "bytes": out["bytes_written"]})
+    return out
+
+
+def _diff_preview(path: Path, new_content: str) -> str:
+    rel = _rel_path(path)
+    old = ""
+    try:
+        if path.exists() and path.is_file():
+            raw = path.read_bytes()
+            old = raw[:250000].decode("utf-8", errors="replace")
+    except Exception:
+        old = ""
+
+    old_lines = old.splitlines(keepends=True)
+    new_lines = str(new_content or "").splitlines(keepends=True)
+    if old_lines == new_lines:
+        return ""
+
+    diff_lines = list(
+        difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=rel,
+            tofile=rel,
+            lineterm="",
+        )
+    )
+    if not diff_lines:
+        return ""
+    diff = "\n".join(diff_lines)
+    if len(diff) > 20000:
+        diff = diff[:20000] + "\n...truncated..."
+    return diff
 
 
 def _apply_mkdir(path: Path, parents: bool) -> dict[str, Any]:
     path.mkdir(parents=parents, exist_ok=True)
-    return {"path": _rel_path(path), "workspace_root": WORKSPACE_ROOT.as_posix()}
+    out = {"path": _rel_path(path), "workspace_root": WORKSPACE_ROOT.as_posix()}
+    _log_change("mkdir", {"path": out["path"]})
+    return out
 
 
-def _apply_run_command(command: str, timeout_seconds: int) -> dict[str, Any]:
+def _apply_run_command(command: str, timeout_seconds: int, *, cwd: Path | None = None) -> dict[str, Any]:
     cmd = str(command or "").strip()
     if not cmd:
         raise RuntimeError("command is required")
 
     timeout = min(600, max(1, int(timeout_seconds or 120)))
+    run_cwd = (cwd or WORKSPACE_ROOT).resolve()
     try:
         cp = subprocess.run(
             cmd,
-            cwd=str(WORKSPACE_ROOT),
+            cwd=str(run_cwd),
             shell=True,
             capture_output=True,
             text=True,
@@ -814,29 +948,42 @@ def _apply_run_command(command: str, timeout_seconds: int) -> dict[str, Any]:
     if len(stderr) > 120000:
         stderr = stderr[:120000] + "\n...truncated..."
 
-    return {
+    out = {
         "command": cmd,
-        "cwd": WORKSPACE_ROOT.as_posix(),
+        "cwd": run_cwd.as_posix(),
         "exit_code": int(cp.returncode),
         "ok": cp.returncode == 0,
         "stdout": stdout,
         "stderr": stderr,
     }
+    _log_change(
+        "run_command",
+        {
+            "cwd": out["cwd"],
+            "command": out["command"],
+            "ok": out["ok"],
+            "exit_code": out["exit_code"],
+        },
+    )
+    return out
 
 
 def _tool_write_file(args: dict[str, Any], req: dict[str, Any] | None = None) -> dict[str, Any]:
-    path = _resolve_workspace_path(str(args.get("path") or ""))
+    root = _tool_root(req)
+    path = _resolve_workspace_path(str(args.get("path") or ""), root=root)
     content = str(args.get("content") or "")
     overwrite = bool(args.get("overwrite", True))
     ensure_parent = bool(args.get("ensure_parent", True))
 
     if _requires_edit_approval(req):
+        diff_preview = _diff_preview(path, content)
         pending = _queue_pending_edit(
             "write_file",
             {
                 "path": _rel_path(path),
                 "content": content,
                 "content_preview": content[:2000],
+                "diff_preview": diff_preview,
                 "overwrite": overwrite,
                 "ensure_parent": ensure_parent,
             },
@@ -853,7 +1000,8 @@ def _tool_write_file(args: dict[str, Any], req: dict[str, Any] | None = None) ->
 
 
 def _tool_mkdir(args: dict[str, Any], req: dict[str, Any] | None = None) -> dict[str, Any]:
-    path = _resolve_workspace_path(str(args.get("path") or ""))
+    root = _tool_root(req)
+    path = _resolve_workspace_path(str(args.get("path") or ""), root=root)
     parents = bool(args.get("parents", True))
     if _requires_edit_approval(req):
         pending = _queue_pending_edit(
@@ -878,6 +1026,7 @@ def _tool_run_command(args: dict[str, Any], req: dict[str, Any] | None = None) -
     if not command:
         raise RuntimeError("command is required")
     timeout_seconds = int(args.get("timeout_seconds") or 120)
+    cwd = _tool_root(req)
     if _requires_command_approval(req):
         pending = _queue_pending_edit(
             "run_command",
@@ -885,6 +1034,7 @@ def _tool_run_command(args: dict[str, Any], req: dict[str, Any] | None = None) -
                 "command": command,
                 "command_preview": command[:2000],
                 "timeout_seconds": timeout_seconds,
+                "cwd": _rel_path(cwd),
             },
         )
         return {
@@ -894,7 +1044,7 @@ def _tool_run_command(args: dict[str, Any], req: dict[str, Any] | None = None) -
             "path": "",
             "message": "Awaiting approval via /api/approve_edit",
         }
-    return _apply_run_command(command=command, timeout_seconds=timeout_seconds)
+    return _apply_run_command(command=command, timeout_seconds=timeout_seconds, cwd=cwd)
 
 
 def _tool_dispatch(
@@ -913,9 +1063,9 @@ def _tool_dispatch(
         args = args_json
 
     if name == "list_files":
-        return _tool_list_files(args)
+        return _tool_list_files(args, req=req)
     if name == "read_file":
-        return _tool_read_file(args)
+        return _tool_read_file(args, req=req)
     if name == "write_file":
         return _tool_write_file(args, req=req)
     if name == "mkdir":
@@ -971,11 +1121,20 @@ def _chat_openai_compat(
 
     msg_list = [dict(m) for m in messages]
     if tools_enabled:
+        root = _tool_root(req)
+        tool_root = ""
+        try:
+            tool_root = root.relative_to(WORKSPACE_ROOT).as_posix() if root != WORKSPACE_ROOT else ""
+        except Exception:
+            tool_root = ""
         msg_list.insert(
             0,
             {
                 "role": "system",
-                "content": LOCAL_TOOL_PROMPT.format(workspace=WORKSPACE_ROOT.as_posix()),
+                "content": LOCAL_TOOL_PROMPT.format(
+                    workspace=WORKSPACE_ROOT.as_posix(),
+                    tool_root=tool_root,
+                ),
             },
         )
 
@@ -1179,28 +1338,33 @@ def _build_messages(req: dict[str, Any]) -> list[dict[str, str]]:
             system_lines.append(f"Persona: {persona}")
         if diff:
             system_lines.append("Diff:\n" + diff)
-        if cot == "brief":
-            system_lines.append(
-                "Reasoning format: include a short 'Reasoning (brief)' section "
-                "with at most 3 bullets, then provide the final answer."
-            )
-        if cot == "structured":
-            system_lines.append(
-                "Reasoning format: include these sections:\n"
-                "1) Plan: 3-7 bullets (high-level)\n"
-                "2) Assumptions: 1-3 bullets\n"
-                "3) Result: what you did / what to do next\n"
-                "Keep it concise and do not include hidden chain-of-thought."
-            )
-        if autonomy == "longrun":
-            system_lines.append(LONGRUN_AUTONOMY_PROMPT)
         if mode_key != "observer":
+            if cot == "brief":
+                system_lines.append(
+                    "Reasoning format: include a short 'Reasoning (brief)' section "
+                    "with at most 3 bullets, then provide the final answer."
+                )
+            if cot == "structured":
+                system_lines.append(
+                    "Reasoning format: include these sections:\n"
+                    "1) Plan: 3-7 bullets (high-level)\n"
+                    "2) Assumptions: 1-3 bullets\n"
+                    "3) Result: what you did / what to do next\n"
+                    "Keep it concise and do not include hidden chain-of-thought."
+                )
+            if autonomy == "longrun":
+                system_lines.append(LONGRUN_AUTONOMY_PROMPT)
             system_lines.append(CODER_IDENTITY_PROMPT)
         if mode_key == "observer":
             system_lines.append(
+                "Observer output rules:\n"
+                "- Do not include 'Reasoning'/'Plan' headings even if cot/autonomy are enabled.\n"
+                "- Do not produce step-by-step coding plans unless explicitly asked.\n"
+            )
+            system_lines.append(
                 "Observer role: review coder outputs and code snippets from coder_context.\n"
                 "- Focus on bugs, regressions, missing tests, and unsafe assumptions.\n"
-                "- Cite concrete evidence from coder_context when possible.\n"
+                "- You MUST cite at least 1 concrete evidence from coder_context (quote or paraphrase).\n"
                 "- If coder_context contains concrete errors (for example 429, 401, 403, 10061), "
                 "you must explicitly mention them.\n"
                 "- If you have actionable guidance, append:\n"
@@ -1523,6 +1687,7 @@ class LiteHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "version": "lite",
+                    "workspace_root": WORKSPACE_ROOT.as_posix(),
                     "features": {
                         "edit_approval_default": _as_bool(os.environ.get("OBS_REQUIRE_EDIT_APPROVAL"), True),
                         "command_approval_default": _as_bool(os.environ.get("OBS_REQUIRE_COMMAND_APPROVAL"), True),
@@ -1639,10 +1804,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run OBSTRAL lite server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument(
+        "--workspace",
+        default=os.environ.get("OBS_WORKSPACE_ROOT", ""),
+        help="Workspace root for local tools (default: repo root).",
+    )
     args = parser.parse_args()
+
+    if str(args.workspace or "").strip():
+        _set_workspace_root(str(args.workspace))
 
     server = ThreadingHTTPServer((args.host, args.port), LiteHandler)
     print(f"OBSTRAL Lite UI: http://{args.host}:{args.port}/")
+    print(f"Workspace root: {WORKSPACE_ROOT.as_posix()}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
