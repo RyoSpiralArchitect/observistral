@@ -54,7 +54,9 @@
       maxTokens: "max_tokens",
       timeoutSeconds: "timeout_seconds",
       stream: "Streaming",
-      cot: "CoT (brief)",
+      cot: "CoT",
+      brief: "Brief",
+      structured: "Structured",
       on: "ON",
       off: "OFF",
       diff: "diff",
@@ -100,6 +102,9 @@
       maxTokens: "max_tokens",
       timeoutSeconds: "timeout_seconds",
       stream: "ストリーミング",
+      cot: "CoT",
+      brief: "簡易",
+      structured: "構造化",
       on: "ON",
       off: "OFF",
       diff: "diff",
@@ -151,7 +156,9 @@
       maxTokens: "max_tokens",
       timeoutSeconds: "timeout_seconds",
       stream: "Streaming",
-      cot: "CoT (bref)",
+      cot: "CoT",
+      brief: "Bref",
+      structured: "Structuré",
       on: "ON",
       off: "OFF",
       diff: "diff",
@@ -609,7 +616,9 @@
       if (typeof cfg.includeCoderContext !== "boolean") cfg.includeCoderContext = !!DEFAULT_CONFIG.includeCoderContext;
       if (typeof cfg.requireEditApproval !== "boolean") cfg.requireEditApproval = !!DEFAULT_CONFIG.requireEditApproval;
       if (typeof cfg.requireCommandApproval !== "boolean") cfg.requireCommandApproval = !!DEFAULT_CONFIG.requireCommandApproval;
-      if (String(cfg.cot || "").trim().toLowerCase() === "off") cfg.cot = "off";
+      const cot0 = String(cfg.cot || "").trim().toLowerCase();
+      if (cot0 === "off") cfg.cot = "off";
+      else if (cot0 === "structured") cfg.cot = "structured";
       else cfg.cot = "brief";
       if (String(cfg.autonomy || "").trim().toLowerCase() === "off") cfg.autonomy = "off";
       else cfg.autonomy = "longrun";
@@ -1569,11 +1578,20 @@
                   e(
                     "button",
                     {
-                      className: "seg-btn " + (String(config.cot || "brief") !== "off" ? "active" : ""),
+                      className: "seg-btn " + (String(config.cot || "brief") === "brief" ? "active" : ""),
                       onClick: () => setConfig({ ...config, cot: "brief" }),
                       type: "button",
                     },
-                    tr(lang, "on")
+                    tr(lang, "brief")
+                  ),
+                  e(
+                    "button",
+                    {
+                      className: "seg-btn " + (String(config.cot || "brief") === "structured" ? "active" : ""),
+                      onClick: () => setConfig({ ...config, cot: "structured" }),
+                      type: "button",
+                    },
+                    tr(lang, "structured")
                   ),
                   e(
                     "button",

@@ -87,6 +87,12 @@ Disable if needed:
 python .\scripts\obstral_lite_cli.py chat "hi" --autonomy off --cot off
 ```
 
+Stronger CoT formatting:
+
+```powershell
+python .\scripts\obstral_lite_cli.py chat "hi" --cot structured
+```
+
 UI approval endpoints:
 
 - `GET /api/pending_edits`

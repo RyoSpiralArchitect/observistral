@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -35,7 +36,14 @@ LOCAL_TOOL_PROMPT = (
     "When the user asks to create/edit/read files, use tool calls."
     " Do not claim lack of permission. Use tools first, then summarize results.\n"
     "If the user asks to create a repository/project/app/game, you must actually create "
-    "folders/files (mkdir/write_file) and then report what was created."
+    "folders/files (mkdir/write_file) and then report what was created.\n\n"
+    "If your provider/model does not support tool calling, you MUST emit tool intents "
+    "in this exact format so OBSTRAL can execute them:\n"
+    "```obstral-tool\n"
+    "{\"name\":\"mkdir\",\"arguments\":{\"path\":\"myproj\"}}\n"
+    "{\"name\":\"write_file\",\"arguments\":{\"path\":\"myproj/README.md\",\"content\":\"...\"}}\n"
+    "```\n"
+    "Only JSON is allowed inside the obstral-tool block."
 )
 
 LONGRUN_AUTONOMY_PROMPT = (
@@ -227,6 +235,8 @@ def _cot_level(req: dict[str, Any]) -> str:
     s = str(v).strip().lower()
     if s in ("off", "false", "0", "none", "disable", "disabled"):
         return "off"
+    if s in ("structured", "plan", "detailed"):
+        return "structured"
     if s in ("brief", "short", "on", "true", "1", "simple"):
         return "brief"
     return "brief"
@@ -486,6 +496,61 @@ def _normalize_assistant_content(content: Any) -> str:
                     chunks.append(txt)
         return "".join(chunks)
     return str(content)
+
+
+_OBSTRAL_TOOL_RE = re.compile(
+    r"```obstral-tool\s*\r?\n(.*?)\r?\n```",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_obstral_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+    s = str(text or "")
+    calls: list[dict[str, Any]] = []
+
+    def collect(obj: Any) -> None:
+        if isinstance(obj, list):
+            for item in obj:
+                collect(item)
+            return
+        if not isinstance(obj, dict):
+            return
+        if isinstance(obj.get("calls"), list):
+            collect(obj.get("calls"))
+            return
+        name = obj.get("name") or obj.get("tool") or obj.get("function")
+        args = obj.get("arguments")
+        if args is None:
+            args = obj.get("args")
+        if isinstance(name, str) and isinstance(args, dict):
+            calls.append({"name": name, "arguments": args})
+
+    def parse_block(block: str) -> None:
+        b = str(block or "").strip()
+        if not b:
+            return
+        try:
+            payload = json.loads(b)
+        except json.JSONDecodeError:
+            payload = None
+        if payload is not None:
+            collect(payload)
+            return
+        for line in b.splitlines():
+            ln = line.strip()
+            if not ln:
+                continue
+            try:
+                item = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            collect(item)
+
+    for m in _OBSTRAL_TOOL_RE.finditer(s):
+        parse_block(m.group(1))
+
+    cleaned = _OBSTRAL_TOOL_RE.sub("", s).strip()
+    return cleaned, calls
 
 
 def _api_key_env_hint(provider: str) -> str:
@@ -870,6 +935,10 @@ def _local_tools_enabled(req: dict[str, Any]) -> bool:
 
     mode = str(req.get("mode") or "").strip().lower()
     if mode == "observer":
+        # Observer pane disables tools in UI, but "mode" can be user-controlled.
+        # If the caller explicitly forces tools, allow them.
+        if _as_bool(req.get("force_tools"), False):
+            return True
         return False
     return True
 
@@ -912,6 +981,7 @@ def _chat_openai_compat(
 
     force_tools = tools_enabled and _force_tool_use(req)
     made_any_tool_call = False
+    tool_refusals = 0
 
     for _ in range(max_tool_steps):
         payload: dict[str, Any] = {
@@ -959,18 +1029,90 @@ def _chat_openai_compat(
         content = _normalize_assistant_content(message.get("content"))
         tool_calls = message.get("tool_calls")
 
-        if not tools_enabled or not isinstance(tool_calls, list) or not tool_calls:
-            return {"content": str(content), "model": model}
+        clean_content = str(content)
+        text_tool_calls: list[dict[str, Any]] = []
+        if tools_enabled:
+            clean_content, text_tool_calls = _extract_obstral_tool_calls(clean_content)
+
+        if not tools_enabled:
+            return {"content": str(clean_content), "model": model}
+
+        if not isinstance(tool_calls, list) or not tool_calls:
+            if text_tool_calls:
+                made_any_tool_call = True
+                msg_list.append({"role": "assistant", "content": clean_content or ""})
+                pending: list[dict[str, str]] = []
+                for c in text_tool_calls:
+                    name = str(c.get("name") or "")
+                    args = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
+                    try:
+                        tool_out = _tool_dispatch(name, args, req=req)
+                        result = {"ok": True, "result": tool_out}
+                        if isinstance(tool_out, dict) and tool_out.get("needs_approval"):
+                            pending.append(
+                                {
+                                    "id": str(tool_out.get("approval_id") or ""),
+                                    "action": str(tool_out.get("action") or name),
+                                    "path": str(tool_out.get("path") or ""),
+                                }
+                            )
+                    except Exception as e:
+                        result = {"ok": False, "error": str(e)}
+                    msg_list.append(
+                        {
+                            "role": "user",
+                            "content": "[obstral-tool result]\n"
+                            + json.dumps(
+                                {"name": name, "result": result},
+                                ensure_ascii=False,
+                            ),
+                        }
+                    )
+                if pending:
+                    lines = ["[pending approval]"]
+                    for it in pending:
+                        lines.append(
+                            f"- {it.get('action')} {it.get('path')} id={it.get('id')}"
+                        )
+                    lines.append("Approve/reject in UI: Pending edits.")
+                    return {"content": "\n".join(lines), "model": model}
+                continue
+
+            if force_tools and not made_any_tool_call:
+                tool_refusals += 1
+                if tool_refusals <= 2:
+                    msg_list.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "Tool use is REQUIRED. Do not reply with steps only.\n"
+                                "Call a tool, or emit an ```obstral-tool``` block of JSON.\n"
+                                "If unsure, start with:\n"
+                                "```obstral-tool\n"
+                                "{\"name\":\"list_files\",\"arguments\":{\"pattern\":\"**/*\",\"max_results\":200}}\n"
+                                "```"
+                            ),
+                        }
+                    )
+                    continue
+                return {
+                    "content": str(clean_content)
+                    + "\n\n[OBSTRAL] Tool use was required but the model did not call tools.",
+                    "model": model,
+                }
+
+            return {"content": str(clean_content), "model": model}
         made_any_tool_call = True
 
         msg_list.append(
             {
                 "role": "assistant",
-                "content": content or "",
+                "content": clean_content or "",
                 "tool_calls": tool_calls,
             }
         )
 
+        pending2: list[dict[str, str]] = []
         for tc in tool_calls:
             if not isinstance(tc, dict):
                 continue
@@ -979,7 +1121,16 @@ def _chat_openai_compat(
             name = str(fn.get("name") or "")
             args_json = fn.get("arguments")
             try:
-                result = {"ok": True, "result": _tool_dispatch(name, args_json, req=req)}
+                tool_out = _tool_dispatch(name, args_json, req=req)
+                result = {"ok": True, "result": tool_out}
+                if isinstance(tool_out, dict) and tool_out.get("needs_approval"):
+                    pending2.append(
+                        {
+                            "id": str(tool_out.get("approval_id") or ""),
+                            "action": str(tool_out.get("action") or name),
+                            "path": str(tool_out.get("path") or ""),
+                        }
+                    )
             except Exception as e:
                 result = {"ok": False, "error": str(e)}
             out = json.dumps(result, ensure_ascii=False)
@@ -992,6 +1143,13 @@ def _chat_openai_compat(
                     "content": out,
                 }
             )
+
+        if pending2:
+            lines = ["[pending approval]"]
+            for it in pending2:
+                lines.append(f"- {it.get('action')} {it.get('path')} id={it.get('id')}")
+            lines.append("Approve/reject in UI: Pending edits.")
+            return {"content": "\n".join(lines), "model": model}
 
     raise RuntimeError("tool loop exceeded max steps")
 
@@ -1021,10 +1179,18 @@ def _build_messages(req: dict[str, Any]) -> list[dict[str, str]]:
             system_lines.append(f"Persona: {persona}")
         if diff:
             system_lines.append("Diff:\n" + diff)
-        if cot != "off":
+        if cot == "brief":
             system_lines.append(
                 "Reasoning format: include a short 'Reasoning (brief)' section "
                 "with at most 3 bullets, then provide the final answer."
+            )
+        if cot == "structured":
+            system_lines.append(
+                "Reasoning format: include these sections:\n"
+                "1) Plan: 3-7 bullets (high-level)\n"
+                "2) Assumptions: 1-3 bullets\n"
+                "3) Result: what you did / what to do next\n"
+                "Keep it concise and do not include hidden chain-of-thought."
             )
         if autonomy == "longrun":
             system_lines.append(LONGRUN_AUTONOMY_PROMPT)

@@ -313,7 +313,7 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--timeout-seconds", type=int, default=120)
     p.add_argument("--diff-file", default=None)
-    p.add_argument("--cot", choices=["off", "brief"], default="brief")
+    p.add_argument("--cot", choices=["off", "brief", "structured"], default="brief")
     p.add_argument("--autonomy", choices=["off", "longrun"], default="longrun")
     p.add_argument(
         "--require-edit-approval",
