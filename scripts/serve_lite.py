@@ -36,6 +36,11 @@ PENDING_EDITS: dict[str, dict[str, Any]] = {}
 CHANGE_LOCK = threading.Lock()
 CHANGE_LOG: list[dict[str, Any]] = []
 
+# Self-evolving meta layer:
+# Prompt overrides live under the workspace root, not the repo, so they can be
+# safely modified via approvals without touching OBSTRAL's source tree.
+META_PROMPTS_REL = ".obstral/meta_prompts.json"
+
 LOCAL_TOOL_PROMPT = (
     "You are a coding agent with local workspace tools.\n"
     "Workspace root: {workspace}\n"
@@ -117,6 +122,29 @@ def _observer_lang_line(ui_lang: str) -> str:
     if l == "en":
         return "- Language: English.\n"
     return "- Language: Japanese.\n"
+
+
+def _language_instruction(ui_lang: str) -> str:
+    """Hard language constraint for both coder and observer outputs.
+
+    Keep tool JSON blocks and code fences intact; only natural language should follow the UI language.
+    """
+    l = str(ui_lang or "").strip().lower()
+    if l == "fr":
+        return (
+            "Language: French. Write assistant messages in French.\n"
+            "Do NOT translate tool JSON blocks or code fences.\n"
+        )
+    if l == "en":
+        return (
+            "Language: English. Write assistant messages in English.\n"
+            "Do NOT translate tool JSON blocks or code fences.\n"
+        )
+    # Default: Japanese.
+    return (
+        "Language: Japanese. Write assistant messages in Japanese.\n"
+        "Do NOT translate tool JSON blocks or code fences.\n"
+    )
 
 
 def _observer_persona_prompt(persona: str, *, ui_lang: str = "") -> str:
@@ -509,6 +537,60 @@ def _queue_pending_edit(action: str, args: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _meta_prompts_path() -> Path:
+    return (WORKSPACE_ROOT / META_PROMPTS_REL).resolve()
+
+
+def _default_meta_prompts() -> dict[str, str]:
+    return {"coder_system_append": "", "observer_system_append": ""}
+
+
+def _load_meta_prompts() -> dict[str, str]:
+    p = _meta_prompts_path()
+    try:
+        if not p.exists() or not p.is_file():
+            return _default_meta_prompts()
+        raw = p.read_text(encoding="utf-8", errors="replace")
+        data = json.loads(raw) if raw.strip() else {}
+        if not isinstance(data, dict):
+            return _default_meta_prompts()
+        out = _default_meta_prompts()
+        for k in ("coder_system_append", "observer_system_append"):
+            v = data.get(k)
+            if isinstance(v, str):
+                out[k] = v
+        return out
+    except Exception:
+        return _default_meta_prompts()
+
+
+def _queue_meta_prompts_write(new_prompts: dict[str, str]) -> dict[str, Any]:
+    p = _meta_prompts_path()
+    # Ensure the target path stays inside the workspace.
+    rel = _rel_path(p)
+    content = json.dumps(new_prompts, ensure_ascii=False, indent=2) + "\n"
+    diff_preview = _diff_preview(p, content)
+    pending = _queue_pending_edit(
+        "write_file",
+        {
+            "path": rel,
+            "content": content,
+            "content_preview": content[:2000],
+            "diff_preview": diff_preview,
+            "overwrite": True,
+            "ensure_parent": True,
+        },
+    )
+    return {
+        "needs_approval": True,
+        "approval_id": pending["id"],
+        "action": "write_file",
+        "path": rel,
+        "message": "Awaiting approval via /api/approve_edit",
+        "prompts": new_prompts,
+    }
+
+
 def _log_change(action: str, payload: dict[str, Any]) -> None:
     now = int(time.time())
     item = {"id": "chg_" + uuid.uuid4().hex[:10], "ts": now, "action": action, **payload}
@@ -850,6 +932,7 @@ def _extract_implied_write_file_calls(text: str, *, max_files: int = 12) -> list
 
 _FENCE_START_RE = re.compile(r"^\s*```([A-Za-z0-9_-]+)?\s*$")
 _PS_PROMPT_RE = re.compile(r"^\s*PS [^>]*>\s*")
+_SHELL_PROMPT_RE = re.compile(r"^\s*(\$\s+|PS(?: [^>]+)?>\s+|>\s+)")
 _ALLOWED_COMMAND_FENCES = {
     "bash",
     "sh",
@@ -934,6 +1017,27 @@ def _strip_shell_prompt_line(line: str) -> str:
     return s
 
 
+def _strip_shell_transcript(text: str) -> str:
+    """Strip prompts from common shell transcripts.
+
+    If the block contains prompts, we keep only prompt lines (drop output like stderr/exit/status).
+    """
+    raw = str(text or "").replace("\r\n", "\n")
+    lines = raw.split("\n")
+    has_prompt = any(_SHELL_PROMPT_RE.match(str(l or "")) for l in lines)
+    out: list[str] = []
+    for l0 in lines:
+        l = str(l0 or "")
+        if has_prompt:
+            m = _SHELL_PROMPT_RE.match(l)
+            if not m:
+                continue
+            out.append(l[m.end() :])
+        else:
+            out.append(re.sub(r"^\s*\$\s+", "", l))
+    return "\n".join(out).strip()
+
+
 def _script_to_local_command(lang: str, script: str) -> str:
     l = str(lang or "").strip().lower()
     s = str(script or "").strip()
@@ -1009,7 +1113,7 @@ def _extract_implied_run_command_calls(text: str, *, max_commands: int = 6) -> l
             continue
 
         if lang in _ALLOWED_COMMAND_FENCES:
-            cleaned = "\n".join(_strip_shell_prompt_line(ln) for ln in buf).strip()
+            cleaned = _strip_shell_transcript("\n".join(str(ln or "") for ln in buf))
             cmd = _script_to_local_command(lang, cleaned)
             if cmd.strip():
                 calls.append({"name": "run_command", "arguments": {"command": cmd}})
@@ -2108,8 +2212,10 @@ def _build_messages(req: dict[str, Any]) -> list[dict[str, str]]:
     cot = _cot_level(req)
     autonomy = _autonomy_level(req)
     mode_key = mode.lower()
+    meta_prompts = _load_meta_prompts()
     if mode or persona or diff:
         system_lines: list[str] = []
+        system_lines.append(_language_instruction(str(req.get("lang") or "")))
         if mode:
             system_lines.append(f"Mode: {mode}")
         if persona:
@@ -2149,6 +2255,9 @@ def _build_messages(req: dict[str, Any]) -> list[dict[str, str]]:
             if autonomy == "longrun":
                 system_lines.append(LONGRUN_AUTONOMY_PROMPT)
             system_lines.append(CODER_IDENTITY_PROMPT)
+            extra = str(meta_prompts.get("coder_system_append") or "").strip()
+            if extra:
+                system_lines.append("[Meta prompt override]\n" + extra)
         if mode_key == "observer":
             system_lines.append(
                 "Observer output rules:\n"
@@ -2170,6 +2279,9 @@ def _build_messages(req: dict[str, Any]) -> list[dict[str, str]]:
             persona_style = _observer_persona_prompt(persona, ui_lang=str(req.get("lang") or ""))
             if persona_style:
                 system_lines.append(persona_style)
+            extra = str(meta_prompts.get("observer_system_append") or "").strip()
+            if extra:
+                system_lines.append("[Meta prompt override]\n" + extra)
         messages.insert(0, {"role": "system", "content": "\n\n".join(system_lines)})
 
     messages.append({"role": "user", "content": str(req.get("input") or "")})
@@ -2486,6 +2598,7 @@ class LiteHandler(BaseHTTPRequestHandler):
                         "exec": True,
                         "pending_edits": True,
                         "chat_tools": False,
+                        "meta_prompts": True,
                         "edit_approval_default": _as_bool(os.environ.get("OBS_REQUIRE_EDIT_APPROVAL"), True),
                         "command_approval_default": _as_bool(os.environ.get("OBS_REQUIRE_COMMAND_APPROVAL"), True),
                     },
@@ -2516,6 +2629,16 @@ class LiteHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/pending_edits":
             self._send_json(200, {"pending": _list_pending_edits()})
+            return
+        if self.path == "/api/meta_prompts":
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "path": META_PROMPTS_REL,
+                    "prompts": _load_meta_prompts(),
+                },
+            )
             return
 
         self._send_text(404, "not found\n")
@@ -2582,6 +2705,35 @@ class LiteHandler(BaseHTTPRequestHandler):
                     raise RuntimeError("id is required")
                 item = _reject_pending_edit(edit_id)
                 self._send_json(200, {"ok": True, "item": item})
+            except Exception as e:
+                out = {"error": str(e)}
+                if _as_bool(os.environ.get("OBS_DEBUG"), False):
+                    out["trace"] = traceback.format_exc()
+                self._send_json(400, out)
+            return
+        
+        if self.path == "/api/meta_prompts":
+            try:
+                op = str(payload.get("op") or "").strip().lower()
+                target = str(payload.get("target") or "").strip().lower()
+                text = str(payload.get("text") or "")
+                if op not in ("set", "append"):
+                    raise RuntimeError("op must be 'set' or 'append'")
+                if target not in ("coder", "observer"):
+                    raise RuntimeError("target must be 'coder' or 'observer'")
+                if len(text) > 20000:
+                    raise RuntimeError("text too large")
+
+                cur = _load_meta_prompts()
+                key = "coder_system_append" if target == "coder" else "observer_system_append"
+                base = str(cur.get(key) or "")
+                new_val = text.strip()
+                if op == "append":
+                    if base.strip():
+                        new_val = (base.rstrip() + "\n" + new_val).strip()
+                cur[key] = new_val
+
+                self._send_json(200, _queue_meta_prompts_write(cur))
             except Exception as e:
                 out = {"error": str(e)}
                 if _as_bool(os.environ.get("OBS_DEBUG"), False):

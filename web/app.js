@@ -30,6 +30,7 @@
       observer: "Observer",
       proposals: "Proposals",
       sendToCoder: "Send to coder",
+      applyMeta: "Apply",
       includeCoderContext: "Include coder context",
       insertCliTemplate: "CLI template",
       editApproval: "Edit approval",
@@ -107,6 +108,7 @@
       observer: "Observer",
       proposals: "提案",
       sendToCoder: "Coderへ送る",
+      applyMeta: "適用",
       includeCoderContext: "Coder状況を付与",
       send: "送信",
       stop: "停止",
@@ -178,6 +180,7 @@
       observer: "Observateur",
       proposals: "Propositions",
       sendToCoder: "Envoyer au codeur",
+      applyMeta: "Appliquer",
       includeCoderContext: "Inclure contexte codeur",
       insertCliTemplate: "Template CLI",
       editApproval: "Approbation édition",
@@ -1094,6 +1097,21 @@
     return out;
   }
 
+  function parseMetaPromptOp(toCoderText) {
+    const s = String(toCoderText || "");
+    const re = /^\s*META_(SET|APPEND)_(CODER|OBSERVER)\s*:\s*(.*)\s*$/im;
+    const m = re.exec(s);
+    if (!m) return null;
+    const op = String(m[1] || "").toLowerCase() === "append" ? "append" : "set";
+    const target = String(m[2] || "").toLowerCase() === "observer" ? "observer" : "coder";
+    const head = String(m[3] || "").trim();
+    // Everything after the directive line is considered part of the meta prompt.
+    const rest = s.slice(m.index + m[0].length).replace(/^\r?\n/, "").trim();
+    const text = (head && rest) ? (head + "\n" + rest) : (head || rest);
+    if (!String(text || "").trim()) return null;
+    return { op, target, text };
+  }
+
   function parsePhase(text) {
     const s = String(text || "");
     const m = /---\s*phase\s*---/i.exec(s);
@@ -1180,6 +1198,7 @@
     const [modelsTarget, setModelsTarget] = useState("chat");
     const [pendingEdits, setPendingEdits] = useState([]);
     const [pendingBusy, setPendingBusy] = useState(false);
+    const [metaBusy, setMetaBusy] = useState(false);
 
     const [threadState, setThreadState] = useState(() => {
       let threads = safeJsonParse(localStorage.getItem(LS.threads) || "null", null);
@@ -2249,6 +2268,7 @@
         `observer_intensity: ${intensity}`,
         loopLine,
         intensityInstr,
+        "Meta ops (optional): if you propose updating OBSTRAL runtime prompts, start to_coder with one of: META_SET_CODER:, META_APPEND_CODER:, META_SET_OBSERVER:, META_APPEND_OBSERVER:.",
         "Review the coder's artifacts below. Check each dimension: CORRECTNESS, SECURITY, RELIABILITY, PERFORMANCE, MAINTAINABILITY.",
         "Cite specific function names, data structures, or code patterns. No generic advice.",
         "Append a proposals block with all actionable findings.",
@@ -2313,6 +2333,32 @@
       const sev = String(p.severity || "info").trim();
       const steer = `[Observer proposal approved]\nTitle: ${title}\nSeverity: ${sev}\n\n${to}\n`;
       sendCoder(steer);
+    };
+
+    const applyMetaOp = async (metaOp) => {
+      if (!metaOp) return;
+      const supported = !!(status && status.features && status.features.meta_prompts);
+      if (!supported) return;
+      if (metaBusy) return;
+      setMetaBusy(true);
+      try {
+        const j = await postJson("/api/meta_prompts", metaOp);
+        refreshPendingEdits();
+        const eid = j && j.approval_id ? String(j.approval_id) : "";
+        if (eid) {
+          const msg =
+            String(lang || "").trim().toLowerCase() === "fr"
+              ? `Mise à jour du meta prompt en attente d'approbation: ${eid}`
+              : String(lang || "").trim().toLowerCase() === "en"
+                ? `Meta prompt update queued for approval: ${eid}`
+                : `メタプロンプト更新が承認待ちです: ${eid}`;
+          window.alert(msg);
+        }
+      } catch (err) {
+        window.alert(prettyErr(err));
+      } finally {
+        setMetaBusy(false);
+      }
     };
 
     const coderMsgs = paneMessages("coder");
@@ -3344,6 +3390,10 @@
                       const phaseMismatch = observerPhase && p.phase && p.phase !== "any" && p.phase !== observerPhase;
                       const scoreColor = score >= 70 ? "var(--accent)" : score >= 40 ? "var(--accent2)" : "var(--warn)";
                       const phaseLabel = p.phase && p.phase !== "any" ? p.phase : null;
+                      const metaOp =
+                        status && status.features && status.features.meta_prompts
+                          ? parseMetaPromptOp(String(p.toCoder || ""))
+                          : null;
                       return e(
                         "div",
                         { key: p.id, className: "proposal sev-" + p.severity + (phaseMismatch ? " phase-mismatch" : "") },
@@ -3367,6 +3417,12 @@
                           ),
                           e("div", { className: "proposal-actions" },
                             score < 30 && e("span", { style: { fontSize: 10, color: "var(--faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap" } }, "低優先"),
+                            metaOp && e("button", {
+                              className: "btn",
+                              disabled: metaBusy,
+                              onClick: () => applyMetaOp(metaOp),
+                              title: "Apply to runtime prompt (requires approval)",
+                            }, tr(lang, "applyMeta")),
                             e("button", {
                               className: "btn btn-primary",
                               disabled: sendingCoder || !String(p.toCoder || "").trim(),
