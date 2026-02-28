@@ -402,10 +402,13 @@ def _force_tool_use(req: dict[str, Any]) -> bool:
 _MATERIAL_INTENT_RE = re.compile(
     r"(repo|repository|scaffold|bootstrap|init|setup|create|generate|implement|"
     r"install|build|test|run|git|winget|bash|powershell|cmd|command|"
-    r"\u30ea\u30dd|\u30ea\u30dd\u30b8\u30c8\u30ea|\u96db\u5f62|\u3072\u306a\u5f62|\u30d7\u30ed\u30b8\u30a7\u30af\u30c8|"
-    r"\u5b9f\u88c5|\u30d5\u30a1\u30a4\u30eb|\u4f5c\u6210|\u4f5c\u308d|\u4f5c\u3063\u3066|\u751f\u6210|\u8ffd\u52a0|\u7d44\u307f\u8fbc|"
-    r"\u30b3\u30de\u30f3\u30c9|\u5b9f\u884c|\u30a4\u30f3\u30b9\u30c8\u30fc\u30eb|\u30bb\u30c3\u30c8\u30a2\u30c3\u30d7|\u30d3\u30eb\u30c9|\u30c6\u30b9\u30c8|"
-    r"\u81ea\u5206\u3067|\u3058\u3076\u3093\u3067|\u3084\u3063\u3066|\u3084\u3063\u3066\u307f\u3066)",
+    r"readme|license|requirements|"
+    r"depot|dépôt|referentiel|référentiel|projet|dossier|répertoire|repertoire|"
+    r"fichier|commande|créer|cree|crée|générer|generer|implément|implementer|exécuter|execute|installer|"
+    r"リポ|リポジトリ|雛形|ひな形|フォルダ|ふぉるだ|ディレクトリ|でぃれくとり|プロジェクト|"
+    r"実装|ファイル|作成|作ろ|作って|生成|追加|組み込|編集|更新|書いて|書き直して|"
+    r"コマンド|実行|インストール|セットアップ|ビルド|テスト|"
+    r"自分で|じぶんで|やって|やってみて)",
     re.IGNORECASE,
 )
 def _wants_material_change(req: dict[str, Any]) -> bool:
@@ -419,7 +422,7 @@ def _wants_material_change(req: dict[str, Any]) -> bool:
 _COMMAND_INTENT_RE = re.compile(
     r"(\bgit\b|\bwinget\b|\bpip\b|\buv\b|\bnpm\b|\bpnpm\b|\byarn\b|\bcargo\b|"
     r"\bpytest\b|\bmake\b|\bcmake\b|\bbash\b|\bpowershell\b|\bcmd\b|"
-    r"\u30b3\u30de\u30f3\u30c9|\u5b9f\u884c)",
+    r"command|commande|execute|exécuter|コマンド|実行)",
     re.IGNORECASE,
 )
 def _wants_command_action(req: dict[str, Any]) -> bool:
@@ -760,9 +763,9 @@ def _extract_obstral_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
 
 
 _FILE_LINE_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:#{1,6}\s*)?(?:file|path|filename)?\s*[:\-]?\s*`?"
+    r"^\s*(?:[-*]\s*)?(?:#{1,6}\s*)?(?:file|path|filename)?\s*[:\-]?\s*[*_]{0,2}`?"
     r"([A-Za-z]:\\[^\s`]+|(?:\.\.?/)?[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\.[A-Za-z0-9]{1,8})"
-    r"`?\s*$",
+    r"`?[*_]{0,2}\s*(?:[:：])?\s*$",
     re.IGNORECASE,
 )
 
@@ -839,6 +842,65 @@ _ALLOWED_COMMAND_FENCES = {
     "bat",
 }
 
+def _bash_script_to_powershell_script(script: str) -> str:
+    """Translate a tiny subset of common bash scaffolding commands to PowerShell.
+
+    This is intentionally conservative: it's meant to turn typical LLM output like
+    mkdir/cd/touch into something runnable on Windows.
+    """
+    s = str(script or "")
+    out_lines: list[str] = []
+    for raw in s.splitlines():
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            out_lines.append(line)
+            continue
+        if line.startswith("sudo "):
+            line = line[5:].strip()
+
+        if line.startswith("mkdir "):
+            try:
+                toks = shlex.split(line, posix=True)
+            except ValueError:
+                toks = line.split()
+            # Drop -p/--parents when present.
+            toks2 = [t for t in toks if t not in ("-p", "--parents")]
+            if len(toks2) >= 2:
+                out_lines.append("mkdir " + " ".join(toks2[1:]))
+                continue
+
+        if line.startswith("cd "):
+            out_lines.append("cd " + line[3:].strip())
+            continue
+
+        if line.startswith("touch "):
+            try:
+                toks = shlex.split(line, posix=True)
+            except ValueError:
+                toks = line.split()
+            paths = toks[1:]
+            if paths:
+                arr = ",".join("'" + p.replace("'", "''") + "'" for p in paths)
+                out_lines.append(f"New-Item -ItemType File -Force -Path {arr} | Out-Null")
+                continue
+
+        if line.startswith("rm "):
+            try:
+                toks = shlex.split(line, posix=True)
+            except ValueError:
+                toks = line.split()
+            paths = [t for t in toks[1:] if not t.startswith("-")]
+            if paths:
+                arr = ",".join("'" + p.replace("'", "''") + "'" for p in paths)
+                out_lines.append(f"Remove-Item -Recurse -Force -Path {arr}")
+                continue
+
+        out_lines.append(line)
+
+    return "\n".join(out_lines).strip()
+
 
 def _strip_shell_prompt_line(line: str) -> str:
     s = str(line or "").rstrip("\r\n")
@@ -867,7 +929,12 @@ def _script_to_local_command(lang: str, script: str) -> str:
         return f"powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {enc}"
 
     if l in ("bash", "sh", "shell"):
-        # Use bash -lc for multi-line scripts. This will fail if bash isn't installed.
+        if os.name == "nt":
+            ps = _bash_script_to_powershell_script(s)
+            if ps:
+                enc = base64.b64encode(ps.encode("utf-16le")).decode("ascii")
+                return f"powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {enc}"
+        # Non-Windows: use bash -lc for multi-line scripts.
         one = "; ".join([ln.strip() for ln in s.splitlines() if ln.strip()])
         one = one.replace('"', '\\"')
         return f'bash -lc \"set -e; {one}\"'

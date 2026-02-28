@@ -1254,7 +1254,7 @@
           setConfig((c) => ({ ...c, mode: "VIBE" }));
         }
 
-        const wantsMaterial = /(?:repo|repository|scaffold|bootstrap|init|setup|create|generate|implement|install|build|test|run|git|winget|bash|powershell|cmd|command|リポ|リポジトリ|雛形|ひな形|プロジェクト|実装|ファイル|作成|作ろ|作って|生成|追加|組み込|コマンド|実行|インストール|セットアップ|ビルド|テスト|自分で|じぶんで|やって|やってみて)/i.test(text);
+        const wantsMaterial = /(?:repo|repository|scaffold|bootstrap|init|setup|create|generate|implement|install|build|test|run|git|winget|bash|powershell|cmd|command|depot|dépôt|referentiel|référentiel|projet|dossier|répertoire|repertoire|fichier|commande|créer|cree|crée|générer|generer|implément|implementer|exécuter|execute|installer|リポ|リポジトリ|雛形|ひな形|プロジェクト|実装|ファイル|作成|作ろ|作って|生成|追加|組み込|コマンド|実行|インストール|セットアップ|ビルド|テスト|自分で|じぶんで|やって|やってみて)/i.test(text);
         const useCode = modeUsesCode(coderCfg.mode) || wantsMaterial;
         const resolvedProvider = useCode ? (String(coderCfg.codeProvider || "").trim() || coderCfg.provider) : coderCfg.provider;
         const resolvedBaseUrl = useCode ? (String(coderCfg.codeBaseUrl || "").trim() || coderCfg.baseUrl) : coderCfg.baseUrl;
