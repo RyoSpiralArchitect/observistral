@@ -1410,6 +1410,19 @@ def _apply_run_command(command: str, timeout_seconds: int, *, cwd: Path | None =
 
     timeout = min(600, max(1, int(timeout_seconds or 120)))
     run_cwd = (cwd or WORKSPACE_ROOT).resolve()
+    if run_cwd == WORKSPACE_ROOT and s.startswith("git init"):
+        rest = s[len("git init") :].strip()
+        # Block `git init` (or `git init -b main`) at workspace root.
+        # Allow `git init <dir>` which initializes a repo in a subdirectory.
+        path_tok = ""
+        if rest:
+            for tok in rest.split(" "):
+                if not tok or tok.startswith("-"):
+                    continue
+                path_tok = tok
+                break
+        if (not path_tok) or path_tok in (".", "./", ".\\"):
+            raise RuntimeError("refusing to run git init at workspace root; create a project directory first")
     try:
         cp = subprocess.run(
             cmd,
@@ -2104,6 +2117,13 @@ def _build_messages(req: dict[str, Any]) -> list[dict[str, str]]:
         if diff:
             system_lines.append("Diff:\n" + diff)
         if mode_key != "observer":
+            ui_lang = str(req.get("lang") or "").strip().lower()
+            if ui_lang == "fr":
+                system_lines.append("Language: French. Write your response in French.")
+            elif ui_lang == "en":
+                system_lines.append("Language: English. Write your response in English.")
+            else:
+                system_lines.append("Language: Japanese. Write your response in Japanese.")
             if cot == "brief":
                 system_lines.append(
                     "Reasoning format: include a short 'Reasoning (brief)' section "

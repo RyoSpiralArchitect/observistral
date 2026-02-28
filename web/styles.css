@@ -822,3 +822,27 @@ body.looping .bubble.assistant {
   color: var(--text);
   background: rgba(255, 255, 255, 0.06);
 }
+
+/* --- choice buttons (multi-choice clarification) --- */
+.choice-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.choice-btn {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: rgba(255,255,255,0.88);
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 999px;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: transform 120ms ease, background 120ms ease, border 120ms ease;
+}
+.choice-btn:hover {
+  background: rgba(255,255,255,0.10);
+  border-color: rgba(255,255,255,0.18);
+  transform: translateY(-1px);
+}

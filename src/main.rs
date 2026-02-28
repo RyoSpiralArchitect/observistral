@@ -248,6 +248,7 @@ async fn run_chat(prompt: String, common: CommonArgs) -> Result<()> {
             &[],
             &cfg.mode,
             &cfg.persona,
+            None,
             "brief",
             cfg.temperature,
             cfg.max_tokens,

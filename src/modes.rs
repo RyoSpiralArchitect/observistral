@@ -157,6 +157,33 @@ pub fn cot_instruction(cot: &str, mode: &Mode) -> &'static str {
     }
 }
 
+/// Language guidance appended to the system prompt.
+/// Defaults to Japanese when not provided or unrecognised.
+pub fn language_instruction(lang: Option<&str>, mode: &Mode) -> &'static str {
+    let l = lang.unwrap_or("").trim();
+    let is_obs = matches!(mode, Mode::Observer);
+
+    if l.eq_ignore_ascii_case("fr") {
+        if is_obs {
+            "Language: French. Write the critique in French. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+        } else {
+            "Language: French. Write your response in French."
+        }
+    } else if l.eq_ignore_ascii_case("en") {
+        if is_obs {
+            "Language: English. Write the critique in English. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+        } else {
+            "Language: English. Write your response in English."
+        }
+    } else {
+        if is_obs {
+            "Language: Japanese. Write the critique in Japanese. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+        } else {
+            "Language: Japanese. Write your response in Japanese."
+        }
+    }
+}
+
 pub fn compose_user_text(
     user_input: &str,
     mode: &Mode,

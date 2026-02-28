@@ -88,6 +88,8 @@
       polite: "polite",
       critical: "critical",
       brutal: "brutal",
+      vibeAgent: "Vibe agent",
+      vibeMaxTurns: "Vibe max turns",
       details: "details",
       hide: "hide",
       serverOutdated: "Server outdated",
@@ -157,6 +159,8 @@
       polite: "丁寧",
       critical: "批評",
       brutal: "容赦なし",
+      vibeAgent: "Vibe agent",
+      vibeMaxTurns: "Vibe max turns",
       details: "詳細",
       hide: "隠す",
       serverOutdated: "サーバ古い",
@@ -230,6 +234,8 @@
       polite: "poli",
       critical: "critique",
       brutal: "brutal",
+      vibeAgent: "Agent Vibe",
+      vibeMaxTurns: "Tours max Vibe",
       details: "détails",
       hide: "masquer",
       autoObserve: "Auto-commenter",
@@ -406,6 +412,8 @@
     autoObserve: false,
     forceAgent: true,
     toolRoot: "",
+    mistralCliAgent: "",
+    mistralCliMaxTurns: "",
     codeProvider: "",
     codeBaseUrl: "",
     observerProvider: "",
@@ -447,6 +455,8 @@
       base_url: strOrUndef(cfg.baseUrl),
       api_key: strOrUndef(apiKey),
       tool_root: strOrUndef(cfg.toolRoot),
+      mistral_cli_agent: strOrUndef(cfg.mistralCliAgent),
+      mistral_cli_max_turns: numOrUndef(cfg.mistralCliMaxTurns),
       mode: strOrUndef(cfg.mode),
       cot: strOrUndef(cfg.cot),
       autonomy: strOrUndef(cfg.autonomy),
@@ -820,6 +830,40 @@
     return cleaned;
   }
 
+  // Render a unified diff block with per-line colours.
+  function renderDiffBody(codeText) {
+    const colorOf = (line) => {
+      if (/^diff\s/.test(line) || /^index\s/.test(line) || /^new file/.test(line) || /^deleted file/.test(line))
+        return "rgba(96,165,250,0.9)";   // blue  — file header
+      if (/^(\+\+\+|---)/.test(line))
+        return "rgba(255,255,255,0.85)"; // white — path line
+      if (/^@@/.test(line))
+        return "rgba(45,212,191,0.9)";  // cyan  — hunk header
+      if (line.startsWith("+"))
+        return "rgba(74,222,128,0.9)";  // green — addition
+      if (line.startsWith("-"))
+        return "rgba(251,113,133,0.9)"; // red   — deletion
+      return "rgba(255,255,255,0.58)";  // faint — context
+    };
+    return e(
+      "div",
+      { style: { padding: "10px", overflow: "auto", maxHeight: 480 } },
+      codeText.split("\n").map((line, i) =>
+        e("div", {
+          key: i,
+          style: {
+            color: colorOf(line),
+            fontFamily: "var(--mono)",
+            fontSize: 12,
+            lineHeight: 1.45,
+            whiteSpace: "pre",
+            minHeight: "1em",
+          },
+        }, line || "")
+      )
+    );
+  }
+
   function parseMarkdown(text, execRes, onRun) {
     const lines = text.split("\n");
     const out = [];
@@ -839,6 +883,7 @@
           : /^(bash|sh|shell|zsh|console)$/i.test(lang)
         );
         const res = execRes && execRes[blockIdx];
+        const isDiff = /^(diff|patch)$/i.test(lang);
         out.push(e("div", { className: "code", key: k++ },
           e("div", { className: "code-head" },
             e("span", null, lang || "code"),
@@ -852,7 +897,7 @@
               onClick: () => navigator.clipboard && navigator.clipboard.writeText(codeText).catch(() => {}),
             }, "⎘ copy"),
           ),
-          e("pre", null, codeText),
+          isDiff ? renderDiffBody(codeText) : e("pre", null, codeText),
           res && !res.running && e("div", {
               className: "exec-result " + (res.exit_code === 0 ? "exec-ok" : "exec-err"),
             },
@@ -929,6 +974,48 @@
       parts.push(...parseMarkdown(text.slice(last), execRes, onRun));
     }
     return parts;
+  }
+
+  // Extract a short sequential list like "1) ...\n2) ..." as clickable choices.
+  // Used to support "multi-choice clarification" flows from VIBE / LLMs.
+  function extractChoices(text) {
+    const s = String(text || "");
+    if (!s) return [];
+    const lines = s.split("\n");
+    const cueRe = /(choose|pick|select|which|option|choice|選ん|どれ|どちら|択|choisissez|s[ée]lectionnez)/i;
+    const itemRe = /^\s*(\d{1,2})[).:\-]\s+(.+)\s*$/;
+
+    for (let i = 0; i < lines.length; i++) {
+      const m = itemRe.exec(lines[i]);
+      if (!m) continue;
+      const n0 = Number(m[1]);
+      if (n0 !== 1) continue;
+      const ctx = lines.slice(Math.max(0, i - 4), i + 1).join("\n");
+      if (!cueRe.test(ctx)) continue;
+
+      const out = [];
+      let expected = 1;
+      for (let j = i; j < lines.length; j++) {
+        const mj = itemRe.exec(lines[j]);
+        if (!mj) break;
+        const nj = Number(mj[1]);
+        const tj = String(mj[2] || "").trim();
+        if (!Number.isFinite(nj) || nj !== expected || !tj) break;
+        out.push({ n: nj, text: tj });
+        expected++;
+        if (out.length >= 6) break;
+      }
+      return out.length >= 2 ? out : [];
+    }
+    return [];
+  }
+
+  function choiceReply(uiLang, n, text) {
+    const l = String(uiLang || "").trim().toLowerCase();
+    const t = String(text || "").trim();
+    if (l === "fr") return `Je choisis ${n}: ${t}`;
+    if (l === "en") return `I choose ${n}: ${t}`;
+    return `選択: ${n} ${t}`;
   }
 
   function parseProposals(text) {
@@ -1044,6 +1131,8 @@
       if (typeof cfg.autoObserve !== "boolean") cfg.autoObserve = !!DEFAULT_CONFIG.autoObserve;
       if (typeof cfg.forceAgent !== "boolean") cfg.forceAgent = !!DEFAULT_CONFIG.forceAgent;
       if (typeof cfg.toolRoot !== "string") cfg.toolRoot = String(cfg.toolRoot || "");
+      if (typeof cfg.mistralCliAgent !== "string") cfg.mistralCliAgent = String(cfg.mistralCliAgent || "");
+      if (typeof cfg.mistralCliMaxTurns !== "string") cfg.mistralCliMaxTurns = String(cfg.mistralCliMaxTurns || "");
       if (typeof cfg.codeProvider !== "string") cfg.codeProvider = String(cfg.codeProvider || "");
       if (typeof cfg.codeBaseUrl !== "string") cfg.codeBaseUrl = String(cfg.codeBaseUrl || "");
       if (typeof cfg.observerProvider !== "string") cfg.observerProvider = String(cfg.observerProvider || "");
@@ -1550,6 +1639,7 @@
     const renderMessage = (m) => {
       const canExec = !!(status && status.features && status.features.exec);
       const s = String(m && m.content ? m.content : "");
+      const choices = (!m.streaming && m.role === "assistant" && m.pane !== "observer") ? extractChoices(s) : [];
       const streamingNode = s
         ? s
         : e("span", { className: "thinking" }, tr(lang, "streaming"));
@@ -1567,11 +1657,33 @@
             m.ts ? e("span", { className: "msg-ts" }, relativeTime(m.ts, lang)) : null,
             e("div", { className: "mini" }, e("button", { onClick: () => copyText(m.content || "") }, tr(lang, "copy")))
           ),
-          e("div", { className: "content" }, m.streaming ? streamingNode : renderWithThink(
-            String(m.content || ""),
-            execResults[m.id] || {},
-            canExec ? ((blockIdx, langHint, codeText) => runCmd(m.id, blockIdx, langHint, codeText)) : null
-          ))
+          e(
+            "div",
+            { className: "content" },
+            m.streaming ? streamingNode : renderWithThink(
+              String(m.content || ""),
+              execResults[m.id] || {},
+              canExec ? ((blockIdx, langHint, codeText) => runCmd(m.id, blockIdx, langHint, codeText)) : null
+            ),
+            choices && choices.length
+              ? e(
+                  "div",
+                  { className: "choice-row" },
+                  choices.map((c) =>
+                    e(
+                      "button",
+                      {
+                        key: "ch" + String(c.n),
+                        className: "choice-btn",
+                        type: "button",
+                        onClick: () => sendCoder(choiceReply(lang, c.n, c.text)),
+                      },
+                      String(c.n) + ") " + String(c.text).slice(0, 42)
+                    )
+                  )
+                )
+              : null
+          )
         )
       );
     };
@@ -1935,6 +2047,35 @@
         const raw = overrideText != null ? String(overrideText) : String(coderInput || "");
         const text = raw.trim();
         if (!text) return;
+
+        // Local slash commands (UI-side). These do not call the model.
+        // They are useful when using the Mistral VIBE CLI provider (mistral-cli).
+        if (overrideText == null && text.startsWith("/")) {
+          const parts = text.split(/\s+/);
+          const cmd = String(parts[0] || "").trim().toLowerCase();
+          const arg = parts.slice(1).join(" ").trim();
+          if (cmd === "/agent") {
+            setConfig((c) => ({ ...c, mistralCliAgent: arg }));
+            const msg = { id: uid(), pane: "coder", role: "assistant", content: `[OBSTRAL] vibe agent = ${arg || "(default)"}`, ts: Date.now() };
+            setThreadState((s) => ({
+              ...s,
+              threads: s.threads.map((t) => (t.id === activeThread.id ? { ...t, updatedAt: Date.now(), messages: [...(t.messages || []), msg] } : t)),
+            }));
+            setCoderInput("");
+            return;
+          }
+          if (cmd === "/turns") {
+            const n = String(arg || "").trim();
+            setConfig((c) => ({ ...c, mistralCliMaxTurns: n }));
+            const msg = { id: uid(), pane: "coder", role: "assistant", content: `[OBSTRAL] vibe max_turns = ${n || "(default)"}`, ts: Date.now() };
+            setThreadState((s) => ({
+              ...s,
+              threads: s.threads.map((t) => (t.id === activeThread.id ? { ...t, updatedAt: Date.now(), messages: [...(t.messages || []), msg] } : t)),
+            }));
+            setCoderInput("");
+            return;
+          }
+        }
 
         const coderCfg = String(config.mode || "").trim() === "Observer" ? { ...config, mode: "VIBE" } : config;
         if (String(config.mode || "").trim() === "Observer") {
@@ -2792,6 +2933,37 @@
                   placeholder: "(optional) subdir (e.g. myrepo)",
                 })
               ),
+              (String(config.provider || "").trim() === "mistral-cli" ||
+                String(config.codeProvider || "").trim() === "mistral-cli" ||
+                String(config.observerProvider || "").trim() === "mistral-cli")
+                ? e(
+                    "div",
+                    { className: "grid2", style: { marginTop: "10px" } },
+                    e(
+                      "div",
+                      { className: "field" },
+                      e("label", null, tr(lang, "vibeAgent")),
+                      e("input", {
+                        className: "input",
+                        value: String(config.mistralCliAgent || ""),
+                        onChange: (ev) => setConfig({ ...config, mistralCliAgent: ev.target.value }),
+                        placeholder: "accept-edits / plan / ...",
+                      })
+                    ),
+                    e(
+                      "div",
+                      { className: "field" },
+                      e("label", null, tr(lang, "vibeMaxTurns")),
+                      e("input", {
+                        className: "input",
+                        value: String(config.mistralCliMaxTurns || ""),
+                        onChange: (ev) => setConfig({ ...config, mistralCliMaxTurns: ev.target.value }),
+                        placeholder: "8",
+                        inputMode: "numeric",
+                      })
+                    )
+                  )
+                : null,
               e(
                 "div",
                 { className: "field", style: { marginTop: "10px" } },

@@ -351,6 +351,9 @@ fn proposal_line_style(line: &str) -> Style {
 //   [RESULT] exit=0    Green                    (success)
 //   [RESULT] exit=N ⚠  Red                     (failure)
 //   [agent] …          DarkGray                 (system annotations)
+//   diff --git / @@    Blue / Cyan              (unified diff header / hunk)
+//   + line             Green                    (diff addition)
+//   - line             Red                      (diff deletion)
 //   everything else    White
 
 fn render_coder_content(content: &str) -> Vec<Line<'static>> {
@@ -362,9 +365,16 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
     let err_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     let annotation_style = Style::default().fg(Color::DarkGray);
     let body_style = Style::default().fg(Color::White);
+    // Diff styles
+    let diff_file_style = Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD);
+    let diff_head_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let diff_hunk_style = Style::default().fg(Color::Cyan);
+    let diff_add_style  = Style::default().fg(Color::Green);
+    let diff_del_style  = Style::default().fg(Color::Red);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut in_think = false;
+    let mut in_diff   = false;
 
     for raw_line in content.lines() {
         let trimmed = raw_line.trim();
@@ -372,6 +382,7 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
         // ── Think block state machine ─────────────────────────────────────
         if trimmed.starts_with("<think>") {
             in_think = true;
+            in_diff = false;
             lines.push(Line::from(vec![Span::styled(raw_line.to_string(), think_style)]));
             if trimmed.contains("</think>") { in_think = false; }
             continue;
@@ -382,17 +393,50 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
             continue;
         }
 
-        // ── Tool / result annotations ─────────────────────────────────────
+        // ── Special markers (reset diff mode) ────────────────────────────
         let style = if trimmed.starts_with("[TOOL]") {
+            in_diff = false;
             tool_style
         } else if trimmed.starts_with("[RESULT] exit=0") {
+            in_diff = false;
             ok_style
         } else if trimmed.starts_with("[RESULT]") {
+            in_diff = false;
             err_style
         } else if trimmed.starts_with("[agent]") {
+            in_diff = false;
             annotation_style
         } else {
-            body_style
+            // ── Diff detection ────────────────────────────────────────────
+            if trimmed.starts_with("diff --git ")
+                || trimmed.starts_with("diff -u ")
+                || trimmed.starts_with("diff -r ")
+            {
+                in_diff = true;
+            }
+
+            if in_diff {
+                if trimmed.starts_with("diff ") {
+                    diff_file_style
+                } else if trimmed.starts_with("+++ ")
+                    || trimmed.starts_with("--- ")
+                    || trimmed.starts_with("index ")
+                    || trimmed.starts_with("new file")
+                    || trimmed.starts_with("deleted file")
+                {
+                    diff_head_style
+                } else if trimmed.starts_with("@@ ") {
+                    diff_hunk_style
+                } else if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
+                    diff_add_style
+                } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
+                    diff_del_style
+                } else {
+                    body_style // context lines
+                }
+            } else {
+                body_style
+            }
         };
 
         lines.push(Line::from(vec![Span::styled(raw_line.to_string(), style)]));

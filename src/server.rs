@@ -621,6 +621,7 @@ async fn api_chat(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Resul
             &history,
             &cfg.mode,
             &cfg.persona,
+            req.lang.as_deref(),
             cot_str,
             cfg.temperature,
             cfg.max_tokens,
@@ -652,6 +653,7 @@ async fn api_chat_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -
     let req: ApiChatRequest =
         serde_json::from_slice(body).context("invalid JSON body (expected ApiChatRequest)")?;
 
+    let lang = req.lang.clone();
     let (cfg, history, diff, cot) = match build_chat_request(state.defaults.clone(), req) {
         Ok(v) => v,
         Err(err) => {
@@ -673,10 +675,12 @@ async fn api_chat_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -
     let persona_def = personas::resolve_persona(&cfg.persona)?;
     let cot_str = cot.as_deref().unwrap_or("brief");
     let cot_instr = crate::modes::cot_instruction(cot_str, &cfg.mode);
+    let lang_instr = crate::modes::language_instruction(lang.as_deref(), &cfg.mode);
     let system_text = format!(
-        "{}{}\n\n[Persona]\n{}",
+        "{}{}\n\n[Language]\n{}\n\n[Persona]\n{}",
         crate::modes::mode_prompt(&cfg.mode),
         cot_instr,
+        lang_instr,
         persona_def.prompt
     );
     let user_text =
@@ -721,9 +725,10 @@ async fn api_chat_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ApiChatRequest {
     input: String,
+    lang: Option<String>,
 
     vibe: Option<bool>,
     provider: Option<ProviderKind>,
@@ -743,7 +748,7 @@ struct ApiChatRequest {
     diff: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ApiMessage {
     role: String,
     content: String,

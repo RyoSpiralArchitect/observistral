@@ -21,6 +21,7 @@ impl ChatBot {
         history: &[ChatMessage],
         mode: &Mode,
         persona: &str,
+        lang: Option<&str>,
         cot: &str,
         temperature: f64,
         max_tokens: u32,
@@ -29,7 +30,14 @@ impl ChatBot {
     ) -> Result<ChatResponse> {
         let persona_def = personas::resolve_persona(persona)?;
         let cot_instr = crate::modes::cot_instruction(cot, mode);
-        let system_text = format!("{}{}\n\n[Persona]\n{}", mode_prompt(mode), cot_instr, persona_def.prompt);
+        let lang_instr = crate::modes::language_instruction(lang, mode);
+        let system_text = format!(
+            "{}{}\n\n[Language]\n{}\n\n[Persona]\n{}",
+            mode_prompt(mode),
+            cot_instr,
+            lang_instr,
+            persona_def.prompt
+        );
 
         let user_text = compose_user_text(user_input, mode, diff_text, log_text);
 
@@ -59,4 +67,3 @@ impl ChatBot {
         self.provider.chat(&request).await
     }
 }
-
