@@ -587,6 +587,178 @@
     return parts;
   }
 
+  function isWindowsHost() {
+    try {
+      return typeof navigator !== "undefined" && /Windows/i.test(String(navigator.userAgent || ""));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function stripShellTranscript(text) {
+    const raw = String(text || "").replace(/\r\n/g, "\n");
+    const lines = raw.split("\n");
+    const promptRe = /^\s*(\$\s+|PS(?: [^>]+)?>\s+|>\s+)/;
+    const hasPrompt = lines.some((l) => promptRe.test(l));
+    const out = [];
+    for (const l0 of lines) {
+      const l = String(l0 || "");
+      if (hasPrompt) {
+        if (!promptRe.test(l)) continue; // drop output lines
+        out.push(l.replace(promptRe, ""));
+      } else {
+        out.push(l.replace(/^\s*\$\s+/, ""));
+      }
+    }
+    return out.join("\n").trim();
+  }
+
+  function splitArgsSimple(s) {
+    const src = String(s || "");
+    const out = [];
+    let cur = "";
+    let q = null;
+    for (let i = 0; i < src.length; i++) {
+      const ch = src[i];
+      if (q) {
+        if (ch === q) { q = null; continue; }
+        if (ch === "\\" && q === "\"" && i + 1 < src.length) { cur += src[i + 1]; i++; continue; }
+        cur += ch;
+        continue;
+      }
+      if (ch === "'" || ch === "\"") { q = ch; continue; }
+      if (/\s/.test(ch)) {
+        if (cur) { out.push(cur); cur = ""; }
+        continue;
+      }
+      cur += ch;
+    }
+    if (cur) out.push(cur);
+    return out;
+  }
+
+  function psSingleQuote(s) {
+    return "'" + String(s || "").replace(/'/g, "''") + "'";
+  }
+
+  function bashToPowerShell(script) {
+    const raw = stripShellTranscript(script);
+    if (!raw) return "";
+    const lines = raw.split("\n");
+    const out = [];
+    out.push("$ErrorActionPreference = 'Stop'");
+
+    for (const line0 of lines) {
+      let line = String(line0 || "").trim();
+      if (!line) continue;
+      if (line.startsWith("#")) continue;
+
+      // Common model glitch: trailing brace.
+      if (line.endsWith("}") && line.indexOf("{") === -1) line = line.slice(0, -1).trim();
+
+      line = line.replace(/&&/g, ";");
+      const segs = line.split(";"); // naive but good enough for typical command snippets
+      for (const seg0 of segs) {
+        const seg = String(seg0 || "").trim();
+        if (!seg) continue;
+
+        const toks = splitArgsSimple(seg);
+        if (!toks.length) continue;
+
+        const head = toks[0];
+        if (head === "mkdir") {
+          let parents = false;
+          const paths = [];
+          for (let i = 1; i < toks.length; i++) {
+            const t = toks[i];
+            if (t === "-p" || t === "--parents") { parents = true; continue; }
+            if (t && t.startsWith("-")) continue;
+            paths.push(t);
+          }
+          if (parents) {
+            for (const p of paths) out.push("[System.IO.Directory]::CreateDirectory(" + psSingleQuote(p) + ") | Out-Null");
+          } else {
+            out.push(seg); // mkdir is an alias in PowerShell
+          }
+          continue;
+        }
+
+        if (head === "touch") {
+          const paths = [];
+          for (let i = 1; i < toks.length; i++) {
+            const t = toks[i];
+            if (t && t.startsWith("-")) continue;
+            paths.push(t);
+          }
+          for (const p of paths) {
+            const q = psSingleQuote(p);
+            out.push("if (-not (Test-Path -LiteralPath " + q + ")) { New-Item -ItemType File -Force -Path " + q + " | Out-Null } else { (Get-Item -LiteralPath " + q + ").LastWriteTime = Get-Date }");
+          }
+          continue;
+        }
+
+        if (head === "rm") {
+          let recurse = false;
+          const paths = [];
+          for (let i = 1; i < toks.length; i++) {
+            const t = toks[i];
+            if (t && t.startsWith("-")) { if (t.indexOf("r") !== -1 || t.indexOf("R") !== -1) recurse = true; continue; }
+            paths.push(t);
+          }
+          for (const p of paths) {
+            const q = psSingleQuote(p);
+            out.push("Remove-Item -Force " + (recurse ? "-Recurse " : "") + "-ErrorAction SilentlyContinue -LiteralPath " + q);
+          }
+          continue;
+        }
+
+        if (head === "cp" && toks.length >= 3) {
+          const src = psSingleQuote(toks[1]);
+          const dst = psSingleQuote(toks[2]);
+          out.push("Copy-Item -Force -LiteralPath " + src + " -Destination " + dst);
+          continue;
+        }
+
+        if (head === "mv" && toks.length >= 3) {
+          const src = psSingleQuote(toks[1]);
+          const dst = psSingleQuote(toks[2]);
+          out.push("Move-Item -Force -LiteralPath " + src + " -Destination " + dst);
+          continue;
+        }
+
+        if (head === "export" && toks.length >= 2 && toks[1].indexOf("=") !== -1) {
+          const idx = toks[1].indexOf("=");
+          const k = toks[1].slice(0, idx);
+          const v = toks[1].slice(idx + 1);
+          if (k) out.push("$env:" + k + " = " + psSingleQuote(v));
+          continue;
+        }
+
+        out.push(seg);
+      }
+    }
+
+    return out.join("\n").trim();
+  }
+
+  function normalizeExecScript(lang, codeText) {
+    const isWin = isWindowsHost();
+    const l = String(lang || "").trim().toLowerCase();
+    const cleaned = stripShellTranscript(codeText);
+    if (!isWin) return cleaned;
+
+    const isBash = /^(bash|sh|shell|zsh|console)$/.test(l);
+    const isPwsh = /^(powershell|pwsh|ps1|ps)$/.test(l);
+    if (isPwsh) return cleaned;
+    if (isBash) return bashToPowerShell(cleaned);
+
+    // Tool logs often use ```bash``` even on Windows.
+    if (/(^|\s)(mkdir\s+-p\b|touch\b|rm\s+-rf\b)/.test(cleaned) || cleaned.indexOf("&&") !== -1) {
+      return bashToPowerShell(cleaned);
+    }
+    return cleaned;
+  }
+
   function parseMarkdown(text, execRes, onRun) {
     const lines = text.split("\n");
     const out = [];
@@ -600,7 +772,11 @@
         while (i < lines.length && !lines[i].startsWith("```")) { code.push(lines[i]); i++; }
         const codeText = code.join("\n");
         const blockIdx = k;
-        const isRunnable = onRun && /^(bash|sh|shell|zsh|console)$/i.test(lang);
+        const win = isWindowsHost();
+        const isRunnable = onRun && (win
+          ? /^(bash|sh|shell|zsh|console|powershell|pwsh|ps1|ps)$/i.test(lang)
+          : /^(bash|sh|shell|zsh|console)$/i.test(lang)
+        );
         const res = execRes && execRes[blockIdx];
         out.push(e("div", { className: "code", key: k++ },
           e("div", { className: "code-head" },
@@ -608,7 +784,7 @@
             isRunnable && e("button", {
               className: "btn-run",
               disabled: !!(res && res.running),
-              onClick: () => onRun(blockIdx, codeText),
+              onClick: () => onRun(blockIdx, lang, codeText),
             }, res && res.running ? "⏳" : "▶ run"),
             e("button", {
               style: { marginLeft: isRunnable ? "0" : "auto", background: "none", border: "none", color: "var(--muted)", cursor: "pointer", fontSize: "11px" },
@@ -1196,14 +1372,15 @@
       window.prompt(tr(lang, "copy"), String(text || ""));
     };
 
-    const runCmd = async (msgId, blockIdx, codeText) => {
+    const runCmd = async (msgId, blockIdx, langHint, codeText) => {
       setExecResults(prev => ({
         ...prev,
         [msgId]: { ...(prev[msgId] || {}), [blockIdx]: { stdout: "", stderr: "", exit_code: 0, running: true } },
       }));
       try {
         const cwd = String(config.toolRoot || "").trim() || undefined;
-        const result = await postJson("/api/exec", { command: codeText, cwd });
+        const command = normalizeExecScript(langHint, codeText);
+        const result = await postJson("/api/exec", { command, cwd });
         setExecResults(prev => ({
           ...prev,
           [msgId]: { ...(prev[msgId] || {}), [blockIdx]: {
@@ -1244,7 +1421,7 @@
           e("div", { className: "content" }, m.streaming ? streamingNode : parseMarkdown(
             String(m.content || ""),
             execResults[m.id] || {},
-            (blockIdx, codeText) => runCmd(m.id, blockIdx, codeText)
+            (blockIdx, langHint, codeText) => runCmd(m.id, blockIdx, langHint, codeText)
           ))
         )
       );
@@ -1440,11 +1617,22 @@
       const MAX_ITERS = 10;
       const cwd = String(config.toolRoot || "").trim() || undefined;
 
-      const SYSTEM = [
+      const isWindows = navigator.userAgent.includes("Windows");
+      const SYSTEM = isWindows ? [
+        "You are an autonomous coding agent running on the user's Windows machine.",
+        "You have an `exec` tool that runs PowerShell commands. Use PowerShell syntax:",
+        "- Create directory tree: New-Item -ItemType Directory -Force -Path 'a/b/c'",
+        "- Create empty file:     New-Item -ItemType File   -Force -Path 'file.txt'",
+        "- Write file content:    Set-Content 'file.txt' 'content here'",
+        "- Multi-line content:    use Set-Content with a here-string @'...'@",
+        "- Git commands work as-is: git init, git add ., git commit -m 'msg'",
+        "- NEVER use mkdir -p or touch — they don't exist in PowerShell.",
+        "Execute everything without asking for confirmation. Summarize results at the end.",
+      ].join("\n") : [
         "You are an autonomous coding agent running on the user's local machine.",
         "You have an `exec` tool that runs shell commands. Use it proactively to:",
         "- Create directories: mkdir -p <dir>",
-        "- Write files: use `tee <file>` with a heredoc, or `python -c` etc.",
+        "- Write files: use tee, cat, or python -c",
         "- Initialize git repos: git init, git add, git commit",
         "- Run any commands needed to complete the task end-to-end.",
         "Execute everything without asking for confirmation. Summarize results at the end.",
@@ -1523,14 +1711,26 @@
 
             let args;
             try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
-            const command = String(args.command || "").trim();
+            const command = stripShellTranscript(String(args.command || ""));
+            const commandToRun = normalizeExecScript("", command);
 
-            display += (display ? "\n\n" : "") + "```bash\n$ " + command;
+            const win = isWindowsHost();
+            const fenceLang = win ? "powershell" : "bash";
+            const prompt = win ? "PS> " : "$ ";
+            display += (display ? "\n\n" : "") + "```" + fenceLang + "\n" + prompt + command;
             flush("\n```");
 
             let toolResult;
             try {
-              const execRes = await postJson("/api/exec", { command, cwd }, ac.signal);
+              if (config.requireCommandApproval && !window.confirm("Run command?\n\n" + commandToRun)) {
+                toolResult = "error: command rejected by user";
+                display += "\n(rejected)\n```\nexit: -1";
+                flush();
+                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                continue;
+              }
+
+              const execRes = await postJson("/api/exec", { command: commandToRun, cwd }, ac.signal);
               const stdout = String(execRes.stdout || "").trim();
               const stderr = String(execRes.stderr || "").trim();
               const exitCode = execRes.exit_code;

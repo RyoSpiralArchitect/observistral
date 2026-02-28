@@ -15,6 +15,19 @@ use crate::personas;
 use crate::providers;
 use crate::types::ChatMessage;
 
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+extern "system" {
+    fn MultiByteToWideChar(
+        CodePage: u32,
+        dwFlags: u32,
+        lpMultiByteStr: *const i8,
+        cbMultiByte: i32,
+        lpWideCharStr: *mut u16,
+        cchWideChar: i32,
+    ) -> i32;
+}
+
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const STYLES_CSS: &str = include_str!("../web/styles.css");
@@ -231,6 +244,60 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     #[derive(Serialize)]
     struct Res { stdout: String, stderr: String, exit_code: i32 }
 
+    fn decode_output(bytes: &[u8]) -> String {
+        if bytes.is_empty() {
+            return String::new();
+        }
+        // On Windows, stdout/stderr are often not UTF-8 (e.g., CP932). Decode them
+        // so the UI doesn't show mojibake. Fall back to UTF-8 on other platforms.
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(s) = std::str::from_utf8(bytes) {
+                return s.to_string();
+            }
+            // CP932 (Windows-31J / Shift-JIS) via Win32 API.
+            const CP_932: u32 = 932;
+            const MB_ERR_INVALID_CHARS: u32 = 0x0000_0008;
+
+            unsafe {
+                let src = bytes.as_ptr() as *const i8;
+                let src_len = if bytes.len() > i32::MAX as usize {
+                    i32::MAX
+                } else {
+                    bytes.len() as i32
+                };
+
+                let needed = MultiByteToWideChar(CP_932, MB_ERR_INVALID_CHARS, src, src_len, std::ptr::null_mut(), 0);
+                if needed <= 0 {
+                    // Fallback: allow invalid bytes.
+                    let needed2 = MultiByteToWideChar(CP_932, 0, src, src_len, std::ptr::null_mut(), 0);
+                    if needed2 <= 0 {
+                        return String::from_utf8_lossy(bytes).into_owned();
+                    }
+                    let mut buf = vec![0u16; needed2 as usize];
+                    let written = MultiByteToWideChar(CP_932, 0, src, src_len, buf.as_mut_ptr(), needed2);
+                    if written <= 0 {
+                        return String::from_utf8_lossy(bytes).into_owned();
+                    }
+                    buf.truncate(written as usize);
+                    return String::from_utf16_lossy(&buf);
+                }
+
+                let mut buf = vec![0u16; needed as usize];
+                let written = MultiByteToWideChar(CP_932, MB_ERR_INVALID_CHARS, src, src_len, buf.as_mut_ptr(), needed);
+                if written <= 0 {
+                    return String::from_utf8_lossy(bytes).into_owned();
+                }
+                buf.truncate(written as usize);
+                return String::from_utf16_lossy(&buf);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            String::from_utf8_lossy(bytes).into_owned()
+        }
+    }
+
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(_) => {
@@ -250,8 +317,15 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     }
 
     let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.args(["/C", cmd_str]);
+        let mut c = Command::new("powershell");
+        // Prepend UTF-8 encoding setup to avoid garbled Japanese output.
+        let wrapped = format!(
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
+             [Console]::InputEncoding=[System.Text.Encoding]::UTF8; \
+             $OutputEncoding=[System.Text.Encoding]::UTF8; {}",
+            cmd_str
+        );
+        c.args(["-NoProfile", "-NonInteractive", "-Command", &wrapped]);
         c
     } else {
         let mut c = Command::new("sh");
@@ -274,8 +348,8 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     };
 
     write_json(stream, 200, "OK", &Res {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout: decode_output(&output.stdout),
+        stderr: decode_output(&output.stderr),
         exit_code: output.status.code().unwrap_or(-1),
     }).await
 }
@@ -287,6 +361,11 @@ async fn api_status(stream: &mut TcpStream) -> Result<()> {
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false)
     }
+
+    let workspace_root = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
 
     let resp = ApiStatusResponse {
         ok: true,
@@ -302,6 +381,8 @@ async fn api_status(stream: &mut TcpStream) -> Result<()> {
                 api_key_present: env_present("OBS_API_KEY") || env_present("OPENAI_API_KEY"),
             },
         },
+        features: ApiFeatures { exec: true, chat_tools: true },
+        workspace_root,
     };
 
     write_json(stream, 200, "OK", &resp).await
@@ -673,6 +754,14 @@ struct ApiStatusResponse {
     ok: bool,
     version: &'static str,
     providers: ApiStatusProviders,
+    features: ApiFeatures,
+    workspace_root: String,
+}
+
+#[derive(Serialize)]
+struct ApiFeatures {
+    exec: bool,
+    chat_tools: bool,
 }
 
 #[derive(Serialize)]
