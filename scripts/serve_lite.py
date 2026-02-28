@@ -99,6 +99,8 @@ OBSERVER_NOVELIST_PROMPT = (
     "- If coder_context contains concrete failures (e.g. 401/403/429/10061), you MUST name them.\n"
     "- Loop breaker: if the coder keeps rewriting README/plan/polish without any concrete action, "
     "call out the loop and force a pivot to implementation (tools, files, commands).\n"
+    "- Anti-loop: do NOT repeat your last critique. Only mention NEW findings or still-UNRESOLVED items.\n"
+    "  If there is no new signal, output exactly: \"[Observer] No new critique. Loop detected.\" and stop.\n"
     "- Output format:\n"
     "  1) First line: one biting sentence (<= 25 words) about what just happened.\n"
     "  2) Body: 2-6 short paragraphs (1-3 sentences each): narrate + critique with metaphor/irony.\n"
@@ -118,6 +120,7 @@ def _observer_persona_prompt(persona: str) -> str:
             "- No pep talk. No basics.\n"
             "- You MUST cite >=1 concrete evidence from coder_context.\n"
             "- Prioritize risks, contradictions, and what will break next.\n"
+            "- Anti-loop: only mention NEW findings or still-UNRESOLVED items. Do not repeat yourself.\n"
         )
     if p == "cheerful":
         return (
@@ -125,6 +128,7 @@ def _observer_persona_prompt(persona: str) -> str:
             "- Language: Japanese.\n"
             "- You MUST cite >=1 concrete evidence from coder_context.\n"
             "- Do not hide risks; make them actionable.\n"
+            "- Anti-loop: only mention NEW findings or still-UNRESOLVED items. Do not repeat yourself.\n"
         )
     if p == "thoughtful":
         return (
@@ -132,6 +136,7 @@ def _observer_persona_prompt(persona: str) -> str:
             "- Language: Japanese.\n"
             "- You MUST cite >=1 concrete evidence from coder_context.\n"
             "- Emphasize trade-offs, unknowns, and verification.\n"
+            "- Anti-loop: only mention NEW findings or still-UNRESOLVED items. Do not repeat yourself.\n"
         )
     return ""
 

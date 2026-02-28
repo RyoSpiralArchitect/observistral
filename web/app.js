@@ -85,6 +85,7 @@
       polite: "polite",
       critical: "critical",
       brutal: "brutal",
+      serverOutdated: "Server outdated",
     },
     ja: {
       threads: "スレッド",
@@ -148,6 +149,7 @@
       polite: "丁寧",
       critical: "批評",
       brutal: "容赦なし",
+      serverOutdated: "サーバ古い",
     },
     fr: {
       threads: "Fils",
@@ -217,6 +219,7 @@
       polite: "poli",
       critical: "critique",
       brutal: "brutal",
+      serverOutdated: "Serveur obsolète",
     },
   };
 
@@ -875,7 +878,7 @@
       }
 
       const minChars = 180;
-      const detected = String(last.content || "").trim().length >= minChars && maxSim >= 0.85;
+      const detected = String(last.content || "").trim().length >= minChars && maxSim >= 0.80;
       let depth = loopRef.current.depth || 0;
       if (detected) depth = Math.min(18, depth + 1);
       else depth = Math.max(0, depth - 1);
@@ -974,6 +977,9 @@
     const keyAnthropicOk = keyAnthropic || typedKeyFor("anthropic");
 
     const KeyDot = ({ ok }) => e("span", { className: "kdot " + (ok ? "ok" : "missing") });
+
+    const serverOutdated =
+      status && status.ok && (!status.workspace_root || !status.features);
 
     const providerLabel = (k) => {
       const p = PROVIDERS.find((x) => x.k === k);
@@ -1505,22 +1511,33 @@
       let intensityInstr = "";
       if (intensity === "polite") {
         intensityInstr =
-          "Intensity policy: polite. Be supportive and friendly. Still point out concrete issues and propose next steps.";
+          "Intensity policy: polite. Be supportive and friendly. Still point out concrete issues and propose next steps.\n" +
+          "Anti-loop: avoid repeating your last critique. Only add NEW info or mark what is still UNRESOLVED.";
       } else if (intensity === "brutal") {
         intensityInstr =
-          "Intensity policy: brutal. Be blunt and uncompromising. Prioritize flaws/risks. Stay accurate and avoid personal attacks. Propose concrete fixes.";
+          "Intensity policy: brutal. Be blunt and uncompromising. Prioritize flaws/risks. Stay accurate and avoid personal attacks. Propose concrete fixes.\n" +
+          "Hard constraint: identify at least ONE concrete architectural flaw or failure mode.\n" +
+          "Anti-loop: only mention NEW findings or still-UNRESOLVED items. Do not rehash generic advice.";
       } else {
         intensityInstr =
-          "Intensity policy: critical. Treat this as a shipping review: prioritize risks, tradeoffs, and concrete next steps. If the conversation loops, call it out and force a pivot to implementation.";
+          "Intensity policy: critical. Treat this as a shipping review: prioritize risks, tradeoffs, and concrete next steps.\n" +
+          "Hard constraint: identify at least ONE concrete architectural flaw or failure mode.\n" +
+          "Anti-loop: only mention NEW findings or still-UNRESOLVED items from prior critique. Do not repeat yourself.\n" +
+          "If there is no new signal, reply with: [Observer] No new critique. Loop detected.";
       }
+      const loopLine =
+        loopInfo && loopInfo.depth > 0
+          ? `ui_loop_detected: depth=${loopInfo.depth} sim=${Math.round((loopInfo.score || 0) * 100)}%`
+          : "";
       const observerBridge = [
         "[Observer bridge]",
         `observer_intensity: ${intensity}`,
+        loopLine,
         intensityInstr,
         "You are reviewing the coder's work artifacts.",
         "Use coder_context and code snippets to find bugs, risks, and missing tests.",
         "When you have actionable guidance, append a proposals block.",
-      ].join("\n");
+      ].filter(Boolean).join("\n");
       const sendText = config.includeCoderContext
         ? (text + "\n\n" + observerBridge + "\n\n" + coderContextPacket())
         : (text + "\n\n" + observerBridge);
@@ -1606,7 +1623,18 @@
             "div",
             { className: "brand" },
             e("h1", null, "OBSTRAL"),
-            e("span", { className: "pill" }, status && status.version ? `v${status.version}` : "local"),
+            e(
+              "span",
+              { className: "pill", title: status && status.workspace_root ? String(status.workspace_root) : "" },
+              status && status.version ? `v${status.version}` : "local"
+            ),
+            serverOutdated
+              ? e(
+                  "span",
+                  { className: "pill pill-warn", title: "Restart the lite server to pick up latest backend features." },
+                  tr(lang, "serverOutdated")
+                )
+              : null,
             e(
               "span",
               { className: "pill", title: tr(lang, "keys") },
