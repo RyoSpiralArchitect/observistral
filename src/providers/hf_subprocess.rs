@@ -98,3 +98,35 @@ impl ChatProvider for HuggingFaceSubprocessProvider {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ChatMessage;
+
+    // Requires a Python environment with `transformers` installed and a valid
+    // local model. Run with: cargo test -- --ignored hf_subprocess
+    #[tokio::test]
+    #[ignore]
+    async fn hf_subprocess_roundtrip() {
+        let provider = HuggingFaceSubprocessProvider::new(
+            "gpt2".to_string(),
+            "cpu".to_string(),
+            false,
+            Duration::from_secs(120),
+        );
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Hello, world!".to_string(),
+            }],
+            temperature: Some(0.4),
+            max_tokens: Some(32),
+            metadata: None,
+        };
+
+        let resp = provider.chat(&request).await.unwrap();
+        assert!(!resp.content.is_empty(), "expected non-empty content from HF subprocess");
+    }
+}
+

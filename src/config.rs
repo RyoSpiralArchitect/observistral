@@ -109,9 +109,6 @@ impl PartialConfig {
         if self.code_model.is_none() {
             self.code_model = env_trimmed("OBS_CODE_MODEL");
         }
-        if self.api_key.is_none() {
-            self.api_key = env_trimmed("OBS_API_KEY");
-        }
         if self.base_url.is_none() {
             self.base_url = env_trimmed("OBS_BASE_URL");
         }
@@ -206,7 +203,7 @@ impl PartialConfig {
         match provider {
             ProviderKind::Mistral if api_key.is_none() => {
                 return Err(anyhow!(
-                    "missing API key for mistral. Set MISTRAL_API_KEY (or pass --api-key)."
+                    "missing API key for mistral. Set MISTRAL_API_KEY (or OBS_API_KEY), or pass --api-key."
                 ));
             }
             ProviderKind::Anthropic if api_key.is_none() => {
@@ -252,9 +249,9 @@ fn default_model(provider: &ProviderKind, vibe: bool) -> &'static str {
         ProviderKind::OpenAiCompatible => "gpt-4o-mini",
         ProviderKind::Mistral => {
             if vibe {
-                "devstral-2"
+                "codestral-latest"
             } else {
-                "devstral-2"
+                "mistral-small-latest"
             }
         }
         ProviderKind::Anthropic => "claude-3-5-sonnet-latest",

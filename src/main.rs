@@ -66,7 +66,7 @@ enum ListWhat {
 
 #[derive(Parser, Clone, Debug)]
 struct CommonArgs {
-    /// Apply VIBE preset defaults (provider=mistral, model=devstral-2, mode=VIBE)
+    /// Apply VIBE preset defaults (provider=mistral, model=codestral-latest, mode=VIBE)
     #[arg(long)]
     vibe: bool,
 

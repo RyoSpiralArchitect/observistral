@@ -2,9 +2,11 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::process::Command;
 
 use crate::chatbot::ChatBot;
 use crate::config::{PartialConfig, ProviderKind};
@@ -123,6 +125,7 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
             .await
         }
         ("GET", "/api/status") => api_status(&mut stream).await,
+        ("POST", "/api/models") => api_models(&mut stream, state, &req.body).await,
         ("POST", "/api/chat") => api_chat(&mut stream, state, &req.body).await,
         ("POST", "/api/chat_stream") => api_chat_stream(&mut stream, state, &req.body).await,
         _ => {
@@ -151,7 +154,7 @@ async fn api_status(stream: &mut TcpStream) -> Result<()> {
         version: env!("CARGO_PKG_VERSION"),
         providers: ApiStatusProviders {
             mistral: ApiProviderStatus {
-                api_key_present: env_present("MISTRAL_API_KEY"),
+                api_key_present: env_present("MISTRAL_API_KEY") || env_present("OBS_API_KEY"),
             },
             anthropic: ApiProviderStatus {
                 api_key_present: env_present("ANTHROPIC_API_KEY"),
@@ -163,6 +166,137 @@ async fn api_status(stream: &mut TcpStream) -> Result<()> {
     };
 
     write_json(stream, 200, "OK", &resp).await
+}
+
+async fn api_models(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct ApiModelsRequest {
+        provider: Option<ProviderKind>,
+        api_key: Option<String>,
+        base_url: Option<String>,
+    }
+
+    #[derive(Serialize)]
+    struct ApiModelsResponse {
+        models: Vec<String>,
+    }
+
+    let req: ApiModelsRequest =
+        serde_json::from_slice(body).context("invalid JSON body (expected ApiModelsRequest)")?;
+
+    let mut partial = state.defaults;
+    if let Some(provider) = req.provider {
+        partial.provider = Some(provider);
+    }
+    if let Some(api_key) = req.api_key {
+        partial.api_key = Some(api_key);
+    }
+    if let Some(base_url) = req.base_url {
+        partial.base_url = Some(base_url);
+    }
+
+    let cfg = match partial.resolve() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: err.to_string(),
+                },
+            )
+            .await;
+        }
+    };
+
+    let models_res: Result<Vec<String>> = match cfg.provider {
+        ProviderKind::OpenAiCompatible | ProviderKind::Mistral => {
+            let url = format!("{}/models", cfg.base_url);
+            let mut req = state
+                .client
+                .get(url)
+                .header("Accept", "application/json")
+                .timeout(Duration::from_secs(cfg.timeout_seconds));
+            if let Some(key) = &cfg.api_key {
+                req = req.bearer_auth(key);
+            }
+            let resp = req.send().await.context("request failed")?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("models API error (HTTP {status})\n{body}"));
+            }
+
+            let v: serde_json::Value = resp.json().await.context("invalid JSON response")?;
+            let mut out: Vec<String> = Vec::new();
+            if let Some(arr) = v.get("data").and_then(|x| x.as_array()) {
+                for item in arr {
+                    if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
+                        out.push(id.to_string());
+                    }
+                }
+            } else if let Some(arr) = v.as_array() {
+                for item in arr {
+                    if let Some(id) = item.as_str() {
+                        out.push(id.to_string());
+                    }
+                }
+            }
+            Ok(out)
+        }
+        ProviderKind::Anthropic => {
+            let api_key = cfg
+                .api_key
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing API key for anthropic"))?;
+            let url = format!("{}/models", cfg.base_url);
+            let resp = state
+                .client
+                .get(url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", crate::providers::anthropic::ANTHROPIC_VERSION)
+                .header("Accept", "application/json")
+                .timeout(Duration::from_secs(cfg.timeout_seconds))
+                .send()
+                .await
+                .context("request failed")?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("Anthropic models API error (HTTP {status})\n{body}"));
+            }
+
+            let v: serde_json::Value = resp.json().await.context("invalid JSON response")?;
+            let mut out: Vec<String> = Vec::new();
+            if let Some(arr) = v.get("data").and_then(|x| x.as_array()) {
+                for item in arr {
+                    if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
+                        out.push(id.to_string());
+                    }
+                }
+            }
+            Ok(out)
+        }
+        ProviderKind::Hf => Ok(Vec::new()),
+    };
+
+    match models_res {
+        Ok(mut models) => {
+            models.sort();
+            models.dedup();
+            write_json(stream, 200, "OK", &ApiModelsResponse { models }).await
+        }
+        Err(err) => write_json(
+            stream,
+            502,
+            "Bad Gateway",
+            &ApiError {
+                error: err.to_string(),
+            },
+        )
+        .await,
+    }
 }
 
 async fn api_chat(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
@@ -348,28 +482,7 @@ async fn api_chat_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -
             .await
         }
         ProviderKind::Hf => {
-            // Fallback: non-streaming request, then emit deltas in chunks so the UI can render progressively.
-            let provider = providers::build_provider(state.client.clone(), &cfg);
-            let bot = ChatBot::new(provider);
-            match bot
-                .run(
-                    &history.user_input,
-                    &history.messages,
-                    &cfg.mode,
-                    &cfg.persona,
-                    cfg.temperature,
-                    cfg.max_tokens,
-                    diff.as_deref(),
-                    None,
-                )
-                .await
-            {
-                Ok(resp) => {
-                    let text = resp.content;
-                    stream_text_in_chunks(stream, &text, 96, Duration::from_millis(6)).await
-                }
-                Err(err) => Err(err),
-            }
+            stream_hf_subprocess(stream, &cfg, &system_text, &history.messages, &user_text).await
         }
     };
 
@@ -623,8 +736,12 @@ async fn stream_openai_compat(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        let provider_label = match cfg.provider {
+            ProviderKind::Mistral => "Mistral",
+            _ => "OpenAI-compatible",
+        };
         return Err(anyhow!(
-            "OpenAI-compatible API error (HTTP {status})\n{body}"
+            "{provider_label} API error (HTTP {status})\n{body}"
         ));
     }
 
@@ -696,32 +813,36 @@ async fn stream_anthropic(
         delta: &'a str,
     }
 
-    let url = format!("{}/messages", cfg.base_url);
-
     let api_key = cfg
         .api_key
         .as_ref()
-        .ok_or_else(|| anyhow!("missing API key for Anthropic"))?;
+        .ok_or_else(|| anyhow!("missing API key for anthropic"))?;
+
+    let url = format!("{}/messages", cfg.base_url);
 
     let mut messages: Vec<serde_json::Value> = Vec::with_capacity(history.len() + 1);
     for m in history {
+        if m.role != "user" && m.role != "assistant" {
+            continue;
+        }
         messages.push(json!({"role": m.role, "content": m.content}));
     }
-    messages.push(json!({"role": "user", "content": user_text}));
+    messages.push(json!({"role":"user","content":user_text}));
 
     let payload = json!({
         "model": cfg.model,
-        "system": system_text,
         "messages": messages,
+        "system": system_text,
         "temperature": cfg.temperature,
         "max_tokens": cfg.max_tokens,
         "stream": true,
     });
 
-    let mut resp = client
+    let resp = client
         .post(url)
         .header("x-api-key", api_key)
         .header("anthropic-version", crate::providers::anthropic::ANTHROPIC_VERSION)
+        .header("Accept", "text/event-stream")
         .header("Content-Type", "application/json")
         .timeout(Duration::from_secs(cfg.timeout_seconds))
         .json(&payload)
@@ -735,47 +856,178 @@ async fn stream_anthropic(
         return Err(anyhow!("Anthropic API error (HTTP {status})\n{body}"));
     }
 
+    let mut resp = resp;
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = resp.chunk().await? {
         buf.extend_from_slice(&chunk);
 
         while let Some(frame) = take_next_sse_frame(&mut buf) {
             let frame_str = String::from_utf8_lossy(&frame);
-            let mut event_type = "";
-            let mut data_str = "";
 
+            let mut event: Option<&str> = None;
+            let mut data_lines: Vec<&str> = Vec::new();
             for line in frame_str.split('\n') {
                 let line = line.trim_end_matches('\r');
+                if line.is_empty() {
+                    continue;
+                }
+                if line.starts_with(':') {
+                    continue;
+                }
                 if let Some(rest) = line.strip_prefix("event:") {
-                    event_type = rest.trim();
-                } else if let Some(rest) = line.strip_prefix("data:") {
-                    data_str = rest.trim();
+                    event = Some(rest.trim());
+                }
+                if let Some(rest) = line.strip_prefix("data:") {
+                    data_lines.push(rest.trim_start());
                 }
             }
 
-            if event_type == "message_stop" || data_str == "[DONE]" {
+            if data_lines.is_empty() {
+                continue;
+            }
+            let data = data_lines.join("\n");
+            if data.trim().is_empty() {
+                continue;
+            }
+            if data.trim() == "[DONE]" {
                 return Ok(());
             }
 
-            if event_type != "content_block_delta" {
-                continue;
-            }
-
-            let v: serde_json::Value = match serde_json::from_str(data_str) {
+            let v: serde_json::Value = match serde_json::from_str(&data) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
 
-            let text = v
-                .pointer("/delta/text")
+            // Prefer the JSON "type" field; fall back to the SSE "event" field.
+            let ty = v
+                .get("type")
                 .and_then(|x| x.as_str())
+                .or(event)
                 .unwrap_or("");
 
-            if !text.is_empty() {
-                let data = serde_json::to_string(&Delta { delta: text })?;
-                write_sse_event(stream, "delta", &data).await?;
+            if ty == "error" {
+                return Err(anyhow!("Anthropic stream error: {v}"));
+            }
+
+            if ty == "content_block_delta" {
+                let delta = v
+                    .pointer("/delta/text")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                if !delta.is_empty() {
+                    let data = serde_json::to_string(&Delta { delta })?;
+                    write_sse_event(stream, "delta", &data).await?;
+                }
+            }
+
+            if ty == "message_stop" {
+                return Ok(());
             }
         }
+    }
+
+    Ok(())
+}
+
+async fn stream_hf_subprocess(
+    stream: &mut TcpStream,
+    cfg: &crate::config::RunConfig,
+    system_text: &str,
+    history: &[ChatMessage],
+    user_text: &str,
+) -> Result<()> {
+    use serde_json::json;
+
+    let python = std::env::var("OBS_HF_PYTHON").unwrap_or_else(|_| "python".to_string());
+    let script_path = std::path::PathBuf::from("scripts").join("hf_infer.py");
+
+    let mut messages: Vec<serde_json::Value> = Vec::with_capacity(1 + history.len() + 1);
+    messages.push(json!({"role":"system","content":system_text}));
+    for m in history {
+        messages.push(json!({"role": m.role, "content": m.content}));
+    }
+    messages.push(json!({"role":"user","content":user_text}));
+
+    let payload = json!({
+        "model": cfg.model,
+        "messages": messages,
+        "max_new_tokens": cfg.max_tokens,
+        "temperature": cfg.temperature,
+        "device": cfg.hf_device,
+        "local_only": cfg.hf_local_only,
+        "stream": true,
+    });
+    let input = serde_json::to_vec(&payload).context("failed to serialize hf request")?;
+
+    let mut child = Command::new(&python)
+        .arg(&script_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn hf subprocess: {python} {script_path:?}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open stdin for hf subprocess"))?;
+    stdin
+        .write_all(&input)
+        .await
+        .context("failed to write request to hf subprocess")?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .context("failed to write newline to hf subprocess")?;
+    drop(stdin);
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to open stdout for hf subprocess"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to open stderr for hf subprocess"))?;
+
+    let stderr_task = tokio::spawn(async move {
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+
+    let timeout = Duration::from_secs(cfg.timeout_seconds);
+    let mut buf = [0u8; 8192];
+
+    let status = match tokio::time::timeout(timeout, async {
+        loop {
+            let n = stdout.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            stream.write_all(&buf[..n]).await?;
+            stream.flush().await?;
+        }
+        child.wait().await
+    })
+    .await
+    {
+        Ok(res) => res.context("hf subprocess wait failed")?,
+        Err(_) => {
+            // Best-effort: terminate runaway subprocess on timeout.
+            let _ = child.kill().await;
+            return Err(anyhow!("hf subprocess timed out after {}s", cfg.timeout_seconds));
+        }
+    };
+
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
+    if !status.success() {
+        let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+        let msg = stderr_text.trim();
+        if msg.is_empty() {
+            return Err(anyhow!("hf subprocess failed (exit code {status})"));
+        }
+        return Err(anyhow!("hf subprocess failed: {msg}"));
     }
 
     Ok(())

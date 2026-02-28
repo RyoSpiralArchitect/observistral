@@ -111,3 +111,94 @@ impl ChatProvider for OpenAICompatibleProvider {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::prelude::*;
+
+    fn make_request(msg: &str) -> ChatRequest {
+        ChatRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: msg.to_string(),
+            }],
+            temperature: Some(0.4),
+            max_tokens: Some(64),
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_content_on_success() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "hello"}}]
+            }));
+        });
+
+        let client = reqwest::Client::new();
+        let provider = OpenAICompatibleProvider::new(
+            client,
+            "test",
+            "gpt-4o-mini".to_string(),
+            None,
+            server.base_url(),
+            Duration::from_secs(5),
+        );
+
+        let resp = provider.chat(&make_request("hi")).await.unwrap();
+        assert_eq!(resp.content, "hello");
+        assert_eq!(resp.model, "gpt-4o-mini");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn returns_error_on_401() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(401).body("Unauthorized");
+        });
+
+        let client = reqwest::Client::new();
+        let provider = OpenAICompatibleProvider::new(
+            client,
+            "test",
+            "gpt-4o-mini".to_string(),
+            Some("bad-key".to_string()),
+            server.base_url(),
+            Duration::from_secs(5),
+        );
+
+        let err = provider.chat(&make_request("hi")).await.unwrap_err();
+        assert!(err.to_string().contains("authentication failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn sends_bearer_auth_header() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .header("Authorization", "Bearer my-key");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            }));
+        });
+
+        let client = reqwest::Client::new();
+        let provider = OpenAICompatibleProvider::new(
+            client,
+            "test",
+            "model".to_string(),
+            Some("my-key".to_string()),
+            server.base_url(),
+            Duration::from_secs(5),
+        );
+
+        provider.chat(&make_request("hi")).await.unwrap();
+        mock.assert();
+    }
+}

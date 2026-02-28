@@ -131,3 +131,119 @@ impl ChatProvider for AnthropicProvider {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::prelude::*;
+
+    fn make_request_with_system(system: &str, user: &str) -> ChatRequest {
+        ChatRequest {
+            messages: vec![
+                ChatMessage { role: "system".to_string(), content: system.to_string() },
+                ChatMessage { role: "user".to_string(), content: user.to_string() },
+            ],
+            temperature: Some(0.4),
+            max_tokens: Some(64),
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_text_content_on_success() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/messages");
+            then.status(200).json_body(serde_json::json!({
+                "content": [{"type": "text", "text": "bonjour"}],
+                "model": "claude-3-5-sonnet"
+            }));
+        });
+
+        let client = reqwest::Client::new();
+        let provider = AnthropicProvider::new(
+            client,
+            "claude-3-5-sonnet".to_string(),
+            Some("test-key".to_string()),
+            server.base_url(),
+            Duration::from_secs(5),
+        );
+
+        let resp = provider
+            .chat(&make_request_with_system("You are helpful.", "Bonjour?"))
+            .await
+            .unwrap();
+        assert_eq!(resp.content, "bonjour");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn sends_x_api_key_header() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/messages")
+                .header("x-api-key", "sk-test");
+            then.status(200).json_body(serde_json::json!({
+                "content": [{"type": "text", "text": "ok"}]
+            }));
+        });
+
+        let client = reqwest::Client::new();
+        let provider = AnthropicProvider::new(
+            client,
+            "claude-3-5-sonnet".to_string(),
+            Some("sk-test".to_string()),
+            server.base_url(),
+            Duration::from_secs(5),
+        );
+
+        provider
+            .chat(&make_request_with_system("sys", "user msg"))
+            .await
+            .unwrap();
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn errors_when_no_api_key() {
+        let client = reqwest::Client::new();
+        let provider = AnthropicProvider::new(
+            client,
+            "claude-3-5-sonnet".to_string(),
+            None,
+            "http://localhost:1".to_string(),
+            Duration::from_secs(5),
+        );
+
+        let err = provider
+            .chat(&make_request_with_system("sys", "hi"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing API key"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn returns_error_on_429() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/messages");
+            then.status(429).body("rate limited");
+        });
+
+        let client = reqwest::Client::new();
+        let provider = AnthropicProvider::new(
+            client,
+            "model".to_string(),
+            Some("key".to_string()),
+            server.base_url(),
+            Duration::from_secs(5),
+        );
+
+        let err = provider
+            .chat(&make_request_with_system("sys", "hi"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("rate limited"), "{err}");
+    }
+}

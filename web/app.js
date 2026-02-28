@@ -34,6 +34,7 @@
       model: "Model",
       chatModel: "Chat model",
       codeModel: "Code model",
+      fetchModels: "Fetch models",
       baseUrl: "Base URL",
       apiKey: "API key",
       mode: "Mode",
@@ -51,7 +52,9 @@
       sending: "sending…",
       streaming: "streaming…",
       error: "error",
+      fetchFailed: "Failed to fetch (is OBSTRAL serve running?)",
       copy: "Copy",
+      refresh: "Refresh",
       keys: "API keys",
     },
     ja: {
@@ -70,7 +73,8 @@
       provider: "プロバイダ",
       model: "モデル",
       chatModel: "チャットモデル",
-      codeModel: "コーディングモデル",
+      codeModel: "コードモデル",
+      fetchModels: "モデル一覧取得",
       baseUrl: "Base URL",
       apiKey: "APIキー",
       mode: "モード",
@@ -88,7 +92,9 @@
       sending: "sending…",
       streaming: "streaming…",
       error: "error",
+      fetchFailed: "通信できません（obstral serve が起動してる？ポート合ってる？）",
       copy: "コピー",
+      refresh: "更新",
       keys: "APIキー状況",
     },
     fr: {
@@ -106,8 +112,9 @@
       clear: "Effacer",
       provider: "Fournisseur",
       model: "Modèle",
-      chatModel: "Modèle (chat)",
-      codeModel: "Modèle (code)",
+      chatModel: "Modèle chat",
+      codeModel: "Modèle code",
+      fetchModels: "Charger modèles",
       baseUrl: "Base URL",
       apiKey: "Clé API",
       mode: "Mode",
@@ -125,7 +132,9 @@
       sending: "envoi…",
       streaming: "stream…",
       error: "erreur",
+      fetchFailed: "Échec de requête (OBSTRAL serve est-il lancé ?)",
       copy: "Copier",
+      refresh: "Rafraîchir",
       keys: "Clés API",
     },
   };
@@ -154,6 +163,7 @@
     { k: "mistral", l: { ja: "Mistral", en: "Mistral", fr: "Mistral" } },
     { k: "openai-compatible", l: { ja: "OpenAI互換", en: "OpenAI compat", fr: "Compat OpenAI" } },
     { k: "anthropic", l: { ja: "Anthropic", en: "Anthropic", fr: "Anthropic" } },
+    { k: "hf", l: { ja: "HF local", en: "HF local", fr: "HF local" } },
   ];
 
   const MODES = [
@@ -169,14 +179,16 @@
     vibe: {
       vibe: true,
       provider: "mistral",
-      chatModel: "devstral-2",
-      codeModel: "devstral-2",
+      model: "codestral-latest",
+      chatModel: "mistral-small-latest",
+      codeModel: "codestral-latest",
       baseUrl: "https://api.mistral.ai/v1",
       mode: "VIBE",
     },
     openai: {
       vibe: false,
       provider: "openai-compatible",
+      model: "gpt-4o-mini",
       chatModel: "gpt-4o-mini",
       codeModel: "gpt-4o-mini",
       baseUrl: "https://api.openai.com/v1",
@@ -185,6 +197,7 @@
     anthropic: {
       vibe: false,
       provider: "anthropic",
+      model: "claude-3-5-sonnet-latest",
       chatModel: "claude-3-5-sonnet-latest",
       codeModel: "claude-3-5-sonnet-latest",
       baseUrl: "https://api.anthropic.com/v1",
@@ -220,8 +233,9 @@
       diff: strOrUndef(diff),
       vibe: cfg.vibe ? true : undefined,
       provider: strOrUndef(cfg.provider),
-      chat_model: strOrUndef(cfg.chatModel),
-      code_model: strOrUndef(cfg.codeModel),
+      model: strOrUndef(cfg.model),
+      chat_model: strOrUndef(cfg.chatModel || cfg.model),
+      code_model: strOrUndef(cfg.codeModel || cfg.model),
       base_url: strOrUndef(cfg.baseUrl),
       api_key: strOrUndef(apiKey),
       mode: strOrUndef(cfg.mode),
@@ -369,6 +383,7 @@
     "mistral":           "#2dd4bf",
     "openai-compatible": "#60a5fa",
     "anthropic":         "#fb7185",
+    "hf":                "#fbbf24",
   };
 
   // SECTION: markdown renderer
@@ -459,15 +474,28 @@
     const [config, setConfig] = useState(() => {
       const v = safeJsonParse(localStorage.getItem(LS.config) || "null", null);
       if (!v || typeof v !== "object") return { ...DEFAULT_CONFIG };
-      const merged = { ...DEFAULT_CONFIG, ...v };
-      // Backward-compat: older config used `model` only.
-      if (!merged.chatModel && merged.model) merged.chatModel = merged.model;
-      if (!merged.codeModel && merged.model) merged.codeModel = merged.model;
-      if (!merged.codeModel && merged.chatModel) merged.codeModel = merged.chatModel;
-      return merged;
+      const cfg = { ...DEFAULT_CONFIG, ...v };
+      if (!cfg.chatModel && cfg.model) cfg.chatModel = cfg.model;
+      if (!cfg.codeModel && cfg.model) cfg.codeModel = cfg.model;
+      if (!cfg.model && (cfg.chatModel || cfg.codeModel)) cfg.model = cfg.chatModel || cfg.codeModel;
+      // Migrate legacy Mistral model ids that no longer exist.
+      if (String(cfg.provider || "").trim() === "mistral") {
+        const isDevstral2 = (x) => String(x || "").trim() === "devstral-2";
+        if (isDevstral2(cfg.model) || isDevstral2(cfg.chatModel) || isDevstral2(cfg.codeModel)) {
+          cfg.model = "codestral-latest";
+          cfg.codeModel = "codestral-latest";
+          if (!cfg.chatModel || isDevstral2(cfg.chatModel)) {
+            cfg.chatModel = "mistral-small-latest";
+          }
+        }
+      }
+      return cfg;
     });
     const [apiKey, setApiKey] = useState("");
     const [diff, setDiff] = useState("");
+    const [models, setModels] = useState([]);
+    const [modelsLoading, setModelsLoading] = useState(false);
+    const [modelsErr, setModelsErr] = useState("");
 
     const [threadState, setThreadState] = useState(() => {
       let threads = safeJsonParse(localStorage.getItem(LS.threads) || "null", null);
@@ -521,11 +549,15 @@
     }, [threadState]);
 
     useEffect(() => {
+      refreshStatus();
+    }, []);
+
+    const refreshStatus = () => {
       fetch("/api/status")
         .then((r) => r.json())
         .then((j) => setStatus(j))
         .catch(() => {});
-    }, []);
+    };
 
     const keyOpenAI =
       status && status.providers && status.providers["openai-compatible"]
@@ -534,6 +566,10 @@
     const keyMistral = status && status.providers && status.providers.mistral ? !!status.providers.mistral.api_key_present : false;
     const keyAnthropic =
       status && status.providers && status.providers.anthropic ? !!status.providers.anthropic.api_key_present : false;
+    const keyInputPresent = String(apiKey || "").trim().length > 0;
+    const keyMistralOk = keyMistral || (config.provider === "mistral" && keyInputPresent);
+    const keyOpenAIOk = keyOpenAI || (config.provider === "openai-compatible" && keyInputPresent);
+    const keyAnthropicOk = keyAnthropic || (config.provider === "anthropic" && keyInputPresent);
 
     const KeyDot = ({ ok }) => e("span", { className: "kdot " + (ok ? "ok" : "missing") });
 
@@ -547,11 +583,18 @@
       return (m && m.l && m.l[lang]) || k;
     };
 
-    const usesCodeModel =
-      config.mode === "VIBE" || config.mode === "diff批評" || config.mode === "ログ解析";
-    const activeModel = usesCodeModel
-      ? (config.codeModel || config.chatModel || "")
-      : (config.chatModel || config.codeModel || "");
+    const activeModel = () => {
+      const mode = String(config.mode || "");
+      const useCode = mode === "VIBE" || mode.startsWith("diff");
+      const m = useCode ? (config.codeModel || config.model) : (config.chatModel || config.model);
+      return String(m || "").trim();
+    };
+
+    const shortModel = (m) => {
+      const s = String(m || "").trim();
+      if (!s) return "";
+      return s.length > 28 ? s.slice(0, 28) + "..." : s;
+    };
 
     const scrollBottom = () => {
       const el = chatBodyRef.current;
@@ -563,6 +606,49 @@
       const p = PRESETS[kind];
       if (!p) return;
       setConfig({ ...DEFAULT_CONFIG, ...p });
+    };
+
+    const setProviderSafe = (provider) => {
+      const p = String(provider || "").trim();
+      let next = { ...config, provider: p };
+
+      if (p === "mistral") {
+        next = { ...next, ...PRESETS.vibe };
+      } else if (p === "openai-compatible") {
+        next = { ...next, ...PRESETS.openai };
+      } else if (p === "anthropic") {
+        next = { ...next, ...PRESETS.anthropic };
+      } else if (p === "hf") {
+        next.provider = "hf";
+        next.baseUrl = next.baseUrl || "http://localhost";
+        next.model = next.model || "local";
+        next.chatModel = next.chatModel || next.model;
+        next.codeModel = next.codeModel || next.model;
+      }
+
+      setModels([]);
+      setModelsErr("");
+      setConfig(next);
+    };
+
+    const fetchModels = async () => {
+      try {
+        setModelsLoading(true);
+        setModelsErr("");
+        const j = await postJson("/api/models", {
+          provider: config.provider,
+          base_url: strOrUndef(config.baseUrl),
+          api_key: strOrUndef(apiKey),
+        });
+        const ms = j && Array.isArray(j.models) ? j.models : [];
+        setModels(ms);
+      } catch (err) {
+        setModels([]);
+        const m = (err && err.message) ? String(err.message) : String(err || "");
+        setModelsErr(m === "Failed to fetch" ? tr(lang, "fetchFailed") : m);
+      } finally {
+        setModelsLoading(false);
+      }
     };
 
     const createThread = () => {
@@ -604,8 +690,9 @@
         thread: activeThread.title,
         exported_at: new Date().toISOString(),
         provider: config.provider,
-        chat_model: config.chatModel,
-        code_model: config.codeModel,
+        chat_model: config.chatModel || config.model,
+        code_model: config.codeModel || config.model,
+        model_selected: activeModel(),
         base_url: config.baseUrl,
         mode: config.mode,
         persona: config.persona,
@@ -694,6 +781,11 @@
       setSending(false);
     };
 
+    const prettyErr = (err) => {
+      const m = (err && err.message) ? String(err.message) : String(err || "");
+      return m === "Failed to fetch" ? tr(lang, "fetchFailed") : (m || tr(lang, "error"));
+    };
+
     const onSend = async () => {
       if (sending) return;
       const text = (input || "").trim();
@@ -741,13 +833,13 @@
           setMsg(threadId, asstMsg.id, String((j && j.content) || ""));
         }
       } catch (err) {
-        const msg = (err && err.message) || String(err || "error");
+        const msg = prettyErr(err);
         if (config.stream && !ac.signal.aborted) {
           try {
             const j = await postJson("/api/chat", reqBody, ac.signal);
             setMsg(threadId, asstMsg.id, String((j && j.content) || ""));
           } catch (err2) {
-            const msg2 = (err2 && err2.message) || String(err2 || "error");
+            const msg2 = prettyErr(err2);
             setMsg(threadId, asstMsg.id, `[${tr(lang, "error")}] ${msg2}`);
           }
         } else if (ac.signal.aborted) {
@@ -778,11 +870,11 @@
             e(
               "span",
               { className: "pill", title: tr(lang, "keys") },
-              e(KeyDot, { ok: keyMistral }),
+              e(KeyDot, { ok: keyMistralOk }),
               " M  ",
-              e(KeyDot, { ok: keyOpenAI }),
+              e(KeyDot, { ok: keyOpenAIOk }),
               " O  ",
-              e(KeyDot, { ok: keyAnthropic }),
+              e(KeyDot, { ok: keyAnthropicOk }),
               " A"
             )
           ),
@@ -795,9 +887,15 @@
               e("button", { className: "seg-btn " + (lang === "ja" ? "active" : ""), onClick: () => setLang("ja") }, "JA"),
               e("button", { className: "seg-btn " + (lang === "en" ? "active" : ""), onClick: () => setLang("en") }, "EN"),
               e("button", { className: "seg-btn " + (lang === "fr" ? "active" : ""), onClick: () => setLang("fr") }, "FR")
-            )
+            ),
+            e("button", { className: "btn", onClick: refreshStatus, type: "button" }, tr(lang, "refresh"))
           )
         )
+      ),
+      e(
+        "datalist",
+        { id: "models-list" },
+        (models || []).map((m) => e("option", { key: m, value: m }))
       ),
       e(
         "div",
@@ -873,7 +971,7 @@
                   "button",
                   { className: "preset preset-vibe", onClick: () => applyPreset("vibe") },
                   e("div", { className: "preset-title" }, "VIBE"),
-                  e("div", { className: "preset-sub" }, "Mistral · devstral-2")
+                  e("div", { className: "preset-sub" }, "Mistral · codestral-latest")
                 ),
                 e(
                   "button",
@@ -901,7 +999,7 @@
                     {
                       className: "select",
                       value: config.provider,
-                      onChange: (ev) => setConfig({ ...config, provider: ev.target.value }),
+                      onChange: (ev) => setProviderSafe(ev.target.value),
                     },
                     PROVIDERS.map((p) =>
                       e("option", { key: p.k, value: p.k }, (p.l && p.l[lang]) || p.k)
@@ -914,7 +1012,8 @@
                   e("label", null, tr(lang, "chatModel")),
                   e("input", {
                     className: "input",
-                    value: config.chatModel,
+                    value: config.chatModel || "",
+                    list: models && models.length ? "models-list" : undefined,
                     onChange: (ev) => setConfig({ ...config, chatModel: ev.target.value }),
                   })
                 )
@@ -925,10 +1024,24 @@
                 e("label", null, tr(lang, "codeModel")),
                 e("input", {
                   className: "input",
-                  value: config.codeModel,
+                  value: config.codeModel || "",
+                  list: models && models.length ? "models-list" : undefined,
                   onChange: (ev) => setConfig({ ...config, codeModel: ev.target.value }),
                 })
               ),
+              e(
+                "div",
+                { style: { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" } },
+                e(
+                  "button",
+                  { className: "btn", onClick: fetchModels, disabled: modelsLoading },
+                  modelsLoading ? "Loading..." : tr(lang, "fetchModels")
+                ),
+                models && models.length
+                  ? e("span", { className: "pill" }, `${models.length} models`)
+                  : null
+              ),
+              modelsErr ? e("div", { className: "hint", style: { color: "var(--warn)", marginTop: "8px" } }, modelsErr) : null,
               e(
                 "div",
                 { className: "field", style: { marginTop: "10px" } },
@@ -1110,7 +1223,11 @@
                   transition: "background 400ms ease, box-shadow 400ms ease",
                 },
               }),
-              e("span", { className: "pill" }, providerLabel(config.provider) + " · " + modeLabel(config.mode) + (activeModel ? " · " + activeModel : "")),
+              e(
+                "span",
+                { className: "pill", title: activeModel() },
+                providerLabel(config.provider) + " · " + modeLabel(config.mode) + " · " + shortModel(activeModel())
+              ),
             )
           ),
           e("div", { className: "chat-body", ref: chatBodyRef }, (activeThread.messages || []).map(renderMessage)),
