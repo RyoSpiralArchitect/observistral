@@ -34,6 +34,7 @@
       insertCliTemplate: "CLI template",
       editApproval: "Edit approval",
       commandApproval: "Command approval",
+      forceAgent: "Agent mode",
       toolRoot: "作業ルート",
       pendingEdits: "Pending edits",
       approve: "Approve",
@@ -130,6 +131,7 @@
       cot: "CoT",
       brief: "簡易",
       structured: "構造化",
+      forceAgent: "エージェント常時ON",
       toolRoot: "Tool root",
       on: "ON",
       off: "OFF",
@@ -219,6 +221,7 @@
       polite: "poli",
       critical: "critique",
       brutal: "brutal",
+      forceAgent: "Mode agent (toujours)",
       serverOutdated: "Serveur obsolète",
     },
   };
@@ -368,6 +371,7 @@
     autonomy: "longrun",
     requireEditApproval: true,
     requireCommandApproval: true,
+    forceAgent: true,
     toolRoot: "",
     codeProvider: "",
     codeBaseUrl: "",
@@ -944,6 +948,7 @@
       if (typeof cfg.includeCoderContext !== "boolean") cfg.includeCoderContext = !!DEFAULT_CONFIG.includeCoderContext;
       if (typeof cfg.requireEditApproval !== "boolean") cfg.requireEditApproval = !!DEFAULT_CONFIG.requireEditApproval;
       if (typeof cfg.requireCommandApproval !== "boolean") cfg.requireCommandApproval = !!DEFAULT_CONFIG.requireCommandApproval;
+      if (typeof cfg.forceAgent !== "boolean") cfg.forceAgent = !!DEFAULT_CONFIG.forceAgent;
       if (typeof cfg.toolRoot !== "string") cfg.toolRoot = String(cfg.toolRoot || "");
       if (typeof cfg.codeProvider !== "string") cfg.codeProvider = String(cfg.codeProvider || "");
       if (typeof cfg.codeBaseUrl !== "string") cfg.codeBaseUrl = String(cfg.codeBaseUrl || "");
@@ -1620,23 +1625,31 @@
 
       const isWindows = navigator.userAgent.includes("Windows");
       const SYSTEM = isWindows ? [
-        "You are an autonomous coding agent running on the user's Windows machine.",
-        "You have an `exec` tool that runs PowerShell commands. Use PowerShell syntax:",
-        "- Create directory tree: New-Item -ItemType Directory -Force -Path 'a/b/c'",
-        "- Create empty file:     New-Item -ItemType File   -Force -Path 'file.txt'",
-        "- Write file content:    Set-Content 'file.txt' 'content here'",
-        "- Multi-line content:    use Set-Content with a here-string @'...'@",
-        "- Git commands work as-is: git init, git add ., git commit -m 'msg'",
-        "- NEVER use mkdir -p or touch — they don't exist in PowerShell.",
-        "Execute everything without asking for confirmation. Summarize results at the end.",
+        "You are an autonomous coding agent with DIRECT access to the user's Windows machine.",
+        "CRITICAL RULES — follow these without exception:",
+        "1. ALWAYS use the `exec` tool to create files, directories, and run commands. NEVER just show code.",
+        "2. Use PowerShell syntax ONLY (cmd.exe is NOT used):",
+        "   - Create directory tree: New-Item -ItemType Directory -Force -Path 'a/b/c'",
+        "   - Create file with content: Set-Content -Path 'file.txt' -Value 'line1`nline2' -Encoding UTF8",
+        "   - Multi-line file: $content = @'\nline1\nline2\n'@; Set-Content -Path 'file.txt' -Value $content -Encoding UTF8",
+        "   - Append to file: Add-Content -Path 'file.txt' -Value 'more' -Encoding UTF8",
+        "   - Git: git init, git add ., git commit -m 'init'",
+        "   - NEVER use mkdir -p, touch, cat >, or any Unix syntax.",
+        "3. Execute ALL steps immediately via exec. Do NOT ask for permission or confirmation.",
+        "4. After each exec call, read the output and continue until the task is 100% complete.",
+        "5. End with a short summary of what was created/executed.",
       ].join("\n") : [
-        "You are an autonomous coding agent running on the user's local machine.",
-        "You have an `exec` tool that runs shell commands. Use it proactively to:",
-        "- Create directories: mkdir -p <dir>",
-        "- Write files: use tee, cat, or python -c",
-        "- Initialize git repos: git init, git add, git commit",
-        "- Run any commands needed to complete the task end-to-end.",
-        "Execute everything without asking for confirmation. Summarize results at the end.",
+        "You are an autonomous coding agent with DIRECT access to the user's local machine.",
+        "CRITICAL RULES — follow these without exception:",
+        "1. ALWAYS use the `exec` tool to create files, directories, and run commands. NEVER just show code.",
+        "2. Use Unix shell commands:",
+        "   - Create directory: mkdir -p path/to/dir",
+        "   - Write file: printf '%s' 'content' > file.txt   OR   python3 -c \"open('f','w').write('...')\"",
+        "   - Multi-line file: use a heredoc via python3 or printf with \\n",
+        "   - Git: git init, git add ., git commit -m 'init'",
+        "3. Execute ALL steps immediately via exec. Do NOT ask for permission or confirmation.",
+        "4. After each exec call, read the output and continue until the task is 100% complete.",
+        "5. End with a short summary of what was created/executed.",
       ].join("\n");
 
       const execTool = {
@@ -1808,9 +1821,9 @@
       abortCoderRef.current = ac;
 
       try {
-        const supportsTools = resolvedProvider === "openai-compatible" || resolvedProvider === "mistral";
+        const supportsTools = resolvedProvider === "openai-compatible" || resolvedProvider === "mistral" || resolvedProvider === "openai";
         const serverChatTools = !!(status && status.features && status.features.chat_tools);
-        if (wantsMaterial && supportsTools && serverChatTools) {
+        if ((config.forceAgent || wantsMaterial) && supportsTools && serverChatTools) {
           await runCoderAgentic(text, threadId, asstMsg.id, reqCfg, resolvedKey, history, ac);
         } else if (config.stream) {
           await streamChat(
@@ -2523,6 +2536,33 @@
                     {
                       className: "seg-btn " + (!config.requireCommandApproval ? "active" : ""),
                       onClick: () => setConfig({ ...config, requireCommandApproval: false }),
+                      type: "button",
+                    },
+                    tr(lang, "off")
+                  )
+                )
+              ),
+              e(
+                "div",
+                { className: "field", style: { marginTop: "10px" } },
+                e("label", null, tr(lang, "forceAgent")),
+                e(
+                  "div",
+                  { className: "seg" },
+                  e(
+                    "button",
+                    {
+                      className: "seg-btn " + (config.forceAgent ? "active" : ""),
+                      onClick: () => setConfig({ ...config, forceAgent: true }),
+                      type: "button",
+                    },
+                    tr(lang, "on")
+                  ),
+                  e(
+                    "button",
+                    {
+                      className: "seg-btn " + (!config.forceAgent ? "active" : ""),
+                      onClick: () => setConfig({ ...config, forceAgent: false }),
                       type: "button",
                     },
                     tr(lang, "off")
