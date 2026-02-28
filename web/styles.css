@@ -40,6 +40,11 @@ body {
     radial-gradient(900px 700px at 95% 15%, rgba(96, 165, 250, 0.18), transparent 60%),
     radial-gradient(1100px 900px at 30% 100%, rgba(251, 113, 133, 0.10), transparent 55%),
     linear-gradient(180deg, var(--bg0), var(--bg1));
+  transition: filter 360ms ease;
+}
+
+body.looping {
+  filter: hue-rotate(var(--loop-hue, 0deg)) saturate(var(--loop-sat, 1.35));
 }
 
 a {
@@ -92,6 +97,12 @@ a {
   border: 1px solid var(--border);
   color: var(--muted);
   background: rgba(255, 255, 255, 0.04);
+}
+
+.pill-warn {
+  border-color: rgba(251, 113, 133, 0.70);
+  background: rgba(251, 113, 133, 0.10);
+  color: rgba(255, 255, 255, 0.88);
 }
 
 .top-actions {
@@ -296,6 +307,21 @@ a {
   background: rgba(45, 212, 191, 0.06);
 }
 
+body.looping .bubble.assistant {
+  animation: loopWobble 2.6s ease-in-out infinite;
+  transform-origin: 50% 40%;
+}
+
+@keyframes loopWobble {
+  0%,
+  100% {
+    transform: translateY(0) skewX(0deg);
+  }
+  50% {
+    transform: translateY(-1px) skewX(0.6deg);
+  }
+}
+
 .msg-meta {
   display: flex;
   gap: 10px;
@@ -337,6 +363,25 @@ a {
   color: rgba(255, 255, 255, 0.88);
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.thinking {
+  display: inline-block;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  animation: thinkingPulse 1.2s ease-in-out infinite;
+}
+
+@keyframes thinkingPulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
 .code {

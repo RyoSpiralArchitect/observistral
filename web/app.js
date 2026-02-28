@@ -80,6 +80,11 @@
       copy: "Copy",
       refresh: "Refresh",
       keys: "API keys",
+      loopDetected: "Loop detected",
+      observerIntensity: "Observer intensity",
+      polite: "polite",
+      critical: "critical",
+      brutal: "brutal",
     },
     ja: {
       threads: "スレッド",
@@ -138,6 +143,11 @@
       copy: "コピー",
       refresh: "更新",
       keys: "APIキー状況",
+      loopDetected: "ループ検出",
+      observerIntensity: "Observer強度",
+      polite: "丁寧",
+      critical: "批評",
+      brutal: "容赦なし",
     },
     fr: {
       threads: "Fils",
@@ -202,6 +212,11 @@
       copy: "Copier",
       refresh: "Rafraîchir",
       keys: "Clés API",
+      loopDetected: "Boucle détectée",
+      observerIntensity: "Intensité observer",
+      polite: "poli",
+      critical: "critique",
+      brutal: "brutal",
     },
   };
 
@@ -223,6 +238,52 @@
       if (crypto && crypto.randomUUID) return crypto.randomUUID();
     } catch (_) {}
     return "id-" + Math.random().toString(16).slice(2) + "-" + Date.now().toString(16);
+  }
+
+  function normalizeForSim(s) {
+    let t = String(s || "");
+    // Remove fenced code blocks and inline code to reduce false positives.
+    t = t.replace(/```[\s\S]*?```/g, " ");
+    t = t.replace(/`[^`]*`/g, " ");
+    t = t.toLowerCase();
+    t = t.replace(/https?:\/\/\S+/g, " ");
+    // Keep latin, extended latin, numbers, and common CJK ranges.
+    t = t.replace(/[^a-z0-9\u00c0-\u024f\u3040-\u30ff\u3400-\u9fff]+/g, " ");
+    t = t.replace(/\s+/g, " ").trim();
+    return t;
+  }
+
+  function tokenSetForSim(s) {
+    const t = normalizeForSim(s);
+    const out = new Set();
+    if (!t) return out;
+
+    // Word-ish tokens.
+    t.split(" ").forEach((w) => {
+      const x = String(w || "").trim();
+      if (x.length >= 2) out.add(x);
+    });
+
+    // For CJK-heavy text, add bigrams so we can detect repetition even without spaces.
+    const cjk = t.replace(/[a-z0-9\u00c0-\u024f ]+/g, "");
+    if (cjk.length >= 8) {
+      for (let i = 0; i < cjk.length - 1 && out.size < 2400; i++) {
+        out.add(cjk.slice(i, i + 2));
+      }
+    }
+    return out;
+  }
+
+  function jaccardSim(aSet, bSet) {
+    if (!aSet || !bSet || !aSet.size || !bSet.size) return 0;
+    let inter = 0;
+    for (const x of aSet) if (bSet.has(x)) inter++;
+    const union = aSet.size + bSet.size - inter;
+    return union ? inter / union : 0;
+  }
+
+  function similarity(a, b) {
+    return jaccardSim(tokenSetForSim(a), tokenSetForSim(b));
   }
 
   const PROVIDERS = [
@@ -313,6 +374,7 @@
     persona: "default",
     observerMode: "Observer",
     observerPersona: "novelist",
+    observerIntensity: "critical",
     includeCoderContext: true,
     temperature: "0.7",
     maxTokens: "1024",
@@ -668,6 +730,9 @@
       if (String(cfg.mode || "").trim() === "Observer") cfg.mode = DEFAULT_CONFIG.mode;
       if (!cfg.observerMode) cfg.observerMode = DEFAULT_CONFIG.observerMode;
       if (!cfg.observerPersona) cfg.observerPersona = DEFAULT_CONFIG.observerPersona;
+      const oi0 = String(cfg.observerIntensity || "").trim().toLowerCase();
+      if (oi0 === "polite" || oi0 === "critical" || oi0 === "brutal") cfg.observerIntensity = oi0;
+      else cfg.observerIntensity = DEFAULT_CONFIG.observerIntensity;
       if (typeof cfg.includeCoderContext !== "boolean") cfg.includeCoderContext = !!DEFAULT_CONFIG.includeCoderContext;
       if (typeof cfg.requireEditApproval !== "boolean") cfg.requireEditApproval = !!DEFAULT_CONFIG.requireEditApproval;
       if (typeof cfg.requireCommandApproval !== "boolean") cfg.requireCommandApproval = !!DEFAULT_CONFIG.requireCommandApproval;
@@ -752,9 +817,11 @@
     const [observerInput, setObserverInput] = useState("");
     const [sendingCoder, setSendingCoder] = useState(false);
     const [sendingObserver, setSendingObserver] = useState(false);
+    const [loopInfo, setLoopInfo] = useState({ active: false, score: 0, depth: 0 });
 
     const abortCoderRef = useRef(null);
     const abortObserverRef = useRef(null);
+    const loopRef = useRef({ lastChecked: "", depth: 0 });
     const saveTimer = useRef(null);
     const coderBodyRef = useRef(null);
     const observerBodyRef = useRef(null);
@@ -784,6 +851,59 @@
       }, 350);
       return () => saveTimer.current && clearTimeout(saveTimer.current);
     }, [threadState]);
+
+    useEffect(() => {
+      loopRef.current = { lastChecked: "", depth: 0 };
+      setLoopInfo({ active: false, score: 0, depth: 0 });
+    }, [threadState.activeId]);
+
+    useEffect(() => {
+      // Detect repeated Observer replies (e.g. review -> rewrite -> review loops) and surface it.
+      const msgs = paneMessages("observer");
+      const asst = (msgs || []).filter((m) => m && m.role === "assistant" && !m.streaming && String(m.content || "").trim());
+      if (asst.length < 2) return;
+
+      const last = asst[asst.length - 1];
+      if (!last || !last.id) return;
+      if (loopRef.current.lastChecked === last.id) return;
+      loopRef.current.lastChecked = last.id;
+
+      const window = asst.slice(0, -1).slice(-4);
+      let maxSim = 0;
+      for (const prev of window) {
+        maxSim = Math.max(maxSim, similarity(last.content, prev.content));
+      }
+
+      const minChars = 180;
+      const detected = String(last.content || "").trim().length >= minChars && maxSim >= 0.85;
+      let depth = loopRef.current.depth || 0;
+      if (detected) depth = Math.min(18, depth + 1);
+      else depth = Math.max(0, depth - 1);
+      loopRef.current.depth = depth;
+
+      setLoopInfo({ active: detected, score: maxSim, depth });
+    }, [threadState]);
+
+    useEffect(() => {
+      const d = Number(loopInfo.depth) || 0;
+      const hue = Math.min(360, d * 20);
+      if (typeof document === "undefined" || !document.body) return;
+      if (d > 0) {
+        document.body.classList.add("looping");
+        document.body.style.setProperty("--loop-hue", hue + "deg");
+        document.body.style.setProperty("--loop-sat", String(1 + Math.min(0.6, d * 0.05)));
+      } else {
+        document.body.classList.remove("looping");
+        document.body.style.removeProperty("--loop-hue");
+        document.body.style.removeProperty("--loop-sat");
+      }
+      return () => {
+        if (typeof document === "undefined" || !document.body) return;
+        document.body.classList.remove("looping");
+        document.body.style.removeProperty("--loop-hue");
+        document.body.style.removeProperty("--loop-sat");
+      };
+    }, [loopInfo.depth]);
 
     useEffect(() => {
       refreshStatus();
@@ -1023,6 +1143,7 @@
         coder_model_selected: coderActiveModel(),
         observer_mode: config.observerMode,
         observer_persona: config.observerPersona,
+        observer_intensity: config.observerIntensity,
         observer_model_selected: observerActiveModel(),
       });
       const safe = String(activeThread.title || "thread").replace(/[\\/:*?\"<>|]/g, "_");
@@ -1039,8 +1160,12 @@
       window.prompt(tr(lang, "copy"), String(text || ""));
     };
 
-    const renderMessage = (m) =>
-      e(
+    const renderMessage = (m) => {
+      const s = String(m && m.content ? m.content : "");
+      const streamingNode = s
+        ? s
+        : e("span", { className: "thinking" }, tr(lang, "streaming"));
+      return e(
         "div",
         { key: m.id, className: "msg" },
         e("div", { className: "avatar" }, m.role === "user" ? "U" : "A"),
@@ -1053,9 +1178,10 @@
             e("div", { className: "who" }, m.role),
             e("div", { className: "mini" }, e("button", { onClick: () => copyText(m.content || "") }, tr(lang, "copy")))
           ),
-          e("div", { className: "content" }, m.streaming ? String(m.content || "") : parseMarkdown(String(m.content || "")))
+          e("div", { className: "content" }, m.streaming ? streamingNode : parseMarkdown(String(m.content || "")))
         )
       );
+    };
 
     const appendDelta = (threadId, msgId, delta, bodyRef) => {
       setThreadState((s) => ({
@@ -1374,8 +1500,23 @@
         chatModel: obsModel,
         codeModel: obsModel,
       };
+      const intensity0 = String(config.observerIntensity || "critical").trim().toLowerCase();
+      const intensity = intensity0 === "polite" || intensity0 === "critical" || intensity0 === "brutal" ? intensity0 : "critical";
+      let intensityInstr = "";
+      if (intensity === "polite") {
+        intensityInstr =
+          "Intensity policy: polite. Be supportive and friendly. Still point out concrete issues and propose next steps.";
+      } else if (intensity === "brutal") {
+        intensityInstr =
+          "Intensity policy: brutal. Be blunt and uncompromising. Prioritize flaws/risks. Stay accurate and avoid personal attacks. Propose concrete fixes.";
+      } else {
+        intensityInstr =
+          "Intensity policy: critical. Treat this as a shipping review: prioritize risks, tradeoffs, and concrete next steps. If the conversation loops, call it out and force a pivot to implementation.";
+      }
       const observerBridge = [
         "[Observer bridge]",
+        `observer_intensity: ${intensity}`,
+        intensityInstr,
         "You are reviewing the coder's work artifacts.",
         "Use coder_context and code snippets to find bugs, risks, and missing tests.",
         "When you have actionable guidance, append a proposals block.",
@@ -1751,6 +1892,42 @@
                       onChange: (ev) => setConfig({ ...config, persona: ev.target.value }),
                     },
                     PERSONAS.map((p) => e("option", { key: p, value: p }, p))
+                  )
+                )
+              ),
+              e(
+                "div",
+                { className: "field", style: { marginTop: "10px" } },
+                e("label", null, tr(lang, "observerIntensity")),
+                e(
+                  "div",
+                  { className: "seg seg-4" },
+                  e(
+                    "button",
+                    {
+                      className: "seg-btn " + (String(config.observerIntensity || "critical") === "polite" ? "active" : ""),
+                      onClick: () => setConfig({ ...config, observerIntensity: "polite" }),
+                      type: "button",
+                    },
+                    tr(lang, "polite")
+                  ),
+                  e(
+                    "button",
+                    {
+                      className: "seg-btn " + (String(config.observerIntensity || "critical") === "critical" ? "active" : ""),
+                      onClick: () => setConfig({ ...config, observerIntensity: "critical" }),
+                      type: "button",
+                    },
+                    tr(lang, "critical")
+                  ),
+                  e(
+                    "button",
+                    {
+                      className: "seg-btn " + (String(config.observerIntensity || "critical") === "brutal" ? "active" : ""),
+                      onClick: () => setConfig({ ...config, observerIntensity: "brutal" }),
+                      type: "button",
+                    },
+                    tr(lang, "brutal")
                   )
                 )
               ),
@@ -2281,7 +2458,17 @@
                   "span",
                   { className: "pill", title: observerActiveModel() },
                   providerLabel(observerResolvedProvider()) + " · " + modeLabel(config.observerMode) + " · " + shortModel(observerActiveModel())
-                )
+                ),
+                loopInfo && loopInfo.depth > 0
+                  ? e(
+                      "span",
+                      {
+                        className: "pill pill-warn",
+                        title: `${tr(lang, "loopDetected")} (sim=${Math.round((loopInfo.score || 0) * 100)}%)`,
+                      },
+                      tr(lang, "loopDetected") + " ×" + String(loopInfo.depth)
+                    )
+                  : null
               )
             ),
             e("div", { className: "chat-body", ref: observerBodyRef }, observerMsgs.map(renderMessage)),
