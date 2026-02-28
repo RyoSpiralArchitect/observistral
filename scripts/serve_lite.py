@@ -198,6 +198,8 @@ DEFAULT_BASE_URL = {
     "mistral": "https://api.mistral.ai/v1",
     "codestral": "https://codestral.mistral.ai/v1",
     "openai-compatible": "https://api.openai.com/v1",
+    # Gemini OpenAI-compat endpoint (Google AI Studio).
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
     "anthropic": "https://api.anthropic.com/v1",
     "mistral-cli": "",
 }
@@ -206,6 +208,7 @@ DEFAULT_MODEL = {
     "mistral": "mistral-small-latest",
     "codestral": "codestral-latest",
     "openai-compatible": "gpt-4o-mini",
+    "gemini": "gemini-2.0-flash",
     "anthropic": "claude-3-5-sonnet-latest",
     "mistral-cli": "mistral-medium-latest",
 }
@@ -233,13 +236,23 @@ def _set_workspace_root(raw_root: str) -> None:
     WORKSPACE_ROOT = p
 
 def _provider_key_from_env(provider: str) -> str:
-    if provider in ("mistral", "codestral"):
+    if provider == "codestral":
+        return (
+            os.environ.get("CODESTRAL_API_KEY", "").strip()
+            or os.environ.get("MISTRAL_API_KEY", "").strip()
+            or os.environ.get("OBS_API_KEY", "").strip()
+        )
+    if provider == "mistral":
         return os.environ.get("MISTRAL_API_KEY", "").strip() or os.environ.get(
             "OBS_API_KEY", ""
         ).strip()
     if provider == "openai-compatible":
         return os.environ.get("OBS_API_KEY", "").strip() or os.environ.get(
             "OPENAI_API_KEY", ""
+        ).strip()
+    if provider == "gemini":
+        return os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get(
+            "GOOGLE_API_KEY", ""
         ).strip()
     if provider == "anthropic":
         return os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -252,6 +265,7 @@ def _provider_from_req(req: dict[str, Any]) -> str:
         "mistral",
         "codestral",
         "openai-compatible",
+        "gemini",
         "anthropic",
         "hf",
         "mistral-cli",
@@ -305,6 +319,21 @@ def _force_tool_use(req: dict[str, Any]) -> bool:
     mode = str(req.get("mode") or "").strip().lower()
     default = mode != "observer"
     return _as_bool(req.get("force_tools"), default)
+
+
+_MATERIAL_INTENT_RE = re.compile(
+    r"(repo|repository|scaffold|bootstrap|init|setup|create|generate|implement|"
+    r"リポ|リポジトリ|雛形|ひな形|プロジェクト|実装|ファイル|作成|作ろ|作って|生成|追加|組み込)",
+    re.IGNORECASE,
+)
+
+
+def _wants_material_change(req: dict[str, Any]) -> bool:
+    """Heuristic: user intent implies we should actually touch files/commands."""
+    s = str(req.get("input") or "").strip()
+    if not s:
+        return False
+    return bool(_MATERIAL_INTENT_RE.search(s))
 
 
 def _requires_edit_approval(req: dict[str, Any] | None) -> bool:
@@ -525,6 +554,27 @@ def _preflight_provider_config(provider: str, base_url: str, api_key: str) -> No
             "Switch provider to mistral/codestral or change Base URL."
         )
 
+    if p == "gemini":
+        if "api.openai.com" in u:
+            raise RuntimeError(
+                "Provider is gemini but Base URL is OpenAI. "
+                "Use https://generativelanguage.googleapis.com/v1beta/openai."
+            )
+        if "generativelanguage.googleapis.com" not in u:
+            raise RuntimeError(
+                "Provider is gemini but Base URL does not look like Gemini API. "
+                "Use https://generativelanguage.googleapis.com/v1beta/openai."
+            )
+        if "/openai" not in u:
+            raise RuntimeError(
+                "Gemini provider expects the OpenAI-compat endpoint path '/openai'. "
+                "Example: https://generativelanguage.googleapis.com/v1beta/openai"
+            )
+        if k.startswith("sk-"):
+            raise RuntimeError(
+                "This API key looks like an OpenAI key (sk-*). Use GEMINI_API_KEY/GOOGLE_API_KEY."
+            )
+
 
 def _extract_text_from_anthropic_response(payload: dict[str, Any]) -> str:
     items = payload.get("content")
@@ -615,12 +665,71 @@ def _extract_obstral_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     return cleaned, calls
 
 
+def _swap_max_tokens_to_max_completion_tokens(payload: dict[str, Any]) -> dict[str, Any]:
+    """Some OpenAI-compatible models reject max_tokens in favor of max_completion_tokens."""
+    if "max_tokens" not in payload:
+        return payload
+    if payload.get("max_tokens") is None:
+        return payload
+    if "max_completion_tokens" in payload:
+        return payload
+    out = dict(payload)
+    out["max_completion_tokens"] = out.pop("max_tokens")
+    return out
+
+
+def _should_use_max_completion_tokens(error_text: str) -> bool:
+    msg = str(error_text or "")
+    msg_lower = msg.lower()
+    return "max_completion_tokens" in msg_lower and "max_tokens" in msg_lower
+
+
+def _should_fallback_to_completions(error_text: str) -> bool:
+    msg = str(error_text or "")
+    msg_lower = msg.lower()
+    return ("not a chat model" in msg_lower) or ("v1/completions" in msg_lower and "chat/completions" in msg_lower)
+
+
+def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "").strip().upper() or "USER"
+        content = _normalize_assistant_content(m.get("content"))
+        if not str(content).strip():
+            continue
+        parts.append(f"{role}:\n{content.strip()}")
+    parts.append("ASSISTANT:\n")
+    return "\n\n".join(parts)
+
+
+def _extract_text_from_openai_completions_response(res: dict[str, Any]) -> str:
+    if not isinstance(res, dict):
+        return str(res)
+    choices = res.get("choices")
+    if isinstance(choices, list) and choices:
+        ch0 = choices[0]
+        if isinstance(ch0, dict):
+            txt = ch0.get("text")
+            if isinstance(txt, str) and txt.strip():
+                return txt
+            msg = ch0.get("message")
+            if isinstance(msg, dict):
+                return _normalize_assistant_content(msg.get("content"))
+    return _normalize_assistant_content(res.get("content"))
+
+
 def _api_key_env_hint(provider: str) -> str:
     p = str(provider or "").strip().lower()
     if p == "openai-compatible":
         return "OBS_API_KEY or OPENAI_API_KEY"
-    if p in ("mistral", "codestral"):
+    if p == "gemini":
+        return "GEMINI_API_KEY or GOOGLE_API_KEY"
+    if p == "mistral":
         return "MISTRAL_API_KEY or OBS_API_KEY"
+    if p == "codestral":
+        return "CODESTRAL_API_KEY or MISTRAL_API_KEY or OBS_API_KEY"
     if p == "anthropic":
         return "ANTHROPIC_API_KEY"
     if p == "mistral-cli":
@@ -632,6 +741,8 @@ def _model_suggestions(provider: str) -> list[str]:
     p = str(provider or "").strip().lower()
     if p == "openai-compatible":
         return ["gpt-4o-mini", "gpt-4.1-mini", "o4-mini"]
+    if p == "gemini":
+        return ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-3-flash-preview"]
     if p == "codestral":
         return ["codestral-latest", "mistral-small-latest"]
     if p == "mistral":
@@ -1140,7 +1251,10 @@ def _chat_openai_compat(
 
     force_tools = tools_enabled and _force_tool_use(req)
     made_any_tool_call = False
+    needs_material = force_tools and _wants_material_change(req)
+    made_material_change = False
     tool_refusals = 0
+    use_completions = False
 
     for _ in range(max_tool_steps):
         payload: dict[str, Any] = {
@@ -1155,46 +1269,174 @@ def _chat_openai_compat(
         if tools_enabled:
             payload["tools"] = LOCAL_TOOLS
             if force_tools and not made_any_tool_call:
-                # Some OpenAI deployments ignore string "required"; forcing a harmless first tool
-                # kickstarts the tool loop reliably.
-                if "api.openai.com" in str(base_url or "").lower():
-                    payload["tool_choice"] = {"type": "function", "function": {"name": "list_files"}}
-                else:
-                    payload["tool_choice"] = "required"
+                # Kickstart the tool loop with a harmless call.
+                payload["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": "list_files"},
+                }
+            elif needs_material and not made_material_change:
+                # If user asked to "create/scaffold/implement", do not stop at advice.
+                payload["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": "write_file"},
+                }
             else:
                 payload["tool_choice"] = "auto"
 
-        paths = _chat_paths_for_provider(provider, base_url)
-        res = None
+        res: dict[str, Any] | None = None
         last_err: RuntimeError | None = None
-        for idx, path in enumerate(paths):
+        from_completions = bool(use_completions and provider == "openai-compatible")
+
+        if from_completions:
+            comp_payload: dict[str, Any] = {
+                "model": model,
+                "prompt": _messages_to_prompt(msg_list),
+                "stream": False,
+            }
+            if temperature is not None:
+                comp_payload["temperature"] = temperature
+            if max_tokens is not None:
+                comp_payload["max_tokens"] = max_tokens
             try:
                 res = _http_json(
                     "POST",
-                    f"{base_url}{path}",
+                    f"{base_url}/completions",
                     headers=headers,
-                    body=payload,
+                    body=comp_payload,
                     timeout_seconds=timeout,
                     error_context={"provider": provider, "model": model},
                 )
-                last_err = None
-                break
             except RuntimeError as e:
-                last_err = e
-                # Endpoint variants differ across providers.
-                if ("HTTP 404" in str(e) or "HTTP 405" in str(e)) and idx < (len(paths) - 1):
-                    continue
-                raise
+                msg = str(e)
+                if _should_use_max_completion_tokens(msg) and "max_tokens" in comp_payload:
+                    comp_payload2 = _swap_max_tokens_to_max_completion_tokens(comp_payload)
+                    res = _http_json(
+                        "POST",
+                        f"{base_url}/completions",
+                        headers=headers,
+                        body=comp_payload2,
+                        timeout_seconds=timeout,
+                        error_context={"provider": provider, "model": model},
+                    )
+                else:
+                    raise
+        else:
+            paths = _chat_paths_for_provider(provider, base_url)
+            for idx, path in enumerate(paths):
+                try:
+                    res = _http_json(
+                        "POST",
+                        f"{base_url}{path}",
+                        headers=headers,
+                        body=payload,
+                        timeout_seconds=timeout,
+                        error_context={"provider": provider, "model": model},
+                    )
+                    last_err = None
+                    break
+                except RuntimeError as e:
+                    msg = str(e)
+                    if provider == "openai-compatible" and _should_fallback_to_completions(msg):
+                        use_completions = True
+                        res = None
+                        last_err = None
+                        break
+
+                    if _should_use_max_completion_tokens(msg) and "max_tokens" in payload:
+                        payload2 = _swap_max_tokens_to_max_completion_tokens(payload)
+                        try:
+                            res = _http_json(
+                                "POST",
+                                f"{base_url}{path}",
+                                headers=headers,
+                                body=payload2,
+                                timeout_seconds=timeout,
+                                error_context={"provider": provider, "model": model},
+                            )
+                            last_err = None
+                            break
+                        except RuntimeError:
+                            pass
+
+                    # Some providers differ on tool_choice schema. Fallback to string "required" if
+                    # a forced function tool_choice object is rejected.
+                    if (
+                        tools_enabled
+                        and isinstance(payload.get("tool_choice"), dict)
+                        and "HTTP 400" in msg
+                        and ("tool_choice" in msg or "tool choice" in msg)
+                    ):
+                        payload3 = dict(payload)
+                        payload3["tool_choice"] = "required"
+                        try:
+                            res = _http_json(
+                                "POST",
+                                f"{base_url}{path}",
+                                headers=headers,
+                                body=payload3,
+                                timeout_seconds=timeout,
+                                error_context={"provider": provider, "model": model},
+                            )
+                            last_err = None
+                            break
+                        except RuntimeError:
+                            pass
+
+                    last_err = e
+                    # Endpoint variants differ across providers.
+                    if ("HTTP 404" in msg or "HTTP 405" in msg) and idx < (len(paths) - 1):
+                        continue
+                    raise
+
+            if res is None and use_completions and provider == "openai-compatible":
+                from_completions = True
+                comp_payload = {
+                    "model": model,
+                    "prompt": _messages_to_prompt(msg_list),
+                    "stream": False,
+                }
+                if temperature is not None:
+                    comp_payload["temperature"] = temperature
+                if max_tokens is not None:
+                    comp_payload["max_tokens"] = max_tokens
+                try:
+                    res = _http_json(
+                        "POST",
+                        f"{base_url}/completions",
+                        headers=headers,
+                        body=comp_payload,
+                        timeout_seconds=timeout,
+                        error_context={"provider": provider, "model": model},
+                    )
+                except RuntimeError as e:
+                    msg = str(e)
+                    if _should_use_max_completion_tokens(msg) and "max_tokens" in comp_payload:
+                        comp_payload2 = _swap_max_tokens_to_max_completion_tokens(comp_payload)
+                        res = _http_json(
+                            "POST",
+                            f"{base_url}/completions",
+                            headers=headers,
+                            body=comp_payload2,
+                            timeout_seconds=timeout,
+                            error_context={"provider": provider, "model": model},
+                        )
+                    else:
+                        raise
+
         if res is None:
             if last_err is not None:
                 raise last_err
             raise RuntimeError("chat request failed")
 
-        choice = (res.get("choices") or [{}])[0]
-        message = choice.get("message") if isinstance(choice, dict) else {}
-        message = message if isinstance(message, dict) else {}
-        content = _normalize_assistant_content(message.get("content"))
-        tool_calls = message.get("tool_calls")
+        if from_completions:
+            content = _extract_text_from_openai_completions_response(res)
+            tool_calls = None
+        else:
+            choice = (res.get("choices") or [{}])[0]
+            message = choice.get("message") if isinstance(choice, dict) else {}
+            message = message if isinstance(message, dict) else {}
+            content = _normalize_assistant_content(message.get("content"))
+            tool_calls = message.get("tool_calls")
 
         clean_content = str(content)
         text_tool_calls: list[dict[str, Any]] = []
@@ -1214,6 +1456,8 @@ def _chat_openai_compat(
                     args = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
                     try:
                         tool_out = _tool_dispatch(name, args, req=req)
+                        if name in ("write_file", "mkdir", "run_command"):
+                            made_material_change = True
                         result = {"ok": True, "result": tool_out}
                         if isinstance(tool_out, dict) and tool_out.get("needs_approval"):
                             pending.append(
@@ -1244,6 +1488,30 @@ def _chat_openai_compat(
                     lines.append("Approve/reject in UI: Pending edits.")
                     return {"content": "\n".join(lines), "model": model}
                 continue
+
+            if needs_material and not made_material_change:
+                tool_refusals += 1
+                if tool_refusals <= 2:
+                    msg_list.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "You must actually create/edit files now (not just describe steps).\n"
+                                "Call mkdir/write_file/run_command, or emit an ```obstral-tool``` block.\n"
+                                "Example:\n"
+                                "```obstral-tool\n"
+                                "{\"name\":\"mkdir\",\"arguments\":{\"path\":\"projects/maze-game\"}}\n"
+                                "{\"name\":\"write_file\",\"arguments\":{\"path\":\"projects/maze-game/README.md\",\"content\":\"# Maze Game\\n\"}}\n"
+                                "```"
+                            ),
+                        }
+                    )
+                    continue
+                return {
+                    "content": str(clean_content)
+                    + "\n\n[OBSTRAL] Material change was required but the model did not call tools.",
+                    "model": model,
+                }
 
             if force_tools and not made_any_tool_call:
                 tool_refusals += 1
@@ -1289,6 +1557,8 @@ def _chat_openai_compat(
             args_json = fn.get("arguments")
             try:
                 tool_out = _tool_dispatch(name, args_json, req=req)
+                if name in ("write_file", "mkdir", "run_command"):
+                    made_material_change = True
                 result = {"ok": True, "result": tool_out}
                 if isinstance(tool_out, dict) and tool_out.get("needs_approval"):
                     pending2.append(
@@ -1521,8 +1791,8 @@ def _chat_impl(req: dict[str, Any]) -> dict[str, Any]:
     max_tokens = req.get("max_tokens")
     messages = _build_messages(req)
 
-    if provider in ("mistral", "codestral", "openai-compatible"):
-        tools_enabled = provider in ("openai-compatible", "codestral", "mistral") and _local_tools_enabled(req)
+    if provider in ("mistral", "codestral", "openai-compatible", "gemini"):
+        tools_enabled = provider in ("openai-compatible", "codestral", "mistral", "gemini") and _local_tools_enabled(req)
         autonomy = _autonomy_level(req)
         max_tool_steps = 30 if autonomy == "longrun" else LOCAL_TOOL_MAX_STEPS
         return _chat_openai_compat(
@@ -1706,8 +1976,13 @@ class LiteHandler(BaseHTTPRequestHandler):
                             or _env_present("OBS_API_KEY")
                         },
                         "codestral": {
-                            "api_key_present": _env_present("MISTRAL_API_KEY")
+                            "api_key_present": _env_present("CODESTRAL_API_KEY")
+                            or _env_present("MISTRAL_API_KEY")
                             or _env_present("OBS_API_KEY")
+                        },
+                        "gemini": {
+                            "api_key_present": _env_present("GEMINI_API_KEY")
+                            or _env_present("GOOGLE_API_KEY")
                         },
                         "anthropic": {
                             "api_key_present": _env_present("ANTHROPIC_API_KEY")

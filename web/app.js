@@ -48,7 +48,16 @@
       codeModel: "Code model",
       fetchModels: "Fetch models",
       baseUrl: "Base URL",
+      codeProvider: "Code provider",
+      codeBaseUrl: "Code Base URL",
+      observerProvider: "Observer provider",
+      observerBaseUrl: "Observer Base URL",
+      observerModel: "Observer model",
       apiKey: "API key",
+      apiKeyChat: "Chat API key",
+      apiKeyCode: "Code API key",
+      apiKeyObserver: "Observer API key",
+      sameAsChat: "(same as chat)",
       mode: "Mode",
       persona: "Persona",
       temperature: "temperature",
@@ -97,6 +106,15 @@
       fetchModels: "モデル一覧取得",
       baseUrl: "Base URL",
       apiKey: "APIキー",
+      apiKeyChat: "チャットAPIキー",
+      apiKeyCode: "コードAPIキー",
+      apiKeyObserver: "Observer APIキー",
+      codeProvider: "コード用プロバイダ",
+      codeBaseUrl: "コード用Base URL",
+      observerProvider: "Observerプロバイダ",
+      observerBaseUrl: "Observer Base URL",
+      observerModel: "Observerモデル",
+      sameAsChat: "（チャットと同じ）",
       mode: "モード",
       persona: "ペルソナ",
       temperature: "temperature",
@@ -152,7 +170,16 @@
       codeModel: "Modèle code",
       fetchModels: "Charger modèles",
       baseUrl: "Base URL",
+      codeProvider: "Provider code",
+      codeBaseUrl: "Base URL code",
+      observerProvider: "Provider observer",
+      observerBaseUrl: "Base URL observer",
+      observerModel: "Modèle observer",
       apiKey: "Clé API",
+      apiKeyChat: "Clé API chat",
+      apiKeyCode: "Clé API code",
+      apiKeyObserver: "Clé API observer",
+      sameAsChat: "(idem chat)",
       mode: "Mode",
       persona: "Persona",
       temperature: "temperature",
@@ -203,6 +230,7 @@
     { k: "codestral", l: { ja: "Codestral", en: "Codestral", fr: "Codestral" } },
     { k: "mistral-cli", l: { ja: "Mistral CLI", en: "Mistral CLI", fr: "Mistral CLI" } },
     { k: "openai-compatible", l: { ja: "OpenAI互換", en: "OpenAI compat", fr: "Compat OpenAI" } },
+    { k: "gemini", l: { ja: "Gemini", en: "Gemini", fr: "Gemini" } },
     { k: "anthropic", l: { ja: "Anthropic", en: "Anthropic", fr: "Anthropic" } },
     { k: "hf", l: { ja: "HF local", en: "HF local", fr: "HF local" } },
   ];
@@ -228,6 +256,8 @@
       chatModel: "mistral-small-latest",
       codeModel: "codestral-latest",
       baseUrl: "https://api.mistral.ai/v1",
+      codeProvider: "codestral",
+      codeBaseUrl: "https://codestral.mistral.ai/v1",
       mode: "VIBE",
     },
     openai: {
@@ -237,6 +267,15 @@
       chatModel: "gpt-4o-mini",
       codeModel: "gpt-4o-mini",
       baseUrl: "https://api.openai.com/v1",
+      mode: "壁打ち",
+    },
+    gemini: {
+      vibe: false,
+      provider: "gemini",
+      model: "gemini-2.0-flash",
+      chatModel: "gemini-2.0-flash",
+      codeModel: "gemini-2.0-flash",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
       mode: "壁打ち",
     },
     codestral: {
@@ -266,6 +305,11 @@
     requireEditApproval: true,
     requireCommandApproval: true,
     toolRoot: "",
+    codeProvider: "",
+    codeBaseUrl: "",
+    observerProvider: "",
+    observerBaseUrl: "",
+    observerModel: "",
     persona: "default",
     observerMode: "Observer",
     observerPersona: "novelist",
@@ -452,6 +496,7 @@
     "codestral":         "#14b8a6",
     "mistral-cli":       "#34d399",
     "openai-compatible": "#60a5fa",
+    "gemini":            "#a3e635",
     "anthropic":         "#fb7185",
     "hf":                "#fbbf24",
   };
@@ -627,6 +672,11 @@
       if (typeof cfg.requireEditApproval !== "boolean") cfg.requireEditApproval = !!DEFAULT_CONFIG.requireEditApproval;
       if (typeof cfg.requireCommandApproval !== "boolean") cfg.requireCommandApproval = !!DEFAULT_CONFIG.requireCommandApproval;
       if (typeof cfg.toolRoot !== "string") cfg.toolRoot = String(cfg.toolRoot || "");
+      if (typeof cfg.codeProvider !== "string") cfg.codeProvider = String(cfg.codeProvider || "");
+      if (typeof cfg.codeBaseUrl !== "string") cfg.codeBaseUrl = String(cfg.codeBaseUrl || "");
+      if (typeof cfg.observerProvider !== "string") cfg.observerProvider = String(cfg.observerProvider || "");
+      if (typeof cfg.observerBaseUrl !== "string") cfg.observerBaseUrl = String(cfg.observerBaseUrl || "");
+      if (typeof cfg.observerModel !== "string") cfg.observerModel = String(cfg.observerModel || "");
       const cot0 = String(cfg.cot || "").trim().toLowerCase();
       if (cot0 === "off") cfg.cot = "off";
       else if (cot0 === "structured") cfg.cot = "structured";
@@ -658,11 +708,14 @@
       }
       return cfg;
     });
-    const [apiKey, setApiKey] = useState("");
+    const [chatApiKey, setChatApiKey] = useState("");
+    const [codeApiKey, setCodeApiKey] = useState("");
+    const [observerApiKey, setObserverApiKey] = useState("");
     const [diff, setDiff] = useState("");
     const [models, setModels] = useState([]);
     const [modelsLoading, setModelsLoading] = useState(false);
     const [modelsErr, setModelsErr] = useState("");
+    const [modelsTarget, setModelsTarget] = useState("chat");
     const [pendingEdits, setPendingEdits] = useState([]);
     const [pendingBusy, setPendingBusy] = useState(false);
 
@@ -772,13 +825,33 @@
         : false;
     const keyMistral = status && status.providers && status.providers.mistral ? !!status.providers.mistral.api_key_present : false;
     const keyCodestral = status && status.providers && status.providers.codestral ? !!status.providers.codestral.api_key_present : false;
+    const keyGemini = status && status.providers && status.providers.gemini ? !!status.providers.gemini.api_key_present : false;
     const keyAnthropic =
       status && status.providers && status.providers.anthropic ? !!status.providers.anthropic.api_key_present : false;
-    const keyInputPresent = String(apiKey || "").trim().length > 0;
-    const keyMistralOk = keyMistral || (config.provider === "mistral" && keyInputPresent);
-    const keyCodestralOk = keyCodestral || (config.provider === "codestral" && keyInputPresent);
-    const keyOpenAIOk = keyOpenAI || (config.provider === "openai-compatible" && keyInputPresent);
-    const keyAnthropicOk = keyAnthropic || (config.provider === "anthropic" && keyInputPresent);
+
+    const chatProvider = String(config.provider || "").trim();
+    const codeProvider = String(config.codeProvider || "").trim() || chatProvider;
+    const observerProvider = String(config.observerProvider || "").trim() || chatProvider;
+
+    const chatKeyPresent = String(chatApiKey || "").trim().length > 0;
+    const codeKeyPresent = String(codeApiKey || "").trim().length > 0;
+    const observerKeyPresent = String(observerApiKey || "").trim().length > 0;
+
+    const typedKeyFor = (p) => {
+      const pp = String(p || "").trim();
+      if (!pp) return false;
+      if (chatProvider === pp && chatKeyPresent) return true;
+      if (codeProvider === pp && codeKeyPresent) return true;
+      if (observerProvider === pp && observerKeyPresent) return true;
+      if ((chatProvider === pp || codeProvider === pp || observerProvider === pp) && (chatKeyPresent || codeKeyPresent || observerKeyPresent)) return true;
+      return false;
+    };
+
+    const keyMistralOk = keyMistral || typedKeyFor("mistral");
+    const keyCodestralOk = keyCodestral || typedKeyFor("codestral");
+    const keyOpenAIOk = keyOpenAI || typedKeyFor("openai-compatible");
+    const keyGeminiOk = keyGemini || typedKeyFor("gemini");
+    const keyAnthropicOk = keyAnthropic || typedKeyFor("anthropic");
 
     const KeyDot = ({ ok }) => e("span", { className: "kdot " + (ok ? "ok" : "missing") });
 
@@ -792,15 +865,27 @@
       return (m && m.l && m.l[lang]) || k;
     };
 
-    const modelForMode = (mode) => {
+    const modeUsesCode = (mode) => {
       const m0 = String(mode || "");
-      const useCode = m0 === "VIBE" || m0.startsWith("diff") || m0 === "ログ解析";
+      return m0 === "VIBE" || m0.startsWith("diff") || m0 === "ログ解析";
+    };
+
+    const coderResolvedProvider = (mode) => (modeUsesCode(mode) ? (String(config.codeProvider || "").trim() || config.provider) : config.provider);
+    const coderResolvedModel = (mode) => {
+      const useCode = modeUsesCode(mode);
       const m = useCode ? (config.codeModel || config.model) : (config.chatModel || config.model);
       return String(m || "").trim();
     };
 
-    const coderActiveModel = () => modelForMode(config.mode);
-    const observerActiveModel = () => modelForMode(config.observerMode);
+    const observerResolvedProvider = () => (String(config.observerProvider || "").trim() || config.provider);
+    const observerResolvedModel = () => {
+      const m0 = String(config.observerModel || "").trim();
+      const m = m0 ? m0 : (config.chatModel || config.model);
+      return String(m || "").trim();
+    };
+
+    const coderActiveModel = () => coderResolvedModel(config.mode);
+    const observerActiveModel = () => observerResolvedModel();
 
     const shortModel = (m) => {
       const s = String(m || "").trim();
@@ -836,6 +921,8 @@
         next.codeModel = next.codeModel || next.model;
       } else if (p === "openai-compatible") {
         next = { ...next, ...PRESETS.openai };
+      } else if (p === "gemini") {
+        next = { ...next, ...PRESETS.gemini };
       } else if (p === "anthropic") {
         next = { ...next, ...PRESETS.anthropic };
       } else if (p === "hf") {
@@ -855,9 +942,27 @@
       try {
         setModelsLoading(true);
         setModelsErr("");
+        const target = String(modelsTarget || "chat");
+        const isCode = target === "code";
+        const isObs = target === "observer";
+        const provider = isCode
+          ? (String(config.codeProvider || "").trim() || config.provider)
+          : isObs
+            ? (String(config.observerProvider || "").trim() || config.provider)
+            : config.provider;
+        const baseUrl = isCode
+          ? (String(config.codeBaseUrl || "").trim() || config.baseUrl)
+          : isObs
+            ? (String(config.observerBaseUrl || "").trim() || config.baseUrl)
+            : config.baseUrl;
+        const apiKey = isCode
+          ? (String(codeApiKey || "").trim() || String(chatApiKey || "").trim() || String(observerApiKey || "").trim())
+          : isObs
+            ? (String(observerApiKey || "").trim() || String(chatApiKey || "").trim() || String(codeApiKey || "").trim())
+            : (String(chatApiKey || "").trim() || String(codeApiKey || "").trim() || String(observerApiKey || "").trim());
         const j = await postJson("/api/models", {
-          provider: config.provider,
-          base_url: strOrUndef(config.baseUrl),
+          provider,
+          base_url: strOrUndef(baseUrl),
           api_key: strOrUndef(apiKey),
         });
         const ms = j && Array.isArray(j.models) ? j.models : [];
@@ -1149,6 +1254,23 @@
           setConfig((c) => ({ ...c, mode: "VIBE" }));
         }
 
+        const wantsMaterial = /(?:repo|repository|scaffold|bootstrap|init|setup|create|generate|implement|リポ|リポジトリ|雛形|ひな形|プロジェクト|実装|ファイル|作成|作ろ|作って|生成|追加|組み込)/i.test(text);
+        const useCode = modeUsesCode(coderCfg.mode) || wantsMaterial;
+        const resolvedProvider = useCode ? (String(coderCfg.codeProvider || "").trim() || coderCfg.provider) : coderCfg.provider;
+        const resolvedBaseUrl = useCode ? (String(coderCfg.codeBaseUrl || "").trim() || coderCfg.baseUrl) : coderCfg.baseUrl;
+        const resolvedModel = useCode ? (coderCfg.codeModel || coderCfg.model) : (coderCfg.chatModel || coderCfg.model);
+        const resolvedKey = useCode
+          ? (String(codeApiKey || "").trim() || String(chatApiKey || "").trim() || String(observerApiKey || "").trim())
+          : (String(chatApiKey || "").trim() || String(codeApiKey || "").trim() || String(observerApiKey || "").trim());
+        const reqCfg = {
+          ...coderCfg,
+          provider: resolvedProvider,
+          baseUrl: resolvedBaseUrl,
+          model: resolvedModel,
+          chatModel: resolvedModel,
+          codeModel: resolvedModel,
+        };
+
         const threadId = activeThread.id;
         const history = paneMessages("coder").map((m) => ({ role: m.role, content: m.content }));
 
@@ -1166,8 +1288,8 @@
       setSendingCoder(true);
       requestAnimationFrame(() => scrollBottom(coderBodyRef));
 
-      const reqBody = buildReq(coderCfg, apiKey, history, text, diff);
-      reqBody.force_tools = true;
+      const reqBody = buildReq(reqCfg, resolvedKey, history, text, diff);
+      reqBody.force_tools = !!(useCode || wantsMaterial);
       const ac = new AbortController();
       abortCoderRef.current = ac;
 
@@ -1236,7 +1358,22 @@
       requestAnimationFrame(() => scrollBottom(observerBodyRef));
 
       // Keep Observer in-character: do not inherit coder's CoT/autonomy formatting.
-      const obsCfg = { ...config, mode: config.observerMode, persona: config.observerPersona, cot: "off", autonomy: "off" };
+      const obsProvider = String(config.observerProvider || "").trim() || config.provider;
+      const obsBaseUrl = String(config.observerBaseUrl || "").trim() || config.baseUrl;
+      const obsModel = String(config.observerModel || "").trim() || (config.chatModel || config.model);
+      const obsKey = String(observerApiKey || "").trim() || String(chatApiKey || "").trim() || String(codeApiKey || "").trim();
+      const obsCfg = {
+        ...config,
+        mode: config.observerMode,
+        persona: config.observerPersona,
+        cot: "off",
+        autonomy: "off",
+        provider: obsProvider,
+        baseUrl: obsBaseUrl,
+        model: obsModel,
+        chatModel: obsModel,
+        codeModel: obsModel,
+      };
       const observerBridge = [
         "[Observer bridge]",
         "You are reviewing the coder's work artifacts.",
@@ -1246,7 +1383,7 @@
       const sendText = config.includeCoderContext
         ? (text + "\n\n" + observerBridge + "\n\n" + coderContextPacket())
         : (text + "\n\n" + observerBridge);
-      const reqBody = buildReq(obsCfg, apiKey, history, sendText, diff);
+      const reqBody = buildReq(obsCfg, obsKey, history, sendText, diff);
       reqBody.force_tools = false;
       const ac = new AbortController();
       abortObserverRef.current = ac;
@@ -1338,6 +1475,8 @@
               " M  ",
               e(KeyDot, { ok: keyOpenAIOk }),
               " O  ",
+              e(KeyDot, { ok: keyGeminiOk }),
+              " G  ",
               e(KeyDot, { ok: keyAnthropicOk }),
               " A"
             )
@@ -1503,6 +1642,37 @@
                 "div",
                 { style: { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" } },
                 e(
+                  "div",
+                  { className: "seg" },
+                  e(
+                    "button",
+                    {
+                      className: "seg-btn " + (modelsTarget === "chat" ? "active" : ""),
+                      onClick: () => setModelsTarget("chat"),
+                      type: "button",
+                    },
+                    "Chat"
+                  ),
+                  e(
+                    "button",
+                    {
+                      className: "seg-btn " + (modelsTarget === "code" ? "active" : ""),
+                      onClick: () => setModelsTarget("code"),
+                      type: "button",
+                    },
+                    "Code"
+                  ),
+                  e(
+                    "button",
+                    {
+                      className: "seg-btn " + (modelsTarget === "observer" ? "active" : ""),
+                      onClick: () => setModelsTarget("observer"),
+                      type: "button",
+                    },
+                    "Obs"
+                  )
+                ),
+                e(
                   "button",
                   { className: "btn", onClick: fetchModels, disabled: modelsLoading },
                   modelsLoading ? "Loading..." : tr(lang, "fetchModels")
@@ -1521,6 +1691,36 @@
                   value: config.baseUrl,
                   onChange: (ev) => setConfig({ ...config, baseUrl: ev.target.value }),
                 })
+              ),
+              e(
+                "div",
+                { className: "grid2", style: { marginTop: "10px" } },
+                e(
+                  "div",
+                  { className: "field" },
+                  e("label", null, tr(lang, "codeProvider")),
+                  e(
+                    "select",
+                    {
+                      className: "select",
+                      value: String(config.codeProvider || ""),
+                      onChange: (ev) => setConfig({ ...config, codeProvider: ev.target.value }),
+                    },
+                    e("option", { value: "" }, tr(lang, "sameAsChat")),
+                    PROVIDERS.map((p) => e("option", { key: p.k, value: p.k }, (p.l && p.l[lang]) || p.k))
+                  )
+                ),
+                e(
+                  "div",
+                  { className: "field" },
+                  e("label", null, tr(lang, "codeBaseUrl")),
+                  e("input", {
+                    className: "input",
+                    value: String(config.codeBaseUrl || ""),
+                    onChange: (ev) => setConfig({ ...config, codeBaseUrl: ev.target.value }),
+                    placeholder: tr(lang, "sameAsChat"),
+                  })
+                )
               ),
               e(
                 "div",
@@ -1585,6 +1785,48 @@
                     PERSONAS.map((p) => e("option", { key: p, value: p }, p))
                   )
                 )
+              ),
+              e(
+                "div",
+                { className: "grid2", style: { marginTop: "10px" } },
+                e(
+                  "div",
+                  { className: "field" },
+                  e("label", null, tr(lang, "observerProvider")),
+                  e(
+                    "select",
+                    {
+                      className: "select",
+                      value: String(config.observerProvider || ""),
+                      onChange: (ev) => setConfig({ ...config, observerProvider: ev.target.value }),
+                    },
+                    e("option", { value: "" }, tr(lang, "sameAsChat")),
+                    PROVIDERS.map((p) => e("option", { key: p.k, value: p.k }, (p.l && p.l[lang]) || p.k))
+                  )
+                ),
+                e(
+                  "div",
+                  { className: "field" },
+                  e("label", null, tr(lang, "observerModel")),
+                  e("input", {
+                    className: "input",
+                    value: String(config.observerModel || ""),
+                    list: models && models.length ? "models-list" : undefined,
+                    onChange: (ev) => setConfig({ ...config, observerModel: ev.target.value }),
+                    placeholder: tr(lang, "sameAsChat"),
+                  })
+                )
+              ),
+              e(
+                "div",
+                { className: "field", style: { marginTop: "10px" } },
+                e("label", null, tr(lang, "observerBaseUrl")),
+                e("input", {
+                  className: "input",
+                  value: String(config.observerBaseUrl || ""),
+                  onChange: (ev) => setConfig({ ...config, observerBaseUrl: ev.target.value }),
+                  placeholder: tr(lang, "sameAsChat"),
+                })
               ),
               e(
                 "div",
@@ -1782,13 +2024,41 @@
               ),
               e(
                 "div",
+                { className: "grid2", style: { marginTop: "10px" } },
+                e(
+                  "div",
+                  { className: "field" },
+                  e("label", null, tr(lang, "apiKeyChat")),
+                  e("input", {
+                    className: "input",
+                    type: "password",
+                    value: chatApiKey,
+                    onChange: (ev) => setChatApiKey(ev.target.value),
+                    placeholder: "env",
+                  })
+                ),
+                e(
+                  "div",
+                  { className: "field" },
+                  e("label", null, tr(lang, "apiKeyCode")),
+                  e("input", {
+                    className: "input",
+                    type: "password",
+                    value: codeApiKey,
+                    onChange: (ev) => setCodeApiKey(ev.target.value),
+                    placeholder: "env",
+                  })
+                )
+              ),
+              e(
+                "div",
                 { className: "field", style: { marginTop: "10px" } },
-                e("label", null, tr(lang, "apiKey")),
+                e("label", null, tr(lang, "apiKeyObserver")),
                 e("input", {
                   className: "input",
                   type: "password",
-                  value: apiKey,
-                  onChange: (ev) => setApiKey(ev.target.value),
+                  value: observerApiKey,
+                  onChange: (ev) => setObserverApiKey(ev.target.value),
                   placeholder: "env",
                 })
               ),
@@ -1919,15 +2189,15 @@
                 e("span", {
                   style: {
                     width: 8, height: 8, borderRadius: "50%", display: "inline-block",
-                    background: PROVIDER_COLORS[config.provider] || "rgba(255,255,255,0.4)",
-                    boxShadow: "0 0 8px " + (PROVIDER_COLORS[config.provider] || "transparent") + "88",
+                    background: PROVIDER_COLORS[coderResolvedProvider(config.mode)] || "rgba(255,255,255,0.4)",
+                    boxShadow: "0 0 8px " + (PROVIDER_COLORS[coderResolvedProvider(config.mode)] || "transparent") + "88",
                     transition: "background 400ms ease, box-shadow 400ms ease",
                   },
                 }),
                 e(
                   "span",
                   { className: "pill", title: coderActiveModel() },
-                  providerLabel(config.provider) + " · " + modeLabel(config.mode) + " · " + shortModel(coderActiveModel())
+                  providerLabel(coderResolvedProvider(config.mode)) + " · " + modeLabel(config.mode) + " · " + shortModel(coderActiveModel())
                 )
               )
             ),
@@ -1972,7 +2242,7 @@
                 className: "dot",
                 style: {
                   background: sendingCoder
-                    ? (PROVIDER_COLORS[config.provider] || "rgba(45,212,191,0.85)")
+                    ? (PROVIDER_COLORS[coderResolvedProvider(config.mode)] || "rgba(45,212,191,0.85)")
                     : "rgba(45,212,191,0.85)",
                   transition: "background 400ms ease",
                 },
@@ -2002,15 +2272,15 @@
                 e("span", {
                   style: {
                     width: 8, height: 8, borderRadius: "50%", display: "inline-block",
-                    background: "rgba(251, 191, 36, 0.85)",
-                    boxShadow: "0 0 8px rgba(251, 191, 36, 0.45)",
+                    background: PROVIDER_COLORS[observerResolvedProvider()] || "rgba(251, 191, 36, 0.85)",
+                    boxShadow: "0 0 8px " + (PROVIDER_COLORS[observerResolvedProvider()] || "rgba(251, 191, 36, 0.45)") + "88",
                     transition: "background 400ms ease, box-shadow 400ms ease",
                   },
                 }),
                 e(
                   "span",
                   { className: "pill", title: observerActiveModel() },
-                  providerLabel(config.provider) + " · " + modeLabel(config.observerMode) + " · " + shortModel(observerActiveModel())
+                  providerLabel(observerResolvedProvider()) + " · " + modeLabel(config.observerMode) + " · " + shortModel(observerActiveModel())
                 )
               )
             ),
@@ -2077,7 +2347,7 @@
               e("span", {
                 className: "dot",
                 style: {
-                  background: sendingObserver ? "rgba(251, 191, 36, 0.95)" : "rgba(251, 191, 36, 0.85)",
+                  background: PROVIDER_COLORS[observerResolvedProvider()] || (sendingObserver ? "rgba(251, 191, 36, 0.95)" : "rgba(251, 191, 36, 0.85)"),
                   transition: "background 400ms ease",
                 },
               }),

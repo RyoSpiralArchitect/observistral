@@ -17,7 +17,7 @@ except Exception:
     import serve_lite  # type: ignore
 
 
-PROVIDERS = ["openai-compatible", "mistral", "codestral", "anthropic", "mistral-cli", "hf"]
+PROVIDERS = ["openai-compatible", "mistral", "codestral", "gemini", "anthropic", "mistral-cli", "hf"]
 CLI_DEFAULT_PROVIDER = "openai-compatible"
 CLI_DEFAULT_MODEL = "gpt-4o-mini"
 CLI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -81,7 +81,7 @@ def _coerce_provider_defaults(
 
 
 def _provider_needs_api_key(provider: str) -> bool:
-    return provider in ("openai-compatible", "mistral", "codestral", "anthropic")
+    return provider in ("openai-compatible", "mistral", "codestral", "gemini", "anthropic")
 
 
 def _effective_api_key(provider: str, inline_key: str | None) -> tuple[str, str]:
