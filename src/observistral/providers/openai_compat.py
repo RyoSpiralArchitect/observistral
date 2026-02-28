@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import requests
-
+from observistral.http_client import HttpResponseError, post_json
 from observistral.providers.base import ChatProvider
 from observistral.types import ChatRequest, ChatResponse
 
@@ -39,13 +38,12 @@ class OpenAICompatibleProvider(ChatProvider):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        response = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-        data = response.json()
+        try:
+            data = post_json(url, payload=payload, headers=headers, timeout_seconds=self.timeout_seconds)
+        except HttpResponseError as exc:
+            detail = f"HTTP {exc.status}"
+            if exc.body:
+                detail = f"{detail}: {exc.body}"
+            raise RuntimeError(f"OpenAI-compatible API error ({detail})") from exc
         content = data["choices"][0]["message"]["content"]
         return ChatResponse(content=content, model=self.model, raw=data)

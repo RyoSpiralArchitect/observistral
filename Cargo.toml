@@ -1,14 +1,15 @@
 [package]
-name = "observistral"
+name = "obstral"
 version = "0.1.0"
-edition = "2024"
-description = "AI-powered observability tool using Mistral AI"
+edition = "2021"
+description = "Provider-abstracted chat runtime (CLI + local UI)"
 license = "MIT"
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+rustyline = "15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

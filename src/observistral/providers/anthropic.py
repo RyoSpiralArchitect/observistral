@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import requests
-
+from observistral.http_client import HttpResponseError, post_json
 from observistral.providers.base import ChatProvider
 from observistral.types import ChatMessage, ChatRequest, ChatResponse
 
@@ -41,18 +40,19 @@ class AnthropicProvider(ChatProvider):
         if request.metadata:
             payload.update(request.metadata)
 
-        response = requests.post(
-            url,
-            json=payload,
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-        data = response.json()
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            data = post_json(url, payload=payload, headers=headers, timeout_seconds=self.timeout_seconds)
+        except HttpResponseError as exc:
+            detail = f"HTTP {exc.status}"
+            if exc.body:
+                detail = f"{detail}: {exc.body}"
+            raise RuntimeError(f"Anthropic API error ({detail})") from exc
         content_blocks = data.get("content", [])
         text = "".join(block.get("text", "") for block in content_blocks if block.get("type") == "text")
         return ChatResponse(content=text, model=self.model, raw=data)

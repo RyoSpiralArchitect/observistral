@@ -1,133 +1,254 @@
-# observistral
+# OBSTRAL
 
-プロバイダ抽象化付きチャットbot実行基盤です。以下に対応しています。
+プロバイダ抽象化付きチャット実行基盤。**Rust 製シングルバイナリ**で CLI・REPL・ローカル Web UI をすべて提供します。
 
-- OpenAI互換API（OpenAI本家、各種互換エンドポイント）
-- Anthropic Messages API
-- Hugging Face ローカル/オフライン推論（`transformers`）
+- **プロバイダ**: OpenAI-compatible / Mistral / Anthropic
+- **モード**: `実況` / `壁打ち` / `diff批評` / `VIBE`
+- **ペルソナ**: `default` / `novelist` / `cynical` / `cheerful` / `thoughtful`
+- **ストリーミング**: OpenAI・Mistral は SSE ストリーミング対応
 
-## インストール
+---
+
+## クイックスタート
+
+### Web UI（デフォルト）
+
+```powershell
+cd C:\Users\user\observistral
+$env:MISTRAL_API_KEY = "your-key"
+
+cargo run
+# → http://127.0.0.1:8080 をブラウザで開く
+```
+
+ポートを変えたい場合:
+
+```powershell
+cargo run -- serve --host 127.0.0.1 --port 3000
+```
+
+### ワンショット
+
+```powershell
+# 短縮形
+cargo run -- "この設計どう思う？" --vibe
+
+# 明示形
+cargo run -- chat "Hello" --provider openai-compatible --model gpt-4o-mini
+```
+
+### REPL（対話セッション）
+
+```powershell
+cargo run -- repl
+# または
+cargo run -- --repl
+```
+
+---
+
+## API キー設定
+
+**シェル履歴に残るため `--api-key` より環境変数を推奨します。**
+
+| プロバイダ | 環境変数 | 備考 |
+|-----------|---------|------|
+| Mistral | `MISTRAL_API_KEY` | 必須 |
+| Anthropic | `ANTHROPIC_API_KEY` | 必須 |
+| OpenAI-compatible | `OBS_API_KEY` または `OPENAI_API_KEY` | ローカルエンドポイントは不要 |
+
+```powershell
+$env:MISTRAL_API_KEY    = "..."
+$env:ANTHROPIC_API_KEY  = "..."
+$env:OBS_API_KEY        = "..."   # OpenAI / vLLM / LM Studio など
+```
+
+---
+
+## モード
+
+| モード | エイリアス | 説明 |
+|--------|-----------|------|
+| `実況` | `jikkyo`, `live` | 操作・思考を逐一ナレーション |
+| `壁打ち` | `kabeuchi`, `ideation` | アイデア整理・トレードオフの壁打ち相手 |
+| `diff批評` | `diff`, `review` | コードレビュー（バグ・リスク・テスト観点） |
+| `VIBE` | `vibe` | 設計〜実装を素早く叩き出す vibe コーディング |
+
+---
+
+## ペルソナ
+
+| ペルソナ | 説明 |
+|---------|------|
+| `default` | バランス重視・簡潔・実用的 |
+| `novelist` | 情景描写・比喩を交えた文体 |
+| `cynical` | 鋭い批判・弱い前提を容赦なく指摘 |
+| `cheerful` | 明るく前向き・励まし重視 |
+| `thoughtful` | 前提確認・段階的・トレードオフ明示 |
+
+---
+
+## CLI リファレンス
+
+```
+obstral [PROMPT] [OPTIONS]
+obstral chat <PROMPT> [OPTIONS]
+obstral repl [OPTIONS]
+obstral serve [--host HOST] [--port PORT] [OPTIONS]
+obstral list <providers|modes|personas>
+```
+
+### 共通オプション
+
+| オプション | デフォルト | 説明 |
+|-----------|-----------|------|
+| `--vibe` | — | Mistral devstral-2 + VIBE モードのプリセット |
+| `--provider` | `openai-compatible` | プロバイダ選択 |
+| `--model` | `gpt-4o-mini` | モデル名 |
+| `--api-key` | — | APIキー（env var 推奨） |
+| `--base-url` | — | カスタムエンドポイント |
+| `--mode` | `壁打ち` | モード選択 |
+| `--persona` | `default` | ペルソナ選択 |
+| `--temperature` | `0.7` | サンプリング温度（0〜2） |
+| `--max-tokens` | `1024` | 最大トークン数 |
+| `--timeout-seconds` | `120` | タイムアウト（秒） |
+| `--diff-file <PATH>` | — | diff ファイルを読み込みプロンプトに注入 |
+| `--stdin` | — | 標準入力をプロンプトに追加 |
+
+### 利用例
+
+```powershell
+# VIBE プリセット（Mistral devstral-2）
+$env:MISTRAL_API_KEY = "..."
+cargo run -- "認証周りのリファクタ案を出して" --vibe
+
+# Anthropic
+$env:ANTHROPIC_API_KEY = "..."
+cargo run -- chat "コードレビューして" --provider anthropic --model claude-opus-4-6 --mode diff批評
+
+# ローカル vLLM / LM Studio
+cargo run -- chat "Hello" --provider openai-compatible --model local-model --base-url http://localhost:8000/v1
+
+# diff ファイルを使ったコードレビュー
+cargo run -- "この変更どうかな" --mode diff批評 --diff-file ./changes.diff --persona cynical
+
+# stdin からプロンプト追加
+git diff HEAD~1 | cargo run -- "この差分をレビューして" --mode diff批評 --stdin --vibe
+
+# 一覧表示
+cargo run -- list providers
+cargo run -- list modes
+cargo run -- list personas
+```
+
+---
+
+## REPL コマンド
+
+REPL 起動後、`/` で始まる行はコマンドとして処理されます。
+
+```
+/help                         コマンド一覧
+/exit  /quit                  終了
+/reset                        会話履歴をクリア
+/config                       現在の設定を表示（APIキーは非表示）
+/vibe                         VIBE プリセットを適用
+
+/provider <name>              openai-compatible | mistral | anthropic
+/model <name>                 モデル名を変更
+/base-url <url>               エンドポイントを変更
+/mode <name>                  実況 | 壁打ち | diff批評 | VIBE
+/persona <name>               default | novelist | cynical | cheerful | thoughtful
+/temperature <0..2>
+/max-tokens <n>
+```
+
+プロンプト表示例:
+```
+obstral[VIBE|default|mistral]>
+```
+
+入力履歴は `.obstral_history` に自動保存されます。
+
+---
+
+## Windows セットアップ
+
+```powershell
+# PATH に Cargo を追加
+$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+
+# ビルド
+cargo build
+
+# 実行
+cargo run
+```
+
+`LNK1181: cannot open input file 'kernel32.lib'` が出る場合は Windows SDK をインストール:
+
+```powershell
+winget install Microsoft.WindowsSDK.10.0.18362
+```
+
+---
+
+## Python 版（レガシー）
+
+Python 実装 (`observistral`) は Hugging Face ローカル推論対応など一部機能を含みます。
 
 ```bash
 pip install -e .
-# HFローカルを使う場合
-pip install -e .[hf]
+pip install -e .[hf]   # HuggingFace ローカル推論
+
+observistral "プロンプト" --provider mistral --model devstral-2
+observistral --repl
 ```
 
-## CLI
+HF ローカル:
 
 ```bash
-observistral "この機能の設計を壁打ちしたい" \
-  --mode 壁打ち \
-  --persona thoughtful \
-  --provider openai-compatible \
-  --model gpt-4o-mini \
-  --api-key "$OBS_API_KEY"
+OBS_HF_LOCAL_ONLY=1 observistral "要約して" --provider hf --model mistralai/Mistral-7B-Instruct-v0.2
 ```
 
-### モード
+---
 
-- `実況`
-- `壁打ち`
-- `diff批評`
+## 環境変数一覧
 
-### ペルソナ（切り替えUI / CLI）
-
-- `default` (Balanced)
-- `novelist`
-- `cynical`
-- `cheerful`
-- `thoughtful`
-
-```bash
-# ペルソナ一覧
-observistral --list-personas
-
-# 例: 小説家ペルソナ
-observistral "短い導入文を書いて" --mode 実況 --persona novelist --provider openai-compatible --model gpt-4o-mini --api-key "$OBS_API_KEY"
-```
-
-### さらに進めた実装ポイント
-
-- `--diff-file` でパッチ/差分ファイルを読み込んで `diff批評` に自動注入
-- `--stdin` で標準入力をプロンプトへ追加
-- `--list-providers` で利用可能なプロバイダ別名を表示
-- `--list-personas` で利用可能なペルソナを表示
-- OpenAI互換はAPIキーなしでも利用可能（ローカル推論サーバー向け）
-- AnthropicはAPIキー必須
-- HFローカルは `OBS_HF_LOCAL_ONLY=1` でオフライン優先
-
-### プロバイダ切替例
-
-```bash
-# OpenAI互換
-observistral "こんにちは" --provider openai-compatible --model gpt-4o-mini --api-key "$OBS_API_KEY"
-
-# OpenAI互換（ローカルvLLM/LM Studioなど）
-observistral "こんにちは" --provider openai-compatible --model local-model --base-url "http://localhost:8000/v1"
-
-# Anthropic
-observistral "こんにちは" --provider anthropic --model claude-3-5-sonnet-latest --api-key "$ANTHROPIC_API_KEY"
-
-# HFローカル（オフライン）
-OBS_HF_LOCAL_ONLY=1 observistral "READMEを要約" --provider hf --model mistralai/Mistral-7B-Instruct-v0.2
-
-# diff批評（diffファイル読み込み）
-observistral "この差分をレビューして" --mode diff批評 --persona thoughtful --provider openai-compatible --model gpt-4o-mini --api-key "$OBS_API_KEY" --diff-file ./changes.diff
-```
-
-環境変数でも指定できます。
-
-- `OBS_PROVIDER`
-- `OBS_MODEL`
-- `OBS_API_KEY`
-- `OBS_BASE_URL`
-- `OBS_TIMEOUT_SECONDS`
-- `OBS_HF_DEVICE`
-- `OBS_HF_LOCAL_ONLY`
-- `OBS_PERSONA`
+| 変数 | 説明 |
+|------|------|
+| `MISTRAL_API_KEY` | Mistral APIキー |
+| `ANTHROPIC_API_KEY` | Anthropic APIキー |
+| `OBS_API_KEY` | OpenAI-compatible APIキー |
+| `OPENAI_API_KEY` | OpenAI APIキー（フォールバック） |
+| `OBS_PROVIDER` | デフォルトプロバイダ（Python版） |
+| `OBS_MODEL` | デフォルトモデル（Python版） |
+| `OBS_PERSONA` | デフォルトペルソナ（Python版） |
+| `OBS_BASE_URL` | デフォルトエンドポイント（Python版） |
+| `OBS_TIMEOUT_SECONDS` | タイムアウト秒数（Python版） |
+| `OBS_HF_DEVICE` | HFデバイス: `auto` / `cpu` / `cuda` |
+| `OBS_HF_LOCAL_ONLY` | `1` でオフラインモード（HF） |
 
 ---
 
 ## Français (FR)
 
-`observistral` est un runtime de chatbot avec abstraction de fournisseurs.
+OBSTRAL est un runtime de chatbot avec abstraction de fournisseurs — CLI, REPL et UI web locale dans un seul binaire Rust.
 
-Fonctionnalités principales :
-- Compatible OpenAI (API `/chat/completions`)
-- Support Anthropic (`/v1/messages`)
-- Support local/offline Hugging Face (`transformers`)
-- Changement de modèle/fournisseur via options CLI ou variables d'environnement
-- Modes prêts à l'emploi : `実況`, `壁打ち`, `diff批評`
-- Personas prêtes à l'emploi : `novelist`, `cynical`, `cheerful`, `thoughtful`
+**Démarrage rapide :**
 
-Exemple rapide :
-
-```bash
-observistral "Aide-moi à structurer cette idée" \
-  --mode 壁打ち \
-  --persona thoughtful \
-  --provider openai-compatible \
-  --model gpt-4o-mini \
-  --api-key "$OBS_API_KEY"
+```powershell
+$env:MISTRAL_API_KEY = "..."
+cargo run
+# → ouvrir http://127.0.0.1:8080
 ```
 
-Lister les personas :
+**Modes :** `実況` (narration) · `壁打ち` (idéation) · `diff批評` (revue de code) · `VIBE` (vibe coding)
 
-```bash
-observistral --list-personas
+**Personas :** `default` · `novelist` · `cynical` · `cheerful` · `thoughtful`
+
+**Revue de patch :**
+
+```powershell
+cargo run -- "Critique ce diff" --mode diff批評 --persona cynical --diff-file ./changes.diff --provider anthropic --model claude-opus-4-6
 ```
-
-Revue de patch :
-
-```bash
-observistral "Critique ce diff" \
-  --mode diff批評 \
-  --persona cynical \
-  --provider anthropic \
-  --model claude-3-5-sonnet-latest \
-  --api-key "$ANTHROPIC_API_KEY" \
-  --diff-file ./changes.diff
-```
-
-SpiralReality
