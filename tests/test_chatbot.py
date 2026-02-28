@@ -3,6 +3,7 @@ from __future__ import annotations
 from observistral.chatbot import ChatBot
 from observistral.config import ProviderConfig
 from observistral.factory import build_provider, supported_providers
+from observistral.personas import resolve_persona, supported_personas
 from observistral.providers.base import ChatProvider
 from observistral.providers.openai_compat import OpenAICompatibleProvider
 from observistral.types import ChatRequest, ChatResponse
@@ -28,6 +29,18 @@ def test_mode_prompt_injection() -> None:
     assert provider.last_request is not None
     assert provider.last_request.messages[0].role == "system"
     assert "コードレビュアー" in provider.last_request.messages[0].content
+
+
+def test_persona_prompt_injection() -> None:
+    provider = DummyProvider()
+    bot = ChatBot(provider)
+
+    bot.run("雰囲気重視で", mode="実況", persona="novelist")
+
+    assert provider.last_request is not None
+    system_msg = provider.last_request.messages[0].content
+    assert "Persona" in system_msg
+    assert "小説家" in system_msg
 
 
 def test_diff_text_is_appended_when_diff_mode() -> None:
@@ -62,3 +75,12 @@ def test_supported_providers_contains_expected_aliases() -> None:
     assert "openai-compatible" in providers
     assert "anthropic" in providers
     assert "hf" in providers
+
+
+def test_persona_catalog() -> None:
+    personas = supported_personas()
+    assert "novelist" in personas
+    assert "cynical" in personas
+    assert "cheerful" in personas
+    assert "thoughtful" in personas
+    assert resolve_persona("novelist").label == "Novelist"

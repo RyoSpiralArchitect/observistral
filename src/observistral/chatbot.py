@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from observistral.personas import resolve_persona
 from observistral.providers.base import ChatProvider
 from observistral.types import ChatMessage, ChatRequest, ChatResponse
 
@@ -21,14 +22,16 @@ class ChatBot:
         self,
         user_input: str,
         mode: str = "壁打ち",
+        persona: str = "default",
         temperature: float = 0.4,
         max_tokens: int = 1024,
         diff_text: str | None = None,
     ) -> ChatResponse:
         system_prompt = MODE_PROMPTS.get(mode, MODE_PROMPTS["壁打ち"])
+        persona_prompt = resolve_persona(persona).prompt
         request = ChatRequest(
             messages=[
-                ChatMessage(role="system", content=system_prompt),
+                ChatMessage(role="system", content=f"{system_prompt}\n\n[Persona]\n{persona_prompt}"),
                 ChatMessage(role="user", content=self._compose_user_input(user_input=user_input, mode=mode, diff_text=diff_text)),
             ],
             temperature=temperature,
