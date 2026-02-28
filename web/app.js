@@ -215,6 +215,9 @@
     { k: "diff批評", l: { ja: "diff批評", en: "Diff review", fr: "Revue diff" } },
   ];
 
+  const CODER_MODES = MODES.filter((m) => m && m.k !== "Observer");
+  const OBSERVER_MODES = MODES.filter((m) => m && m.k === "Observer");
+
   const PERSONAS = ["default", "novelist", "cynical", "cheerful", "thoughtful"];
 
   const PRESETS = {
@@ -616,6 +619,8 @@
       if (!cfg.chatModel && cfg.model) cfg.chatModel = cfg.model;
       if (!cfg.codeModel && cfg.model) cfg.codeModel = cfg.model;
       if (!cfg.model && (cfg.chatModel || cfg.codeModel)) cfg.model = cfg.chatModel || cfg.codeModel;
+      // Coder pane should never run in Observer mode (it disables autonomy/tooling and looks "broken").
+      if (String(cfg.mode || "").trim() === "Observer") cfg.mode = DEFAULT_CONFIG.mode;
       if (!cfg.observerMode) cfg.observerMode = DEFAULT_CONFIG.observerMode;
       if (!cfg.observerPersona) cfg.observerPersona = DEFAULT_CONFIG.observerPersona;
       if (typeof cfg.includeCoderContext !== "boolean") cfg.includeCoderContext = !!DEFAULT_CONFIG.includeCoderContext;
@@ -1133,14 +1138,19 @@
       return parts.join("\n");
     };
 
-    const sendCoder = async (overrideText) => {
-      if (sendingCoder) return;
-      const raw = overrideText != null ? String(overrideText) : String(coderInput || "");
-      const text = raw.trim();
-      if (!text) return;
+      const sendCoder = async (overrideText) => {
+        if (sendingCoder) return;
+        const raw = overrideText != null ? String(overrideText) : String(coderInput || "");
+        const text = raw.trim();
+        if (!text) return;
 
-      const threadId = activeThread.id;
-      const history = paneMessages("coder").map((m) => ({ role: m.role, content: m.content }));
+        const coderCfg = String(config.mode || "").trim() === "Observer" ? { ...config, mode: "VIBE" } : config;
+        if (String(config.mode || "").trim() === "Observer") {
+          setConfig((c) => ({ ...c, mode: "VIBE" }));
+        }
+
+        const threadId = activeThread.id;
+        const history = paneMessages("coder").map((m) => ({ role: m.role, content: m.content }));
 
       const userMsg = { id: uid(), pane: "coder", role: "user", content: text, ts: Date.now() };
       const asstMsg = { id: uid(), pane: "coder", role: "assistant", content: "", ts: Date.now(), streaming: true };
@@ -1156,7 +1166,7 @@
       setSendingCoder(true);
       requestAnimationFrame(() => scrollBottom(coderBodyRef));
 
-      const reqBody = buildReq(config, apiKey, history, text, diff);
+      const reqBody = buildReq(coderCfg, apiKey, history, text, diff);
       reqBody.force_tools = true;
       const ac = new AbortController();
       abortCoderRef.current = ac;
@@ -1526,7 +1536,7 @@
                       value: config.mode,
                       onChange: (ev) => setConfig({ ...config, mode: ev.target.value }),
                     },
-                    MODES.map((m) => e("option", { key: m.k, value: m.k }, (m.l && m.l[lang]) || m.k))
+                    CODER_MODES.map((m) => e("option", { key: m.k, value: m.k }, (m.l && m.l[lang]) || m.k))
                   )
                 ),
                 e(
@@ -1558,7 +1568,7 @@
                       value: config.observerMode,
                       onChange: (ev) => setConfig({ ...config, observerMode: ev.target.value }),
                     },
-                    MODES.map((m) => e("option", { key: m.k, value: m.k }, (m.l && m.l[lang]) || m.k))
+                    OBSERVER_MODES.map((m) => e("option", { key: m.k, value: m.k }, (m.l && m.l[lang]) || m.k))
                   )
                 ),
                 e(

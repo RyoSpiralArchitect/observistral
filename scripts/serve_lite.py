@@ -770,9 +770,9 @@ def _tool_root(req: dict[str, Any] | None) -> Path:
     except ValueError:
         raise RuntimeError("tool_root escapes workspace root") from None
 
-    if not p.exists():
-        raise RuntimeError("tool_root does not exist")
-    if not p.is_dir():
+    # Allow non-existent tool_root so the agent can create a new project folder.
+    # We still prevent pointing at an existing non-directory.
+    if p.exists() and not p.is_dir():
         raise RuntimeError("tool_root is not a directory")
     return p
 
@@ -1154,7 +1154,15 @@ def _chat_openai_compat(
             payload["max_tokens"] = max_tokens
         if tools_enabled:
             payload["tools"] = LOCAL_TOOLS
-            payload["tool_choice"] = "required" if (force_tools and not made_any_tool_call) else "auto"
+            if force_tools and not made_any_tool_call:
+                # Some OpenAI deployments ignore string "required"; forcing a harmless first tool
+                # kickstarts the tool loop reliably.
+                if "api.openai.com" in str(base_url or "").lower():
+                    payload["tool_choice"] = {"type": "function", "function": {"name": "list_files"}}
+                else:
+                    payload["tool_choice"] = "required"
+            else:
+                payload["tool_choice"] = "auto"
 
         paths = _chat_paths_for_provider(provider, base_url)
         res = None
