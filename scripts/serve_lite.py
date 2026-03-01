@@ -124,10 +124,10 @@ OBSERVER_NOVELIST_PROMPT = (
 def _observer_lang_line(ui_lang: str) -> str:
     l = str(ui_lang or "").strip().lower()
     if l == "fr":
-        return "- Langue: français.\n"
+        return "- Language: French.\n- Langue: français.\n"
     if l == "en":
         return "- Language: English.\n"
-    return "- 言語: 日本語。\n"
+    return "- Language: Japanese.\n- 言語: 日本語。\n"
 
 
 def _language_instruction(ui_lang: str) -> str:
@@ -138,6 +138,7 @@ def _language_instruction(ui_lang: str) -> str:
     l = str(ui_lang or "").strip().lower()
     if l == "fr":
         return (
+            "Language: French. Write assistant messages in French.\n"
             "Langue: français. Écris les messages de l'assistant en français.\n"
             "Ne traduis pas les blocs JSON d'outils ni les fences de code.\n"
         )
@@ -148,6 +149,7 @@ def _language_instruction(ui_lang: str) -> str:
         )
     # Default: Japanese.
     return (
+        "Language: Japanese. Write assistant messages in Japanese.\n"
         "言語: 日本語。アシスタントのメッセージは日本語で書いてください。\n"
         "ツールJSONブロックとコードフェンスは翻訳しないでください。\n"
     )

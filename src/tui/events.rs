@@ -293,7 +293,7 @@ async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
     let tx = tx.clone();
     let handle = tokio::spawn(async move {
         if let Err(e) = agent::run_agentic(messages, &cfg, tool_root.as_deref(), tx.clone()).await {
-            let _ = tx.send(StreamToken::Error(e.to_string())).await;
+            let _ = tx.send(StreamToken::Error(format!("{e:#}"))).await;
         }
     });
     app.coder_task = Some(handle);

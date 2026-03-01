@@ -181,9 +181,13 @@ pub fn language_instruction(lang: Option<&str>, mode: &Mode) -> &'static str {
 
     if l.eq_ignore_ascii_case("fr") {
         if is_obs {
-            "Langue: français. Écris la critique en français. Garde les clés du bloc proposals en anglais (title/to_coder/severity/score/phase/impact/cost)."
+            "Language: French. Write the critique in French. \
+Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).\n\
+Langue: français. Écris la critique en français. \
+Garde les clés du bloc proposals en anglais (title/to_coder/severity/score/phase/impact/cost)."
         } else {
-            "Langue: français. Réponds en français."
+            "Language: French. Write your response in French.\n\
+Langue: français. Réponds en français."
         }
     } else if l.eq_ignore_ascii_case("en") {
         if is_obs {
@@ -193,9 +197,13 @@ pub fn language_instruction(lang: Option<&str>, mode: &Mode) -> &'static str {
         }
     } else {
         if is_obs {
-            "言語: 日本語。批評は日本語で書いてください。proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。"
+            "Language: Japanese. Write the critique in Japanese. \
+Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).\n\
+言語: 日本語。批評は日本語で書いてください。\
+proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。"
         } else {
-            "言語: 日本語。日本語で返答してください。"
+            "Language: Japanese. Write your response in Japanese.\n\
+言語: 日本語。日本語で返答してください。"
         }
     }
 }

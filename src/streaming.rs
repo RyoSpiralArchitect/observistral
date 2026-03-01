@@ -69,7 +69,12 @@ pub async fn stream_openai_compat_json(
         req = req.bearer_auth(key);
     }
 
-    let mut resp = req.send().await.context("request failed")?;
+    let mut resp = req.send().await.with_context(|| {
+        format!(
+            "failed to connect to {url}\n\
+             If behind a proxy, set: $env:HTTPS_PROXY=\"http://host:port\""
+        )
+    })?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();

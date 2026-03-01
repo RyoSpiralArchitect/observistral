@@ -38,7 +38,7 @@
       commandApproval: "Command approval",
       autoObserve: "Auto-observe",
       forceAgent: "Agent mode",
-      toolRoot: "作業ルート",
+      toolRoot: "Tool root",
       pendingEdits: "Pending edits",
       approve: "Approve",
       reject: "Reject",
@@ -155,7 +155,7 @@
       deep: "本格",
       autoObserve: "自動実況",
       forceAgent: "エージェント常時ON",
-      toolRoot: "Tool root",
+      toolRoot: "作業ルート",
       on: "ON",
       off: "OFF",
       diff: "diff",
@@ -457,7 +457,7 @@
     requireCommandApproval: true,
     autoObserve: false,
     forceAgent: true,
-    toolRoot: "",
+    toolRoot: ".tmp",
     mistralCliAgent: "",
     mistralCliMaxTurns: "",
     codeProvider: "",
@@ -1377,6 +1377,7 @@
     const saveTimer = useRef(null);
     const coderBodyRef = useRef(null);
     const observerBodyRef = useRef(null);
+    const toolRootInitRef = useRef(false);
 
     // Drag-to-resize pane handler.
     const onSplitDragStart = useCallback((e) => {
@@ -1534,6 +1535,26 @@
       const t = setInterval(() => refreshPendingEdits(), 3000);
       return () => clearInterval(t);
     }, []);
+
+    // Safer default: run local commands under a scratch directory, not the OBSTRAL repo root.
+    // This prevents nested git repos (embedded repo warnings) and accidental `git add .` fallout.
+    useEffect(() => {
+      if (toolRootInitRef.current) return;
+      if (!status || !status.features || !status.features.exec) return;
+      toolRootInitRef.current = true;
+
+      const cur = String(config.toolRoot || "").trim();
+      const desired = cur || ".tmp";
+      if (!cur) setConfig((c) => ({ ...c, toolRoot: desired }));
+
+      // Best-effort: ensure the default scratch dir exists so exec doesn't fail.
+      if (desired === ".tmp") {
+        const cmd = isWindowsHost()
+          ? "New-Item -ItemType Directory -Force -Path '.tmp' | Out-Null"
+          : "mkdir -p .tmp";
+        postJson("/api/exec", { command: cmd }).catch(() => {});
+      }
+    }, [status && status.features && status.features.exec]);
 
     const refreshStatus = () => {
       fetch("/api/status")

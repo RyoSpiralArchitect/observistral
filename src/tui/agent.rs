@@ -246,8 +246,15 @@ pub async fn run_agentic(
             }
         }
 
-        if let Err(e) = stream_task.await {
-            return Err(anyhow!("stream task panicked: {e}"));
+        match stream_task.await {
+            Err(join_err) => return Err(anyhow!("stream task panicked: {join_err}")),
+            Ok(Err(e)) => {
+                // Stream failed (network error, bad status, etc.) — surface it.
+                let msg = format!("{e:#}");
+                let _ = tx.send(StreamToken::Error(msg.clone())).await;
+                return Err(anyhow!("{msg}"));
+            }
+            Ok(Ok(())) => {}
         }
 
         // ── Append assistant turn ──────────────────────────────────────────
