@@ -79,11 +79,95 @@ fn to_openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
         .collect()
 }
 
+fn chat_urls_for_base_url(base_url: &str) -> Vec<String> {
+    let base = base_url.trim_end_matches('/');
+
+    // Codestral uses a singular endpoint: /v1/chat/completion
+    // We still keep the plural path as a fallback for compatibility.
+    if base.contains("codestral.mistral.ai") {
+        vec![
+            format!("{base}/chat/completion"),
+            format!("{base}/chat/completions"),
+        ]
+    } else {
+        vec![
+            format!("{base}/chat/completions"),
+            format!("{base}/chat/completion"),
+        ]
+    }
+}
+
+fn should_use_v1_completions(status: StatusCode, body: &str) -> bool {
+    // Some OpenAI-compatible providers return 404 for non-chat models with a hint to use /v1/completions.
+    // Example: "This is not a chat model ... Did you mean to use v1/completions?"
+    let msg = body.to_ascii_lowercase();
+    if msg.contains("not a chat model") {
+        return true;
+    }
+    if status == StatusCode::NOT_FOUND && msg.contains("v1/completions") && msg.contains("chat/complet") {
+        return true;
+    }
+    false
+}
+
+fn to_completions_prompt(messages: &[ChatMessage]) -> String {
+    // Minimal, robust chat->prompt adapter.
+    // This is used only as a fallback when the provider rejects /chat/completions.
+    let mut out = String::new();
+
+    let mut system_parts: Vec<&str> = Vec::new();
+    for m in messages {
+        if m.role == "system" {
+            system_parts.push(m.content.as_str());
+        }
+    }
+    if !system_parts.is_empty() {
+        out.push_str(system_parts.join("\n").trim());
+        out.push_str("\n\n");
+    }
+
+    for m in messages {
+        if m.role == "system" {
+            continue;
+        }
+        let label = match m.role.as_str() {
+            "user" => "User",
+            "assistant" => "Assistant",
+            other => other,
+        };
+        out.push_str(label);
+        out.push_str(": ");
+        out.push_str(m.content.trim_end());
+        out.push('\n');
+    }
+
+    // Cue the next assistant completion.
+    out.push_str("Assistant: ");
+    out
+}
+
+fn extract_chat_content(data: &Value) -> Option<String> {
+    data.pointer("/choices/0/message/content")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            // Some providers return text completions format even on chat endpoints.
+            data.pointer("/choices/0/text")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        })
+}
+
+fn extract_completion_text(data: &Value) -> Option<String> {
+    data.pointer("/choices/0/text")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| extract_chat_content(data))
+}
+
 #[async_trait]
 impl ChatProvider for OpenAICompatibleProvider {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
-        let url = format!("{}/chat/completions", self.base_url);
-
         let mut payload = json!({
             "model": self.model,
             "messages": to_openai_messages(&request.messages),
@@ -100,36 +184,111 @@ impl ChatProvider for OpenAICompatibleProvider {
             }
         }
 
-        let data: Value = match self.post_json(&url, &payload).await? {
-            Ok(v) => v,
-            Err((status, body)) => {
-                // Some OpenAI models reject `max_tokens` and require `max_completion_tokens` instead.
-                if status == StatusCode::BAD_REQUEST
-                    && body.contains("max_completion_tokens")
-                    && body.contains("max_tokens")
-                    && request.max_tokens.is_some()
-                {
-                    let mut payload2 = payload.clone();
-                    if let Some(mt) = request.max_tokens {
-                        if let Value::Object(obj) = &mut payload2 {
-                            obj.remove("max_tokens");
-                            obj.insert("max_completion_tokens".to_string(), json!(mt));
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut want_completions = false;
+
+        let mut data: Option<Value> = None;
+        for url in chat_urls_for_base_url(&self.base_url) {
+            match self.post_json(&url, &payload).await? {
+                Ok(v) => {
+                    data = Some(v);
+                    break;
+                }
+                Err((status, body)) => {
+                    // Some models reject `max_tokens` and require `max_completion_tokens` instead.
+                    if status == StatusCode::BAD_REQUEST
+                        && body.contains("max_completion_tokens")
+                        && body.contains("max_tokens")
+                        && request.max_tokens.is_some()
+                    {
+                        let mut payload2 = payload.clone();
+                        if let Some(mt) = request.max_tokens {
+                            if let Value::Object(obj) = &mut payload2 {
+                                obj.remove("max_tokens");
+                                obj.insert("max_completion_tokens".to_string(), json!(mt));
+                            }
+                        }
+                        match self.post_json(&url, &payload2).await? {
+                            Ok(v2) => {
+                                data = Some(v2);
+                                break;
+                            }
+                            Err((status2, body2)) => {
+                                last_err = Some(http_error(self.kind_label, status2, &body2));
+                                continue;
+                            }
                         }
                     }
-                    match self.post_json(&url, &payload2).await? {
-                        Ok(v2) => v2,
-                        Err((status2, body2)) => return Err(http_error(self.kind_label, status2, &body2)),
+
+                    if should_use_v1_completions(status, &body) {
+                        want_completions = true;
+                        last_err = Some(http_error(self.kind_label, status, &body));
+                        break;
                     }
-                } else {
+
+                    // Endpoint mismatch (e.g. Codestral uses /chat/completion). Try the next path.
+                    if status == StatusCode::NOT_FOUND {
+                        last_err = Some(http_error(self.kind_label, status, &body));
+                        continue;
+                    }
+
                     return Err(http_error(self.kind_label, status, &body));
                 }
             }
+        }
+
+        let data: Value = if let Some(v) = data {
+            v
+        } else if want_completions {
+            let url = format!("{}/completions", self.base_url.trim_end_matches('/'));
+            let mut comp_payload = json!({
+                "model": self.model,
+                "prompt": to_completions_prompt(&request.messages),
+                "temperature": request.temperature.unwrap_or(0.4),
+            });
+            if let Some(max_tokens) = request.max_tokens {
+                comp_payload["max_tokens"] = json!(max_tokens);
+            }
+            if let Some(Value::Object(extra)) = &request.metadata {
+                if let Value::Object(obj) = &mut comp_payload {
+                    for (k, v) in extra {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+
+            match self.post_json(&url, &comp_payload).await? {
+                Ok(v) => v,
+                Err((status, body)) => {
+                    // Keep parity with chat path: retry once using max_completion_tokens if suggested.
+                    if status == StatusCode::BAD_REQUEST
+                        && body.contains("max_completion_tokens")
+                        && body.contains("max_tokens")
+                        && request.max_tokens.is_some()
+                    {
+                        let mut payload2 = comp_payload.clone();
+                        if let Some(mt) = request.max_tokens {
+                            if let Value::Object(obj) = &mut payload2 {
+                                obj.remove("max_tokens");
+                                obj.insert("max_completion_tokens".to_string(), json!(mt));
+                            }
+                        }
+                        match self.post_json(&url, &payload2).await? {
+                            Ok(v2) => v2,
+                            Err((status2, body2)) => return Err(http_error(self.kind_label, status2, &body2)),
+                        }
+                    } else {
+                        return Err(http_error(self.kind_label, status, &body));
+                    }
+                }
+            }
+        } else {
+            return Err(last_err.unwrap_or_else(|| anyhow!("OpenAI-compatible request failed")));
         };
-        let content = data
-            .pointer("/choices/0/message/content")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
+
+        let content = extract_chat_content(&data)
+            .or_else(|| extract_completion_text(&data))
+            .ok_or_else(|| anyhow!("OpenAI-compatible: missing content in response"))?;
 
         Ok(ChatResponse {
             content,
@@ -228,5 +387,65 @@ mod tests {
 
         provider.chat(&make_request("hi")).await.unwrap();
         mock.assert();
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_singular_chat_path_on_404() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(404).body("Not Found");
+        });
+        let mock2 = server.mock(|when, then| {
+            when.method(POST).path("/chat/completion");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "hello"}}]
+            }));
+        });
+
+        let client = reqwest::Client::new();
+        let provider = OpenAICompatibleProvider::new(
+            client,
+            "test",
+            "model".to_string(),
+            None,
+            server.base_url(),
+            Duration::from_secs(5),
+        );
+
+        let resp = provider.chat(&make_request("hi")).await.unwrap();
+        assert_eq!(resp.content, "hello");
+        mock2.assert();
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_v1_completions_when_not_chat_model() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(404).json_body(serde_json::json!({
+                "error": { "message": "This is not a chat model and thus not supported in the v1/chat/completions endpoint. Did you mean to use v1/completions?" }
+            }));
+        });
+        let mock2 = server.mock(|when, then| {
+            when.method(POST).path("/completions");
+            then.status(200).json_body(serde_json::json!({
+                "choices": [{"text": "hello from completions"}]
+            }));
+        });
+
+        let client = reqwest::Client::new();
+        let provider = OpenAICompatibleProvider::new(
+            client,
+            "test",
+            "model".to_string(),
+            None,
+            server.base_url(),
+            Duration::from_secs(5),
+        );
+
+        let resp = provider.chat(&make_request("hi")).await.unwrap();
+        assert!(resp.content.contains("hello from completions"), "{}", resp.content);
+        mock2.assert();
     }
 }

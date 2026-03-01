@@ -1,6 +1,7 @@
 mod chatbot;
 mod config;
 mod exec;
+mod loop_detect;
 mod modes;
 mod personas;
 mod repl;

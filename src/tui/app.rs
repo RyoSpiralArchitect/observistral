@@ -129,6 +129,13 @@ pub struct App {
     /// (set after Ctrl+K, cleared on the next send).
     pub ignore_coder_tokens: bool,
     pub ignore_observer_tokens: bool,
+
+    /// One-shot anti-loop retry budget for the Observer pane.
+    /// Reset to 1 on each new Observer send (manual or auto-observe).
+    pub observer_loop_retry_budget: u8,
+    /// When set, the next Tick will re-run the Observer with a diff-only instruction
+    /// and overwrite the last assistant message (value = similarity 0..1).
+    pub observer_loop_pending: Option<f64>,
 }
 
 impl App {
@@ -158,6 +165,8 @@ impl App {
             observer_task: None,
             ignore_coder_tokens: false,
             ignore_observer_tokens: false,
+            observer_loop_retry_budget: 0,
+            observer_loop_pending: None,
         }
     }
 

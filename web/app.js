@@ -2651,7 +2651,7 @@
               break;
             }
           }
-          continue;
+          break; // implied exec done — don't loop back; prevents "complete" notification spam
         }
       }
 
@@ -2874,6 +2874,14 @@
 
       const threadId = activeThread.id;
       const history = paneMessages("observer").map((m) => ({ role: m.role, content: m.content }));
+      const prevObserverAssts = (() => {
+        const out = [];
+        for (let i = history.length - 1; i >= 0 && out.length < 4; i--) {
+          const m = history[i];
+          if (m && m.role === "assistant") out.push(String(m.content || ""));
+        }
+        return out;
+      })();
 
       const userMsg = { id: uid(), pane: "observer", role: "user", content: text, ts: Date.now() };
       const asstMsg = { id: uid(), pane: "observer", role: "assistant", content: "", ts: Date.now(), streaming: true };
@@ -3082,9 +3090,80 @@
           try {
             const j2 = await postJson("/api/chat", retryBody, ac.signal);
             const fixed = String((j2 && j2.content) || "");
-            if (fixed) setMsg(threadId, asstMsg.id, fixed, observerBodyRef);
+            if (fixed) {
+              finalText = fixed;
+              setMsg(threadId, asstMsg.id, fixed, observerBodyRef);
+            }
           } catch (_) {
             // If retry fails, keep the original response.
+          }
+        }
+
+        // One-shot loop retry: if the Observer repeats itself with no new signal,
+        // force a diff-style critique instead of reprinting the same template.
+        if (!ac.signal.aborted && prevObserverAssts.length && !skippable(finalText)) {
+          const maxSim = (() => {
+            let s = 0;
+            for (const prev of prevObserverAssts) s = Math.max(s, similarity(prev, finalText));
+            return s;
+          })();
+          const titleJacc = (() => {
+            try {
+              const norm = (s) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+              const a0 = prevObserverAssts[0] || "";
+              const a = new Set(parseProposals(a0).map((p) => norm(p.title)).filter(Boolean));
+              const b = new Set(parseProposals(finalText).map((p) => norm(p.title)).filter(Boolean));
+              if (!a.size && !b.size) return 1;
+              return jaccardSim(a, b);
+            } catch (_) {
+              return maxSim;
+            }
+          })();
+          const loopish = maxSim >= 0.82 && titleJacc >= 0.75;
+          if (loopish) {
+            const msg =
+              outLang === "fr"
+                ? "Observer se répète — nouvelle tentative (diff-only)…"
+                : outLang === "en"
+                  ? "Observer repeated itself — retrying (diff-only)…"
+                  : "Observerが同じ内容を繰り返しているため、差分批評で再試行します…";
+            showToast(msg, "info");
+
+            const loopFixInstr =
+              outLang === "fr"
+                ? "LOOP FIX: Your last message repeated the same critique. Write a NEW critique ONLY based on NEW information since your previous message. Do not restate the same proposals. If there is no new signal, reply exactly: [Observer] No new critique. Loop detected."
+                : outLang === "en"
+                  ? "LOOP FIX: Your last message repeated the same critique. Write a NEW critique ONLY based on NEW information since your previous message. Do not restate the same proposals. If there is no new signal, reply exactly: [Observer] No new critique. Loop detected."
+                  : "LOOP FIX: 直前の批評と内容がほぼ同一です。前回から増えた情報に基づく「新しい」批評だけを書いてください。同じ提案の焼き直しは禁止。新しい指摘が無い場合は、次の1行だけを厳密に出力: [Observer] No new critique. Loop detected.";
+            const extHistory2 = [
+              ...history,
+              { role: "user", content: sendText },
+              { role: "assistant", content: finalText },
+            ];
+            const retryBody2 = buildReq(obsCfg, obsKey, extHistory2, loopFixInstr + "\n\n" + observerBridge, diff);
+            retryBody2.lang = lang;
+            retryBody2.force_tools = false;
+            try {
+              const j3 = await postJson("/api/chat", retryBody2, ac.signal);
+              const fixed2 = String((j3 && j3.content) || "");
+              if (fixed2) {
+                finalText = fixed2;
+                setMsg(threadId, asstMsg.id, fixed2, observerBodyRef);
+              }
+            } catch (_) {
+              // Keep original if retry fails.
+            }
+
+            // If retry still loops, hard-stop it instead of spamming templates.
+            const maxSim2 = (() => {
+              let s = 0;
+              for (const prev of prevObserverAssts) s = Math.max(s, similarity(prev, finalText));
+              return s;
+            })();
+            if (maxSim2 >= 0.82 && !skippable(finalText)) {
+              finalText = "[Observer] No new critique. Loop detected.";
+              setMsg(threadId, asstMsg.id, finalText, observerBodyRef);
+            }
           }
         }
       } catch (err) {

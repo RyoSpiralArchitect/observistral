@@ -193,6 +193,7 @@ pub async fn run_event_loop(
             AppEvent::Tick => {
                 app.tick_count = app.tick_count.wrapping_add(1);
                 maybe_auto_observe(app, &observer_tx).await;
+                maybe_observer_loop_retry(app, &observer_tx).await;
             }
         }
 
@@ -398,6 +399,27 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
         StreamToken::ToolCall(_) => {}
         StreamToken::Done => {
             app.observer.finish_stream();
+            // Detect repeated Observer replies and schedule a one-shot diff-only retry.
+            // This prevents the common "template critique loop" when nothing new happened.
+            if app.observer_loop_retry_budget > 0 {
+                let asst: Vec<&Message> = app.observer.messages.iter()
+                    .filter(|m| matches!(m.role, Role::Assistant) && m.complete && !m.content.trim().is_empty())
+                    .collect();
+                if asst.len() >= 2 {
+                    let last = asst[asst.len() - 1];
+                    if !crate::loop_detect::is_skippable_for_loop(&last.content) {
+                        let mut max_sim: f64 = 0.0;
+                        for prev in asst[..asst.len() - 1].iter().rev().take(4) {
+                            max_sim = max_sim.max(crate::loop_detect::similarity(&last.content, &prev.content));
+                        }
+                        let detected = last.content.trim().len() >= 180 && max_sim >= 0.80;
+                        if detected {
+                            app.observer_loop_retry_budget = app.observer_loop_retry_budget.saturating_sub(1);
+                            app.observer_loop_pending = Some(max_sim);
+                        }
+                    }
+                }
+            }
         }
         StreamToken::Error(e) => {
             app.observer.push_tool(format!("ERROR: {e}"));
@@ -484,6 +506,9 @@ async fn send_observer_message(
 
     app.observer.scroll = 0;
     app.ignore_observer_tokens = false;
+    // Each new Observer send gets a single anti-loop retry budget.
+    app.observer_loop_retry_budget = 1;
+    app.observer_loop_pending = None;
     app.observer.push_user(text.clone());
     app.observer.streaming = true;
     app.observer.messages.push(Message::new_streaming(Role::Assistant));
@@ -560,4 +585,98 @@ async fn maybe_auto_observe(app: &mut App, observer_tx: &mpsc::Sender<StreamToke
         };
         send_observer_message(app, observer_tx, Some(prompt)).await;
     }
+}
+
+async fn maybe_observer_loop_retry(app: &mut App, observer_tx: &mpsc::Sender<StreamToken>) {
+    let Some(sim) = app.observer_loop_pending.take() else { return; };
+    if app.observer.streaming { return; }
+
+    // Best-effort: abort the previous task handle (it should already be complete).
+    if let Some(handle) = app.observer_task.take() { handle.abort(); }
+
+    // Build the retry request using the already-visible history (including the repeated reply),
+    // but do not add a visible user message for the loop fix.
+    let history = app.observer.chat_history();
+    let coder_history = app.coder.chat_history();
+    let cfg = app.observer_cfg.clone();
+
+    let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
+    let lang = language_instruction(Some(&app.lang), &cfg.mode);
+    let obs_mode_prompt = mode_prompt(&cfg.mode);
+    let obs_system = format!("{obs_mode_prompt}\n\n{lang}\n\n{persona_prompt}");
+    let obs_system = obs_system.trim_end().to_string();
+    let coder_context = if !coder_history.is_empty() {
+        let snippet = coder_history
+            .iter()
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|m| {
+                format!(
+                    "[{}]: {}",
+                    m.role,
+                    m.content.chars().take(500).collect::<String>()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\n\n[Recent Coder activity]\n{snippet}")
+    } else {
+        String::new()
+    };
+
+    let system = format!("{obs_system}{coder_context}").trim_end().to_string();
+    let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
+    for m in &history { messages.push(m.clone()); }
+
+    let loop_fix = match app.lang.as_str() {
+        "fr" => format!(
+            "CORRECTION BOUCLE: Ton dernier message se répète (sim={}%). Fais une critique NOUVELLE basée UNIQUEMENT sur les informations NOUVELLES depuis le message précédent. Ne répète pas les mêmes proposals. S'il n'y a rien de nouveau, réponds exactement: [Observer] No new critique. Loop detected.",
+            (sim * 100.0).round() as i64
+        ),
+        "en" => format!(
+            "LOOP FIX: Your last message repeated the same critique (sim={}%). Write a NEW critique ONLY based on NEW information since your previous message. Do not restate the same proposals. If there is no new signal, reply exactly: [Observer] No new critique. Loop detected.",
+            (sim * 100.0).round() as i64
+        ),
+        _ => format!(
+            "LOOP FIX: 直前の批評がほぼ同一です (sim={}%)。前回から増えた情報に基づく「新しい」批評だけを書いてください。同じ提案の焼き直しは禁止。新しい指摘が無い場合は、次の1行だけを厳密に出力: [Observer] No new critique. Loop detected.",
+            (sim * 100.0).round() as i64
+        ),
+    };
+    messages.push(ChatMessage { role: "user".to_string(), content: loop_fix });
+
+    // Overwrite the last assistant message if it's the tail; otherwise append a new streaming assistant.
+    if let Some(idx) = app.observer.messages.iter().rposition(|m| matches!(m.role, Role::Assistant) && m.complete) {
+        if idx + 1 == app.observer.messages.len() {
+            if let Some(m) = app.observer.messages.get_mut(idx) {
+                m.content.clear();
+                m.complete = false;
+            }
+        } else {
+            app.observer.messages.push(Message::new_streaming(Role::Assistant));
+        }
+    } else {
+        app.observer.messages.push(Message::new_streaming(Role::Assistant));
+    }
+
+    app.observer.scroll = 0;
+    app.ignore_observer_tokens = false;
+    app.observer.streaming = true;
+
+    let tx = observer_tx.clone();
+    let handle = tokio::spawn(async move {
+        use crate::config::ProviderKind;
+        use crate::streaming::{stream_anthropic, stream_openai_compat};
+        let client = reqwest::Client::new();
+        let result = match cfg.provider {
+            ProviderKind::Anthropic => stream_anthropic(&client, &cfg, &messages, tx.clone()).await,
+            _ => stream_openai_compat(&client, &cfg, &messages, None, tx.clone()).await,
+        };
+        if let Err(e) = result {
+            let _ = tx.send(StreamToken::Error(e.to_string())).await;
+        }
+    });
+    app.observer_task = Some(handle);
 }

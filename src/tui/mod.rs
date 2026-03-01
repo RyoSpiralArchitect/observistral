@@ -10,6 +10,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::PartialConfig;
 
@@ -32,6 +33,23 @@ pub struct TuiArgs {
     pub auto_observe: bool,
 }
 
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+extern "system" {
+    fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
+    fn SetConsoleCP(wCodePageID: u32) -> i32;
+}
+
+fn default_tui_tool_root() -> String {
+    // Isolate each TUI session to avoid collisions and nested git repo disasters.
+    // Keep it relative so it stays under the user's workspace root by default.
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!(".tmp/tui_{epoch}")
+}
+
 pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
     // Resolve the Coder config from the shared partial config.
     let coder_cfg = partial_cfg.clone().resolve().context("failed to resolve coder config")?;
@@ -49,9 +67,36 @@ pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
         obs_partial.resolve().context("failed to resolve observer config")?
     };
 
-    let tool_root = args.tool_root.clone();
+    let tool_root = args.tool_root.clone().or_else(|| Some(default_tui_tool_root()));
+    if let Some(ref r) = tool_root {
+        if !r.trim().is_empty() {
+            std::fs::create_dir_all(r).context("failed to create tool_root")?;
+        }
+    }
     let auto_observe = args.auto_observe;
     let lang = args.lang.clone();
+
+    // Windows: force UTF-8 so Japanese/French and box-drawing characters don't mojibake.
+    #[cfg(target_os = "windows")]
+    unsafe {
+        const CP_UTF8: u32 = 65001;
+        let _ = SetConsoleOutputCP(CP_UTF8);
+        let _ = SetConsoleCP(CP_UTF8);
+    }
+
+    // ── Panic hook — restore terminal before printing the panic message ──────
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort restore; ignore errors (we're already panicking).
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stderr(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::event::DisableMouseCapture,
+        );
+        let _ = crossterm::execute!(std::io::stderr(), crossterm::cursor::Show);
+        default_hook(info);
+    }));
 
     // ── Terminal setup ────────────────────────────────────────────────────────
     enable_raw_mode().context("failed to enable raw mode")?;

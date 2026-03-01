@@ -21,12 +21,68 @@ pub struct ExecResult {
     pub exit_code: i32,
 }
 
+/// Check whether a command matches the dangerous-command blocklist.
+/// Returns `Some(reason)` if blocked, `None` if safe to run.
+pub fn check_dangerous_command(cmd: &str) -> Option<&'static str> {
+    let s = cmd.trim().to_ascii_lowercase();
+
+    // Unix destructive patterns
+    let unix_dangerous = [
+        ("rm -rf /", "rm -rf / would erase the entire filesystem"),
+        ("rm -rf /*", "rm -rf /* would erase the entire filesystem"),
+        ("rm -rf ~", "rm -rf ~ would erase the home directory"),
+        ("> /dev/sda", "writing to raw disk device"),
+        ("dd if=", "dd writes raw bytes to block devices"),
+        ("mkfs.", "mkfs formats a filesystem partition"),
+        (":(){ :|:& };:", "fork bomb"),
+        ("shutdown", "shutdown/reboot command"),
+        ("halt", "halt command"),
+        ("reboot", "reboot command"),
+        ("chmod -r 000 /", "removing all permissions from root"),
+        ("chown -r root /", "changing ownership of root"),
+    ];
+    for (pat, reason) in &unix_dangerous {
+        if s.contains(pat) {
+            return Some(reason);
+        }
+    }
+
+    // Windows destructive patterns
+    let win_dangerous = [
+        ("format ", "format command can erase drives"),
+        ("del /s /q c:\\", "recursive delete of C: drive"),
+        ("del /f /s /q c:\\", "recursive delete of C: drive"),
+        ("rd /s /q c:\\", "recursive remove of C: drive"),
+        ("remove-item -recurse -force c:\\", "recursive remove of C: drive"),
+        ("remove-item -recurse c:\\", "recursive remove of C: drive"),
+        ("stop-computer", "stop-computer shuts down the machine"),
+        ("restart-computer", "restart-computer reboots the machine"),
+        ("disable-computerrestore", "disabling system restore"),
+        ("clear-disk", "clear-disk erases disk contents"),
+        ("initialize-disk", "initialize-disk reformats a disk"),
+    ];
+    for (pat, reason) in &win_dangerous {
+        if s.contains(pat) {
+            return Some(reason);
+        }
+    }
+
+    None
+}
+
 /// Run a local shell command and return its combined output.
 ///
 /// On Windows, PowerShell is used. Here-strings (`@'...'@` / `@"..."@`) are
 /// handled by writing a temp `.ps1` file and invoking with `-File`, which avoids
 /// the column-0 terminator constraint when passing via `-Command`.
 pub async fn run_command(command: &str, cwd: Option<&str>) -> Result<ExecResult> {
+    if let Some(reason) = check_dangerous_command(command) {
+        return Ok(ExecResult {
+            stdout: String::new(),
+            stderr: format!("[BLOCKED] dangerous command: {reason}"),
+            exit_code: -1,
+        });
+    }
     let cmd_str = command.trim();
 
     let mut cmd = build_command(cmd_str).await?;

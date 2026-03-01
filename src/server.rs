@@ -57,6 +57,89 @@ fn read_dev_asset(rel: &str) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
+fn openai_compat_chat_urls(base_url: &str) -> Vec<String> {
+    let base = base_url.trim_end_matches('/');
+    // Codestral uses a singular endpoint: /v1/chat/completion
+    if base.contains("codestral.mistral.ai") {
+        vec![
+            format!("{base}/chat/completion"),
+            format!("{base}/chat/completions"),
+        ]
+    } else {
+        vec![
+            format!("{base}/chat/completions"),
+            format!("{base}/chat/completion"),
+        ]
+    }
+}
+
+fn should_use_v1_completions(status: reqwest::StatusCode, body: &str) -> bool {
+    let msg = body.to_ascii_lowercase();
+    if msg.contains("not a chat model") {
+        return true;
+    }
+    if status == reqwest::StatusCode::NOT_FOUND && msg.contains("v1/completions") && msg.contains("chat/complet") {
+        return true;
+    }
+    false
+}
+
+fn should_swap_to_max_completion_tokens(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST
+        && body.contains("max_completion_tokens")
+        && body.contains("max_tokens")
+}
+
+fn swap_max_tokens_to_max_completion_tokens(payload: &mut serde_json::Value) {
+    if let Some(obj) = payload.as_object_mut() {
+        if let Some(mt) = obj.remove("max_tokens") {
+            obj.insert("max_completion_tokens".to_string(), mt);
+        }
+    }
+}
+
+fn prompt_from_chat_messages(messages: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+
+    let mut sys: Vec<String> = Vec::new();
+    for m in messages {
+        if m.get("role").and_then(|x| x.as_str()) == Some("system") {
+            if let Some(s) = m.get("content").and_then(|x| x.as_str()) {
+                if !s.trim().is_empty() {
+                    sys.push(s.trim_end().to_string());
+                }
+            }
+        }
+    }
+    if !sys.is_empty() {
+        out.push_str(sys.join("\n").trim());
+        out.push_str("\n\n");
+    }
+
+    for m in messages {
+        let role = m.get("role").and_then(|x| x.as_str()).unwrap_or("");
+        if role == "system" {
+            continue;
+        }
+        let content = m.get("content").and_then(|x| x.as_str()).unwrap_or("");
+        if content.trim().is_empty() {
+            continue;
+        }
+        let label = match role {
+            "user" => "User",
+            "assistant" => "Assistant",
+            other => other,
+        };
+        out.push_str(label);
+        out.push_str(": ");
+        out.push_str(content.trim_end());
+        out.push('\n');
+    }
+
+    out.push_str("Assistant: ");
+    out
+}
+
 #[derive(Parser, Clone, Debug)]
 pub struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1")]
@@ -103,11 +186,41 @@ pub async fn run(args: ServeArgs, defaults: PartialConfig) -> Result<()> {
 struct HttpRequest {
     method: String,
     path: String,
+    /// Value of the `Origin:` header, if present.
+    origin: Option<String>,
     body: Vec<u8>,
+}
+
+/// Returns true only for origins that are the local server itself.
+/// Rejects cross-site requests from arbitrary web pages.
+fn is_localhost_origin(origin: &str) -> bool {
+    let o = origin.trim().to_ascii_lowercase();
+    o.starts_with("http://127.0.0.1")
+        || o.starts_with("http://localhost")
+        || o.starts_with("http://[::1]")
+        || o.starts_with("https://127.0.0.1")
+        || o.starts_with("https://localhost")
 }
 
 async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()> {
     let req = read_http_request(&mut stream).await?;
+
+    // Block cross-origin requests to API endpoints.
+    // Browsers include Origin for cross-site requests; if it's present and
+    // doesn't look like localhost, we reject the request outright.
+    if req.path.starts_with("/api/") {
+        if let Some(ref origin) = req.origin {
+            if !is_localhost_origin(origin) {
+                return write_text(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    "text/plain; charset=utf-8",
+                    "cross-origin requests not allowed\n",
+                ).await;
+            }
+        }
+    }
 
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => {
@@ -254,7 +367,8 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
         }
     };
 
-    let url = format!("{}/chat/completions", req.base_url.trim_end_matches('/'));
+    let base_url = req.base_url.trim_end_matches('/').to_string();
+    let messages_for_prompt = req.messages.clone();
 
     let mut payload = json!({
         "model": req.model,
@@ -270,46 +384,176 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
     }
 
     let timeout = Duration::from_secs(req.timeout_seconds.unwrap_or(120));
-    let mut http_req = state.client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .timeout(timeout)
-        .json(&payload);
+    let mut last_err: Option<String> = None;
+    let mut want_completions = false;
 
-    if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
-        http_req = http_req.bearer_auth(key);
-    }
+    let payload_cur = payload.clone();
+    let mut ok_json: Option<serde_json::Value> = None;
 
-    let resp = match http_req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            #[derive(Serialize)]
-            struct E { error: String }
-            return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+    for url in openai_compat_chat_urls(&base_url) {
+        let mut http_req = state.client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .timeout(timeout)
+            .json(&payload_cur);
+
+        if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+            http_req = http_req.bearer_auth(key);
         }
-    };
 
-    let status = resp.status();
-    let resp_text = resp.text().await.unwrap_or_default();
+        let resp = match http_req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                #[derive(Serialize)]
+                struct E { error: String }
+                return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+            }
+        };
 
-    if !status.is_success() {
+        let status = resp.status();
+        let resp_text = resp.text().await.unwrap_or_default();
+
+        if status.is_success() {
+            match serde_json::from_str(&resp_text) {
+                Ok(v) => { ok_json = Some(v); break; }
+                Err(e) => {
+                    #[derive(Serialize)]
+                    struct E { error: String }
+                    return write_json(stream, 502, "Bad Gateway",
+                        &E { error: format!("invalid JSON from API: {e}") }).await;
+                }
+            }
+        }
+
+        // Retry once with max_completion_tokens if suggested.
+        if should_swap_to_max_completion_tokens(status, &resp_text) && payload_cur.get("max_tokens").is_some() {
+            let mut payload2 = payload_cur.clone();
+            swap_max_tokens_to_max_completion_tokens(&mut payload2);
+
+            let mut http_req2 = state.client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .timeout(timeout)
+                .json(&payload2);
+            if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+                http_req2 = http_req2.bearer_auth(key);
+            }
+
+            let resp2 = match http_req2.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    #[derive(Serialize)]
+                    struct E { error: String }
+                    return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+                }
+            };
+            let status2 = resp2.status();
+            let resp_text2 = resp2.text().await.unwrap_or_default();
+            if status2.is_success() {
+                match serde_json::from_str(&resp_text2) {
+                    Ok(v) => { ok_json = Some(v); break; }
+                    Err(e) => {
+                        #[derive(Serialize)]
+                        struct E { error: String }
+                        return write_json(stream, 502, "Bad Gateway",
+                            &E { error: format!("invalid JSON from API: {e}") }).await;
+                    }
+                }
+            }
+            last_err = Some(format!("API error (HTTP {status2}): {resp_text2}"));
+            continue;
+        }
+
+        if should_use_v1_completions(status, &resp_text) {
+            want_completions = true;
+            last_err = Some(format!("API error (HTTP {status}): {resp_text}"));
+            break;
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            last_err = Some(format!("API error (HTTP {status}): {resp_text}"));
+            continue;
+        }
+
         #[derive(Serialize)]
         struct E { error: String }
         return write_json(stream, 502, "Bad Gateway",
             &E { error: format!("API error (HTTP {status}): {resp_text}") }).await;
     }
 
-    let v: serde_json::Value = match serde_json::from_str(&resp_text) {
-        Ok(v) => v,
-        Err(e) => {
-            #[derive(Serialize)]
-            struct E { error: String }
-            return write_json(stream, 502, "Bad Gateway",
-                &E { error: format!("invalid JSON from API: {e}") }).await;
+    if ok_json.is_none() && want_completions {
+        let url = format!("{}/completions", base_url);
+        let mut comp_payload = json!({
+            "model": req.model,
+            "prompt": prompt_from_chat_messages(&messages_for_prompt),
+            "temperature": req.temperature.unwrap_or(0.7),
+            "max_tokens": req.max_tokens.unwrap_or(4096),
+        });
+        let mut http_req = state.client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .timeout(timeout)
+            .json(&comp_payload);
+        if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+            http_req = http_req.bearer_auth(key);
         }
-    };
+        let resp = match http_req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                #[derive(Serialize)]
+                struct E { error: String }
+                return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+            }
+        };
+        let status = resp.status();
+        let resp_text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if should_swap_to_max_completion_tokens(status, &resp_text) && comp_payload.get("max_tokens").is_some() {
+                swap_max_tokens_to_max_completion_tokens(&mut comp_payload);
+                let mut http_req2 = state.client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .timeout(timeout)
+                    .json(&comp_payload);
+                if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+                    http_req2 = http_req2.bearer_auth(key);
+                }
+                let resp2 = match http_req2.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        #[derive(Serialize)]
+                        struct E { error: String }
+                        return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+                    }
+                };
+                let status2 = resp2.status();
+                let resp_text2 = resp2.text().await.unwrap_or_default();
+                if !status2.is_success() {
+                    #[derive(Serialize)]
+                    struct E { error: String }
+                    return write_json(stream, 502, "Bad Gateway",
+                        &E { error: format!("API error (HTTP {status2}): {resp_text2}") }).await;
+                }
+                ok_json = Some(serde_json::from_str(&resp_text2).context("invalid JSON from API")?);
+            } else {
+                #[derive(Serialize)]
+                struct E { error: String }
+                return write_json(stream, 502, "Bad Gateway",
+                    &E { error: format!("API error (HTTP {status}): {resp_text}") }).await;
+            }
+        } else {
+            ok_json = Some(serde_json::from_str(&resp_text).context("invalid JSON from API")?);
+        }
+    }
 
-    write_json(stream, 200, "OK", &v).await
+    if let Some(v) = ok_json {
+        write_json(stream, 200, "OK", &v).await
+    } else {
+        #[derive(Serialize)]
+        struct E { error: String }
+        write_json(stream, 502, "Bad Gateway",
+            &E { error: last_err.unwrap_or_else(|| "API request failed".to_string()) }).await
+    }
 }
 
 async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
@@ -337,7 +581,8 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
         }
     };
 
-    let url = format!("{}/chat/completions", req.base_url.trim_end_matches('/'));
+    let base_url = req.base_url.trim_end_matches('/').to_string();
+    let messages_for_prompt = req.messages.clone();
 
     let mut payload = json!({
         "model": req.model,
@@ -354,33 +599,162 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
     }
 
     let timeout = Duration::from_secs(req.timeout_seconds.unwrap_or(120));
-    let mut http_req = state.client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .timeout(timeout)
-        .json(&payload);
+    let mut last_err: Option<String> = None;
+    let mut want_completions = false;
+    let payload_cur = payload.clone();
+    let mut resp: Option<reqwest::Response> = None;
 
-    if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
-        http_req = http_req.bearer_auth(key);
-    }
+    for url in openai_compat_chat_urls(&base_url) {
+        let mut http_req = state.client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .timeout(timeout)
+            .json(&payload_cur);
 
-    let resp = match http_req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            #[derive(Serialize)]
-            struct E { error: String }
-            return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+        if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+            http_req = http_req.bearer_auth(key);
         }
-    };
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
+        let r = match http_req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                #[derive(Serialize)]
+                struct E { error: String }
+                return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+            }
+        };
+
+        let status = r.status();
+        if status.is_success() {
+            resp = Some(r);
+            break;
+        }
+
+        let body_text = r.text().await.unwrap_or_default();
+
+        if should_swap_to_max_completion_tokens(status, &body_text) && payload_cur.get("max_tokens").is_some() {
+            let mut payload2 = payload_cur.clone();
+            swap_max_tokens_to_max_completion_tokens(&mut payload2);
+            let mut http_req2 = state.client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .timeout(timeout)
+                .json(&payload2);
+            if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+                http_req2 = http_req2.bearer_auth(key);
+            }
+            let r2 = match http_req2.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    #[derive(Serialize)]
+                    struct E { error: String }
+                    return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+                }
+            };
+            let status2 = r2.status();
+            if status2.is_success() {
+                resp = Some(r2);
+                break;
+            }
+            let body2 = r2.text().await.unwrap_or_default();
+            last_err = Some(format!("API error (HTTP {status2}): {body2}"));
+            continue;
+        }
+
+        if should_use_v1_completions(status, &body_text) {
+            want_completions = true;
+            last_err = Some(format!("API error (HTTP {status}): {body_text}"));
+            break;
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            last_err = Some(format!("API error (HTTP {status}): {body_text}"));
+            continue;
+        }
+
         #[derive(Serialize)]
         struct E { error: String }
         return write_json(stream, 502, "Bad Gateway",
             &E { error: format!("API error (HTTP {status}): {body_text}") }).await;
     }
+
+    if resp.is_none() && want_completions {
+        let url = format!("{}/completions", base_url);
+        let mut comp_payload = json!({
+            "model": req.model,
+            "prompt": prompt_from_chat_messages(&messages_for_prompt),
+            "temperature": req.temperature.unwrap_or(0.7),
+            "max_tokens": req.max_tokens.unwrap_or(4096),
+            "stream": true,
+        });
+
+        let mut http_req = state.client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .timeout(timeout)
+            .json(&comp_payload);
+        if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+            http_req = http_req.bearer_auth(key);
+        }
+        let r = match http_req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                #[derive(Serialize)]
+                struct E { error: String }
+                return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+            }
+        };
+        let status = r.status();
+        if status.is_success() {
+            resp = Some(r);
+        } else {
+            let body_text = r.text().await.unwrap_or_default();
+            if should_swap_to_max_completion_tokens(status, &body_text) && comp_payload.get("max_tokens").is_some() {
+                swap_max_tokens_to_max_completion_tokens(&mut comp_payload);
+                let mut http_req2 = state.client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .timeout(timeout)
+                    .json(&comp_payload);
+                if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+                    http_req2 = http_req2.bearer_auth(key);
+                }
+                let r2 = match http_req2.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        #[derive(Serialize)]
+                        struct E { error: String }
+                        return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+                    }
+                };
+                let status2 = r2.status();
+                if status2.is_success() {
+                    resp = Some(r2);
+                } else {
+                    let body2 = r2.text().await.unwrap_or_default();
+                    #[derive(Serialize)]
+                    struct E { error: String }
+                    return write_json(stream, 502, "Bad Gateway",
+                        &E { error: format!("API error (HTTP {status2}): {body2}") }).await;
+                }
+            } else {
+                #[derive(Serialize)]
+                struct E { error: String }
+                return write_json(stream, 502, "Bad Gateway",
+                    &E { error: format!("API error (HTTP {status}): {body_text}") }).await;
+            }
+        }
+    }
+
+    let resp = match resp {
+        Some(r) => r,
+        None => {
+            #[derive(Serialize)]
+            struct E { error: String }
+            return write_json(stream, 502, "Bad Gateway",
+                &E { error: last_err.unwrap_or_else(|| "API request failed".to_string()) }).await;
+        }
+    };
 
     // Headers OK — switch to SSE mode.
     write_sse_header(stream, 200, "OK").await?;
@@ -436,6 +810,8 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
             // Text delta.
             let delta_text = v.pointer("/choices/0/delta/content")
                 .and_then(|x| x.as_str())
+                .or_else(|| v.pointer("/choices/0/delta/text").and_then(|x| x.as_str()))
+                .or_else(|| v.pointer("/choices/0/text").and_then(|x| x.as_str()))
                 .unwrap_or("");
             if !delta_text.is_empty() {
                 let d = serde_json::to_string(&json!({"delta": delta_text}))?;
@@ -1146,7 +1522,12 @@ fn build_chat_request(
 
 async fn write_sse_header(stream: &mut TcpStream, code: u16, reason: &str) -> Result<()> {
     let header = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 {code} {reason}\r\n\
+         Content-Type: text/event-stream; charset=utf-8\r\n\
+         Cache-Control: no-cache\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: DENY\r\n\
+         Connection: close\r\n\r\n"
     );
     stream.write_all(header.as_bytes()).await?;
     stream.flush().await?;
@@ -1161,6 +1542,7 @@ async fn write_sse_event(stream: &mut TcpStream, event: &str, data: &str) -> Res
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn stream_text_in_chunks(
     stream: &mut TcpStream,
     text: &str,
@@ -1202,8 +1584,6 @@ async fn stream_openai_compat(
         delta: &'a str,
     }
 
-    let url = format!("{}/chat/completions", cfg.base_url);
-
     let mut messages: Vec<serde_json::Value> = Vec::with_capacity(1 + history.len() + 1);
     messages.push(json!({"role":"system","content":system_text}));
     for m in history {
@@ -1213,33 +1593,128 @@ async fn stream_openai_compat(
 
     let payload = json!({
         "model": cfg.model,
-        "messages": messages,
+        "messages": messages.clone(),
         "temperature": cfg.temperature,
         "max_tokens": cfg.max_tokens,
         "stream": true,
     });
 
-    let mut req = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .timeout(Duration::from_secs(cfg.timeout_seconds))
-        .json(&payload);
-    if let Some(key) = &cfg.api_key {
-        req = req.bearer_auth(key);
+    let provider_label = match cfg.provider {
+        ProviderKind::Mistral => "Mistral",
+        _ => "OpenAI-compatible",
+    };
+
+    let base_url = cfg.base_url.trim_end_matches('/').to_string();
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut want_completions = false;
+    let mut resp: Option<reqwest::Response> = None;
+
+    for url in openai_compat_chat_urls(&base_url) {
+        let mut req = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(cfg.timeout_seconds))
+            .json(&payload);
+        if let Some(key) = &cfg.api_key {
+            req = req.bearer_auth(key);
+        }
+
+        let r = req.send().await.context("request failed")?;
+        let status = r.status();
+        if status.is_success() {
+            resp = Some(r);
+            break;
+        }
+
+        let body = r.text().await.unwrap_or_default();
+
+        if should_swap_to_max_completion_tokens(status, &body) && payload.get("max_tokens").is_some() {
+            let mut payload2 = payload.clone();
+            swap_max_tokens_to_max_completion_tokens(&mut payload2);
+
+            let mut req2 = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .timeout(Duration::from_secs(cfg.timeout_seconds))
+                .json(&payload2);
+            if let Some(key) = &cfg.api_key {
+                req2 = req2.bearer_auth(key);
+            }
+            let r2 = req2.send().await.context("request failed")?;
+            let status2 = r2.status();
+            if status2.is_success() {
+                resp = Some(r2);
+                break;
+            }
+            let body2 = r2.text().await.unwrap_or_default();
+            last_err = Some(anyhow!("{provider_label} API error (HTTP {status2})\n{body2}"));
+            continue;
+        }
+
+        if should_use_v1_completions(status, &body) {
+            want_completions = true;
+            last_err = Some(anyhow!("{provider_label} API error (HTTP {status})\n{body}"));
+            break;
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            last_err = Some(anyhow!("{provider_label} API error (HTTP {status})\n{body}"));
+            continue;
+        }
+
+        return Err(anyhow!("{provider_label} API error (HTTP {status})\n{body}"));
     }
 
-    let mut resp = req.send().await.context("request failed")?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let provider_label = match cfg.provider {
-            ProviderKind::Mistral => "Mistral",
-            _ => "OpenAI-compatible",
-        };
-        return Err(anyhow!(
-            "{provider_label} API error (HTTP {status})\n{body}"
-        ));
-    }
+    let mut resp = if let Some(r) = resp {
+        r
+    } else if want_completions {
+        let url = format!("{}/completions", base_url);
+        let mut comp_payload = json!({
+            "model": cfg.model,
+            "prompt": prompt_from_chat_messages(&messages),
+            "temperature": cfg.temperature,
+            "max_tokens": cfg.max_tokens,
+            "stream": true,
+        });
+        let mut req = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(cfg.timeout_seconds))
+            .json(&comp_payload);
+        if let Some(key) = &cfg.api_key {
+            req = req.bearer_auth(key);
+        }
+        let r = req.send().await.context("request failed")?;
+        let status = r.status();
+        if status.is_success() {
+            r
+        } else {
+            let body = r.text().await.unwrap_or_default();
+            if should_swap_to_max_completion_tokens(status, &body) && comp_payload.get("max_tokens").is_some() {
+                swap_max_tokens_to_max_completion_tokens(&mut comp_payload);
+                let mut req2 = client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .timeout(Duration::from_secs(cfg.timeout_seconds))
+                    .json(&comp_payload);
+                if let Some(key) = &cfg.api_key {
+                    req2 = req2.bearer_auth(key);
+                }
+                let r2 = req2.send().await.context("request failed")?;
+                let status2 = r2.status();
+                if status2.is_success() {
+                    r2
+                } else {
+                    let body2 = r2.text().await.unwrap_or_default();
+                    return Err(anyhow!("{provider_label} API error (HTTP {status2})\n{body2}"));
+                }
+            } else {
+                return Err(anyhow!("{provider_label} API error (HTTP {status})\n{body}"));
+            }
+        }
+    } else {
+        return Err(last_err.unwrap_or_else(|| anyhow!("{provider_label} request failed")));
+    };
 
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = resp.chunk().await? {
@@ -1282,6 +1757,7 @@ async fn stream_openai_compat(
                 .pointer("/choices/0/delta/content")
                 .and_then(|x| x.as_str())
                 .or_else(|| v.pointer("/choices/0/delta/text").and_then(|x| x.as_str()))
+                .or_else(|| v.pointer("/choices/0/text").and_then(|x| x.as_str()))
                 .unwrap_or("");
 
             if !delta.is_empty() {
@@ -1586,7 +2062,14 @@ async fn write_response(
     body: &[u8],
 ) -> Result<()> {
     let header = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nPragma: no-cache\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {reason}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-store\r\n\
+         Pragma: no-cache\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: DENY\r\n\
+         Connection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes()).await?;
@@ -1636,13 +2119,16 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         .to_string();
 
     let mut content_length: usize = 0;
+    let mut origin: Option<String> = None;
     for line in lines {
         let Some((k, v)) = line.split_once(':') else {
             continue;
         };
-        if k.trim().eq_ignore_ascii_case("content-length") {
+        let key = k.trim();
+        if key.eq_ignore_ascii_case("content-length") {
             content_length = v.trim().parse::<usize>().unwrap_or(0);
-            break;
+        } else if key.eq_ignore_ascii_case("origin") {
+            origin = Some(v.trim().to_string());
         }
     }
 
@@ -1666,7 +2152,7 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         body.truncate(content_length);
     }
 
-    Ok(HttpRequest { method, path, body })
+    Ok(HttpRequest { method, path, origin, body })
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
