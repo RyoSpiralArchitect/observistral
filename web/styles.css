@@ -697,6 +697,94 @@ body.looping .bubble.assistant {
   overflow: hidden;
 }
 
+.taskbox {
+  border-top: 1px solid var(--border);
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.10);
+  max-height: 24vh;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.task {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 14px;
+  padding: 10px;
+}
+
+.task.task-done {
+  opacity: 0.62;
+}
+
+.task-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.task-target {
+  width: 20px;
+  height: 20px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: 11px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.20);
+  color: rgba(255, 255, 255, 0.85);
+  flex: 0 0 auto;
+}
+
+.task-title {
+  font-weight: 800;
+  font-size: 12.5px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  max-width: 340px;
+}
+
+.task-phase,
+.task-prio,
+.task-status {
+  font-size: 10px;
+  font-family: var(--mono);
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.task-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+.task-body {
+  margin: 10px 0 0 0;
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(0, 0, 0, 0.35);
+  color: rgba(255, 255, 255, 0.86);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .proposalbox {
   border-top: 1px solid var(--border);
   padding: 12px;

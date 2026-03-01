@@ -3308,6 +3308,133 @@
       sendCoder(steer);
     };
 
+    const upsertTasksForThread = (threadId, items) => {
+      const incoming = Array.isArray(items) ? items : [];
+      if (!incoming.length) return;
+      setThreadState((s) => ({
+        ...s,
+        threads: s.threads.map((t) => {
+          if (t.id !== threadId) return t;
+          const existing = Array.isArray(t.tasks) ? t.tasks : [];
+          const seen = new Set(existing.map((x) => `${String(x.target || "coder")}|${normTitle(x.title || "")}`));
+          const merged = [...existing];
+          for (const it of incoming) {
+            const k = `${String(it.target || "coder")}|${normTitle(it.title || "")}`;
+            if (!k.endsWith("|") && !seen.has(k)) {
+              seen.add(k);
+              merged.push({
+                id: it.id || uid(),
+                target: it.target === "observer" ? "observer" : "coder",
+                title: String(it.title || "").trim(),
+                body: String(it.body || "").trim(),
+                phase: String(it.phase || "any").trim().toLowerCase(),
+                priority: typeof it.priority === "number" ? it.priority : null,
+                status: String(it.status || "new").trim().toLowerCase() || "new",
+                createdAt: typeof it.createdAt === "number" ? it.createdAt : Date.now(),
+              });
+            }
+          }
+          return { ...t, updatedAt: Date.now(), tasks: merged };
+        }),
+      }));
+    };
+
+    const patchTask = (threadId, taskId, patch) => {
+      if (!taskId) return;
+      setThreadState((s) => ({
+        ...s,
+        threads: s.threads.map((t) => {
+          if (t.id !== threadId) return t;
+          const tasks = Array.isArray(t.tasks) ? t.tasks : [];
+          return {
+            ...t,
+            updatedAt: Date.now(),
+            tasks: tasks.map((x) => (x && x.id === taskId ? { ...x, ...patch } : x)),
+          };
+        }),
+      }));
+    };
+
+    const dispatchTask = (task) => {
+      if (!task || !activeThread) return;
+      const threadId = activeThread.id;
+      const title = String(task.title || "").trim();
+      const body = String(task.body || "").trim();
+      const id = String(task.id || "").trim();
+      const payload = `[Task ${id}] ${title}\n\n${body}\n`;
+
+      if (String(task.target || "") === "observer") {
+        sendObserver(payload);
+      } else {
+        sendCoder(payload);
+      }
+      patchTask(threadId, id, { status: "sent" });
+    };
+
+    const markTaskDone = (task) => {
+      if (!task || !activeThread) return;
+      patchTask(activeThread.id, String(task.id || ""), { status: "done" });
+    };
+
+    const planTasksFromChat = async (userText, ctxText) => {
+      if (!activeThread) return;
+      if (planningTasks) return;
+
+      const threadId = activeThread.id;
+      const obsProvider = String(config.observerProvider || "").trim() || config.provider;
+      const obsBaseUrl = String(config.observerBaseUrl || "").trim() || config.baseUrl;
+      const obsModel = String(config.observerModel || "").trim() || (config.chatModel || config.model);
+      const obsKey = String(observerApiKey || "").trim() || String(chatApiKey || "").trim() || String(codeApiKey || "").trim();
+      if (!obsKey) return;
+
+      setPlanningTasks(true);
+      showToast(tr(lang, "planningTasks"), "info");
+
+      const langName = (lang === "fr") ? "French" : (lang === "en") ? "English" : "Japanese";
+      const routerPrompt = [
+        "You are TaskRouter for OBSTRAL (behind-the-scenes).",
+        "Return ONLY valid JSON. No markdown. No commentary.",
+        "Schema: {\"tasks\":[{\"target\":\"coder|observer\",\"title\":\"...\",\"body\":\"...\",\"phase\":\"core|feature|polish|any\",\"priority\":0-100}]}",
+        "Rules:",
+        "- Keep it minimal: 2-6 tasks total.",
+        "- coder tasks MUST be concrete (file edits, commands, checks).",
+        "- observer tasks are audit/validation tasks (risks, checks, acceptance criteria).",
+        `Write title/body in ${langName}.`,
+        "",
+        "User message:",
+        String(userText || ""),
+        ctxText ? ("\nContext:\n" + String(ctxText || "")) : "",
+      ].join("\n");
+
+      const routerCfg = {
+        ...config,
+        mode: "壁打ち",
+        cot: "off",
+        autonomy: "off",
+        provider: obsProvider,
+        baseUrl: obsBaseUrl,
+        model: obsModel,
+        chatModel: obsModel,
+        codeModel: obsModel,
+        persona: "default",
+      };
+      const req = buildReq(routerCfg, obsKey, [], routerPrompt, null);
+      req.lang = lang;
+      req.force_tools = false;
+      req.temperature = 0.2;
+      req.max_tokens = 900;
+
+      try {
+        const j = await postJson("/api/chat", req);
+        const tasks = parseTasksJson(String((j && j.content) || ""));
+        if (tasks.length) upsertTasksForThread(threadId, tasks);
+      } catch (err) {
+        showToast(prettyErr(err), "error");
+      } finally {
+        setPlanningTasks(false);
+      }
+    };
+
     const sendChat = async (overrideText) => {
       if (sendingChat) return;
       const raw = overrideText != null ? String(overrideText) : String(chatInput || "");
@@ -3330,6 +3457,7 @@
       requestAnimationFrame(() => scrollBottom(chatBodyRef));
       const history = paneMessages("chat").filter((m) => !m.streaming && m.content).map((m) => ({ role: m.role, content: m.content }));
       const ctx = config.includeCoderContext ? coderContextPacket() : "";
+      planTasksFromChat(text, ctx);
       const fullInput = ctx ? `${ctx}\n\n${text}` : text;
       const reqBody = buildReq(chatCfg, apiKey, history, fullInput, null);
       reqBody.lang = lang;
@@ -3415,6 +3543,21 @@
       };
       const coderMsgsView = filterMsgs(coderMsgs, coderFind);
       const observerMsgsView = filterMsgs(observerMsgs, observerFind);
+      const threadTasks = (activeThread && Array.isArray(activeThread.tasks)) ? activeThread.tasks : [];
+      const sortedTasks = [...threadTasks].sort((a, b) => {
+        const sa = String(a && a.status ? a.status : "new");
+        const sb = String(b && b.status ? b.status : "new");
+        if (sa !== sb) {
+          if (sa === "done") return 1;
+          if (sb === "done") return -1;
+          if (sa === "sent") return 1;
+          if (sb === "sent") return -1;
+        }
+        const pa = typeof a.priority === "number" ? a.priority : 50;
+        const pb = typeof b.priority === "number" ? b.priority : 50;
+        if (pa !== pb) return pb - pa;
+        return (a && a.createdAt ? a.createdAt : 0) - (b && b.createdAt ? b.createdAt : 0);
+      });
       const normTitle = (s) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
       const approvedProposalTitles = (() => {
         const out = new Set();
@@ -4608,6 +4751,49 @@
                     ? e("div", { className: "critical-path-banner" },
                         e("span", { className: "critical-path-icon" }, "⚠"),
                         e("span", { className: "critical-path-text" }, criticalPath)
+                      )
+                    : null,
+                  sortedTasks && sortedTasks.length
+                    ? e(
+                        "div",
+                        { className: "taskbox" },
+                        e("div", { className: "section-title", style: { margin: 0, display: "flex", alignItems: "center", gap: 10 } },
+                          tr(lang, "tasks"),
+                          planningTasks && e("span", { className: "pill", style: { marginLeft: "auto" } }, tr(lang, "planningTasks"))
+                        ),
+                        e(
+                          "div",
+                          { className: "task-list" },
+                          sortedTasks.map((t) => {
+                            const tgt = String(t.target || "coder") === "observer" ? "O" : "C";
+                            const sendLabel = tgt === "O" ? tr(lang, "sendToObserver") : tr(lang, "sendToCoder");
+                            const done = String(t.status || "") === "done";
+                            return e(
+                              "div",
+                              { key: t.id, className: "task task-" + String(t.status || "new") },
+                              e("div", { className: "task-head" },
+                                e("span", { className: "task-target", title: String(t.target || "coder") }, tgt),
+                                e("div", { className: "task-title", title: String(t.title || "") }, String(t.title || "(untitled)")),
+                                t.phase && t.phase !== "any" && e("span", { className: "task-phase" }, String(t.phase)),
+                                typeof t.priority === "number" && e("span", { className: "task-prio" }, String(t.priority) + "pt"),
+                                e("span", { className: "task-status" }, String(t.status || "new")),
+                                e("div", { className: "task-actions" },
+                                  e("button", {
+                                    className: "btn btn-primary",
+                                    disabled: done,
+                                    onClick: () => dispatchTask(t),
+                                  }, sendLabel),
+                                  e("button", {
+                                    className: "btn",
+                                    disabled: done,
+                                    onClick: () => markTaskDone(t),
+                                  }, tr(lang, "done"))
+                                )
+                              ),
+                              t.body ? e("pre", { className: "task-body" }, String(t.body || "").trim()) : null
+                            );
+                          })
+                        )
                       )
                     : null,
                   sortedProposals && sortedProposals.length
