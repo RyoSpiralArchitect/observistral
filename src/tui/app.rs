@@ -40,6 +40,8 @@ pub struct Pane {
     /// N = N lines above the bottom (user has scrolled up).
     pub scroll: usize,
     pub streaming: bool,
+    /// Optional local filter for history readability (slash command: /find).
+    pub find_query: String,
 }
 
 impl Pane {
@@ -49,6 +51,7 @@ impl Pane {
             textarea: TextArea::default(),
             scroll: 0,
             streaming: false,
+            find_query: String::new(),
         }
     }
 

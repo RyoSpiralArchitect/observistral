@@ -181,13 +181,13 @@ pub fn language_instruction(lang: Option<&str>, mode: &Mode) -> &'static str {
 
     if l.eq_ignore_ascii_case("fr") {
         if is_obs {
-            "Language: French. Write the critique in French. \
-Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).\n\
-Langue: français. Écris la critique en français. \
-Garde les clés du bloc proposals en anglais (title/to_coder/severity/score/phase/impact/cost)."
+            "Language: French. Write the critique in French. Do not write in English. \
+ Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).\n\
+ Langue: français. Écris la critique en français. N'écris pas en anglais. \
+ Garde les clés du bloc proposals en anglais (title/to_coder/severity/score/phase/impact/cost)."
         } else {
-            "Language: French. Write your response in French.\n\
-Langue: français. Réponds en français."
+            "Language: French. Write your response in French. Do not write in English.\n\
+ Langue: français. Réponds en français. N'écris pas en anglais."
         }
     } else if l.eq_ignore_ascii_case("en") {
         if is_obs {
@@ -197,13 +197,13 @@ Langue: français. Réponds en français."
         }
     } else {
         if is_obs {
-            "Language: Japanese. Write the critique in Japanese. \
-Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).\n\
-言語: 日本語。批評は日本語で書いてください。\
-proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。"
+            "Language: Japanese. Write the critique in Japanese. Do not write in English. \
+ Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).\n\
+ 言語: 日本語。批評は日本語で書いてください。英語で書かないでください。\
+ proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。"
         } else {
-            "Language: Japanese. Write your response in Japanese.\n\
-言語: 日本語。日本語で返答してください。"
+            "Language: Japanese. Write your response in Japanese. Do not write in English.\n\
+ 言語: 日本語。日本語で返答してください。英語で書かないでください。"
         }
     }
 }

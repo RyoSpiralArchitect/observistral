@@ -107,13 +107,26 @@ fn handle_slash_command(text: &str, app: &mut App, focus: Focus) -> bool {
                 push!(format!("✓ 作業ディレクトリ → {arg}"));
             }
         }
+        "/find" => {
+            let q = arg.to_string();
+            match focus {
+                Focus::Coder => app.coder.find_query = q.clone(),
+                Focus::Observer => app.observer.find_query = q.clone(),
+            }
+            if q.trim().is_empty() {
+                push!("✓ 検索フィルタ OFF".to_string());
+            } else {
+                push!(format!("✓ 検索フィルタ → {q}"));
+            }
+        }
         "/help" | "/?" => {
             push!("\
-/model <name>       モデル変更 (例: /model gpt-4o)\n\
-/persona <name>     ペルソナ (default/cynical/cheerful/thoughtful/novelist)\n\
-/temp <0.0-2.0>     温度変更\n\
-/root <path>        作業ディレクトリ変更\n\
-Ctrl+Y              最後のAI返答をクリップボードにコピー".to_string());
+ /model <name>       モデル変更 (例: /model gpt-4o)\n\
+ /persona <name>     ペルソナ (default/cynical/cheerful/thoughtful/novelist)\n\
+ /temp <0.0-2.0>     温度変更\n\
+ /root <path>        作業ディレクトリ変更\n\
+ /find <text>        履歴を検索フィルタ (空でOFF)\n\
+ Ctrl+Y              最後のAI返答をクリップボードにコピー".to_string());
         }
         _ => push!(format!("不明なコマンド: {cmd}  /help で一覧")),
     }

@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 };
 
-use super::app::{App, Focus, Role};
+use super::app::{App, Focus, Message, Role};
 
 // ── Brand palette (mirrors web UI) ────────────────────────────────────────────
 
@@ -171,6 +171,16 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
     } else {
         String::new()
     };
+    let find_badge = if !pane.find_query.trim().is_empty() {
+        let q0 = pane.find_query.trim();
+        let mut q = q0.to_string();
+        if q.chars().count() > 18 {
+            q = q.chars().take(18).collect::<String>() + "…";
+        }
+        format!(" /find:{q}")
+    } else {
+        String::new()
+    };
     let focus_dot = if focused { "◉" } else { "○" };
     let label = match which {
         Focus::Coder => "CODER",
@@ -187,6 +197,7 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
         ),
         Span::styled(spin, Style::default().fg(ACCENT)),
         Span::styled(scroll_badge, Style::default().fg(WARN)),
+        Span::styled(find_badge, Style::default().fg(MUTED)),
         Span::raw(" "),
     ]);
 
@@ -206,7 +217,26 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    for msg in &pane.messages {
+    let q = pane.find_query.trim();
+    let view: Vec<&Message> = if q.is_empty() {
+        pane.messages.iter().collect()
+    } else {
+        let ql = q.to_ascii_lowercase();
+        pane.messages
+            .iter()
+            .filter(|m| m.content.to_ascii_lowercase().contains(&ql))
+            .collect()
+    };
+
+    if view.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (一致なし)  /find <text> でフィルタ, /find で解除",
+            Style::default().fg(MUTED),
+        )));
+        lines.push(Line::default());
+    }
+
+    for msg in view {
         match msg.role {
             Role::User => {
                 lines.push(Line::from(vec![
