@@ -478,6 +478,17 @@
     };
   }
 
+  function avatarLabel(m) {
+    if (m && m.role === "user") return "U";
+    return m && m.pane === "observer" ? "O" : "C";
+  }
+
+  function whoLabel(m, lang) {
+    const L = String(lang || "ja").trim().toLowerCase();
+    if (m && m.role === "user") return L === "fr" ? "Vous" : L === "en" ? "You" : "あなた";
+    return m && m.pane === "observer" ? "Observer" : "Coder";
+  }
+
   function makeThread(title) {
     return {
       id: uid(),
@@ -1117,6 +1128,12 @@
       const co = /^\s*cost\s*:\s*(\w+)/.exec(line);
       if (co) { cur.cost = co[1]; lastKey = "cost"; continue; }
 
+      const st = /^\s*status\s*:\s*(.+)$/.exec(line);
+      if (st) { cur.status = st[1].trim(); lastKey = "status"; continue; }
+
+      const qt = /^\s*quote\s*:\s*(.+)$/.exec(line);
+      if (qt) { cur.quote = qt[1].trim(); lastKey = "quote"; continue; }
+
       // Continuation lines (indented)
       if (/^\s+/.test(line)) {
         const cont = line.trim();
@@ -1129,6 +1146,29 @@
 
     finish();
     return out;
+  }
+
+  function parseCriticalPath(text) {
+    const s = String(text || "");
+    const m = /---\s*critical_path\s*---/i.exec(s);
+    if (!m) return "";
+    const after = s.slice(m.index + m[0].length).trimStart();
+    const line = after.split(/\r?\n/)[0].trim();
+    return line.toLowerCase() === "none" || !line ? "" : line;
+  }
+
+  function parseHealthScore(text) {
+    const s = String(text || "");
+    const m = /---\s*health\s*---/i.exec(s);
+    if (!m) return null;
+    const block = s.slice(m.index + m[0].length);
+    const sc = /score\s*:\s*(\d+)/.exec(block);
+    const ra = /rationale\s*:\s*(.+)/.exec(block);
+    if (!sc) return null;
+    return {
+      score: Math.min(100, Math.max(0, parseInt(sc[1], 10))),
+      rationale: ra ? ra[1].trim() : "",
+    };
   }
 
   function parseMetaPromptOp(toCoderText) {
@@ -1708,15 +1748,15 @@
       );
       return e(
         "div",
-        { key: m.id, className: "msg" },
-        e("div", { className: "avatar" }, m.role === "user" ? "U" : "A"),
+        { key: m.id, className: "msg" + (m.role === "user" ? " msg-user" : " msg-assistant") },
+        e("div", { className: "avatar" }, avatarLabel(m)),
         e(
           "div",
           { className: "bubble " + (m.role === "user" ? "user" : "assistant") },
           e(
             "div",
             { className: "msg-meta" },
-            e("div", { className: "who" }, m.role),
+            e("div", { className: "who" }, whoLabel(m, lang)),
             m.ts ? e("span", { className: "msg-ts" }, relativeTime(m.ts, lang)) : null,
             e("div", { className: "mini" }, e("button", {
               className: copiedId === m.id ? "copied" : "",
@@ -1946,10 +1986,34 @@
 
     const runCoderAgentic = async (text, threadId, asstMsgId, reqCfg, resolvedKey, history, ac) => {
       const MAX_ITERS = 10;
+      const TRUNC_STDOUT = 2000;
+      const TRUNC_STDERR = 800;
+      const KEEP_TOOL_TURNS = 4;
+
+      const truncTool = (s, max) => {
+        const t = String(s || "").trim();
+        if (t.length <= max) return t;
+        const lines = t.split("\n").length;
+        return t.slice(0, max) + `\n[…truncated — ${lines} lines total, first ${max} chars shown]`;
+      };
+
+      const pruneToolMessages = (msgs) => {
+        const toolIdxs = msgs.reduce((acc, m, i) => m.role === "tool" ? [...acc, i] : acc, []);
+        if (toolIdxs.length <= KEEP_TOOL_TURNS) return;
+        const toPrune = toolIdxs.slice(0, toolIdxs.length - KEEP_TOOL_TURNS);
+        for (const idx of toPrune) {
+          const content = String(msgs[idx].content || "");
+          const lines = content.split("\n");
+          if (lines.length > 2) {
+            msgs[idx] = { ...msgs[idx], content: lines[0] + ` [pruned ${lines.length}L]` };
+          }
+        }
+      };
+
       const cwd = String(config.toolRoot || "").trim() || undefined;
 
       const isWindows = navigator.userAgent.includes("Windows");
-      const SYSTEM = isWindows ? [
+      const SYSTEM_BASE = isWindows ? [
         "You are an autonomous coding agent with DIRECT access to the user's Windows machine.",
         "CRITICAL RULES — follow these without exception:",
         "1. ALWAYS use the `exec` tool to create files, directories, and run commands. NEVER just show code.",
@@ -1962,7 +2026,7 @@
         "   - NEVER use mkdir -p, touch, cat >, or any Unix syntax.",
         "3. Execute ALL steps immediately via exec. Do NOT ask for permission or confirmation.",
         "4. After each exec call, read the output and continue until the task is 100% complete.",
-        "5. End with a short summary of what was created/executed.",
+        "5. End with a brief summary listing every file created/modified and any remaining steps.",
       ].join("\n") : [
         "You are an autonomous coding agent with DIRECT access to the user's local machine.",
         "CRITICAL RULES — follow these without exception:",
@@ -1974,8 +2038,38 @@
         "   - Git: git init, git add ., git commit -m 'init'",
         "3. Execute ALL steps immediately via exec. Do NOT ask for permission or confirmation.",
         "4. After each exec call, read the output and continue until the task is 100% complete.",
-        "5. End with a short summary of what was created/executed.",
+        "5. End with a brief summary listing every file created/modified and any remaining steps.",
       ].join("\n");
+
+      const SYSTEM_REASONING = [
+        "",
+        "[Planning Protocol — emit ONCE before your very first exec call]",
+        "<plan>",
+        "goal: <one sentence: what the finished task looks like when done>",
+        "steps: 1) ... 2) ... 3) ... (3-7 concrete, ordered steps)",
+        "risks: <the 2 most likely failure modes for this specific task>",
+        "assumptions: <what you are taking as given>",
+        "</plan>",
+        "",
+        "[Reasoning Protocol — emit before EVERY exec call]",
+        "<think>",
+        "goal: <≤12 words: what must succeed right now>",
+        "risk: <≤12 words: most likely failure mode>",
+        "next: <≤12 words: exact command or step>",
+        "verify: <≤12 words: how to confirm this step succeeded>",
+        "</think>",
+        "This 4-line check (~40 tokens) prevents wrong-direction errors that cost 300+ tokens to recover.",
+        "",
+        "[Error Protocol]",
+        "If exit_code ≠ 0: STOP immediately.",
+        "  1. Quote the exact error line.",
+        "  2. State root cause in one sentence.",
+        "  3. Fix with one corrected command.",
+        "If the SAME approach fails 3 consecutive times: STOP, explain why,",
+        "  and propose a completely different strategy. Never repeat a failing command.",
+      ].join("\n");
+
+      const SYSTEM = SYSTEM_BASE + SYSTEM_REASONING;
 
       const execTool = {
         type: "function",
@@ -2005,6 +2099,7 @@
 
       for (let iter = 0; iter < MAX_ITERS; iter++) {
         if (ac.signal.aborted) break;
+        pruneToolMessages(messages);
 
         let resp;
         try {
@@ -2080,8 +2175,8 @@
               }
 
               const execRes = await postJson("/api/exec", { command: commandToRun, cwd }, ac.signal);
-              const stdout = String(execRes.stdout || "").trim();
-              const stderr = String(execRes.stderr || "").trim();
+              const stdout = truncTool(execRes.stdout, TRUNC_STDOUT);
+              const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
               const exitCode = execRes.exit_code;
               const failed = exitCode !== 0 || (stderr && !stdout);
 
@@ -2305,10 +2400,10 @@
           : "";
       const outLang = String(lang || "ja").trim().toLowerCase();
       const langLine = outLang === "fr"
-        ? "Language: French. Write the critique in French. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+        ? "Langue: français. Écris la critique en français. Garde les clés du bloc proposals en anglais (title/to_coder/severity/score/phase/impact/cost)."
         : outLang === "en"
           ? "Language: English. Write the critique in English. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
-          : "Language: Japanese. Write the critique in Japanese. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).";
+          : "言語: 日本語。批評は日本語で書いてください。proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。";
       const observerBridge = [
         "[Observer bridge]",
         langLine,
@@ -2317,8 +2412,17 @@
         intensityInstr,
         "Meta ops (optional): if you propose updating OBSTRAL runtime prompts, start to_coder with one of: META_SET_CODER:, META_APPEND_CODER:, META_SET_OBSERVER:, META_APPEND_OBSERVER:.",
         "Review the coder's artifacts below. Check each dimension: CORRECTNESS, SECURITY, RELIABILITY, PERFORMANCE, MAINTAINABILITY.",
-        "Cite specific function names, data structures, or code patterns. No generic advice.",
-        "Append a proposals block with all actionable findings.",
+        "Code citation: for every warn/crit proposal, add a quote: field containing an exact function name,",
+        "  variable name, or ≤40-char code snippet from the coder's output. Use n/a only if no code is visible.",
+        "Follow-through: scan for prior proposals in the conversation.",
+        "  If addressed by the Coder: mark status: addressed.",
+        "  If still unresolved: mark status: [UNRESOLVED] and add +10 to the score.",
+        "After proposals, always append BOTH additional blocks:",
+        "--- critical_path ---",
+        "<ONE sentence: the single issue that, if unaddressed, makes all other improvements pointless. Or 'none' if no blockers.>",
+        "--- health ---",
+        "score: <0-100 integer: 0=won't run, 50=works-but-risky, 100=shippable>",
+        "rationale: <one sentence explaining the score>",
       ].filter(Boolean).join("\n");
       const sendText = config.includeCoderContext
         ? (text + "\n\n" + observerBridge + "\n\n" + coderContextPacket())
@@ -2418,6 +2522,8 @@
       }
     }
     const observerProposals = parseProposals(lastObserverAsst ? lastObserverAsst.content : "");
+    const criticalPath = parseCriticalPath(lastObserverAsst ? lastObserverAsst.content : "");
+    const healthScore = parseHealthScore(lastObserverAsst ? lastObserverAsst.content : "");
 
     // Detect current development phase from the latest Observer message that contains one.
     const observerPhase = (() => {
@@ -3441,6 +3547,12 @@
                   )
                 : observerMsgs.map(renderMessage)
             ),
+            criticalPath
+              ? e("div", { className: "critical-path-banner" },
+                  e("span", { className: "critical-path-icon" }, "⚠"),
+                  e("span", { className: "critical-path-text" }, criticalPath)
+                )
+              : null,
             sortedProposals && sortedProposals.length
               ? e(
                   "div",
@@ -3470,6 +3582,13 @@
                                 title: phaseMismatch ? `フェーズ外 (現在: ${observerPhase}、提案: ${p.phase})` : p.phase,
                               }, p.phase),
                               p.cost && e("span", { className: "cost-badge" }, p.cost),
+                              p.status && p.status !== "new" && e("span", {
+                                className: "status-badge status-" + (
+                                  p.status.includes("UNRESOLVED") ? "unresolved" :
+                                  p.status.includes("ESCALATED") ? "escalated" :
+                                  p.status === "addressed" ? "addressed" : "info"
+                                ),
+                              }, p.status),
                             ),
                             e("div", { className: "proposal-score-bar" },
                               e("div", { className: "proposal-score-fill", style: { width: score + "%", background: `linear-gradient(90deg, ${scoreColor}88, ${scoreColor})` } })
@@ -3478,6 +3597,11 @@
                               e("span", { className: "proposal-score-text" }, score + "pt"),
                               p.impact && e("span", { style: { fontSize: 11, color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, p.impact),
                             ),
+                            p.quote && p.quote !== "n/a" && e("div", {
+                              style: { fontSize: 11, fontFamily: "var(--mono)", color: "rgba(45,212,191,0.7)",
+                                       overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 2 },
+                              title: p.quote,
+                            }, "❝ " + p.quote),
                           ),
                           e("div", { className: "proposal-actions" },
                             score < 30 && e("span", { style: { fontSize: 10, color: "var(--faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap" } }, "低優先"),
@@ -3552,6 +3676,15 @@
                 },
               }),
               e("span", null, sendingObserver ? (config.stream ? tr(lang, "streaming") : tr(lang, "sending")) : tr(lang, "ready")),
+              healthScore && e("span", {
+                className: "pill health-badge",
+                style: {
+                  background: healthScore.score >= 70 ? "rgba(45,212,191,0.15)" : healthScore.score >= 40 ? "rgba(251,191,36,0.15)" : "rgba(251,113,133,0.15)",
+                  borderColor: healthScore.score >= 70 ? "rgba(45,212,191,0.5)" : healthScore.score >= 40 ? "rgba(251,191,36,0.5)" : "rgba(251,113,133,0.5)",
+                  color: healthScore.score >= 70 ? "var(--accent)" : healthScore.score >= 40 ? "#fbbf24" : "var(--warn)",
+                },
+                title: healthScore.rationale,
+              }, "❤ " + healthScore.score),
               observerMsgs.length > 0 && e(
                 "span",
                 {

@@ -124,10 +124,10 @@ OBSERVER_NOVELIST_PROMPT = (
 def _observer_lang_line(ui_lang: str) -> str:
     l = str(ui_lang or "").strip().lower()
     if l == "fr":
-        return "- Language: French.\n"
+        return "- Langue: français.\n"
     if l == "en":
         return "- Language: English.\n"
-    return "- Language: Japanese.\n"
+    return "- 言語: 日本語。\n"
 
 
 def _language_instruction(ui_lang: str) -> str:
@@ -138,8 +138,8 @@ def _language_instruction(ui_lang: str) -> str:
     l = str(ui_lang or "").strip().lower()
     if l == "fr":
         return (
-            "Language: French. Write assistant messages in French.\n"
-            "Do NOT translate tool JSON blocks or code fences.\n"
+            "Langue: français. Écris les messages de l'assistant en français.\n"
+            "Ne traduis pas les blocs JSON d'outils ni les fences de code.\n"
         )
     if l == "en":
         return (
@@ -148,8 +148,8 @@ def _language_instruction(ui_lang: str) -> str:
         )
     # Default: Japanese.
     return (
-        "Language: Japanese. Write assistant messages in Japanese.\n"
-        "Do NOT translate tool JSON blocks or code fences.\n"
+        "言語: 日本語。アシスタントのメッセージは日本語で書いてください。\n"
+        "ツールJSONブロックとコードフェンスは翻訳しないでください。\n"
     )
 
 
@@ -2274,9 +2274,12 @@ def _build_messages(req: dict[str, Any]) -> list[dict[str, str]]:
     autonomy = _autonomy_level(req)
     mode_key = mode.lower()
     meta_prompts = _load_meta_prompts()
-    if mode or persona or diff:
+    lang_raw = str(req.get("lang") or "").strip()
+    # If we have a UI language set, always include a system message so language
+    # constraints actually apply (especially important for Observer).
+    if mode or persona or diff or lang_raw:
         system_lines: list[str] = []
-        system_lines.append(_language_instruction(str(req.get("lang") or "")))
+        system_lines.append(_language_instruction(lang_raw))
         if mode:
             system_lines.append(f"Mode: {mode}")
         if persona:
@@ -2592,6 +2595,9 @@ class LiteHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
+        # Avoid stale JS/CSS during fast iterate loops (and reduce "why is it still English?" confusion).
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(payload)

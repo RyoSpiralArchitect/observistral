@@ -41,20 +41,32 @@ const WIN_SYSTEM_ADDON: &str = "\n\n[Windows execution rules]\n\
 
 /// Compact reasoning protocol injected into every agentic system prompt.
 ///
-/// Cost: ~35 tokens per iteration in the response.
+/// Cost: ~50 tokens per iteration in the response.
 /// Benefit: avoids wrong-direction mistakes that cost 300-500 tokens to correct.
-/// Each think block is exactly 3 lines; total overhead is tiny relative to
-/// the tool call results that dominate the context.
+/// The <plan> block runs once; <think> runs before every tool call.
 const SCRATCHPAD_ADDON: &str = "\n\n\
-[Reasoning Protocol — follow before every tool call]\n\
-Before issuing any exec call, emit a compact scratchpad as text:\n\
+[Planning Protocol — emit ONCE before your very first exec call]\n\
+<plan>\n\
+goal: <one sentence: what the finished task looks like when done>\n\
+steps: 1) ... 2) ... 3) ... (3-7 concrete, ordered steps)\n\
+risks: <the 2 most likely failure modes for this specific task>\n\
+assumptions: <what you are taking as given>\n\
+</plan>\n\
+\n\
+[Reasoning Protocol — emit before EVERY exec call]\n\
 <think>\n\
 goal: <≤12 words: what must succeed right now>\n\
 risk: <≤12 words: most likely failure mode>\n\
 next: <≤12 words: exact command or step>\n\
+verify: <≤12 words: how to confirm this step succeeded>\n\
 </think>\n\
-Keep each field under 15 words. This 3-line check costs ~30 tokens but prevents\n\
-wrong-direction errors that cost 300+ tokens to recover from.";
+Keep each field under 15 words. This 4-line check (~40 tokens) prevents\n\
+wrong-direction errors that cost 300+ tokens to recover from.\n\
+\n\
+[Error Protocol]\n\
+If exit_code ≠ 0: STOP. Quote the exact error. State root cause in one sentence.\n\
+Fix with one corrected command. If the SAME approach fails 3 consecutive times:\n\
+abandon it, explain why, and propose a completely different strategy.";
 
 // ── Tool definition ───────────────────────────────────────────────────────────
 

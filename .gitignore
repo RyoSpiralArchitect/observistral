@@ -33,3 +33,8 @@ __pycache__/
 .venv/
 .tmp/
 tests/_tmp/
+
+# Local scratch projects created during demos/tests (keep out of git)
+MazeGame/
+PuzzleGame/
+maze_game/

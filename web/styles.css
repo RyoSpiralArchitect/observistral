@@ -16,10 +16,10 @@
   --radius: 14px;
   --radius2: 18px;
 
-  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
-    monospace;
-  --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial,
-    "Apple Color Emoji", "Segoe UI Emoji";
+  --mono: "Cascadia Code", "Cascadia Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  --sans: "Segoe UI Variable Text", "Segoe UI", "Yu Gothic UI", "Meiryo", ui-sans-serif, system-ui,
+    -apple-system, "Apple Color Emoji", "Segoe UI Emoji";
 }
 
 * {
@@ -264,7 +264,7 @@ a {
 }
 
 .chat-body {
-  padding: 14px;
+  padding: 16px;
   overflow: auto;
   flex: 1;
   min-height: 0; /* allow flex item to shrink below content size */
@@ -276,6 +276,19 @@ a {
   gap: 12px;
   margin: 0 0 14px 0;
   align-items: start;
+}
+
+.msg.msg-user {
+  grid-template-columns: 1fr 32px;
+}
+
+.msg.msg-user .avatar {
+  grid-column: 2;
+}
+
+.msg.msg-user .bubble {
+  grid-column: 1;
+  justify-self: end;
 }
 
 .avatar {
@@ -295,7 +308,9 @@ a {
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.04);
   border-radius: 18px;
-  padding: 12px 12px 10px 12px;
+  padding: 14px 14px 12px 14px;
+  width: fit-content;
+  max-width: min(980px, 100%);
 }
 
 .bubble.user {
@@ -359,9 +374,9 @@ body.looping .bubble.assistant {
 }
 
 .content {
-  font-size: 13px;
-  line-height: 1.55;
-  color: rgba(255, 255, 255, 0.88);
+  font-size: 14px;
+  line-height: 1.7;
+  color: rgba(255, 255, 255, 0.92);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -408,8 +423,9 @@ body.looping .bubble.assistant {
   margin: 0;
   padding: 10px;
   font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.45;
+  font-size: 13px;
+  line-height: 1.55;
+  tab-size: 2;
   color: rgba(255, 255, 255, 0.86);
   overflow: auto;
 }
@@ -1005,3 +1021,44 @@ pre[class*="language-"] {
   border-color: rgba(255,255,255,0.18);
   transform: translateY(-1px);
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   REASONING QUALITY — critical path, health, status badges
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* --- critical path banner (Observer panel, above proposals) --- */
+.critical-path-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 6px 12px 2px;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: rgba(251, 113, 133, 0.10);
+  border: 1px solid rgba(251, 113, 133, 0.40);
+  font-size: 12px;
+  line-height: 1.5;
+  animation: msgIn 240ms ease forwards;
+}
+.critical-path-icon {
+  color: var(--warn);
+  flex-shrink: 0;
+  font-size: 14px;
+}
+.critical-path-text {
+  color: rgba(255,255,255,0.88);
+}
+
+/* --- proposal status badges --- */
+.status-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.status-unresolved  { background: rgba(251,191,36,0.15); border-color: rgba(251,191,36,0.45); color: #fbbf24; }
+.status-escalated   { background: rgba(251,113,133,0.15); border-color: rgba(251,113,133,0.55); color: var(--warn); }
+.status-addressed   { background: rgba(45,212,191,0.12); border-color: rgba(45,212,191,0.40); color: var(--accent); }
+.status-info        { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.12); color: var(--muted); }

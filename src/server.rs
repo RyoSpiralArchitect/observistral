@@ -143,6 +143,7 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/chat_stream") => api_chat_stream(&mut stream, state, &req.body).await,
         ("POST", "/api/exec") => api_exec(&mut stream, &req.body).await,
         ("POST", "/api/chat_tools") => api_chat_tools(&mut stream, state, &req.body).await,
+        ("POST", "/api/chat_tools_stream") => api_chat_tools_stream(&mut stream, state, &req.body).await,
         _ => {
             write_text(
                 &mut stream,
@@ -236,6 +237,176 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
     };
 
     write_json(stream, 200, "OK", &v).await
+}
+
+async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[derive(Deserialize)]
+    struct Req {
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: String,
+        base_url: String,
+        api_key: Option<String>,
+        temperature: Option<f64>,
+        max_tokens: Option<u32>,
+        timeout_seconds: Option<u64>,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            #[derive(Serialize)]
+            struct E { error: String }
+            return write_json(stream, 400, "Bad Request", &E { error: e.to_string() }).await;
+        }
+    };
+
+    let url = format!("{}/chat/completions", req.base_url.trim_end_matches('/'));
+
+    let mut payload = json!({
+        "model": req.model,
+        "messages": req.messages,
+        "temperature": req.temperature.unwrap_or(0.7),
+        "max_tokens": req.max_tokens.unwrap_or(4096),
+        "stream": true,
+    });
+
+    if let Some(tools) = &req.tools {
+        if !tools.is_empty() {
+            payload["tools"] = json!(tools);
+        }
+    }
+
+    let timeout = Duration::from_secs(req.timeout_seconds.unwrap_or(120));
+    let mut http_req = state.client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .timeout(timeout)
+        .json(&payload);
+
+    if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+        http_req = http_req.bearer_auth(key);
+    }
+
+    let resp = match http_req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            #[derive(Serialize)]
+            struct E { error: String }
+            return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        #[derive(Serialize)]
+        struct E { error: String }
+        return write_json(stream, 502, "Bad Gateway",
+            &E { error: format!("API error (HTTP {status}): {body_text}") }).await;
+    }
+
+    // Headers OK — switch to SSE mode.
+    write_sse_header(stream, 200, "OK").await?;
+
+    #[derive(Default)]
+    struct TcAcc {
+        id: String,
+        name: String,
+        arguments: String,
+    }
+
+    let mut tool_calls: HashMap<usize, TcAcc> = HashMap::new();
+    let mut finish_reason = String::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut done = false;
+
+    let mut resp = resp;
+    while let Some(chunk) = resp.chunk().await? {
+        if done { break; }
+        buf.extend_from_slice(&chunk);
+
+        while let Some(frame) = take_next_sse_frame(&mut buf) {
+            let frame_str = String::from_utf8_lossy(&frame);
+            let mut data_lines: Vec<&str> = Vec::new();
+            for line in frame_str.split('\n') {
+                let line = line.trim_end_matches('\r');
+                if line.is_empty() || line.starts_with(':') { continue; }
+                if let Some(rest) = line.strip_prefix("data:") {
+                    data_lines.push(rest.trim_start());
+                }
+            }
+            if data_lines.is_empty() { continue; }
+            let data = data_lines.join("\n");
+            if data.trim() == "[DONE]" { done = true; break; }
+
+            let v: serde_json::Value = match serde_json::from_str(&data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if let Some(err) = v.get("error") {
+                let d = serde_json::to_string(&json!({"error": err.to_string()}))?;
+                write_sse_event(stream, "error", &d).await?;
+                write_sse_event(stream, "done", "{}").await?;
+                return Ok(());
+            }
+
+            // Track finish_reason.
+            if let Some(fr) = v.pointer("/choices/0/finish_reason").and_then(|x| x.as_str()) {
+                if !fr.is_empty() { finish_reason = fr.to_string(); }
+            }
+
+            // Text delta.
+            let delta_text = v.pointer("/choices/0/delta/content")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if !delta_text.is_empty() {
+                let d = serde_json::to_string(&json!({"delta": delta_text}))?;
+                write_sse_event(stream, "delta", &d).await?;
+            }
+
+            // Tool-call delta accumulation (OpenAI streaming format).
+            if let Some(tc_arr) = v.pointer("/choices/0/delta/tool_calls").and_then(|x| x.as_array()) {
+                for tc in tc_arr {
+                    let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                    let acc = tool_calls.entry(idx).or_default();
+                    if let Some(id) = tc["id"].as_str() {
+                        if !id.is_empty() { acc.id = id.to_string(); }
+                    }
+                    if let Some(nm) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
+                        acc.name.push_str(nm);
+                    }
+                    if let Some(args) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
+                        acc.arguments.push_str(args);
+                    }
+                }
+            }
+        }
+    }
+
+    // Emit finish event with accumulated tool calls.
+    let mut tc_sorted: Vec<usize> = tool_calls.keys().copied().collect();
+    tc_sorted.sort_unstable();
+    let tc_json: Vec<serde_json::Value> = tc_sorted.iter().map(|idx| {
+        let tc = &tool_calls[idx];
+        json!({
+            "id": tc.id,
+            "type": "function",
+            "function": { "name": tc.name, "arguments": tc.arguments }
+        })
+    }).collect();
+
+    let finish_data = serde_json::to_string(&json!({
+        "finish_reason": finish_reason,
+        "tool_calls": tc_json,
+    }))?;
+    write_sse_event(stream, "finish", &finish_data).await?;
+    write_sse_event(stream, "done", "{}").await?;
+    Ok(())
 }
 
 async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
@@ -1330,7 +1501,7 @@ async fn write_response(
     body: &[u8],
 ) -> Result<()> {
     let header = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nPragma: no-cache\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes()).await?;
