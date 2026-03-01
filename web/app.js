@@ -2097,13 +2097,64 @@
         setMsg(threadId, asstMsgId, (display + (extra || "")).trim() || "…", coderBodyRef);
       };
 
+      // SSE streaming helper — streams token deltas in real-time, returns finish event.
+      const streamChatTools = async (payload, signal, onDelta) => {
+        const resp = await fetch("/api/chat_tools_stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal,
+        });
+        if (!resp.ok) {
+          const errBody = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+          throw new Error(errBody.error || `HTTP ${resp.status}`);
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let sseBuffer = "";
+        let fullText = "";
+        let finishReason = "stop";
+        let toolCalls = [];
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            sseBuffer += decoder.decode(value, { stream: true });
+            let sep;
+            while ((sep = sseBuffer.indexOf("\n\n")) !== -1) {
+              const block = sseBuffer.slice(0, sep);
+              sseBuffer = sseBuffer.slice(sep + 2);
+              let evtType = "message", evtData = "";
+              for (const line of block.split("\n")) {
+                if (line.startsWith("event: ")) evtType = line.slice(7).trim();
+                else if (line.startsWith("data: ")) evtData = line.slice(6);
+              }
+              if (evtType === "delta") {
+                try { const { delta } = JSON.parse(evtData); if (delta) { fullText += delta; onDelta(delta); } } catch (_) {}
+              } else if (evtType === "finish") {
+                try { const f = JSON.parse(evtData); finishReason = f.finish_reason || "stop"; toolCalls = f.tool_calls || []; } catch (_) {}
+              } else if (evtType === "error") {
+                let msg = "stream error";
+                try { msg = JSON.parse(evtData).error || msg; } catch (_) {}
+                throw new Error(msg);
+              }
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+        return { text: fullText, finishReason, toolCalls };
+      };
+
       for (let iter = 0; iter < MAX_ITERS; iter++) {
         if (ac.signal.aborted) break;
         pruneToolMessages(messages);
 
-        let resp;
+        let streamResult;
         try {
-          resp = await postJson("/api/chat_tools", {
+          // Separate text tokens from previous turn with a blank line.
+          if (display) display += "\n\n";
+          streamResult = await streamChatTools({
             messages,
             tools: [execTool],
             model: String(reqCfg.codeModel || reqCfg.model || ""),
@@ -2112,36 +2163,26 @@
             temperature: numOrUndef(reqCfg.temperature),
             max_tokens: numOrUndef(reqCfg.maxTokens) || 4096,
             timeout_seconds: numOrUndef(reqCfg.timeoutSeconds),
-          }, ac.signal);
+          }, ac.signal, (delta) => {
+            display += delta;
+            flush();
+          });
         } catch (err) {
-          display += (display ? "\n\n" : "") + `[error] ${err.message}`;
+          if (ac.signal.aborted) break;
+          display += `[error] ${err.message}`;
           flush();
           break;
         }
 
-        if (resp && resp.error) {
-          display += (display ? "\n\n" : "") + `[error] ${resp.error}`;
-          flush();
-          break;
-        }
+        const { text: asstText, finishReason, toolCalls: asstToolCalls } = streamResult;
 
-        const choice = resp && resp.choices && resp.choices[0];
-        if (!choice) {
-          display += (display ? "\n\n" : "") + "[error] unexpected response from API";
-          flush();
-          break;
-        }
+        // Append assistant turn to conversation history (OpenAI format).
+        const asstMsg = { role: "assistant", content: asstText || null };
+        if (asstToolCalls.length > 0) asstMsg.tool_calls = asstToolCalls;
+        messages.push(asstMsg);
 
-        const msg = choice.message;
-        messages.push(msg);
-
-        if (msg.content) {
-          display += (display ? "\n\n" : "") + msg.content;
-          flush();
-        }
-
-        if (choice.finish_reason === "tool_calls" && msg.tool_calls && msg.tool_calls.length > 0) {
-          for (const tc of msg.tool_calls) {
+        if (finishReason === "tool_calls" && asstToolCalls.length > 0) {
+          for (const tc of asstToolCalls) {
             if (ac.signal.aborted) break;
             if (tc.type !== "function" || tc.function.name !== "exec") continue;
 
