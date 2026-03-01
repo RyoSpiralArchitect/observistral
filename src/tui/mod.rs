@@ -5,6 +5,7 @@ pub mod agent;
 
 use anyhow::{Context, Result};
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -50,7 +51,8 @@ pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
     // ── Terminal setup ────────────────────────────────────────────────────────
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .context("failed to enter alternate screen")?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
@@ -62,7 +64,7 @@ pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
     // ── Restore terminal ──────────────────────────────────────────────────────
     // Always restore even if run errored.
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
     let _ = terminal.show_cursor();
 
     result

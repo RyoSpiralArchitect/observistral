@@ -1,4 +1,7 @@
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
@@ -11,6 +14,7 @@ use super::app::{App, Focus, Message, Role};
 
 pub enum AppEvent {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     CoderToken(StreamToken),
     ObserverToken(StreamToken),
     Tick,
@@ -31,7 +35,8 @@ pub async fn run_event_loop(
         let ev = tokio::select! {
             maybe_key = event_stream.next() => {
                 match maybe_key {
-                    Some(Ok(Event::Key(k))) => AppEvent::Key(k),
+                    Some(Ok(Event::Key(k)))   => AppEvent::Key(k),
+                    Some(Ok(Event::Mouse(m))) => AppEvent::Mouse(m),
                     Some(Err(e)) => return Err(e.into()),
                     _ => continue,
                 }
@@ -47,8 +52,9 @@ pub async fn run_event_loop(
                     break;
                 }
             }
-            AppEvent::CoderToken(token) => handle_coder_token(token, app),
-            AppEvent::ObserverToken(token) => handle_observer_token(token, app),
+            AppEvent::Mouse(m)                  => handle_mouse(m, app),
+            AppEvent::CoderToken(token)         => handle_coder_token(token, app),
+            AppEvent::ObserverToken(token)      => handle_observer_token(token, app),
             AppEvent::Tick => {
                 app.tick_count = app.tick_count.wrapping_add(1);
                 maybe_auto_observe(app, &observer_tx).await;
@@ -63,6 +69,55 @@ pub async fn run_event_loop(
     if let Some(t) = app.observer_task.take() { t.abort(); }
 
     Ok(())
+}
+
+// ── Mouse handler ─────────────────────────────────────────────────────────────
+
+fn handle_mouse(mouse: MouseEvent, app: &mut App) {
+    // Query terminal dimensions for hit-testing (fall back to 80×24).
+    let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+
+    // The layout produced by ui::render:
+    //   row 0-1    → header (2 rows)
+    //   row 2..h-4 → body panes
+    //   row h-3..h → input box (3 rows)
+    // Horizontal: left 55 % = Coder, right 45 % = Observer.
+    let coder_w = (term_w as u32 * 55 / 100) as u16;
+    let body_start: u16 = 2;
+    let body_end: u16 = term_h.saturating_sub(3);
+
+    match mouse.kind {
+        // Scroll wheel: scroll whichever pane the cursor is over.
+        MouseEventKind::ScrollUp => {
+            let pane = if mouse.column < coder_w {
+                &mut app.coder
+            } else {
+                &mut app.observer
+            };
+            pane.scroll = pane.scroll.saturating_add(3);
+        }
+        MouseEventKind::ScrollDown => {
+            let pane = if mouse.column < coder_w {
+                &mut app.coder
+            } else {
+                &mut app.observer
+            };
+            pane.scroll = pane.scroll.saturating_sub(3);
+        }
+
+        // Left-click in the body: focus that pane.
+        MouseEventKind::Down(MouseButton::Left) => {
+            if mouse.row >= body_start && mouse.row < body_end {
+                app.focus = if mouse.column < coder_w {
+                    Focus::Coder
+                } else {
+                    Focus::Observer
+                };
+            }
+        }
+
+        _ => {}
+    }
 }
 
 // ── Key handler ───────────────────────────────────────────────────────────────
