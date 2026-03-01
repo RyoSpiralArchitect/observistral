@@ -392,6 +392,27 @@ body.looping .bubble.assistant {
   word-break: break-word;
 }
 
+.content.content-collapsed {
+  position: relative;
+  max-height: 260px;
+  overflow: hidden;
+}
+
+.content.content-collapsed::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 64px;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    rgba(10, 15, 20, 0),
+    rgba(10, 15, 20, 0.92)
+  );
+}
+
 .thinking {
   display: inline-block;
   color: var(--faint);

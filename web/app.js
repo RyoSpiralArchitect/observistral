@@ -13,6 +13,7 @@
     config: "obstral.config.v1",
     threads: "obstral.threads.v1",
     active: "obstral.active.v1",
+    splitPct: "obstral.splitPct.v1",
   };
 
   // SECTION: i18n (filled below)
@@ -94,6 +95,18 @@
       details: "details",
       hide: "hide",
       serverOutdated: "Server outdated",
+      more: "More",
+      less: "Less",
+      shortcuts: "Keyboard shortcuts",
+      close: "Close",
+      delQ: "Delete?",
+      yes: "Yes",
+      no: "No",
+      sendMsg: "Send message",
+      newline: "New line",
+      toggleHelp: "Toggle this help",
+      closeModals: "Close modals / cancel rename",
+      stopStreamingCoder: "Stop streaming (Coder/Observer)",
     },
     ja: {
       threads: "スレッド",
@@ -166,6 +179,18 @@
       details: "詳細",
       hide: "隠す",
       serverOutdated: "サーバ古い",
+      more: "もっと見る",
+      less: "折りたたむ",
+      shortcuts: "ショートカット",
+      close: "閉じる",
+      delQ: "削除しますか？",
+      yes: "はい",
+      no: "いいえ",
+      sendMsg: "送信",
+      newline: "改行",
+      toggleHelp: "ヘルプ表示切替",
+      closeModals: "モーダルを閉じる / リネーム取消",
+      stopStreamingCoder: "ストリーミング停止（Coder/Observer）",
       insertCliTemplate: "CLIテンプレート",
       editApproval: "編集承認",
       commandApproval: "コマンド承認",
@@ -250,6 +275,18 @@
       autoObserve: "Auto-commenter",
       forceAgent: "Mode agent (toujours)",
       serverOutdated: "Serveur obsolète",
+      more: "Afficher plus",
+      less: "Réduire",
+      shortcuts: "Raccourcis clavier",
+      close: "Fermer",
+      delQ: "Supprimer ?",
+      yes: "Oui",
+      no: "Non",
+      sendMsg: "Envoyer",
+      newline: "Nouvelle ligne",
+      toggleHelp: "Afficher/masquer l'aide",
+      closeModals: "Fermer les modales / annuler le renommage",
+      stopStreamingCoder: "Arrêter le streaming (Coder/Observer)",
     },
   };
 
@@ -1310,13 +1347,20 @@
     const [loopInfo, setLoopInfo] = useState({ active: false, score: 0, depth: 0 });
     const [execResults, setExecResults] = useState({}); // { msgId: { blockIdx: {stdout,stderr,exit_code,running} } }
     const [expandedProposals, setExpandedProposals] = useState(new Set());
+    const [expandedMsgs, setExpandedMsgs] = useState(new Set());
     const [copiedId, setCopiedId] = useState(null);
     const [toasts, setToasts] = useState([]);
     const [editingThreadId, setEditingThreadId] = useState(null);
     const [editingTitle, setEditingTitle] = useState("");
     const [confirmDeleteId, setConfirmDeleteId] = useState(null);
     const [showShortcuts, setShowShortcuts] = useState(false);
-    const [splitPct, setSplitPct] = useState(55);
+    const [splitPct, setSplitPct] = useState(() => {
+      try {
+        const v = Number(localStorage.getItem(LS.splitPct));
+        if (Number.isFinite(v) && v >= 20 && v <= 80) return v;
+      } catch (_) {}
+      return 55;
+    });
     const arenaRef = useRef(null);
     const isDraggingRef = useRef(false);
 
@@ -1360,6 +1404,15 @@
         if (e.key === "?" && !["INPUT", "TEXTAREA", "SELECT"].includes(e.target.tagName)) {
           setShowShortcuts((v) => !v);
         }
+        if ((e.ctrlKey || e.metaKey) && String(e.key || "").toLowerCase() === "k") {
+          e.preventDefault();
+          try { if (abortCoderRef.current) abortCoderRef.current.abort(); } catch (_) {}
+          abortCoderRef.current = null;
+          setSendingCoder(false);
+          try { if (abortObserverRef.current) abortObserverRef.current.abort(); } catch (_) {}
+          abortObserverRef.current = null;
+          setSendingObserver(false);
+        }
         if (e.key === "Escape") {
           setShowShortcuts(false);
           setEditingThreadId(null);
@@ -1369,6 +1422,11 @@
       window.addEventListener("keydown", onKey);
       return () => window.removeEventListener("keydown", onKey);
     }, []);
+
+    // Persist pane split ratio.
+    useEffect(() => {
+      try { localStorage.setItem(LS.splitPct, String(splitPct)); } catch (_) {}
+    }, [splitPct]);
 
     const activeThread = useMemo(() => {
       return threadState.threads.find((t) => t.id === threadState.activeId) || threadState.threads[0];
@@ -1795,6 +1853,9 @@
     const renderMessage = (m) => {
       const canExec = !!(status && status.features && status.features.exec);
       const s = String(m && m.content ? m.content : "");
+      const isLong = !m.streaming && (s.length > 2600 || (s.match(/\n/g) || []).length > 40);
+      const isExpanded = expandedMsgs.has(m.id);
+      const isCollapsed = isLong && !isExpanded;
       const choices = (!m.streaming && m.role === "assistant" && m.pane !== "observer") ? extractChoices(s) : [];
       const streamingNode = e("span", null,
         s || e("span", { className: "thinking" }, tr(lang, "streaming")),
@@ -1812,14 +1873,23 @@
             { className: "msg-meta" },
             e("div", { className: "who" }, whoLabel(m, lang)),
             m.ts ? e("span", { className: "msg-ts" }, relativeTime(m.ts, lang)) : null,
-            e("div", { className: "mini" }, e("button", {
-              className: copiedId === m.id ? "copied" : "",
-              onClick: () => copyText(m.content || "", m.id),
-            }, copiedId === m.id ? "✓" : tr(lang, "copy")))
+            e("div", { className: "mini" },
+              isLong && e("button", {
+                onClick: () => setExpandedMsgs((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(m.id)) next.delete(m.id); else next.add(m.id);
+                  return next;
+                }),
+              }, isExpanded ? tr(lang, "less") : tr(lang, "more")),
+              e("button", {
+                className: copiedId === m.id ? "copied" : "",
+                onClick: () => copyText(m.content || "", m.id),
+              }, copiedId === m.id ? "✓" : tr(lang, "copy"))
+            )
           ),
           e(
             "div",
-            { className: "content" },
+            { className: "content" + (isCollapsed ? " content-collapsed" : "") },
             m.streaming ? streamingNode : renderWithThink(
               String(m.content || ""),
               execResults[m.id] || {},
@@ -2693,7 +2763,7 @@
             e("button", { className: "btn", onClick: refreshStatus, type: "button" }, tr(lang, "refresh")),
             e("button", {
               className: "btn btn-icon",
-              title: "Keyboard shortcuts (?)",
+              title: tr(lang, "shortcuts") + " (?)",
               onClick: () => setShowShortcuts((v) => !v),
               type: "button",
             }, "⌨")
@@ -2763,9 +2833,9 @@
                       ? e(
                           "div",
                           { style: { flex: 1, display: "flex", gap: 6, alignItems: "center" } },
-                          e("span", { style: { flex: 1, fontSize: 12, color: "var(--danger,#f87171)" } }, "Delete?"),
-                          e("button", { className: "btn btn-warn", style: { padding: "6px 10px" }, onClick: () => confirmDelete(t.id) }, "Yes"),
-                          e("button", { className: "btn", style: { padding: "6px 10px" }, onClick: () => setConfirmDeleteId(null) }, "No")
+                          e("span", { style: { flex: 1, fontSize: 12, color: "var(--danger,#f87171)" } }, tr(lang, "delQ")),
+                          e("button", { className: "btn btn-warn", style: { padding: "6px 10px" }, onClick: () => confirmDelete(t.id) }, tr(lang, "yes")),
+                          e("button", { className: "btn", style: { padding: "6px 10px" }, onClick: () => setConfirmDeleteId(null) }, tr(lang, "no"))
                         )
                       : e(
                           "button",
@@ -3840,19 +3910,19 @@
           "div",
           { className: "modal-box shortcuts-modal", onClick: (e) => e.stopPropagation() },
           e("div", { className: "modal-header" },
-            e("h3", null, "Keyboard shortcuts"),
-            e("button", { className: "btn btn-icon", onClick: () => setShowShortcuts(false) }, "×")
+            e("h3", null, tr(lang, "shortcuts")),
+            e("button", { className: "btn btn-icon", title: tr(lang, "close"), onClick: () => setShowShortcuts(false) }, "×")
           ),
           e(
             "table",
             { className: "shortcuts-table" },
             e("tbody", null,
               [
-                ["Enter", "Send message"],
-                ["Shift+Enter", "New line"],
-                ["?", "Toggle this help"],
-                ["Esc", "Close modals / cancel rename"],
-                ["Ctrl+K", "Stop streaming (Coder)"],
+                ["Enter", tr(lang, "sendMsg")],
+                ["Shift+Enter", tr(lang, "newline")],
+                ["?", tr(lang, "toggleHelp")],
+                ["Esc", tr(lang, "closeModals")],
+                ["Ctrl+K", tr(lang, "stopStreamingCoder")],
               ].map(([key, desc]) =>
                 e("tr", { key },
                   e("td", null, e("kbd", null, key)),
