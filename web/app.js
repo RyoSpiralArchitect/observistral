@@ -166,6 +166,12 @@
       details: "詳細",
       hide: "隠す",
       serverOutdated: "サーバ古い",
+      insertCliTemplate: "CLIテンプレート",
+      editApproval: "編集承認",
+      commandApproval: "コマンド承認",
+      pendingEdits: "保留中の編集",
+      approve: "承認",
+      reject: "却下",
     },
     fr: {
       threads: "Fils",
@@ -867,6 +873,31 @@
     );
   }
 
+  const PRISM_LANG_MAP = {
+    js: "javascript", jsx: "javascript",
+    ts: "typescript", tsx: "typescript",
+    py: "python",
+    sh: "bash", shell: "bash", zsh: "bash", console: "bash",
+    ps1: "powershell", pwsh: "powershell", ps: "powershell",
+    rs: "rust",
+    html: "markup", xml: "markup",
+  };
+
+  function hlCode(code, lang) {
+    const norm = PRISM_LANG_MAP[lang.toLowerCase()] || lang.toLowerCase();
+    const P = window.Prism;
+    if (!P) {
+      return code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+    const grammar = P.languages[norm];
+    if (!grammar) {
+      return code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+    try { return P.highlight(code, grammar, norm); } catch (_) {
+      return code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+  }
+
   function parseMarkdown(text, execRes, onRun) {
     const lines = text.split("\n");
     const out = [];
@@ -900,7 +931,10 @@
               onClick: () => navigator.clipboard && navigator.clipboard.writeText(codeText).catch(() => {}),
             }, "⎘ copy"),
           ),
-          isDiff ? renderDiffBody(codeText) : e("pre", null, codeText),
+          isDiff ? renderDiffBody(codeText) : e("pre", {
+            className: "language-" + (PRISM_LANG_MAP[lang.toLowerCase()] || lang.toLowerCase()),
+            dangerouslySetInnerHTML: { __html: hlCode(codeText, lang) },
+          }),
           res && !res.running && e("div", {
               className: "exec-result " + (res.exit_code === 0 ? "exec-ok" : "exec-err"),
             },
@@ -1237,6 +1271,13 @@
     const [execResults, setExecResults] = useState({}); // { msgId: { blockIdx: {stdout,stderr,exit_code,running} } }
     const [expandedProposals, setExpandedProposals] = useState(new Set());
     const [copiedId, setCopiedId] = useState(null);
+    const [toasts, setToasts] = useState([]);
+
+    const showToast = (msg, type = "info") => {
+      const id = Date.now() + Math.random();
+      setToasts((t) => [...t, { id, msg, type }]);
+      setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3500);
+    };
 
     const abortCoderRef = useRef(null);
     const abortObserverRef = useRef(null);
@@ -1661,9 +1702,10 @@
       const canExec = !!(status && status.features && status.features.exec);
       const s = String(m && m.content ? m.content : "");
       const choices = (!m.streaming && m.role === "assistant" && m.pane !== "observer") ? extractChoices(s) : [];
-      const streamingNode = s
-        ? s
-        : e("span", { className: "thinking" }, tr(lang, "streaming"));
+      const streamingNode = e("span", null,
+        s || e("span", { className: "thinking" }, tr(lang, "streaming")),
+        e("span", { className: "cursor-blink" }, "▊")
+      );
       return e(
         "div",
         { key: m.id, className: "msg" },
@@ -2357,10 +2399,10 @@
               : String(lang || "").trim().toLowerCase() === "en"
                 ? `Meta prompt update queued for approval: ${eid}`
                 : `メタプロンプト更新が承認待ちです: ${eid}`;
-          window.alert(msg);
+          showToast(msg, "success");
         }
       } catch (err) {
-        window.alert(prettyErr(err));
+        showToast(prettyErr(err), "error");
       } finally {
         setMetaBusy(false);
       }
@@ -3520,6 +3562,9 @@
             )
           )
         )
+      ),
+      e("div", { className: "toast-container" },
+        toasts.map((t) => e("div", { key: t.id, className: "toast toast-" + t.type }, t.msg))
       )
     );
   }
