@@ -35,6 +35,27 @@ impl OpenAICompatibleProvider {
             timeout,
         }
     }
+
+    async fn post_json(&self, url: &str, payload: &Value) -> Result<Result<Value, (StatusCode, String)>> {
+        let mut req = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .timeout(self.timeout)
+            .json(payload);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+
+        let resp = req.send().await.context("request failed")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Ok(Err((status, body)));
+        }
+        let data: Value = serde_json::from_str(&body).context("invalid JSON response")?;
+        Ok(Ok(data))
+    }
 }
 
 fn http_error(kind: &str, status: StatusCode, body: &str) -> anyhow::Error {
@@ -79,24 +100,31 @@ impl ChatProvider for OpenAICompatibleProvider {
             }
         }
 
-        let mut req = self
-            .client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .timeout(self.timeout)
-            .json(&payload);
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
-
-        let resp = req.send().await.context("request failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(http_error(self.kind_label, status, &body));
-        }
-
-        let data: Value = resp.json().await.context("invalid JSON response")?;
+        let data: Value = match self.post_json(&url, &payload).await? {
+            Ok(v) => v,
+            Err((status, body)) => {
+                // Some OpenAI models reject `max_tokens` and require `max_completion_tokens` instead.
+                if status == StatusCode::BAD_REQUEST
+                    && body.contains("max_completion_tokens")
+                    && body.contains("max_tokens")
+                    && request.max_tokens.is_some()
+                {
+                    let mut payload2 = payload.clone();
+                    if let Some(mt) = request.max_tokens {
+                        if let Value::Object(obj) = &mut payload2 {
+                            obj.remove("max_tokens");
+                            obj.insert("max_completion_tokens".to_string(), json!(mt));
+                        }
+                    }
+                    match self.post_json(&url, &payload2).await? {
+                        Ok(v2) => v2,
+                        Err((status2, body2)) => return Err(http_error(self.kind_label, status2, &body2)),
+                    }
+                } else {
+                    return Err(http_error(self.kind_label, status, &body));
+                }
+            }
+        };
         let content = data
             .pointer("/choices/0/message/content")
             .and_then(|x| x.as_str())
