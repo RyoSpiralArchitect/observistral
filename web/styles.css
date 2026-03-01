@@ -293,14 +293,14 @@ a {
 
 .msg {
   display: grid;
-  grid-template-columns: 32px 1fr;
+  grid-template-columns: 32px minmax(0, 1fr);
   gap: 12px;
   margin: 0 0 14px 0;
   align-items: start;
 }
 
 .msg.msg-user {
-  grid-template-columns: 1fr 32px;
+  grid-template-columns: minmax(0, 1fr) 32px;
 }
 
 .msg.msg-user .avatar {
@@ -333,6 +333,13 @@ a {
   width: fit-content;
   max-width: min(820px, 100%);
   min-width: 0; /* allow grid item to shrink to 1fr allocation */
+}
+
+.msg.msg-assistant .bubble {
+  /* Assistant messages (especially Observer critiques) should use the full pane width
+     for readability. `fit-content` + `word-break` can shrink bubbles too much. */
+  width: 100%;
+  max-width: 100%;
 }
 
 .bubble.user {
@@ -1200,4 +1207,102 @@ kbd {
   border: 1px solid rgba(255, 255, 255, 0.18);
   color: var(--text);
   white-space: nowrap;
+}
+
+/* --- Observer sub-tab bar --- */
+.obs-subtab-bar {
+  display: flex;
+  gap: 4px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.obs-subtab {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 3px 10px;
+  cursor: pointer;
+  transition: color 120ms, background 120ms, border-color 120ms;
+}
+.obs-subtab:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+.obs-subtab.active {
+  color: var(--text);
+  border-color: rgba(255,255,255,0.15);
+  background: rgba(255,255,255,0.08);
+}
+
+/* --- Proposal send modal --- */
+.proposal-send-modal {
+  width: min(600px, 92vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.proposal-send-textarea {
+  flex: 1;
+  min-height: 220px;
+  max-height: 55vh;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  resize: vertical;
+  overflow-y: auto;
+}
+.modal-footer {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 14px;
+  flex-shrink: 0;
+}
+
+/* --- File chips (paths extracted from Coder messages) --- */
+.file-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+.file-chip {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: background 120ms, border-color 120ms, color 120ms;
+}
+.file-chip:hover {
+  background: rgba(45, 212, 191, 0.10);
+  border-color: rgba(45, 212, 191, 0.40);
+  color: var(--accent);
+}
+
+/* --- Open button in code-head --- */
+.btn-open {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms, color 120ms;
+  font-family: var(--mono);
+}
+.btn-open:hover {
+  background: rgba(45, 212, 191, 0.10);
+  border-color: rgba(45, 212, 191, 0.45);
+  color: var(--accent);
 }

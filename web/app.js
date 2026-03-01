@@ -535,12 +535,14 @@
 
   function avatarLabel(m) {
     if (m && m.role === "user") return "U";
+    if (m && m.pane === "chat") return "A";
     return m && m.pane === "observer" ? "O" : "C";
   }
 
   function whoLabel(m, lang) {
     const L = String(lang || "ja").trim().toLowerCase();
     if (m && m.role === "user") return L === "fr" ? "Vous" : L === "en" ? "You" : "あなた";
+    if (m && m.pane === "chat") return "AI";
     return m && m.pane === "observer" ? "Observer" : "Coder";
   }
 
@@ -1042,14 +1044,20 @@
     }
   }
 
-  function parseMarkdown(text, execRes, onRun) {
+  function parseMarkdown(text, execRes, onRun, onOpen) {
     const lines = text.split("\n");
     const out = [];
     let i = 0, k = 0;
     while (i < lines.length) {
       const line = lines[i];
       if (line.startsWith("```")) {
-        const lang = line.slice(3).trim();
+        const rawLang = line.slice(3).trim();
+        // Detect optional filepath appended to lang: e.g. "python src/main.py"
+        const langParts = rawLang.split(/\s+/);
+        const lang = langParts[0];
+        const filePath = (onOpen && langParts.length >= 2 &&
+          (langParts[1].includes('/') || langParts[1].includes('\\') || langParts[1].includes('.')))
+          ? langParts.slice(1).join(' ') : null;
         const code = [];
         i++;
         while (i < lines.length && !lines[i].startsWith("```")) { code.push(lines[i]); i++; }
@@ -1064,14 +1072,19 @@
         const isDiff = /^(diff|patch)$/i.test(lang);
         out.push(e("div", { className: "code", key: k++ },
           e("div", { className: "code-head" },
-            e("span", null, lang || "code"),
+            e("span", null, filePath ? (lang + " " + filePath) : (lang || "code")),
             isRunnable && e("button", {
               className: "btn-run",
               disabled: !!(res && res.running),
               onClick: () => onRun(blockIdx, lang, codeText),
             }, res && res.running ? "⏳" : "▶ run"),
+            filePath && e("button", {
+              className: "btn-open",
+              title: filePath,
+              onClick: () => onOpen(filePath),
+            }, "📂 open"),
             e("button", {
-              style: { marginLeft: isRunnable ? "0" : "auto", background: "none", border: "none", color: "var(--muted)", cursor: "pointer", fontSize: "11px" },
+              style: { marginLeft: (isRunnable || filePath) ? "0" : "auto", background: "none", border: "none", color: "var(--muted)", cursor: "pointer", fontSize: "11px" },
               onClick: () => navigator.clipboard && navigator.clipboard.writeText(codeText).catch(() => {}),
             }, "⎘ copy"),
           ),
@@ -1138,7 +1151,7 @@
   }
 
   // Renders message content with <think>…</think> blocks dimmed separately.
-  function renderWithThink(text, execRes, onRun) {
+  function renderWithThink(text, execRes, onRun, onOpen) {
     const re = /<think>([\s\S]*?)<\/think>/gi;
     const parts = [];
     let last = 0;
@@ -1146,13 +1159,13 @@
     let m;
     while ((m = re.exec(text)) !== null) {
       if (m.index > last) {
-        parts.push(...parseMarkdown(text.slice(last, m.index), execRes, onRun));
+        parts.push(...parseMarkdown(text.slice(last, m.index), execRes, onRun, onOpen));
       }
       parts.push(e("div", { key: "think" + k++, className: "think-block" }, m[1].trim()));
       last = m.index + m[0].length;
     }
     if (last < text.length) {
-      parts.push(...parseMarkdown(text.slice(last), execRes, onRun));
+      parts.push(...parseMarkdown(text.slice(last), execRes, onRun, onOpen));
     }
     return parts;
   }
@@ -1406,6 +1419,11 @@
     const [pendingEdits, setPendingEdits] = useState([]);
     const [pendingBusy, setPendingBusy] = useState(false);
     const [metaBusy, setMetaBusy] = useState(false);
+    const [observerSubTab, setObserverSubTab] = useState("analysis"); // "analysis" | "chat"
+    const [chatInput, setChatInput] = useState("");
+    const [sendingChat, setSendingChat] = useState(false);
+    const [proposalModal, setProposalModal] = useState(null);
+    const [proposalModalText, setProposalModalText] = useState("");
 
     const [threadState, setThreadState] = useState(() => {
       let threads = safeJsonParse(localStorage.getItem(LS.threads) || "null", null);
@@ -1422,7 +1440,7 @@
                 .filter((m) => m && typeof m === "object")
                 .map((m) => ({
                   id: typeof m.id === "string" && m.id ? m.id : uid(),
-                  pane: m.pane === "observer" ? "observer" : "coder",
+                  pane: m.pane === "observer" ? "observer" : m.pane === "chat" ? "chat" : "coder",
                   role: m.role === "assistant" ? "assistant" : "user",
                   content: typeof m.content === "string" ? m.content : String(m.content || ""),
                   ts: typeof m.ts === "number" ? m.ts : Date.now(),
@@ -1475,6 +1493,8 @@
     const saveTimer = useRef(null);
     const coderBodyRef = useRef(null);
     const observerBodyRef = useRef(null);
+    const abortChatRef = useRef(null);
+    const chatBodyRef = useRef(null);
     const toolRootInitRef = useRef(false);
     const ensuredWorkdirRef = useRef({});
 
@@ -1989,8 +2009,16 @@
       }
     };
 
+    const openFile = async (path) => {
+      try {
+        const cwd = resolvedCwd(config.toolRoot, activeThread && activeThread.id);
+        await postJson("/api/open", { path, cwd });
+      } catch (_) {}
+    };
+
     const renderMessage = (m) => {
       const canExec = !!(status && status.features && status.features.exec);
+      const canOpen = !!(status && status.features && status.features.open_file);
       const s = String(m && m.content ? m.content : "");
       const isLong = !m.streaming && (s.length > 2600 || (s.match(/\n/g) || []).length > 40);
       const isExpanded = expandedMsgs.has(m.id);
@@ -2000,6 +2028,9 @@
         s || e("span", { className: "thinking" }, tr(lang, "streaming")),
         e("span", { className: "cursor-blink" }, "▊")
       );
+      // File chips: shown below completed Coder assistant messages when open_file is supported.
+      const isCoderAsst = !m.streaming && m.role === "assistant" && m.pane !== "observer" && m.pane !== "chat";
+      const fileChips = (canOpen && isCoderAsst) ? extractPathHints(s, 10) : [];
       return e(
         "div",
         { key: m.id, className: "msg" + (m.role === "user" ? " msg-user" : " msg-assistant") },
@@ -2032,7 +2063,8 @@
             m.streaming ? streamingNode : renderWithThink(
               String(m.content || ""),
               execResults[m.id] || {},
-              canExec ? ((blockIdx, langHint, codeText) => runCmd(m.id, blockIdx, langHint, codeText)) : null
+              canExec ? ((blockIdx, langHint, codeText) => runCmd(m.id, blockIdx, langHint, codeText)) : null,
+              canOpen ? openFile : null
             ),
             choices && choices.length
               ? e(
@@ -2052,7 +2084,19 @@
                   )
                 )
               : null
-          )
+          ),
+          fileChips.length ? e(
+            "div",
+            { className: "file-chips" },
+            fileChips.map((p) =>
+              e("button", {
+                key: p,
+                className: "file-chip",
+                title: p,
+                onClick: () => openFile(p),
+              }, "📂 " + p)
+            )
+          ) : null
         )
       );
     };
@@ -2123,7 +2167,8 @@
     const paneMessages = (pane) => {
       const all = (activeThread && activeThread.messages) ? activeThread.messages : [];
       if (pane === "observer") return all.filter((m) => m.pane === "observer");
-      return all.filter((m) => m.pane !== "observer");
+      if (pane === "chat") return all.filter((m) => m.pane === "chat");
+      return all.filter((m) => m.pane !== "observer" && m.pane !== "chat");
     };
 
     const finishStreaming = (threadId, msgId) => {
@@ -3078,7 +3123,9 @@
           const retryInstr =
             outLang === "fr"
               ? "LANGUAGE FIX: Rewrite the assistant's last message in French ONLY. Do not add new content. Output ONLY the rewritten text. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
-              : "LANGUAGE FIX: Rewrite the assistant's last message in Japanese ONLY. Do not add new content. Output ONLY the rewritten text. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).";
+              : outLang === "en"
+                ? "LANGUAGE FIX: Rewrite the assistant's last message in English ONLY. Do not add new content. Output ONLY the rewritten text. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+                : "LANGUAGE FIX: Rewrite the assistant's last message in Japanese ONLY. Do not add new content. Output ONLY the rewritten text. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).";
           const extHistory = [
             ...history,
             { role: "user", content: sendText },
@@ -3133,7 +3180,7 @@
 
             const loopFixInstr =
               outLang === "fr"
-                ? "LOOP FIX: Your last message repeated the same critique. Write a NEW critique ONLY based on NEW information since your previous message. Do not restate the same proposals. If there is no new signal, reply exactly: [Observer] No new critique. Loop detected."
+                ? "LOOP FIX: Ton dernier message répétait la même critique. Écris une NOUVELLE critique UNIQUEMENT à partir des informations NOUVELLES depuis ton message précédent. Ne répète pas les mêmes proposals. S'il n'y a pas de nouveau signal, réponds exactement: [Observer] No new critique. Loop detected."
                 : outLang === "en"
                   ? "LOOP FIX: Your last message repeated the same critique. Write a NEW critique ONLY based on NEW information since your previous message. Do not restate the same proposals. If there is no new signal, reply exactly: [Observer] No new critique. Loop detected."
                   : "LOOP FIX: 直前の批評と内容がほぼ同一です。前回から増えた情報に基づく「新しい」批評だけを書いてください。同じ提案の焼き直しは禁止。新しい指摘が無い場合は、次の1行だけを厳密に出力: [Observer] No new critique. Loop detected.";
@@ -3199,6 +3246,78 @@
       const sev = String(p.severity || "info").trim();
       const steer = `[Observer proposal approved]\nTitle: ${title}\nSeverity: ${sev}\n\n${to}\n`;
       sendCoder(steer);
+    };
+
+    const sendChat = async (overrideText) => {
+      if (sendingChat) return;
+      const raw = overrideText != null ? String(overrideText) : String(chatInput || "");
+      const text = raw.trim();
+      if (!text) return;
+      if (!activeThread) return;
+      const threadId = activeThread.id;
+      const apiKey = String(chatApiKey || "").trim() || String(codeApiKey || "").trim() || String(observerApiKey || "").trim();
+      const chatCfg = { ...config, mode: "壁打ち", cot: "off", autonomy: "off" };
+      const userMsg = { id: uid(), pane: "chat", role: "user", content: text, ts: Date.now() };
+      const asstMsg = { id: uid(), pane: "chat", role: "assistant", content: "", ts: Date.now(), streaming: true };
+      setThreadState((s) => ({
+        ...s,
+        threads: s.threads.map((t) =>
+          t.id === threadId ? { ...t, updatedAt: Date.now(), messages: [...(t.messages || []), userMsg, asstMsg] } : t
+        ),
+      }));
+      setChatInput("");
+      setSendingChat(true);
+      requestAnimationFrame(() => scrollBottom(chatBodyRef));
+      const history = paneMessages("chat").filter((m) => !m.streaming && m.content).map((m) => ({ role: m.role, content: m.content }));
+      const ctx = config.includeCoderContext ? coderContextPacket() : "";
+      const fullInput = ctx ? `${ctx}\n\n${text}` : text;
+      const reqBody = buildReq(chatCfg, apiKey, history, fullInput, null);
+      reqBody.lang = lang;
+      reqBody.force_tools = false;
+      const ac = new AbortController();
+      abortChatRef.current = ac;
+      try {
+        if (config.stream) {
+          await streamChat(reqBody, (evt) => {
+            if (!evt) return;
+            if (evt.event === "delta") {
+              const j = safeJsonParse(evt.data || "{}", {});
+              if (j && j.delta) appendDelta(threadId, asstMsg.id, j.delta, chatBodyRef);
+            } else if (evt.event === "error") {
+              const j = safeJsonParse(evt.data || "{}", {});
+              throw new Error(j.error || tr(lang, "error"));
+            }
+          }, ac.signal);
+          finishStreaming(threadId, asstMsg.id);
+        } else {
+          const j = await postJson("/api/chat", reqBody, ac.signal);
+          setMsg(threadId, asstMsg.id, String((j && j.content) || ""), chatBodyRef);
+        }
+      } catch (err) {
+        const msg2 = prettyErr(err);
+        if (config.stream && !ac.signal.aborted) {
+          try {
+            const j = await postJson("/api/chat", reqBody, ac.signal);
+            setMsg(threadId, asstMsg.id, String((j && j.content) || ""), chatBodyRef);
+          } catch (_) {
+            setMsg(threadId, asstMsg.id, `[${tr(lang, "error")}] ${msg2}`, chatBodyRef);
+          }
+        } else if (ac.signal.aborted) {
+          setMsg(threadId, asstMsg.id, `[${tr(lang, "stop")}]`, chatBodyRef);
+        } else {
+          setMsg(threadId, asstMsg.id, `[${tr(lang, "error")}] ${msg2}`, chatBodyRef);
+        }
+        finishStreaming(threadId, asstMsg.id);
+      } finally {
+        setSendingChat(false);
+        abortChatRef.current = null;
+      }
+    };
+
+    const stopChat = () => {
+      if (abortChatRef.current) abortChatRef.current.abort();
+      abortChatRef.current = null;
+      setSendingChat(false);
     };
 
     const applyMetaOp = async (metaOp) => {
@@ -4335,45 +4454,95 @@
                 config.autoObserve && e("span", { className: "pill auto-badge" }, "AUTO")
               )
             ),
-            e(
-              "div",
-              { className: "chat-find" },
-              e("input", {
-                className: "input",
-                value: observerFind,
-                placeholder: tr(lang, "findInThread"),
-                onChange: (ev) => setObserverFind(ev.target.value),
-                onKeyDown: (ev) => { if (ev.key === "Escape") setObserverFind(""); },
-                style: { flex: 1, padding: "8px 10px", fontSize: 12, fontFamily: "var(--mono)" },
-              }),
-              observerFind
-                ? e("button", { className: "btn btn-icon", type: "button", title: tr(lang, "clear"), onClick: () => setObserverFind("") }, "✕")
-                : null,
-              observerFind
-                ? e("span", { className: "msg-ts", style: { marginLeft: 6 } }, `${observerMsgsView.length}/${observerMsgs.length}`)
-                : null
+            e("div", { className: "obs-subtab-bar" },
+              e("button", {
+                className: "obs-subtab" + (observerSubTab === "analysis" ? " active" : ""),
+                onClick: () => setObserverSubTab("analysis"),
+              }, tr(lang, "observer")),
+              e("button", {
+                className: "obs-subtab" + (observerSubTab === "chat" ? " active" : ""),
+                onClick: () => setObserverSubTab("chat"),
+              }, tr(lang, "chat"))
             ),
-            e("div", { className: "chat-body", ref: observerBodyRef },
-              observerMsgs.length === 0
-                ? e("div", { className: "pane-empty" },
-                    e("div", { className: "pane-empty-icon" }, "👁"),
-                    e("p", { className: "pane-empty-hint" }, tr(lang, "autoObserve"))
+            observerSubTab === "chat"
+              ? e(React.Fragment, { key: "chat" },
+                  e("div", { className: "chat-body", ref: chatBodyRef },
+                    paneMessages("chat").length === 0
+                      ? e("div", { className: "pane-empty" },
+                          e("div", { className: "pane-empty-icon" }, "💬"),
+                          e("p", { className: "pane-empty-hint" },
+                            lang === "en" ? "Ask anything about the implementation"
+                            : lang === "fr" ? "Posez vos questions sur l'implémentation"
+                            : "実装について何でも聞いてください"
+                          )
+                        )
+                      : paneMessages("chat").map(renderMessage)
+                  ),
+                  e("div", { className: "composer" },
+                    e("textarea", {
+                      className: "textarea",
+                      value: chatInput,
+                      placeholder: tr(lang, "placeholder"),
+                      rows: Math.max(2, Math.min(8, (chatInput.match(/\n/g) || []).length + 1)),
+                      style: { resize: "none" },
+                      onChange: (ev) => setChatInput(ev.target.value),
+                      onKeyDown: (ev) => {
+                        if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter") { ev.preventDefault(); sendChat(); return; }
+                        if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); sendChat(); }
+                      },
+                    }),
+                    sendingChat
+                      ? e("button", { className: "btn btn-warn", onClick: stopChat }, tr(lang, "stop"))
+                      : e("button", { className: "btn btn-primary", onClick: () => sendChat() }, tr(lang, "send"))
+                  ),
+                  e("div", { className: "statusline" },
+                    e("span", { className: "dot" + (sendingChat ? " streaming" : "") }),
+                    e("span", null, sendingChat ? (config.stream ? tr(lang, "streaming") : tr(lang, "sending")) : tr(lang, "ready")),
+                    paneMessages("chat").length > 0 && e("span", {
+                      style: { marginLeft: "auto", color: "var(--faint)", fontSize: 11, fontFamily: "var(--mono)" },
+                    }, paneMessages("chat").length + " msgs")
                   )
-                : observerMsgsView.length === 0
-                  ? e("div", { className: "pane-empty" },
-                      e("div", { className: "pane-empty-icon" }, "🔎"),
-                      e("p", { className: "pane-empty-hint" }, tr(lang, "noMatches"))
-                    )
-                  : observerMsgsView.map(renderMessage)
-            ),
-            criticalPath
-              ? e("div", { className: "critical-path-banner" },
-                  e("span", { className: "critical-path-icon" }, "⚠"),
-                  e("span", { className: "critical-path-text" }, criticalPath)
                 )
-              : null,
-            sortedProposals && sortedProposals.length
-              ? e(
+              : e(React.Fragment, { key: "analysis" },
+                  e(
+                    "div",
+                    { className: "chat-find" },
+                    e("input", {
+                      className: "input",
+                      value: observerFind,
+                      placeholder: tr(lang, "findInThread"),
+                      onChange: (ev) => setObserverFind(ev.target.value),
+                      onKeyDown: (ev) => { if (ev.key === "Escape") setObserverFind(""); },
+                      style: { flex: 1, padding: "8px 10px", fontSize: 12, fontFamily: "var(--mono)" },
+                    }),
+                    observerFind
+                      ? e("button", { className: "btn btn-icon", type: "button", title: tr(lang, "clear"), onClick: () => setObserverFind("") }, "✕")
+                      : null,
+                    observerFind
+                      ? e("span", { className: "msg-ts", style: { marginLeft: 6 } }, `${observerMsgsView.length}/${observerMsgs.length}`)
+                      : null
+                  ),
+                  e("div", { className: "chat-body", ref: observerBodyRef },
+                    observerMsgs.length === 0
+                      ? e("div", { className: "pane-empty" },
+                          e("div", { className: "pane-empty-icon" }, "👁"),
+                          e("p", { className: "pane-empty-hint" }, tr(lang, "autoObserve"))
+                        )
+                      : observerMsgsView.length === 0
+                        ? e("div", { className: "pane-empty" },
+                            e("div", { className: "pane-empty-icon" }, "🔎"),
+                            e("p", { className: "pane-empty-hint" }, tr(lang, "noMatches"))
+                          )
+                        : observerMsgsView.map(renderMessage)
+                  ),
+                  criticalPath
+                    ? e("div", { className: "critical-path-banner" },
+                        e("span", { className: "critical-path-icon" }, "⚠"),
+                        e("span", { className: "critical-path-text" }, criticalPath)
+                      )
+                    : null,
+                  sortedProposals && sortedProposals.length
+                    ? e(
                   "div",
                   { className: "proposalbox" },
                   e("div", { className: "section-title", style: { margin: 0 } }, tr(lang, "proposals")),
@@ -4438,7 +4607,8 @@
                               onClick: () => {
                                 if (alreadyApproved) { showToast(tr(lang, "alreadyApproved"), "info"); return; }
                                 if (phaseMismatch && !confirmPhaseMismatch(lang, observerPhase, p.phase)) return;
-                                sendProposalToCoder(p);
+                                setProposalModal(p);
+                                setProposalModalText(String(p.toCoder || "").trim());
                               },
                               title: alreadyApproved
                                 ? tr(lang, "alreadyApproved")
@@ -4465,66 +4635,104 @@
                     })
                   )
                 )
-              : null,
-            e(
-              "div",
-              { className: "composer" },
-              e("textarea", {
-                className: "textarea",
-                value: observerInput,
-                placeholder: tr(lang, "placeholder"),
-                rows: Math.max(2, Math.min(8, (observerInput.match(/\n/g) || []).length + 1)),
-                style: { resize: "none" },
-                onChange: (ev) => setObserverInput(ev.target.value),
-                onKeyDown: (ev) => {
-                  if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter") {
-                    ev.preventDefault();
-                    sendObserver();
-                    return;
-                  }
-                  if (ev.key === "Enter" && !ev.shiftKey) {
-                    ev.preventDefault();
-                    sendObserver();
-                  }
-                },
-              }),
-              sendingObserver
-                ? e("button", { className: "btn btn-warn", onClick: stopObserver }, tr(lang, "stop"))
-                : e("button", { className: "btn btn-primary", onClick: sendObserver }, tr(lang, "send"))
-            ),
-            e(
-              "div",
-              { className: "statusline" },
-              e("span", {
-                className: "dot" + (sendingObserver ? " streaming" : ""),
-                style: {
-                  background: PROVIDER_COLORS[observerResolvedProvider()] || (sendingObserver ? "rgba(251, 191, 36, 0.95)" : "rgba(251, 191, 36, 0.85)"),
-                  transition: "background 400ms ease",
-                },
-              }),
-              e("span", null, sendingObserver ? (config.stream ? tr(lang, "streaming") : tr(lang, "sending")) : tr(lang, "ready")),
-              healthScore && e("span", {
-                className: "pill health-badge",
-                style: {
-                  background: healthScore.score >= 70 ? "rgba(45,212,191,0.15)" : healthScore.score >= 40 ? "rgba(251,191,36,0.15)" : "rgba(251,113,133,0.15)",
-                  borderColor: healthScore.score >= 70 ? "rgba(45,212,191,0.5)" : healthScore.score >= 40 ? "rgba(251,191,36,0.5)" : "rgba(251,113,133,0.5)",
-                  color: healthScore.score >= 70 ? "var(--accent)" : healthScore.score >= 40 ? "#fbbf24" : "var(--warn)",
-                },
-                title: healthScore.rationale,
-              }, "❤ " + healthScore.score),
-              observerMsgs.length > 0 && e(
-                "span",
-                {
-                  style: { marginLeft: "auto", color: "var(--faint)", fontSize: 11, fontFamily: "var(--mono)" },
-                },
-                "~" + observerMsgs.reduce((s, m) => s + estimateTokens(m.content), 0) + " tokens · " + observerMsgs.length + " msgs"
-              )
-            )
+                  : null,
+                  e(
+                    "div",
+                    { className: "composer" },
+                    e("textarea", {
+                      className: "textarea",
+                      value: observerInput,
+                      placeholder: tr(lang, "placeholder"),
+                      rows: Math.max(2, Math.min(8, (observerInput.match(/\n/g) || []).length + 1)),
+                      style: { resize: "none" },
+                      onChange: (ev) => setObserverInput(ev.target.value),
+                      onKeyDown: (ev) => {
+                        if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter") {
+                          ev.preventDefault();
+                          sendObserver();
+                          return;
+                        }
+                        if (ev.key === "Enter" && !ev.shiftKey) {
+                          ev.preventDefault();
+                          sendObserver();
+                        }
+                      },
+                    }),
+                    sendingObserver
+                      ? e("button", { className: "btn btn-warn", onClick: stopObserver }, tr(lang, "stop"))
+                      : e("button", { className: "btn btn-primary", onClick: sendObserver }, tr(lang, "send"))
+                  ),
+                  e(
+                    "div",
+                    { className: "statusline" },
+                    e("span", {
+                      className: "dot" + (sendingObserver ? " streaming" : ""),
+                      style: {
+                        background: PROVIDER_COLORS[observerResolvedProvider()] || (sendingObserver ? "rgba(251, 191, 36, 0.95)" : "rgba(251, 191, 36, 0.85)"),
+                        transition: "background 400ms ease",
+                      },
+                    }),
+                    e("span", null, sendingObserver ? (config.stream ? tr(lang, "streaming") : tr(lang, "sending")) : tr(lang, "ready")),
+                    healthScore && e("span", {
+                      className: "pill health-badge",
+                      style: {
+                        background: healthScore.score >= 70 ? "rgba(45,212,191,0.15)" : healthScore.score >= 40 ? "rgba(251,191,36,0.15)" : "rgba(251,113,133,0.15)",
+                        borderColor: healthScore.score >= 70 ? "rgba(45,212,191,0.5)" : healthScore.score >= 40 ? "rgba(251,191,36,0.5)" : "rgba(251,113,133,0.5)",
+                        color: healthScore.score >= 70 ? "var(--accent)" : healthScore.score >= 40 ? "#fbbf24" : "var(--warn)",
+                      },
+                      title: healthScore.rationale,
+                    }, "❤ " + healthScore.score),
+                    observerMsgs.length > 0 && e(
+                      "span",
+                      { style: { marginLeft: "auto", color: "var(--faint)", fontSize: 11, fontFamily: "var(--mono)" } },
+                      "~" + observerMsgs.reduce((s, m) => s + estimateTokens(m.content), 0) + " tokens · " + observerMsgs.length + " msgs"
+                    )
+                  )
+                ) // analysis Fragment
           )
         )
       ),
       e("div", { className: "toast-container" },
         toasts.map((t) => e("div", { key: t.id, className: "toast toast-" + t.type }, t.msg))
+      ),
+
+      // Proposal send modal
+      proposalModal && e(
+        "div",
+        { className: "modal-overlay", onClick: () => setProposalModal(null) },
+        e(
+          "div",
+          { className: "modal-box proposal-send-modal", onClick: (ev) => ev.stopPropagation() },
+          e("div", { className: "modal-header" },
+            e("div", { style: { display: "flex", flexDirection: "column", gap: 3 } },
+              e("h3", null, String(proposalModal.title || "")),
+              e("span", { style: { fontSize: 11, fontFamily: "var(--mono)", color: "var(--muted)" } },
+                `[${String(proposalModal.severity || "info")}]` +
+                (proposalModal.score != null ? ` · ${proposalModal.score}pt` : "")
+              )
+            ),
+            e("button", { className: "btn btn-icon", title: tr(lang, "close"), onClick: () => setProposalModal(null) }, "×")
+          ),
+          e("textarea", {
+            className: "textarea proposal-send-textarea",
+            value: proposalModalText,
+            onChange: (ev) => setProposalModalText(ev.target.value),
+            spellCheck: false,
+          }),
+          e("div", { className: "modal-footer" },
+            e("button", { className: "btn", onClick: () => setProposalModal(null) }, tr(lang, "close")),
+            e("button", {
+              className: "btn btn-primary",
+              disabled: !proposalModalText.trim() || sendingCoder,
+              onClick: () => {
+                const to = proposalModalText.trim();
+                if (!to) return;
+                sendProposalToCoder({ ...proposalModal, toCoder: to });
+                setProposalModal(null);
+              },
+            }, tr(lang, "sendToCoder"))
+          )
+        )
       ),
 
       // Keyboard shortcuts modal

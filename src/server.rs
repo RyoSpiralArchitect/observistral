@@ -328,6 +328,7 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/chat") => api_chat(&mut stream, state, &req.body).await,
         ("POST", "/api/chat_stream") => api_chat_stream(&mut stream, state, &req.body).await,
         ("POST", "/api/exec") => api_exec(&mut stream, &req.body).await,
+        ("POST", "/api/open") => api_open(&mut stream, &req.body).await,
         ("POST", "/api/chat_tools") => api_chat_tools(&mut stream, state, &req.body).await,
         ("POST", "/api/chat_tools_stream") => api_chat_tools_stream(&mut stream, state, &req.body).await,
         _ => {
@@ -986,6 +987,54 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     }).await
 }
 
+async fn api_open(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req { path: String, cwd: Option<String> }
+    #[derive(Serialize)]
+    struct Res { ok: bool }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => return write_json(stream, 400, "Bad Request",
+            &ApiError { error: "invalid JSON".into() }).await,
+    };
+
+    let target = req.path.trim().to_string();
+    if target.is_empty() {
+        return write_json(stream, 400, "Bad Request",
+            &ApiError { error: "path is required".into() }).await;
+    }
+
+    // Resolve relative paths against cwd.
+    let resolved = if let Some(cwd) = req.cwd.as_deref().filter(|s| !s.trim().is_empty()) {
+        let t = Path::new(&target);
+        if t.is_absolute() {
+            target.clone()
+        } else {
+            Path::new(cwd).join(t).to_string_lossy().into_owned()
+        }
+    } else {
+        target.clone()
+    };
+
+    #[cfg(target_os = "windows")]
+    let spawn_result = Command::new("cmd")
+        .args(["/c", "start", "", &resolved])
+        .spawn();
+
+    #[cfg(target_os = "macos")]
+    let spawn_result = Command::new("open").arg(&resolved).spawn();
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let spawn_result = Command::new("xdg-open").arg(&resolved).spawn();
+
+    match spawn_result {
+        Ok(_) => write_json(stream, 200, "OK", &Res { ok: true }).await,
+        Err(err) => write_json(stream, 500, "Internal Server Error",
+            &ApiError { error: err.to_string() }).await,
+    }
+}
+
 async fn api_status(stream: &mut TcpStream) -> Result<()> {
     fn env_present(key: &str) -> bool {
         std::env::var(key)
@@ -1013,7 +1062,7 @@ async fn api_status(stream: &mut TcpStream) -> Result<()> {
                 api_key_present: env_present("OBS_API_KEY") || env_present("OPENAI_API_KEY"),
             },
         },
-        features: ApiFeatures { exec: true, chat_tools: true },
+        features: ApiFeatures { exec: true, chat_tools: true, open_file: true },
         workspace_root,
     };
 
@@ -1405,6 +1454,7 @@ struct ApiStatusResponse {
 struct ApiFeatures {
     exec: bool,
     chat_tools: bool,
+    open_file: bool,
 }
 
 #[derive(Serialize)]
