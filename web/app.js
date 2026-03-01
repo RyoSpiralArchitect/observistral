@@ -883,7 +883,11 @@
 
     const isBash = /^(bash|sh|shell|zsh|console)$/.test(l);
     const isPwsh = /^(powershell|pwsh|ps1|ps)$/.test(l);
-    if (isPwsh) return cleaned;
+    if (isPwsh) {
+      // Windows PowerShell 5.x doesn't support `&&` — treat as bash-ish and split.
+      if (cleaned.indexOf("&&") !== -1) return bashToPowerShell(cleaned);
+      return cleaned;
+    }
     if (isBash) return bashToPowerShell(cleaned);
 
     // Tool logs often use ```bash``` even on Windows.
@@ -2164,10 +2168,44 @@
       };
 
       const cwd = String(config.toolRoot || "").trim() || undefined;
+      const cwdLabel = cwd ? String(cwd) : "(workspace root)";
+
+      // UI-side loop breaker: if the model repeats the exact same failing command,
+      // block it and force a different strategy.
+      const cmdStats = new Map(); // key -> { attempts, fails, lastErr }
+      const cmdKey = (cmd) => String(cmd || "").toLowerCase().replace(/\s+/g, " ").trim();
+      const cmdSig = (stderr, stdout) => {
+        const s = String(stderr || "") || String(stdout || "");
+        const first = (s.split("\n")[0] || "").trim();
+        return first.slice(0, 180);
+      };
+      const blockedByRepeatFailure = (k) => {
+        const st = cmdStats.get(k);
+        if (!st) return "";
+        if ((st.fails || 0) >= 2) {
+          const why = st.lastErr ? ` last_error: ${st.lastErr}` : "";
+          return `repeated failure (${st.fails}x).${why}`;
+        }
+        return "";
+      };
+      const noteCmd = (k, failed, sig) => {
+        const st = cmdStats.get(k) || { attempts: 0, fails: 0, lastErr: "" };
+        st.attempts++;
+        if (failed) {
+          st.fails++;
+          if (sig) st.lastErr = sig;
+        } else {
+          st.fails = 0;
+          st.lastErr = "";
+        }
+        cmdStats.set(k, st);
+        return st;
+      };
 
       const isWindows = navigator.userAgent.includes("Windows");
       const SYSTEM_BASE = isWindows ? [
         "You are an autonomous coding agent with DIRECT access to the user's Windows machine.",
+        `Working directory (tool_root): ${cwdLabel}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "1. ALWAYS use the `exec` tool to create files, directories, and run commands. NEVER just show code.",
         "   Fallback (if tool calls are not supported): output ONE ```powershell``` code block containing ONLY commands (no `$ ` or `PS>` prompts).",
@@ -2183,6 +2221,7 @@
         "5. End with a brief summary listing every file created/modified and any remaining steps.",
       ].join("\n") : [
         "You are an autonomous coding agent with DIRECT access to the user's local machine.",
+        `Working directory (tool_root): ${cwdLabel}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "1. ALWAYS use the `exec` tool to create files, directories, and run commands. NEVER just show code.",
         "   Fallback (if tool calls are not supported): output ONE ```bash``` code block containing ONLY commands (no `$ ` prompts).",
@@ -2364,6 +2403,8 @@
             try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
             const command = stripShellTranscript(String(args.command || ""));
             const commandToRun = normalizeExecScript("", command);
+            const k = cmdKey(commandToRun);
+            const repeatBlock = blockedByRepeatFailure(k);
             const danger = dangerousCommandReason(commandToRun);
 
             const win = isWindowsHost();
@@ -2374,6 +2415,13 @@
 
             let toolResult;
             try {
+              if (repeatBlock) {
+                toolResult = `error: blocked repeated failing command (${repeatBlock}). You MUST choose a different command/strategy.`;
+                display += `\n(blocked: ${repeatBlock})\n\`\`\`\nexit: -1`;
+                flush();
+                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                continue;
+              }
               if (danger) {
                 toolResult = `error: blocked dangerous command (${danger}). Ask the user to run it manually if truly intended.`;
                 display += `\n(blocked: ${danger})\n\`\`\`\nexit: -1`;
@@ -2394,6 +2442,7 @@
               const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
               const exitCode = execRes.exit_code;
               const failed = exitCode !== 0 || (stderr && !stdout);
+              noteCmd(k, failed, cmdSig(stderr, stdout));
 
               toolResult = failed
                 ? `FAILED (exit_code: ${exitCode}).\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}\n⚠ The command failed. Diagnose the error above and call exec again with the fix. Do NOT continue to the next step until this succeeds.`
@@ -2403,6 +2452,7 @@
               if (stderr) display += "\nstderr: " + stderr;
               display += "\n```\nexit: " + exitCode;
             } catch (execErr) {
+              noteCmd(k, true, cmdSig(execErr.message || "", ""));
               toolResult = `error: ${execErr.message}`;
               display += "\nerror: " + execErr.message + "\n```";
             }
@@ -2421,6 +2471,8 @@
             const command = stripShellTranscript(String(im.script || ""));
             if (!command) continue;
             const commandToRun = normalizeExecScript(im.langHint, command);
+            const k = cmdKey(commandToRun);
+            const repeatBlock = blockedByRepeatFailure(k);
             const danger = dangerousCommandReason(commandToRun);
             const win = isWindowsHost();
             const fenceLang = win ? "powershell" : "bash";
@@ -2431,6 +2483,13 @@
 
             let resultText;
             try {
+              if (repeatBlock) {
+                resultText = `error: blocked repeated failing command (${repeatBlock}). You MUST choose a different command/strategy.`;
+                display += `\n(blocked: ${repeatBlock})\n\`\`\`\nexit: -1`;
+                flush();
+                messages.push({ role: "user", content: `[exec blocked repeated-failure]\n${repeatBlock}\ncommand:\n${commandToRun}` });
+                break;
+              }
               if (danger) {
                 resultText = `error: blocked dangerous command (${danger}). Ask the user to run it manually if truly intended.`;
                 display += `\n(blocked: ${danger})\n\`\`\`\nexit: -1`;
@@ -2451,6 +2510,7 @@
               const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
               const exitCode = execRes.exit_code;
               const failed = exitCode !== 0 || (stderr && !stdout);
+              noteCmd(k, failed, cmdSig(stderr, stdout));
 
               resultText = failed
                 ? `FAILED (exit_code: ${exitCode}).\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}`
@@ -2472,6 +2532,7 @@
                 ].join("\n"),
               });
             } catch (execErr) {
+              noteCmd(k, true, cmdSig(execErr.message || "", ""));
               resultText = `error: ${execErr.message}`;
               display += "\nerror: " + execErr.message + "\n```";
               flush();
@@ -2689,6 +2750,8 @@
             "Langue: français.",
             "Write the critique in French.",
             "Écris la critique en français.",
+            "Do not write in English.",
+            "N'écris pas en anglais.",
             proposalKeysLine,
             "Garde les clés du bloc proposals en anglais (title/to_coder/severity/score/phase/impact/cost).",
           ].join("\n")
@@ -2703,6 +2766,8 @@
               "言語: 日本語。",
               "Write the critique in Japanese.",
               "批評は日本語で書いてください。",
+              "Do not write in English.",
+              "英語で書かないでください。",
               proposalKeysLine,
               "proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。",
             ].join("\n");
@@ -2736,14 +2801,46 @@
       abortObserverRef.current = ac;
 
       try {
+        // One-shot language retry: if the response ignores the requested language (ja/fr),
+        // retry once with an explicit rewrite instruction.
+        const countRe = (re, s) => (String(s || "").match(re) || []).length;
+        const looksJapanese = (s) => countRe(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g, s) >= 6;
+        const looksFrench = (s) => {
+          const a = countRe(/[àâçéèêëîïôùûüÿœæ]/gi, s);
+          const fr = countRe(/\b(le|la|les|des|du|de|pour|avec|sans|est|sont|pas|mais|donc|sur|dans|vous|tu|je|nous|votre)\b/gi, s);
+          const en = countRe(/\b(the|and|you|your|should|this|that|with|for|not|are|is|was|were|will|can|cannot|do|does)\b/gi, s);
+          if (a > 0 && fr >= 1) return true;
+          return fr > en + 1;
+        };
+        const skippable = (s) => {
+          const t = String(s || "").trim();
+          if (!t) return true;
+          if (t.startsWith("[Observer]")) return true;
+          if (/^\[(error|erreur|エラー)\]/i.test(t)) return true;
+          if (t.startsWith("[" + tr(lang, "error") + "]")) return true;
+          if (t.startsWith("[" + tr(lang, "stop") + "]")) return true;
+          return false;
+        };
+        const needsLangRetry = (expected, content) => {
+          if (skippable(content)) return false;
+          if (expected === "ja") return !looksJapanese(content);
+          if (expected === "fr") return !looksFrench(content);
+          return false;
+        };
+
+        let finalText = "";
         if (config.stream) {
+          let acc = "";
           await streamChat(
             reqBody,
             (evt) => {
               if (!evt) return;
               if (evt.event === "delta") {
                 const j = safeJsonParse(evt.data || "{}", {});
-                if (j && j.delta) appendDelta(threadId, asstMsg.id, j.delta, observerBodyRef);
+                if (j && j.delta) {
+                  acc += String(j.delta);
+                  appendDelta(threadId, asstMsg.id, j.delta, observerBodyRef);
+                }
               } else if (evt.event === "error") {
                 const j = safeJsonParse(evt.data || "{}", {});
                 throw new Error(j.error || tr(lang, "error"));
@@ -2752,9 +2849,41 @@
             ac.signal
           );
           finishStreaming(threadId, asstMsg.id);
+          finalText = acc;
         } else {
           const j = await postJson("/api/chat", reqBody, ac.signal);
-          setMsg(threadId, asstMsg.id, String((j && j.content) || ""), observerBodyRef);
+          finalText = String((j && j.content) || "");
+          setMsg(threadId, asstMsg.id, finalText, observerBodyRef);
+        }
+
+        if (!ac.signal.aborted && needsLangRetry(outLang, finalText)) {
+          const msg =
+            outLang === "fr"
+              ? "Observer replied in the wrong language — retrying in French…"
+              : outLang === "en"
+                ? "Observer language mismatch — retrying…"
+                : "Observerが指定言語で返していないため、再試行します…";
+          showToast(msg, "info");
+
+          const retryInstr =
+            outLang === "fr"
+              ? "LANGUAGE FIX: Rewrite the assistant's last message in French ONLY. Do not add new content. Output ONLY the rewritten text. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+              : "LANGUAGE FIX: Rewrite the assistant's last message in Japanese ONLY. Do not add new content. Output ONLY the rewritten text. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).";
+          const extHistory = [
+            ...history,
+            { role: "user", content: sendText },
+            { role: "assistant", content: finalText },
+          ];
+          const retryBody = buildReq(obsCfg, obsKey, extHistory, retryInstr + "\n\n" + observerBridge, diff);
+          retryBody.lang = lang;
+          retryBody.force_tools = false;
+          try {
+            const j2 = await postJson("/api/chat", retryBody, ac.signal);
+            const fixed = String((j2 && j2.content) || "");
+            if (fixed) setMsg(threadId, asstMsg.id, fixed, observerBodyRef);
+          } catch (_) {
+            // If retry fails, keep the original response.
+          }
         }
       } catch (err) {
         const msg = prettyErr(err);
