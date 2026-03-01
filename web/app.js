@@ -2170,6 +2170,7 @@
         "You are an autonomous coding agent with DIRECT access to the user's Windows machine.",
         "CRITICAL RULES — follow these without exception:",
         "1. ALWAYS use the `exec` tool to create files, directories, and run commands. NEVER just show code.",
+        "   Fallback (if tool calls are not supported): output ONE ```powershell``` code block containing ONLY commands (no `$ ` or `PS>` prompts).",
         "2. Use PowerShell syntax ONLY (cmd.exe is NOT used):",
         "   - Create directory tree: New-Item -ItemType Directory -Force -Path 'a/b/c'",
         "   - Create file with content: Set-Content -Path 'file.txt' -Value 'line1`nline2' -Encoding UTF8",
@@ -2184,6 +2185,7 @@
         "You are an autonomous coding agent with DIRECT access to the user's local machine.",
         "CRITICAL RULES — follow these without exception:",
         "1. ALWAYS use the `exec` tool to create files, directories, and run commands. NEVER just show code.",
+        "   Fallback (if tool calls are not supported): output ONE ```bash``` code block containing ONLY commands (no `$ ` prompts).",
         "2. Use Unix shell commands:",
         "   - Create directory: mkdir -p path/to/dir",
         "   - Write file: printf '%s' 'content' > file.txt   OR   python3 -c \"open('f','w').write('...')\"",
@@ -2299,6 +2301,25 @@
         return { text: fullText, finishReason, toolCalls };
       };
 
+      const extractImpliedExecScripts = (txt) => {
+        const src = String(txt || "");
+        const out = [];
+        const fenceRe = /```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g;
+        let m;
+        while ((m = fenceRe.exec(src)) !== null) {
+          const langHint = String(m[1] || "").trim().toLowerCase();
+          const body = String(m[2] || "").trim();
+          if (!body) continue;
+          const isShellLang = /^(bash|sh|shell|zsh|powershell|pwsh|ps1|ps|console)$/.test(langHint);
+          const looksLikeCmd = /(New-Item\b|Set-Content\b|Add-Content\b|Remove-Item\b|Copy-Item\b|Move-Item\b|\bmkdir\b|\bcd\b|\bgit\b|\bcargo\b|\bpython\b|\bnode\b|\bnpm\b|\bpnpm\b|\byarn\b)/i.test(body);
+          if (isShellLang || looksLikeCmd) {
+            out.push({ langHint, script: body });
+            if (out.length >= 3) break;
+          }
+        }
+        return out;
+      };
+
       for (let iter = 0; iter < MAX_ITERS; iter++) {
         if (ac.signal.aborted) break;
         pruneToolMessages(messages);
@@ -2390,7 +2411,75 @@
             messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
           }
         } else {
-          break; // finish_reason === "stop" — done
+          // finish_reason === "stop" — if the model didn't produce tool calls, try implied scripts.
+          const implied = extractImpliedExecScripts(asstText);
+          if (!implied.length) {
+            break;
+          }
+          for (const im of implied) {
+            if (ac.signal.aborted) break;
+            const command = stripShellTranscript(String(im.script || ""));
+            if (!command) continue;
+            const commandToRun = normalizeExecScript(im.langHint, command);
+            const danger = dangerousCommandReason(commandToRun);
+            const win = isWindowsHost();
+            const fenceLang = win ? "powershell" : "bash";
+            const prompt = win ? "PS> " : "$ ";
+            const shown = command.split("\n").map((l, i) => (i === 0 ? prompt : "    ") + l).join("\n");
+            display += (display ? "\n\n" : "") + "```" + fenceLang + "\n" + shown;
+            flush("\n```");
+
+            let resultText;
+            try {
+              if (danger) {
+                resultText = `error: blocked dangerous command (${danger}). Ask the user to run it manually if truly intended.`;
+                display += `\n(blocked: ${danger})\n\`\`\`\nexit: -1`;
+                flush();
+                messages.push({ role: "user", content: `[exec blocked]\nreason: ${danger}\ncommand:\n${commandToRun}` });
+                break;
+              }
+              if (config.requireCommandApproval && !window.confirm("Run command?\n\n" + commandToRun)) {
+                resultText = "error: command rejected by user";
+                display += "\n(rejected)\n```\nexit: -1";
+                flush();
+                messages.push({ role: "user", content: `[exec rejected]\ncommand:\n${commandToRun}` });
+                break;
+              }
+
+              const execRes = await postJson("/api/exec", { command: commandToRun, cwd }, ac.signal);
+              const stdout = truncTool(execRes.stdout, TRUNC_STDOUT);
+              const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
+              const exitCode = execRes.exit_code;
+              const failed = exitCode !== 0 || (stderr && !stdout);
+
+              resultText = failed
+                ? `FAILED (exit_code: ${exitCode}).\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}`
+                : `OK (exit_code: 0)\nstdout: ${stdout || "(empty)"}`;
+
+              if (stdout) display += "\n" + stdout;
+              if (stderr) display += "\nstderr: " + stderr;
+              display += "\n```\nexit: " + exitCode;
+              flush();
+
+              messages.push({
+                role: "user",
+                content: [
+                  "[exec result]",
+                  "command:",
+                  commandToRun,
+                  resultText,
+                  "Continue by outputting the NEXT command(s) as ONE code block (or use exec tool calls if supported).",
+                ].join("\n"),
+              });
+            } catch (execErr) {
+              resultText = `error: ${execErr.message}`;
+              display += "\nerror: " + execErr.message + "\n```";
+              flush();
+              messages.push({ role: "user", content: `[exec error]\n${execErr.message}` });
+              break;
+            }
+          }
+          continue;
         }
       }
 
