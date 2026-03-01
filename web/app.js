@@ -30,7 +30,11 @@
       coder: "Coder",
       observer: "Observer",
       proposals: "Proposals",
+      tasks: "Tasks",
+      planningTasks: "Planning tasks…",
       sendToCoder: "Send to coder",
+      sendToObserver: "Send to observer",
+      done: "Done",
       approved: "approved",
       alreadyApproved: "Already approved",
       phaseMismatch: "Phase mismatch",
@@ -41,6 +45,7 @@
       editApproval: "Edit approval",
       commandApproval: "Command approval",
       autoObserve: "Auto-observe",
+      observerHint: "Type a message below to start observing, or enable Auto-observe in settings.",
       forceAgent: "Agent mode",
       toolRoot: "Tool root",
       findInThread: "Find in thread…",
@@ -126,7 +131,11 @@
       coder: "Coder",
       observer: "Observer",
       proposals: "提案",
+      tasks: "タスク",
+      planningTasks: "タスク生成中…",
       sendToCoder: "Coderへ送る",
+      sendToObserver: "Observerへ送る",
+      done: "完了",
       approved: "承認済み",
       alreadyApproved: "すでに送信済み",
       phaseMismatch: "フェーズ不一致",
@@ -164,6 +173,7 @@
       structured: "構造化",
       deep: "本格",
       autoObserve: "自動実況",
+      observerHint: "下の入力欄にメッセージを送信するか、設定で「自動実況」をONにしてください。",
       forceAgent: "エージェント常時ON",
       toolRoot: "作業ルート",
       findInThread: "スレッド内検索…",
@@ -222,7 +232,11 @@
       coder: "Codeur",
       observer: "Observateur",
       proposals: "Propositions",
+      tasks: "Tâches",
+      planningTasks: "Planification des tâches…",
       sendToCoder: "Envoyer au codeur",
+      sendToObserver: "Envoyer à l'observer",
+      done: "Fait",
       approved: "approuvé",
       alreadyApproved: "Déjà approuvé",
       phaseMismatch: "Phase incompatible",
@@ -291,6 +305,7 @@
       details: "détails",
       hide: "masquer",
       autoObserve: "Auto-commenter",
+      observerHint: "Tapez un message ci-dessous pour commencer, ou activez Auto-commenter dans les paramètres.",
       forceAgent: "Mode agent (toujours)",
       serverOutdated: "Serveur obsolète",
       more: "Afficher plus",
@@ -326,6 +341,35 @@
       if (crypto && crypto.randomUUID) return crypto.randomUUID();
     } catch (_) {}
     return "id-" + Math.random().toString(16).slice(2) + "-" + Date.now().toString(16);
+  }
+
+  function extractJsonObject(text) {
+    const s = String(text || "").trim();
+    if (!s) return null;
+    const i = s.indexOf("{");
+    const j = s.lastIndexOf("}");
+    if (i < 0 || j <= i) return null;
+    return s.slice(i, j + 1);
+  }
+
+  function parseTasksJson(text) {
+    const raw = extractJsonObject(text);
+    if (!raw) return [];
+    const j = safeJsonParse(raw, null);
+    if (!j || typeof j !== "object" || !Array.isArray(j.tasks)) return [];
+    return j.tasks
+      .filter((t) => t && typeof t === "object")
+      .map((t) => ({
+        id: typeof t.id === "string" && t.id ? t.id : uid(),
+        target: String(t.target || "").trim().toLowerCase() === "observer" ? "observer" : "coder",
+        title: String(t.title || "").trim(),
+        body: String(t.body || "").trim(),
+        phase: String(t.phase || "any").trim().toLowerCase(),
+        priority: typeof t.priority === "number" ? Math.max(0, Math.min(100, t.priority)) : null,
+        status: String(t.status || "new").trim().toLowerCase() || "new",
+        createdAt: typeof t.createdAt === "number" ? t.createdAt : Date.now(),
+      }))
+      .filter((t) => t.title || t.body);
   }
 
   function normalizeForSim(s) {
@@ -553,6 +597,7 @@
       createdAt: Date.now(),
       updatedAt: Date.now(),
       messages: [],
+      tasks: [],
     };
   }
 
@@ -1424,6 +1469,7 @@
     const [sendingChat, setSendingChat] = useState(false);
     const [proposalModal, setProposalModal] = useState(null);
     const [proposalModalText, setProposalModalText] = useState("");
+    const [planningTasks, setPlanningTasks] = useState(false);
 
     const [threadState, setThreadState] = useState(() => {
       let threads = safeJsonParse(localStorage.getItem(LS.threads) || "null", null);
@@ -1445,6 +1491,20 @@
                   content: typeof m.content === "string" ? m.content : String(m.content || ""),
                   ts: typeof m.ts === "number" ? m.ts : Date.now(),
                   streaming: !!m.streaming,
+                }))
+            : [],
+          tasks: Array.isArray(t.tasks)
+            ? t.tasks
+                .filter((x) => x && typeof x === "object")
+                .map((x) => ({
+                  id: typeof x.id === "string" && x.id ? x.id : uid(),
+                  target: String(x.target || "").trim().toLowerCase() === "observer" ? "observer" : "coder",
+                  title: typeof x.title === "string" ? x.title : String(x.title || ""),
+                  body: typeof x.body === "string" ? x.body : String(x.body || ""),
+                  phase: typeof x.phase === "string" ? x.phase : "",
+                  priority: typeof x.priority === "number" ? x.priority : null,
+                  status: typeof x.status === "string" && x.status ? x.status : "new",
+                  createdAt: typeof x.createdAt === "number" ? x.createdAt : Date.now(),
                 }))
             : [],
         }));
@@ -4504,6 +4564,7 @@
                   )
                 )
               : e(React.Fragment, { key: "analysis" },
+                  e("div", { className: "obs-scroll-zone" },
                   e(
                     "div",
                     { className: "chat-find" },
@@ -4524,9 +4585,17 @@
                   ),
                   e("div", { className: "chat-body", ref: observerBodyRef },
                     observerMsgs.length === 0
-                      ? e("div", { className: "pane-empty" },
+                      ? e("div", { className: "pane-empty pane-empty-obs" },
                           e("div", { className: "pane-empty-icon" }, "👁"),
-                          e("p", { className: "pane-empty-hint" }, tr(lang, "autoObserve"))
+                          e("p", { className: "pane-empty-hint" }, tr(lang, "observerHint")),
+                          !config.autoObserve && coderMsgs.length > 0 && e("button", {
+                            className: "btn btn-accent obs-quick-trigger",
+                            onClick: () => sendObserver(lang === "en"
+                              ? "Please review the Coder's latest output."
+                              : lang === "fr"
+                                ? "Veuillez examiner la dernière sortie du Coder."
+                                : "Coderの最新の出力をレビューしてください。"),
+                          }, lang === "en" ? "▶ Observe now" : lang === "fr" ? "▶ Observer" : "▶ 今すぐ観察")
                         )
                       : observerMsgsView.length === 0
                         ? e("div", { className: "pane-empty" },
@@ -4636,6 +4705,7 @@
                   )
                 )
                   : null,
+                  ), // end obs-scroll-zone
                   e(
                     "div",
                     { className: "composer" },

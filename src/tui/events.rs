@@ -547,7 +547,12 @@ async fn send_observer_message(
 
     let system = format!("{obs_system}{coder_context}").trim_end().to_string();
     let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
-    for m in &history { messages.push(m.clone()); }
+    // Exclude the last entry in history (current user message, already pushed to pane)
+    // to avoid sending a duplicate user message, matching the pattern in send_coder_message.
+    let hist_len = history.len();
+    for m in history.iter().take(hist_len.saturating_sub(1)) {
+        messages.push(m.clone());
+    }
     messages.push(ChatMessage { role: "user".to_string(), content: text });
 
     let tx = tx.clone();
