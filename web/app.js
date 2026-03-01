@@ -1236,6 +1236,7 @@
     const [loopInfo, setLoopInfo] = useState({ active: false, score: 0, depth: 0 });
     const [execResults, setExecResults] = useState({}); // { msgId: { blockIdx: {stdout,stderr,exit_code,running} } }
     const [expandedProposals, setExpandedProposals] = useState(new Set());
+    const [copiedId, setCopiedId] = useState(null);
 
     const abortCoderRef = useRef(null);
     const abortObserverRef = useRef(null);
@@ -1609,10 +1610,11 @@
       downloadText(`obstral-${safe}.md`, md);
     };
 
-    const copyText = async (text) => {
+    const copyText = async (text, id) => {
       try {
         if (navigator.clipboard && navigator.clipboard.writeText) {
           await navigator.clipboard.writeText(String(text || ""));
+          if (id) { setCopiedId(id); setTimeout(() => setCopiedId(null), 1400); }
           return;
         }
       } catch (_) {}
@@ -1674,7 +1676,10 @@
             { className: "msg-meta" },
             e("div", { className: "who" }, m.role),
             m.ts ? e("span", { className: "msg-ts" }, relativeTime(m.ts, lang)) : null,
-            e("div", { className: "mini" }, e("button", { onClick: () => copyText(m.content || "") }, tr(lang, "copy")))
+            e("div", { className: "mini" }, e("button", {
+              className: copiedId === m.id ? "copied" : "",
+              onClick: () => copyText(m.content || "", m.id),
+            }, copiedId === m.id ? "✓" : tr(lang, "copy")))
           ),
           e(
             "div",
@@ -3282,13 +3287,22 @@
                 )
               )
             ),
-            e("div", { className: "chat-body", ref: coderBodyRef }, coderMsgs.map(renderMessage)),
+            e("div", { className: "chat-body", ref: coderBodyRef },
+              coderMsgs.length === 0
+                ? e("div", { className: "pane-empty" },
+                    e("div", { className: "pane-empty-icon" }, "⚡"),
+                    e("p", { className: "pane-empty-hint" }, tr(lang, "placeholder"))
+                  )
+                : coderMsgs.map(renderMessage)
+            ),
             e(
               "div",
               { className: "composer" },
               e("textarea", {
                 className: "textarea",
                 value: coderInput,
+                rows: Math.max(2, Math.min(8, (coderInput.match(/\n/g) || []).length + 1)),
+                style: { resize: "none" },
                 placeholder: tr(lang, "placeholder"),
                 onChange: (ev) => setCoderInput(ev.target.value),
                 onKeyDown: (ev) => {
@@ -3373,10 +3387,18 @@
                       tr(lang, "loopDetected") + " ×" + String(loopInfo.depth)
                     )
                   : null,
-                observerPhase && e("span", { className: "phase-indicator phase-" + observerPhase }, observerPhase)
+                observerPhase && e("span", { className: "phase-indicator phase-" + observerPhase }, observerPhase),
+                config.autoObserve && e("span", { className: "pill auto-badge" }, "AUTO")
               )
             ),
-            e("div", { className: "chat-body", ref: observerBodyRef }, observerMsgs.map(renderMessage)),
+            e("div", { className: "chat-body", ref: observerBodyRef },
+              observerMsgs.length === 0
+                ? e("div", { className: "pane-empty" },
+                    e("div", { className: "pane-empty-icon" }, "👁"),
+                    e("p", { className: "pane-empty-hint" }, tr(lang, "autoObserve"))
+                  )
+                : observerMsgs.map(renderMessage)
+            ),
             sortedProposals && sortedProposals.length
               ? e(
                   "div",
@@ -3458,6 +3480,8 @@
                 className: "textarea",
                 value: observerInput,
                 placeholder: tr(lang, "placeholder"),
+                rows: Math.max(2, Math.min(8, (observerInput.match(/\n/g) || []).length + 1)),
+                style: { resize: "none" },
                 onChange: (ev) => setObserverInput(ev.target.value),
                 onKeyDown: (ev) => {
                   if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter") {

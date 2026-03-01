@@ -823,6 +823,108 @@ body.looping .bubble.assistant {
   background: rgba(255, 255, 255, 0.06);
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+   HACKATHON POLISH — scroll, animations, empty state, feedback
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* --- custom scrollbar (dark theme) --- */
+::-webkit-scrollbar          { width: 5px; height: 5px; }
+::-webkit-scrollbar-track    { background: transparent; }
+::-webkit-scrollbar-thumb    { background: rgba(255,255,255,0.12); border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.22); }
+
+/* --- message slide-in --- */
+@keyframes msgIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.msg { animation: msgIn 200ms ease forwards; }
+
+/* --- proposal card slide-in --- */
+@keyframes cardIn {
+  from { opacity: 0; transform: translateX(10px);
+         box-shadow: 0 0 18px rgba(45, 212, 191, 0.18); }
+  to   { opacity: 1; transform: translateX(0); box-shadow: none; }
+}
+.proposal { animation: cardIn 280ms ease; }
+
+/* --- copy "✓ Copied" button state --- */
+.mini button.copied {
+  color: var(--accent);
+  border-color: rgba(45, 212, 191, 0.50);
+  transition: color 80ms, border-color 80ms;
+}
+
+/* --- empty pane hint --- */
+.pane-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  min-height: 180px;
+  height: 100%;
+  opacity: 0.35;
+  user-select: none;
+  pointer-events: none;
+}
+.pane-empty-icon { font-size: 36px; }
+.pane-empty-hint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+  text-align: center;
+  max-width: 200px;
+  line-height: 1.55;
+}
+
+/* --- AUTO observe badge in Observer header --- */
+.auto-badge {
+  border-color: rgba(45, 212, 191, 0.65);
+  background: rgba(45, 212, 191, 0.14);
+  color: var(--accent);
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  animation: dotPulse 2.2s ease-in-out infinite;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   HACKATHON POLISH v2 — focus, pane identity, proposal UX
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* --- focus rings: keyboard nav feels native --- */
+.input:focus,
+.select:focus,
+.textarea:focus {
+  outline: 2px solid rgba(45, 212, 191, 0.55);
+  outline-offset: 2px;
+}
+
+/* --- Coder / Observer pane left-border identity --- */
+.arena > .panel:first-child {
+  border-left: 3px solid rgba(96, 165, 250, 0.55);   /* blue = Coder */
+}
+.arena > .panel:last-child {
+  border-left: 3px solid rgba(217, 70, 239, 0.45);   /* magenta = Observer */
+}
+
+/* --- proposal card: hover lift --- */
+.proposal {
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+.proposal:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+/* --- proposal title: ellipsis on long titles --- */
+.proposal-title {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
 /* --- choice buttons (multi-choice clarification) --- */
 .choice-row {
   display: flex;

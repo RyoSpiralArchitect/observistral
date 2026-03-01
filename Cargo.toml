@@ -1,6 +1,6 @@
 [package]
 name = "obstral"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Provider-abstracted chat runtime (CLI + local UI)"
 license = "MIT"
@@ -23,3 +23,9 @@ tempfile = "3"
 
 [dev-dependencies]
 httpmock = "0.7"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
