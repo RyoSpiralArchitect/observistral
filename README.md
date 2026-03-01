@@ -74,6 +74,15 @@ cd C:\Users\user\observistral
 .\scripts\run-ui-lite.ps1 -Host 127.0.0.1 -Port 18080 -WorkspaceRoot C:\Users\user
 ```
 
+##### Lite TUI（Python / ターミナル完結）
+
+```powershell
+cd C:\Users\user\observistral
+.\scripts\obstral-lite.ps1 tui --lang ja
+# or:
+python .\scripts\obstral_lite_cli.py tui --lang ja
+```
+
 #### Web GUI（Linux / Mac / 管理者権限あり）
 
 ```bash
@@ -342,6 +351,15 @@ To extend the workspace root:
 .\scripts\run-ui-lite.ps1 -Host 127.0.0.1 -Port 18080 -WorkspaceRoot C:\Users\user
 ```
 
+##### Lite TUI (Python / terminal-only)
+
+```powershell
+cd C:\Users\user\observistral
+.\scripts\obstral-lite.ps1 tui --lang en
+# or:
+python .\scripts\obstral_lite_cli.py tui --lang en
+```
+
 #### Web GUI
 
 ```bash
@@ -587,6 +605,15 @@ cd C:\Users\user\observistral
 Pour élargir le workspace:
 ```powershell
 .\scripts\run-ui-lite.ps1 -Host 127.0.0.1 -Port 18080 -WorkspaceRoot C:\Users\user
+```
+
+##### Lite TUI (Python / terminal)
+
+```powershell
+cd C:\Users\user\observistral
+.\scripts\obstral-lite.ps1 tui --lang fr
+# ou:
+python .\scripts\obstral_lite_cli.py tui --lang fr
 ```
 
 #### Web GUI
