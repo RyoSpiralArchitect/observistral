@@ -276,7 +276,8 @@ a {
 
 .chat-body {
   padding: 16px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   flex: 1;
   min-height: 0; /* allow flex item to shrink below content size */
 }
@@ -331,6 +332,7 @@ a {
   padding: 14px 14px 12px 14px;
   width: fit-content;
   max-width: min(820px, 100%);
+  min-width: 0; /* allow grid item to shrink to 1fr allocation */
 }
 
 .bubble.user {

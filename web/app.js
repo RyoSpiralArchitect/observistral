@@ -3087,6 +3087,8 @@
           const retryBody = buildReq(obsCfg, obsKey, extHistory, retryInstr + "\n\n" + observerBridge, diff);
           retryBody.lang = lang;
           retryBody.force_tools = false;
+          // Make the rewrite more deterministic (language fix should not "drift").
+          retryBody.temperature = 0.2;
           try {
             const j2 = await postJson("/api/chat", retryBody, ac.signal);
             const fixed = String((j2 && j2.content) || "");
@@ -3143,6 +3145,7 @@
             const retryBody2 = buildReq(obsCfg, obsKey, extHistory2, loopFixInstr + "\n\n" + observerBridge, diff);
             retryBody2.lang = lang;
             retryBody2.force_tools = false;
+            retryBody2.temperature = 0.2;
             try {
               const j3 = await postJson("/api/chat", retryBody2, ac.signal);
               const fixed2 = String((j3 && j3.content) || "");

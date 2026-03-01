@@ -111,7 +111,9 @@ impl ChatBot {
                         content: resp.content.clone(),
                     });
 
-                    let request2 = build_request(&hist2, loop_fix);
+                    let mut request2 = build_request(&hist2, loop_fix);
+                    // Make the loop-break retry more deterministic.
+                    request2.temperature = Some(0.2);
                     if let Ok(resp2) = self.provider.chat(&request2).await {
                         let cur2 = resp2.content.trim();
                         let sim2 = if !loop_detect::is_skippable_for_loop(cur2) {

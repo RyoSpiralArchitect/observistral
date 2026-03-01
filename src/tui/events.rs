@@ -521,7 +521,7 @@ async fn send_observer_message(
     let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
     let lang = language_instruction(Some(&app.lang), &cfg.mode);
     let obs_mode_prompt = mode_prompt(&cfg.mode);
-    let obs_system = format!("{obs_mode_prompt}\n\n{lang}\n\n{persona_prompt}");
+    let obs_system = format!("{obs_mode_prompt}\n\n[Language]\n{lang}\n\n[Persona]\n{persona_prompt}");
     let obs_system = obs_system.trim_end().to_string();
     let coder_context = if !coder_history.is_empty() {
         let snippet = coder_history
@@ -603,7 +603,7 @@ async fn maybe_observer_loop_retry(app: &mut App, observer_tx: &mpsc::Sender<Str
     let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
     let lang = language_instruction(Some(&app.lang), &cfg.mode);
     let obs_mode_prompt = mode_prompt(&cfg.mode);
-    let obs_system = format!("{obs_mode_prompt}\n\n{lang}\n\n{persona_prompt}");
+    let obs_system = format!("{obs_mode_prompt}\n\n[Language]\n{lang}\n\n[Persona]\n{persona_prompt}");
     let obs_system = obs_system.trim_end().to_string();
     let coder_context = if !coder_history.is_empty() {
         let snippet = coder_history
