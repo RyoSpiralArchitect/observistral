@@ -2918,8 +2918,15 @@
       try {
         // One-shot language retry: if the response ignores the requested language (ja/fr),
         // retry once with an explicit rewrite instruction.
-        const countRe = (re, s) => (String(s || "").match(re) || []).length;
-        const looksJapanese = (s) => countRe(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g, s) >= 6;
+         const countRe = (re, s) => (String(s || "").match(re) || []).length;
+         const looksJapanese = (s) => {
+           const jp = countRe(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g, s);
+           const lat = countRe(/[A-Za-z]/g, s);
+           if (jp <= 0) return false;
+           if (lat <= 0) return true;
+           const ratio = jp / (jp + lat);
+           return jp >= 6 && ratio >= 0.25;
+         };
         const looksFrench = (s) => {
           const a = countRe(/[àâçéèêëîïôùûüÿœæ]/gi, s);
           const fr = countRe(/\b(le|la|les|des|du|de|pour|avec|sans|est|sont|pas|mais|donc|sur|dans|vous|tu|je|nous|votre)\b/gi, s);

@@ -330,7 +330,7 @@ a {
   border-radius: 18px;
   padding: 14px 14px 12px 14px;
   width: fit-content;
-  max-width: min(980px, 100%);
+  max-width: min(820px, 100%);
 }
 
 .bubble.user {
@@ -394,7 +394,7 @@ body.looping .bubble.assistant {
 }
 
 .content {
-  font-size: 14px;
+  font-size: 15px;
   line-height: 1.7;
   color: rgba(255, 255, 255, 0.92);
   white-space: pre-wrap;
