@@ -5,7 +5,7 @@
   if (!root) return;
 
   const e = React.createElement;
-  const { useEffect, useMemo, useRef, useState } = React;
+  const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
   // SECTION: constants
   const LS = {
@@ -1312,6 +1312,13 @@
     const [expandedProposals, setExpandedProposals] = useState(new Set());
     const [copiedId, setCopiedId] = useState(null);
     const [toasts, setToasts] = useState([]);
+    const [editingThreadId, setEditingThreadId] = useState(null);
+    const [editingTitle, setEditingTitle] = useState("");
+    const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+    const [showShortcuts, setShowShortcuts] = useState(false);
+    const [splitPct, setSplitPct] = useState(55);
+    const arenaRef = useRef(null);
+    const isDraggingRef = useRef(false);
 
     const showToast = (msg, type = "info") => {
       const id = Date.now() + Math.random();
@@ -1326,6 +1333,42 @@
     const saveTimer = useRef(null);
     const coderBodyRef = useRef(null);
     const observerBodyRef = useRef(null);
+
+    // Drag-to-resize pane handler.
+    const onSplitDragStart = useCallback((e) => {
+      e.preventDefault();
+      isDraggingRef.current = true;
+      const onMove = (ev) => {
+        if (!isDraggingRef.current || !arenaRef.current) return;
+        const rect = arenaRef.current.getBoundingClientRect();
+        const x = ev.touches ? ev.touches[0].clientX : ev.clientX;
+        const pct = Math.round(Math.min(80, Math.max(20, ((x - rect.left) / rect.width) * 100)));
+        setSplitPct(pct);
+      };
+      const onUp = () => {
+        isDraggingRef.current = false;
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    }, []);
+
+    // Global keyboard shortcuts.
+    useEffect(() => {
+      const onKey = (e) => {
+        if (e.key === "?" && !["INPUT", "TEXTAREA", "SELECT"].includes(e.target.tagName)) {
+          setShowShortcuts((v) => !v);
+        }
+        if (e.key === "Escape") {
+          setShowShortcuts(false);
+          setEditingThreadId(null);
+          setConfirmDeleteId(null);
+        }
+      };
+      window.addEventListener("keydown", onKey);
+      return () => window.removeEventListener("keydown", onKey);
+    }, []);
 
     const activeThread = useMemo(() => {
       return threadState.threads.find((t) => t.id === threadState.activeId) || threadState.threads[0];
@@ -1646,16 +1689,27 @@
 
     const renameThread = (id) => {
       const th = threadState.threads.find((t) => t.id === id);
-      const next = window.prompt(tr(lang, "rename"), th ? th.title : "");
-      if (!next || !next.trim()) return;
-      setThreadState((s) => ({
-        ...s,
-        threads: s.threads.map((t) => (t.id === id ? { ...t, title: next.trim(), updatedAt: Date.now() } : t)),
-      }));
+      setEditingTitle(th ? th.title : "");
+      setEditingThreadId(id);
+    };
+
+    const commitRename = (id) => {
+      const title = editingTitle.trim();
+      if (title) {
+        setThreadState((s) => ({
+          ...s,
+          threads: s.threads.map((t) => (t.id === id ? { ...t, title, updatedAt: Date.now() } : t)),
+        }));
+      }
+      setEditingThreadId(null);
     };
 
     const deleteThread = (id) => {
-      if (!window.confirm(tr(lang, "delConfirm"))) return;
+      setConfirmDeleteId(id);
+    };
+
+    const confirmDelete = (id) => {
+      setConfirmDeleteId(null);
       setThreadState((s) => {
         const remain = s.threads.filter((t) => t.id !== id);
         const nextThreads = remain.length ? remain : [makeThread("Thread 1")];
@@ -2636,7 +2690,13 @@
               e("button", { className: "seg-btn " + (lang === "en" ? "active" : ""), onClick: () => setLang("en") }, "EN"),
               e("button", { className: "seg-btn " + (lang === "fr" ? "active" : ""), onClick: () => setLang("fr") }, "FR")
             ),
-            e("button", { className: "btn", onClick: refreshStatus, type: "button" }, tr(lang, "refresh"))
+            e("button", { className: "btn", onClick: refreshStatus, type: "button" }, tr(lang, "refresh")),
+            e("button", {
+              className: "btn btn-icon",
+              title: "Keyboard shortcuts (?)",
+              onClick: () => setShowShortcuts((v) => !v),
+              type: "button",
+            }, "⌨")
           )
         )
       ),
@@ -2676,25 +2736,53 @@
                   const activeStyle = active
                     ? { borderColor: "rgba(96,165,250,0.60)", background: "rgba(96,165,250,0.10)" }
                     : null;
+                  const isEditing = editingThreadId === t.id;
+                  const isConfirmDel = confirmDeleteId === t.id;
                   return e(
                     "div",
                     { key: t.id, style: { display: "flex", gap: "8px", alignItems: "stretch" } },
-                    e(
-                      "button",
-                      {
-                        className: "preset",
-                        style: { flex: 1, ...(activeStyle || {}) },
-                        onClick: () => setThreadState((s) => ({ ...s, activeId: t.id })),
-                      },
-                      e("div", { className: "preset-title" }, t.title),
-                      e(
-                        "div",
-                        { className: "preset-sub" },
-                        `${new Date(t.updatedAt).toLocaleString()} · ${(t.messages || []).length} msgs`
-                      )
-                    ),
-                    e("button", { className: "btn", style: { padding: "8px 10px" }, onClick: () => renameThread(t.id) }, "✎"),
-                    e(
+                    isEditing
+                      ? e(
+                          "div",
+                          { style: { flex: 1, display: "flex", gap: 6 } },
+                          e("input", {
+                            className: "field",
+                            style: { flex: 1, padding: "6px 8px", fontSize: 13 },
+                            value: editingTitle,
+                            autoFocus: true,
+                            onChange: (ev) => setEditingTitle(ev.target.value),
+                            onKeyDown: (ev) => {
+                              if (ev.key === "Enter") commitRename(t.id);
+                              if (ev.key === "Escape") setEditingThreadId(null);
+                            },
+                          }),
+                          e("button", { className: "btn btn-accent", style: { padding: "6px 10px" }, onClick: () => commitRename(t.id) }, "✓"),
+                          e("button", { className: "btn", style: { padding: "6px 10px" }, onClick: () => setEditingThreadId(null) }, "✕")
+                        )
+                      : isConfirmDel
+                      ? e(
+                          "div",
+                          { style: { flex: 1, display: "flex", gap: 6, alignItems: "center" } },
+                          e("span", { style: { flex: 1, fontSize: 12, color: "var(--danger,#f87171)" } }, "Delete?"),
+                          e("button", { className: "btn btn-warn", style: { padding: "6px 10px" }, onClick: () => confirmDelete(t.id) }, "Yes"),
+                          e("button", { className: "btn", style: { padding: "6px 10px" }, onClick: () => setConfirmDeleteId(null) }, "No")
+                        )
+                      : e(
+                          "button",
+                          {
+                            className: "preset",
+                            style: { flex: 1, ...(activeStyle || {}) },
+                            onClick: () => setThreadState((s) => ({ ...s, activeId: t.id })),
+                          },
+                          e("div", { className: "preset-title" }, t.title),
+                          e(
+                            "div",
+                            { className: "preset-sub" },
+                            `${new Date(t.updatedAt).toLocaleString()} · ${(t.messages || []).length} msgs`
+                          )
+                        ),
+                    !isEditing && !isConfirmDel && e("button", { className: "btn", style: { padding: "8px 10px" }, onClick: () => renameThread(t.id) }, "✎"),
+                    !isEditing && !isConfirmDel && e(
                       "button",
                       { className: "btn btn-warn", style: { padding: "8px 10px" }, onClick: () => deleteThread(t.id) },
                       "×"
@@ -3449,11 +3537,11 @@
         ),
         e(
           "div",
-          { className: "arena" },
+          { className: "arena", ref: arenaRef, style: { display: "flex", gap: 0 } },
           // Coder pane
           e(
             "div",
-            { className: "panel chat" },
+            { className: "panel chat", style: { flex: splitPct, minWidth: 0 } },
             e(
               "div",
               { className: "panel-header" },
@@ -3542,10 +3630,13 @@
             )
           ),
 
+          // Drag handle
+          e("div", { className: "drag-handle", onMouseDown: onSplitDragStart }),
+
           // Observer pane
           e(
             "div",
-            { className: "panel chat" },
+            { className: "panel chat", style: { flex: 100 - splitPct, minWidth: 0 } },
             e(
               "div",
               { className: "panel-header" },
@@ -3739,6 +3830,38 @@
       ),
       e("div", { className: "toast-container" },
         toasts.map((t) => e("div", { key: t.id, className: "toast toast-" + t.type }, t.msg))
+      ),
+
+      // Keyboard shortcuts modal
+      showShortcuts && e(
+        "div",
+        { className: "modal-overlay", onClick: () => setShowShortcuts(false) },
+        e(
+          "div",
+          { className: "modal-box shortcuts-modal", onClick: (e) => e.stopPropagation() },
+          e("div", { className: "modal-header" },
+            e("h3", null, "Keyboard shortcuts"),
+            e("button", { className: "btn btn-icon", onClick: () => setShowShortcuts(false) }, "×")
+          ),
+          e(
+            "table",
+            { className: "shortcuts-table" },
+            e("tbody", null,
+              [
+                ["Enter", "Send message"],
+                ["Shift+Enter", "New line"],
+                ["?", "Toggle this help"],
+                ["Esc", "Close modals / cancel rename"],
+                ["Ctrl+K", "Stop streaming (Coder)"],
+              ].map(([key, desc]) =>
+                e("tr", { key },
+                  e("td", null, e("kbd", null, key)),
+                  e("td", null, desc)
+                )
+              )
+            )
+          )
+        )
       )
     );
   }

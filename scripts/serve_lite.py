@@ -2633,28 +2633,29 @@ class LiteHandler(BaseHTTPRequestHandler):
         self._send_bytes(200, content_type, path.read_bytes())
 
     def do_GET(self) -> None:
-        if self.path == "/":
+        path = self.path.split("?", 1)[0]
+        if path == "/":
             self._serve_file(WEB_ROOT / "index.html", "text/html; charset=utf-8")
             return
-        if self.path == "/assets/app.js":
+        if path == "/assets/app.js":
             self._serve_file(WEB_ROOT / "app.js", "text/javascript; charset=utf-8")
             return
-        if self.path == "/assets/styles.css":
+        if path == "/assets/styles.css":
             self._serve_file(WEB_ROOT / "styles.css", "text/css; charset=utf-8")
             return
-        if self.path == "/assets/vendor/react.production.min.js":
+        if path == "/assets/vendor/react.production.min.js":
             self._serve_file(
                 WEB_ROOT / "vendor" / "react.production.min.js",
                 "text/javascript; charset=utf-8",
             )
             return
-        if self.path == "/assets/vendor/react-dom.production.min.js":
+        if path == "/assets/vendor/react-dom.production.min.js":
             self._serve_file(
                 WEB_ROOT / "vendor" / "react-dom.production.min.js",
                 "text/javascript; charset=utf-8",
             )
             return
-        if self.path == "/api/status":
+        if path == "/api/status":
             self._send_json(
                 200,
                 {
@@ -2694,10 +2695,10 @@ class LiteHandler(BaseHTTPRequestHandler):
                 },
             )
             return
-        if self.path == "/api/pending_edits":
+        if path == "/api/pending_edits":
             self._send_json(200, {"pending": _list_pending_edits()})
             return
-        if self.path == "/api/meta_prompts":
+        if path == "/api/meta_prompts":
             self._send_json(
                 200,
                 {
@@ -2717,7 +2718,9 @@ class LiteHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(e)})
             return
 
-        if self.path == "/api/models":
+        path = self.path.split("?", 1)[0]
+
+        if path == "/api/models":
             try:
                 self._send_json(200, _models_impl(payload))
             except Exception as e:
@@ -2727,7 +2730,7 @@ class LiteHandler(BaseHTTPRequestHandler):
                 self._send_json(502, out)
             return
 
-        if self.path == "/api/chat":
+        if path == "/api/chat":
             try:
                 self._send_json(200, _chat_impl(payload))
             except Exception as e:
@@ -2737,11 +2740,11 @@ class LiteHandler(BaseHTTPRequestHandler):
                 self._send_json(502, out)
             return
 
-        if self.path == "/api/chat_stream":
+        if path == "/api/chat_stream":
             self._serve_chat_stream(payload)
             return
 
-        if self.path == "/api/exec":
+        if path == "/api/exec":
             try:
                 self._send_json(200, _exec_impl(payload))
             except Exception as e:
@@ -2751,7 +2754,7 @@ class LiteHandler(BaseHTTPRequestHandler):
                 self._send_json(400, out)
             return
 
-        if self.path == "/api/approve_edit":
+        if path == "/api/approve_edit":
             try:
                 edit_id = str(payload.get("id") or "").strip()
                 if not edit_id:
@@ -2765,7 +2768,7 @@ class LiteHandler(BaseHTTPRequestHandler):
                 self._send_json(400, out)
             return
 
-        if self.path == "/api/reject_edit":
+        if path == "/api/reject_edit":
             try:
                 edit_id = str(payload.get("id") or "").strip()
                 if not edit_id:
@@ -2779,7 +2782,7 @@ class LiteHandler(BaseHTTPRequestHandler):
                 self._send_json(400, out)
             return
         
-        if self.path == "/api/meta_prompts":
+        if path == "/api/meta_prompts":
             try:
                 op = str(payload.get("op") or "").strip().lower()
                 target = str(payload.get("target") or "").strip().lower()

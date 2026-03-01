@@ -1545,6 +1545,9 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     let path = start_parts
         .next()
         .ok_or_else(|| anyhow!("invalid request line"))?
+        .split('?')
+        .next()
+        .unwrap_or("/")
         .to_string();
 
     let mut content_length: usize = 0;
