@@ -31,6 +31,10 @@
       observer: "Observer",
       proposals: "Proposals",
       sendToCoder: "Send to coder",
+      approved: "approved",
+      alreadyApproved: "Already approved",
+      phaseMismatch: "Phase mismatch",
+      phaseMismatchConfirm: "Phase mismatch (current: {cur} / proposal: {prop}). Send anyway?",
       applyMeta: "Apply",
       includeCoderContext: "Include coder context",
       insertCliTemplate: "CLI template",
@@ -123,6 +127,10 @@
       observer: "Observer",
       proposals: "提案",
       sendToCoder: "Coderへ送る",
+      approved: "承認済み",
+      alreadyApproved: "すでに送信済み",
+      phaseMismatch: "フェーズ不一致",
+      phaseMismatchConfirm: "フェーズが一致しません（現在: {cur} / 提案: {prop}）。それでもCoderへ送りますか？",
       applyMeta: "適用",
       includeCoderContext: "Coder状況を付与",
       send: "送信",
@@ -215,6 +223,10 @@
       observer: "Observateur",
       proposals: "Propositions",
       sendToCoder: "Envoyer au codeur",
+      approved: "approuvé",
+      alreadyApproved: "Déjà approuvé",
+      phaseMismatch: "Phase incompatible",
+      phaseMismatchConfirm: "Phase incompatible (actuelle: {cur} / proposition: {prop}). Envoyer quand même ?",
       applyMeta: "Appliquer",
       includeCoderContext: "Inclure contexte codeur",
       insertCliTemplate: "Template CLI",
@@ -808,6 +820,16 @@
         : l === "en"
           ? `Dangerous command detected: ${r}\nRun anyway?`
           : `危険なコマンドを検出: ${r}\nそれでも実行しますか？`;
+    try { return window.confirm(msg); } catch (_) { return false; }
+  }
+
+  function confirmPhaseMismatch(uiLang, curPhase, propPhase) {
+    const cur = String(curPhase || "").trim() || "n/a";
+    const prop = String(propPhase || "").trim() || "n/a";
+    const tmpl = tr(uiLang, "phaseMismatchConfirm");
+    const msg = String(tmpl || "")
+      .replace(/\{cur\}/g, cur)
+      .replace(/\{prop\}/g, prop);
     try { return window.confirm(msg); } catch (_) { return false; }
   }
 
@@ -3045,6 +3067,20 @@
       };
       const coderMsgsView = filterMsgs(coderMsgs, coderFind);
       const observerMsgsView = filterMsgs(observerMsgs, observerFind);
+      const normTitle = (s) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+      const approvedProposalTitles = (() => {
+        const out = new Set();
+        for (const m of coderMsgs || []) {
+          if (!m || m.role !== "user") continue;
+          const t = String(m.content || "");
+          if (!t.startsWith("[Observer proposal approved]")) continue;
+          const mm = t.match(/^Title:\s*(.+)$/im);
+          const title = mm ? mm[1] : "";
+          const k = normTitle(title);
+          if (k) out.add(k);
+        }
+        return out;
+      })();
       let lastObserverAsst = null;
       for (let i = observerMsgs.length - 1; i >= 0; i--) {
         if (observerMsgs[i].role === "assistant") {
@@ -4178,6 +4214,7 @@
                     sortedProposals.map((p) => {
                       const score = typeof p.score === "number" ? p.score : 50;
                       const phaseMismatch = observerPhase && p.phase && p.phase !== "any" && p.phase !== observerPhase;
+                      const alreadyApproved = approvedProposalTitles && approvedProposalTitles.has(normTitle(p.title));
                       const scoreColor = score >= 70 ? "var(--accent)" : score >= 40 ? "var(--accent2)" : "var(--warn)";
                       const phaseLabel = p.phase && p.phase !== "any" ? p.phase : null;
                       const metaOp =
@@ -4193,7 +4230,7 @@
                               e("div", { className: "proposal-title" }, p.title),
                               phaseLabel && e("span", {
                                 className: "proposal-phase-badge " + (phaseMismatch ? "phase-miss" : "phase-match"),
-                                title: phaseMismatch ? `フェーズ外 (現在: ${observerPhase}、提案: ${p.phase})` : p.phase,
+                                title: phaseMismatch ? `${tr(lang, "phaseMismatch")} (${observerPhase} -> ${p.phase})` : p.phase,
                               }, p.phase),
                               p.cost && e("span", { className: "cost-badge" }, p.cost),
                               p.status && p.status !== "new" && e("span", {
@@ -4203,6 +4240,7 @@
                                   p.status === "addressed" ? "addressed" : "info"
                                 ),
                               }, p.status),
+                              alreadyApproved && e("span", { className: "status-badge status-approved" }, tr(lang, "approved")),
                             ),
                             e("div", { className: "proposal-score-bar" },
                               e("div", { className: "proposal-score-fill", style: { width: score + "%", background: `linear-gradient(90deg, ${scoreColor}88, ${scoreColor})` } })
@@ -4227,9 +4265,15 @@
                             }, tr(lang, "applyMeta")),
                             e("button", {
                               className: "btn btn-primary",
-                              disabled: sendingCoder || !String(p.toCoder || "").trim(),
-                              onClick: () => sendProposalToCoder(p),
-                              title: phaseMismatch ? `フェーズ外 (現在: ${observerPhase}、提案: ${p.phase})` : "",
+                              disabled: alreadyApproved || sendingCoder || !String(p.toCoder || "").trim(),
+                              onClick: () => {
+                                if (alreadyApproved) { showToast(tr(lang, "alreadyApproved"), "info"); return; }
+                                if (phaseMismatch && !confirmPhaseMismatch(lang, observerPhase, p.phase)) return;
+                                sendProposalToCoder(p);
+                              },
+                              title: alreadyApproved
+                                ? tr(lang, "alreadyApproved")
+                                : (phaseMismatch ? `${tr(lang, "phaseMismatch")} (${observerPhase} -> ${p.phase})` : ""),
                             }, tr(lang, "sendToCoder"))
                           )
                         ),

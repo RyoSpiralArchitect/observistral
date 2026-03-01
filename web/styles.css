@@ -1105,6 +1105,7 @@ pre[class*="language-"] {
 .status-unresolved  { background: rgba(251,191,36,0.15); border-color: rgba(251,191,36,0.45); color: #fbbf24; }
 .status-escalated   { background: rgba(251,113,133,0.15); border-color: rgba(251,113,133,0.55); color: var(--warn); }
 .status-addressed   { background: rgba(45,212,191,0.12); border-color: rgba(45,212,191,0.40); color: var(--accent); }
+.status-approved    { background: rgba(96,165,250,0.12); border-color: rgba(96,165,250,0.35); color: var(--accent2); }
 .status-info        { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.12); color: var(--muted); }
 
 /* --- Drag-to-resize pane handle --- */

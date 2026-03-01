@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -33,6 +34,28 @@ const APP_JS: &str = include_str!("../web/app.js");
 const STYLES_CSS: &str = include_str!("../web/styles.css");
 const REACT_JS: &str = include_str!("../web/vendor/react.production.min.js");
 const REACT_DOM_JS: &str = include_str!("../web/vendor/react-dom.production.min.js");
+
+fn dev_assets_root() -> Option<PathBuf> {
+    if let Ok(v) = std::env::var("OBSTRAL_ASSETS_DIR") {
+        let p = PathBuf::from(v.trim());
+        if !p.as_os_str().is_empty() {
+            return Some(p);
+        }
+    }
+
+    // Debug builds: allow fast UI iteration without rebuilding the Rust binary.
+    if cfg!(debug_assertions) {
+        return Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web"));
+    }
+
+    None
+}
+
+fn read_dev_asset(rel: &str) -> Option<Vec<u8>> {
+    let root = dev_assets_root()?;
+    let path = root.join(rel);
+    std::fs::read(path).ok()
+}
 
 #[derive(Parser, Clone, Debug)]
 pub struct ServeArgs {
@@ -88,6 +111,16 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
 
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => {
+            if let Some(bytes) = read_dev_asset("index.html") {
+                return write_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "text/html; charset=utf-8",
+                    &bytes,
+                )
+                .await;
+            }
             write_response(
                 &mut stream,
                 200,
@@ -98,6 +131,16 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
             .await
         }
         ("GET", "/assets/app.js") => {
+            if let Some(bytes) = read_dev_asset("app.js") {
+                return write_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "text/javascript; charset=utf-8",
+                    &bytes,
+                )
+                .await;
+            }
             write_response(
                 &mut stream,
                 200,
@@ -108,6 +151,16 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
             .await
         }
         ("GET", "/assets/styles.css") => {
+            if let Some(bytes) = read_dev_asset("styles.css") {
+                return write_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "text/css; charset=utf-8",
+                    &bytes,
+                )
+                .await;
+            }
             write_response(
                 &mut stream,
                 200,
@@ -118,6 +171,16 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
             .await
         }
         ("GET", "/assets/vendor/react.production.min.js") => {
+            if let Some(bytes) = read_dev_asset("vendor/react.production.min.js") {
+                return write_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "text/javascript; charset=utf-8",
+                    &bytes,
+                )
+                .await;
+            }
             write_response(
                 &mut stream,
                 200,
@@ -128,6 +191,16 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
             .await
         }
         ("GET", "/assets/vendor/react-dom.production.min.js") => {
+            if let Some(bytes) = read_dev_asset("vendor/react-dom.production.min.js") {
+                return write_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "text/javascript; charset=utf-8",
+                    &bytes,
+                )
+                .await;
+            }
             write_response(
                 &mut stream,
                 200,
@@ -505,6 +578,18 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     };
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(cwd) = req.cwd.as_deref().filter(|s| !s.trim().is_empty()) {
+        let cwd_path = Path::new(cwd);
+        if let Err(err) = std::fs::create_dir_all(cwd_path) {
+            #[derive(Serialize)]
+            struct E { error: String }
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &E { error: format!("invalid cwd (create_dir_all failed): {err}") },
+            )
+            .await;
+        }
         cmd.current_dir(cwd);
     }
 

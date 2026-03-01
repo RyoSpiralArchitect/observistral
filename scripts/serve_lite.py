@@ -1638,6 +1638,9 @@ def _exec_impl(req: dict[str, Any]) -> dict[str, Any]:
     cwd_raw = str(req.get("cwd") or "").strip()
     if cwd_raw:
         cwd = _resolve_workspace_path(cwd_raw, root=WORKSPACE_ROOT)
+    if cwd.exists() and not cwd.is_dir():
+        raise RuntimeError("cwd is not a directory")
+    cwd.mkdir(parents=True, exist_ok=True)
 
     timeout = min(600, max(1, int(req.get("timeout_seconds") or 120)))
     if sys.platform.startswith("win"):
