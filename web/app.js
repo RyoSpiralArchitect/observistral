@@ -39,6 +39,8 @@
       autoObserve: "Auto-observe",
       forceAgent: "Agent mode",
       toolRoot: "Tool root",
+      findInThread: "Find in thread…",
+      noMatches: "No matches",
       pendingEdits: "Pending edits",
       approve: "Approve",
       reject: "Reject",
@@ -156,6 +158,8 @@
       autoObserve: "自動実況",
       forceAgent: "エージェント常時ON",
       toolRoot: "作業ルート",
+      findInThread: "スレッド内検索…",
+      noMatches: "一致するメッセージがありません",
       on: "ON",
       off: "OFF",
       diff: "diff",
@@ -217,6 +221,8 @@
       editApproval: "Approbation édition",
       commandApproval: "Approbation commande",
       toolRoot: "Racine outils",
+      findInThread: "Rechercher dans le fil…",
+      noMatches: "Aucun résultat",
       pendingEdits: "Éditions en attente",
       approve: "Approuver",
       reject: "Rejeter",
@@ -1342,6 +1348,8 @@
 
     const [coderInput, setCoderInput] = useState("");
     const [observerInput, setObserverInput] = useState("");
+    const [coderFind, setCoderFind] = useState("");
+    const [observerFind, setObserverFind] = useState("");
     const [sendingCoder, setSendingCoder] = useState(false);
     const [sendingObserver, setSendingObserver] = useState(false);
     const [loopInfo, setLoopInfo] = useState({ active: false, score: 0, depth: 0 });
@@ -2585,11 +2593,30 @@
           ? `ui_loop_detected: depth=${loopInfo.depth} sim=${Math.round((loopInfo.score || 0) * 100)}%`
           : "";
       const outLang = String(lang || "ja").trim().toLowerCase();
+      const proposalKeysLine = "Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).";
       const langLine = outLang === "fr"
-        ? "Langue: français. Écris la critique en français. Garde les clés du bloc proposals en anglais (title/to_coder/severity/score/phase/impact/cost)."
+        ? [
+            "Language: French.",
+            "Langue: français.",
+            "Write the critique in French.",
+            "Écris la critique en français.",
+            proposalKeysLine,
+            "Garde les clés du bloc proposals en anglais (title/to_coder/severity/score/phase/impact/cost).",
+          ].join("\n")
         : outLang === "en"
-          ? "Language: English. Write the critique in English. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
-          : "言語: 日本語。批評は日本語で書いてください。proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。";
+          ? [
+              "Language: English.",
+              "Write the critique in English.",
+              proposalKeysLine,
+            ].join("\n")
+          : [
+              "Language: Japanese.",
+              "言語: 日本語。",
+              "Write the critique in Japanese.",
+              "批評は日本語で書いてください。",
+              proposalKeysLine,
+              "proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。",
+            ].join("\n");
       const observerBridge = [
         "[Observer bridge]",
         langLine,
@@ -2698,12 +2725,19 @@
       }
     };
 
-    const coderMsgs = paneMessages("coder");
-    const observerMsgs = paneMessages("observer");
-    let lastObserverAsst = null;
-    for (let i = observerMsgs.length - 1; i >= 0; i--) {
-      if (observerMsgs[i].role === "assistant") {
-        lastObserverAsst = observerMsgs[i];
+      const coderMsgs = paneMessages("coder");
+      const observerMsgs = paneMessages("observer");
+      const filterMsgs = (msgs, q) => {
+        const needle = String(q || "").trim().toLowerCase();
+        if (!needle) return msgs;
+        return (msgs || []).filter((m) => String(m && m.content ? m.content : "").toLowerCase().indexOf(needle) !== -1);
+      };
+      const coderMsgsView = filterMsgs(coderMsgs, coderFind);
+      const observerMsgsView = filterMsgs(observerMsgs, observerFind);
+      let lastObserverAsst = null;
+      for (let i = observerMsgs.length - 1; i >= 0; i--) {
+        if (observerMsgs[i].role === "assistant") {
+          lastObserverAsst = observerMsgs[i];
         break;
       }
     }
@@ -3655,13 +3689,36 @@
                 )
               )
             ),
+            e(
+              "div",
+              { className: "chat-find" },
+              e("input", {
+                className: "input",
+                value: coderFind,
+                placeholder: tr(lang, "findInThread"),
+                onChange: (ev) => setCoderFind(ev.target.value),
+                onKeyDown: (ev) => { if (ev.key === "Escape") setCoderFind(""); },
+                style: { flex: 1, padding: "8px 10px", fontSize: 12, fontFamily: "var(--mono)" },
+              }),
+              coderFind
+                ? e("button", { className: "btn btn-icon", type: "button", title: tr(lang, "clear"), onClick: () => setCoderFind("") }, "✕")
+                : null,
+              coderFind
+                ? e("span", { className: "msg-ts", style: { marginLeft: 6 } }, `${coderMsgsView.length}/${coderMsgs.length}`)
+                : null
+            ),
             e("div", { className: "chat-body", ref: coderBodyRef },
               coderMsgs.length === 0
                 ? e("div", { className: "pane-empty" },
                     e("div", { className: "pane-empty-icon" }, "⚡"),
                     e("p", { className: "pane-empty-hint" }, tr(lang, "placeholder"))
                   )
-                : coderMsgs.map(renderMessage)
+                : coderMsgsView.length === 0
+                  ? e("div", { className: "pane-empty" },
+                      e("div", { className: "pane-empty-icon" }, "🔎"),
+                      e("p", { className: "pane-empty-hint" }, tr(lang, "noMatches"))
+                    )
+                  : coderMsgsView.map(renderMessage)
             ),
             e(
               "div",
@@ -3762,13 +3819,36 @@
                 config.autoObserve && e("span", { className: "pill auto-badge" }, "AUTO")
               )
             ),
+            e(
+              "div",
+              { className: "chat-find" },
+              e("input", {
+                className: "input",
+                value: observerFind,
+                placeholder: tr(lang, "findInThread"),
+                onChange: (ev) => setObserverFind(ev.target.value),
+                onKeyDown: (ev) => { if (ev.key === "Escape") setObserverFind(""); },
+                style: { flex: 1, padding: "8px 10px", fontSize: 12, fontFamily: "var(--mono)" },
+              }),
+              observerFind
+                ? e("button", { className: "btn btn-icon", type: "button", title: tr(lang, "clear"), onClick: () => setObserverFind("") }, "✕")
+                : null,
+              observerFind
+                ? e("span", { className: "msg-ts", style: { marginLeft: 6 } }, `${observerMsgsView.length}/${observerMsgs.length}`)
+                : null
+            ),
             e("div", { className: "chat-body", ref: observerBodyRef },
               observerMsgs.length === 0
                 ? e("div", { className: "pane-empty" },
                     e("div", { className: "pane-empty-icon" }, "👁"),
                     e("p", { className: "pane-empty-hint" }, tr(lang, "autoObserve"))
                   )
-                : observerMsgs.map(renderMessage)
+                : observerMsgsView.length === 0
+                  ? e("div", { className: "pane-empty" },
+                      e("div", { className: "pane-empty-icon" }, "🔎"),
+                      e("p", { className: "pane-empty-hint" }, tr(lang, "noMatches"))
+                    )
+                  : observerMsgsView.map(renderMessage)
             ),
             criticalPath
               ? e("div", { className: "critical-path-banner" },

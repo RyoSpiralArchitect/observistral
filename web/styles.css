@@ -281,6 +281,15 @@ a {
   min-height: 0; /* allow flex item to shrink below content size */
 }
 
+.chat-find {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.14);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .msg {
   display: grid;
   grid-template-columns: 32px 1fr;

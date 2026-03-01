@@ -100,11 +100,33 @@ pub fn exec_tool_def() -> serde_json::Value {
 
 // ── System prompt builders ────────────────────────────────────────────────────
 
-pub fn coder_system(base: &str) -> String {
-    let mut s = base.to_string();
+/// Fixed base for the TUI Coder pane — always an agentic executor, not a chat bot.
+const CODER_BASE_SYSTEM: &str = "\
+You are an autonomous coding agent. Complete the user's task by actively \
+creating files, directories, and running code with the exec tool.\n\
+\n\
+File operations you must use:\n\
+- Create directories: New-Item -ItemType Directory (Windows) / mkdir\n\
+- Write files: Set-Content / Out-File on Windows; tee/cat on Unix\n\
+- Verify writes: Get-Content <path> to confirm content is correct\n\
+- Run and build: cargo, python, node, etc. — always check exit_code\n\
+\n\
+Deliver working, runnable code — not descriptions or instructions to the user.";
+
+/// Build the full Coder system prompt: base + scratchpad + OS rules + persona + language.
+pub fn coder_system(persona_prompt: &str, lang_instruction: &str) -> String {
+    let mut s = CODER_BASE_SYSTEM.to_string();
     s.push_str(SCRATCHPAD_ADDON);
     if cfg!(target_os = "windows") {
         s.push_str(WIN_SYSTEM_ADDON);
+    }
+    if !persona_prompt.is_empty() {
+        s.push_str("\n\n");
+        s.push_str(persona_prompt);
+    }
+    if !lang_instruction.is_empty() {
+        s.push_str("\n\n");
+        s.push_str(lang_instruction);
     }
     s
 }

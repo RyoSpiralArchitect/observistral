@@ -5,7 +5,8 @@ use crossterm::event::{
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::modes::mode_prompt;
+use crate::modes::{mode_prompt, language_instruction};
+use crate::personas::resolve_persona;
 use crate::streaming::StreamToken;
 use crate::types::ChatMessage;
 
@@ -282,7 +283,9 @@ async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
     let cfg = app.coder_cfg.clone();
     let tool_root = app.tool_root.clone();
 
-    let system = agent::coder_system(mode_prompt(&cfg.mode));
+    let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
+    let lang = language_instruction(None, &cfg.mode);
+    let system = agent::coder_system(persona_prompt, lang);
     let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
     let hist_len = history.len();
     for m in history.iter().take(hist_len.saturating_sub(1)) {
@@ -328,7 +331,11 @@ async fn send_observer_message(
     let cfg = app.observer_cfg.clone();
 
     // Inject recent Coder context into Observer system prompt.
-    let obs_system = mode_prompt(&cfg.mode);
+    let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
+    let lang = language_instruction(None, &cfg.mode);
+    let obs_mode_prompt = mode_prompt(&cfg.mode);
+    let obs_system = format!("{obs_mode_prompt}\n\n{lang}\n\n{persona_prompt}");
+    let obs_system = obs_system.trim_end().to_string();
     let coder_context = if !coder_history.is_empty() {
         let snippet = coder_history
             .iter()
@@ -351,7 +358,7 @@ async fn send_observer_message(
         String::new()
     };
 
-    let system = format!("{obs_system}{coder_context}");
+    let system = format!("{obs_system}{coder_context}").trim_end().to_string();
     let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
     for m in &history { messages.push(m.clone()); }
     messages.push(ChatMessage { role: "user".to_string(), content: text });
