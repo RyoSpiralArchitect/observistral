@@ -1038,6 +1038,23 @@ def _strip_shell_transcript(text: str) -> str:
     return "\n".join(out).strip()
 
 
+_POISON_PROXY_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost):9(?:/|$)", re.IGNORECASE)
+
+
+def _clean_subprocess_env() -> dict[str, str]:
+    """Environment for local subprocesses.
+
+    Some environments poison proxy vars (e.g. http://127.0.0.1:9), which breaks `git push` and
+    other networked tools by forcing traffic into a dead local proxy. We strip only that known-bad case.
+    """
+    env = dict(os.environ)
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        v = str(env.get(k) or "").strip()
+        if v and _POISON_PROXY_RE.match(v):
+            env.pop(k, None)
+    return env
+
+
 def _script_to_local_command(lang: str, script: str) -> str:
     l = str(lang or "").strip().lower()
     s = str(script or "").strip()
@@ -1535,6 +1552,7 @@ def _apply_run_command(command: str, timeout_seconds: int, *, cwd: Path | None =
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_clean_subprocess_env(),
             encoding="utf-8",
             errors="replace",
         )
@@ -1587,6 +1605,7 @@ def _exec_impl(req: dict[str, Any]) -> dict[str, Any]:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_clean_subprocess_env(),
             encoding="utf-8",
             errors="replace",
         )
@@ -1598,6 +1617,7 @@ def _exec_impl(req: dict[str, Any]) -> dict[str, Any]:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_clean_subprocess_env(),
             encoding="utf-8",
             errors="replace",
         )
