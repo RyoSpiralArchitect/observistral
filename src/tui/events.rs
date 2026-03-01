@@ -98,6 +98,19 @@ fn handle_slash_command(text: &str, app: &mut App, focus: Focus) -> bool {
                 push!("使い方: /temp 0.0〜2.0".to_string());
             }
         }
+        "/lang" => {
+            if arg.is_empty() {
+                push!(format!("言語: {}", app.lang));
+            } else {
+                let v = arg.trim().to_ascii_lowercase();
+                if v == "ja" || v == "en" || v == "fr" {
+                    app.lang = v.clone();
+                    push!(format!("✓ 言語 → {v}"));
+                } else {
+                    push!("使い方: /lang ja|en|fr".to_string());
+                }
+            }
+        }
         "/root" | "/wd" => {
             if arg.is_empty() {
                 let r = app.tool_root.as_deref().unwrap_or("(未設定 = カレントディレクトリ)").to_string();
@@ -124,6 +137,7 @@ fn handle_slash_command(text: &str, app: &mut App, focus: Focus) -> bool {
  /model <name>       モデル変更 (例: /model gpt-4o)\n\
  /persona <name>     ペルソナ (default/cynical/cheerful/thoughtful/novelist)\n\
  /temp <0.0-2.0>     温度変更\n\
+ /lang <ja|en|fr>    言語変更\n\
  /root <path>        作業ディレクトリ変更\n\
  /find <text>        履歴を検索フィルタ (空でOFF)\n\
  Ctrl+Y              最後のAI返答をクリップボードにコピー".to_string());
@@ -427,7 +441,7 @@ async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
     });
 
     let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
-    let lang = language_instruction(None, &cfg.mode);
+    let lang = language_instruction(Some(&app.lang), &cfg.mode);
     let system = agent::coder_system(persona_prompt, lang);
     let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
     let hist_len = history.len();
@@ -480,7 +494,7 @@ async fn send_observer_message(
 
     // Inject recent Coder context into Observer system prompt.
     let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
-    let lang = language_instruction(None, &cfg.mode);
+    let lang = language_instruction(Some(&app.lang), &cfg.mode);
     let obs_mode_prompt = mode_prompt(&cfg.mode);
     let obs_system = format!("{obs_mode_prompt}\n\n{lang}\n\n{persona_prompt}");
     let obs_system = obs_system.trim_end().to_string();
@@ -532,10 +546,18 @@ async fn send_observer_message(
 async fn maybe_auto_observe(app: &mut App, observer_tx: &mpsc::Sender<StreamToken>) {
     if let Some((idx, content)) = app.auto_observe_trigger() {
         app.last_auto_obs_idx = Some(idx);
-        let prompt = format!(
-            "[AUTO-OBSERVE] コーダーが新しいアウトプットを生成した。実況しながら批評せよ。\n\n最新のコーダー出力:\n{}",
-            content.chars().take(800).collect::<String>()
-        );
+        let snippet = content.chars().take(800).collect::<String>();
+        let prompt = match app.lang.as_str() {
+            "fr" => format!(
+                "[AUTO-OBSERVE] Le Coder vient de produire une nouvelle sortie. Fais une critique en mode commentaire live.\n\nDernière sortie du Coder:\n{snippet}"
+            ),
+            "en" => format!(
+                "[AUTO-OBSERVE] The Coder produced new output. Commentate and critique live.\n\nLatest Coder output:\n{snippet}"
+            ),
+            _ => format!(
+                "[AUTO-OBSERVE] コーダーが新しいアウトプットを生成した。実況しながら批評せよ。\n\n最新のコーダー出力:\n{snippet}"
+            ),
+        };
         send_observer_message(app, observer_tx, Some(prompt)).await;
     }
 }

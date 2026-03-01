@@ -110,6 +110,10 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             Span::raw("")
         },
+        Span::styled(
+            format!("  LANG: {}", app.lang.to_ascii_uppercase()),
+            Style::default().fg(MUTED),
+        ),
     ]);
 
     let row2 = Line::from(Span::styled(

@@ -105,6 +105,8 @@ pub struct App {
     pub coder: Pane,
     pub observer: Pane,
     pub focus: Focus,
+    /// UI / response language hint (ja/en/fr).
+    pub lang: String,
     pub auto_observe: bool,
     pub last_auto_obs_idx: Option<usize>,
     pub coder_cfg: RunConfig,
@@ -135,11 +137,15 @@ impl App {
         observer_cfg: RunConfig,
         tool_root: Option<String>,
         auto_observe: bool,
+        lang: String,
     ) -> Self {
+        let l = lang.trim().to_ascii_lowercase();
+        let lang = if l == "en" || l == "fr" { l } else { "ja".to_string() };
         Self {
             coder: Pane::new(),
             observer: Pane::new(),
             focus: Focus::Coder,
+            lang,
             auto_observe,
             last_auto_obs_idx: None,
             coder_cfg,

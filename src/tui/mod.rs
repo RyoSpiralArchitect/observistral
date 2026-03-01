@@ -19,6 +19,10 @@ pub struct TuiArgs {
     #[arg(long)]
     pub observer_model: Option<String>,
 
+    /// UI / response language hint (ja/en/fr).
+    #[arg(long, default_value = "ja")]
+    pub lang: String,
+
     /// Working directory for exec tool calls.
     #[arg(long)]
     pub tool_root: Option<String>,
@@ -47,6 +51,7 @@ pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
 
     let tool_root = args.tool_root.clone();
     let auto_observe = args.auto_observe;
+    let lang = args.lang.clone();
 
     // ── Terminal setup ────────────────────────────────────────────────────────
     enable_raw_mode().context("failed to enable raw mode")?;
@@ -58,7 +63,7 @@ pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
     // ── Run ───────────────────────────────────────────────────────────────────
-    let mut app = app::App::new(coder_cfg, observer_cfg, tool_root, auto_observe);
+    let mut app = app::App::new(coder_cfg, observer_cfg, tool_root, auto_observe, lang);
     let result = events::run_event_loop(&mut app, &mut terminal).await;
 
     // ── Restore terminal ──────────────────────────────────────────────────────
