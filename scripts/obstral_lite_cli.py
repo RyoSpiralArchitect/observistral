@@ -640,7 +640,7 @@ def _auto_observe_prompt(lang: str) -> str:
     if l == "fr":
         return (
             "[AUTO-OBSERVE] Le codeur a produit un nouvel output. "
-            "Décris en une phrase ce qui s'est passé, puis analyse 5 axes de risques, "
+            "Decris en une phrase ce qui s'est passe, puis analyse 5 axes de risques, "
             "et termine par un bloc --- proposals ---."
         )
     if l == "en":
