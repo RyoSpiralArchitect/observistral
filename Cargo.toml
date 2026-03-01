@@ -21,6 +21,9 @@ tui-textarea = { version = "0.7", features = ["crossterm"] }
 futures-util = "0.3"
 tempfile = "3"
 
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5"
+
 [dev-dependencies]
 httpmock = "0.7"
 

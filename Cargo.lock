@@ -1380,6 +1380,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "clipboard-win",
  "crossterm",
  "futures-util",
  "httpmock",

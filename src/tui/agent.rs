@@ -102,16 +102,25 @@ pub fn exec_tool_def() -> serde_json::Value {
 
 /// Fixed base for the TUI Coder pane — always an agentic executor, not a chat bot.
 const CODER_BASE_SYSTEM: &str = "\
-You are an autonomous coding agent. Complete the user's task by actively \
-creating files, directories, and running code with the exec tool.\n\
+You are an autonomous coding agent with an exec tool that runs shell commands.\n\
 \n\
-File operations you must use:\n\
-- Create directories: New-Item -ItemType Directory (Windows) / mkdir\n\
-- Write files: Set-Content / Out-File on Windows; tee/cat on Unix\n\
-- Verify writes: Get-Content <path> to confirm content is correct\n\
-- Run and build: cargo, python, node, etc. — always check exit_code\n\
+RULE: You MUST call exec on every single turn. Never respond with text only.\n\
+If you need to create a file — call exec. If you need to run code — call exec.\n\
+If you are done — call exec to verify the result, then say done.\n\
 \n\
-Deliver working, runnable code — not descriptions or instructions to the user.";
+File creation (Windows PowerShell):\n\
+  New-Item -ItemType Directory -Path 'src' -Force\n\
+  Set-Content -Path 'main.py' -Value @'\n\
+  print(\"hello\")\n\
+  '@ -Encoding UTF8\n\
+\n\
+File creation (Unix sh):\n\
+  mkdir -p src && cat > main.py << 'EOF'\n\
+  print(\"hello\")\n\
+  EOF\n\
+\n\
+After every file write: verify with Get-Content or cat.\n\
+After every build/test: confirm exit_code == 0 before proceeding.";
 
 /// Build the full Coder system prompt: base + scratchpad + OS rules + persona + language.
 pub fn coder_system(persona_prompt: &str, lang_instruction: &str) -> String {

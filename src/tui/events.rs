@@ -13,6 +13,113 @@ use crate::types::ChatMessage;
 use super::agent;
 use super::app::{App, Focus, Message, Role};
 
+// ── Clipboard ─────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+fn copy_to_clipboard(text: &str) {
+    use clipboard_win::{formats, set_clipboard};
+    let _ = set_clipboard(formats::Unicode, text);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn copy_to_clipboard(_text: &str) {}
+
+// ── Slash command handler ─────────────────────────────────────────────────────
+
+/// Returns true if `text` was a slash command (caller should NOT send to AI).
+fn handle_slash_command(text: &str, app: &mut App, focus: Focus) -> bool {
+    if !text.starts_with('/') { return false; }
+
+    let (cmd, arg) = match text.find(' ') {
+        Some(i) => (&text[..i], text[i + 1..].trim()),
+        None    => (text, ""),
+    };
+    let cmd_lc = cmd.to_ascii_lowercase();
+
+    macro_rules! push {
+        ($msg:expr) => {
+            match focus {
+                Focus::Coder    => app.coder.push_tool($msg),
+                Focus::Observer => app.observer.push_tool($msg),
+            }
+        };
+    }
+
+    match cmd_lc.as_str() {
+        "/model" => {
+            if arg.is_empty() {
+                let m = match focus {
+                    Focus::Coder    => app.coder_cfg.model.clone(),
+                    Focus::Observer => app.observer_cfg.model.clone(),
+                };
+                push!(format!("現在のモデル: {m}"));
+            } else {
+                match focus {
+                    Focus::Coder => {
+                        app.coder_cfg.model = arg.to_string();
+                        app.coder.push_tool(format!("✓ Coder モデル → {arg}"));
+                    }
+                    Focus::Observer => {
+                        app.observer_cfg.model = arg.to_string();
+                        app.observer.push_tool(format!("✓ Observer モデル → {arg}"));
+                    }
+                }
+            }
+        }
+        "/persona" => {
+            if arg.is_empty() {
+                push!(format!("現在のペルソナ: {}", app.coder_cfg.persona));
+            } else {
+                match resolve_persona(arg) {
+                    Ok(p) => {
+                        let key = p.key.to_string();
+                        app.coder_cfg.persona    = key.clone();
+                        app.observer_cfg.persona = key.clone();
+                        push!(format!("✓ ペルソナ → {key} (両ペイン)"));
+                    }
+                    Err(e) => push!(format!("✗ {e}")),
+                }
+            }
+        }
+        "/temp" | "/temperature" => {
+            if let Ok(t) = arg.parse::<f64>() {
+                let t = t.clamp(0.0, 2.0);
+                match focus {
+                    Focus::Coder => {
+                        app.coder_cfg.temperature = t;
+                        app.coder.push_tool(format!("✓ 温度 → {t:.2}"));
+                    }
+                    Focus::Observer => {
+                        app.observer_cfg.temperature = t;
+                        app.observer.push_tool(format!("✓ 温度 → {t:.2}"));
+                    }
+                }
+            } else {
+                push!("使い方: /temp 0.0〜2.0".to_string());
+            }
+        }
+        "/root" | "/wd" => {
+            if arg.is_empty() {
+                let r = app.tool_root.as_deref().unwrap_or("(未設定 = カレントディレクトリ)").to_string();
+                push!(format!("作業ディレクトリ: {r}"));
+            } else {
+                app.tool_root = Some(arg.to_string());
+                push!(format!("✓ 作業ディレクトリ → {arg}"));
+            }
+        }
+        "/help" | "/?" => {
+            push!("\
+/model <name>       モデル変更 (例: /model gpt-4o)\n\
+/persona <name>     ペルソナ (default/cynical/cheerful/thoughtful/novelist)\n\
+/temp <0.0-2.0>     温度変更\n\
+/root <path>        作業ディレクトリ変更\n\
+Ctrl+Y              最後のAI返答をクリップボードにコピー".to_string());
+        }
+        _ => push!(format!("不明なコマンド: {cmd}  /help で一覧")),
+    }
+    true
+}
+
 pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
@@ -144,6 +251,20 @@ async fn handle_key(
         // Switch focus
         KeyCode::Tab => app.toggle_focus(),
 
+        // Yank (copy) last assistant message to clipboard
+        KeyCode::Char('y') if ctrl => {
+            let content = {
+                let pane = match app.focus { Focus::Coder => &app.coder, Focus::Observer => &app.observer };
+                pane.messages.iter().rev()
+                    .find(|m| matches!(m.role, Role::Assistant) && m.complete)
+                    .map(|m| m.content.clone())
+            };
+            if let Some(text) = content {
+                copy_to_clipboard(&text);
+                app.focused_pane_mut().push_tool("✓ クリップボードにコピー".to_string());
+            }
+        }
+
         // Toggle auto-observe
         KeyCode::Char('a') if ctrl => {
             app.auto_observe = !app.auto_observe;
@@ -266,6 +387,12 @@ async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
     let text = text.trim().to_string();
     if text.is_empty() || app.coder.streaming { return; }
 
+    // Handle slash commands before sending to AI.
+    if handle_slash_command(&text, app, Focus::Coder) {
+        app.coder.textarea = tui_textarea::TextArea::default();
+        return;
+    }
+
     // Abort any previous task before starting a new one.
     if let Some(handle) = app.coder_task.take() { handle.abort(); }
 
@@ -281,7 +408,10 @@ async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
 
     let history = app.coder.chat_history();
     let cfg = app.coder_cfg.clone();
-    let tool_root = app.tool_root.clone();
+    // Default tool_root to the current working directory so the model knows where to create files.
+    let tool_root = app.tool_root.clone().or_else(|| {
+        std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())
+    });
 
     let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
     let lang = language_instruction(None, &cfg.mode);
@@ -312,6 +442,11 @@ async fn send_observer_message(
         None => {
             let t = app.observer.textarea.lines().join("\n").trim().to_string();
             if t.is_empty() { return; }
+            // Handle slash commands before sending to AI.
+            if handle_slash_command(&t, app, Focus::Observer) {
+                app.observer.textarea = tui_textarea::TextArea::default();
+                return;
+            }
             app.observer.textarea = tui_textarea::TextArea::default();
             t
         }
