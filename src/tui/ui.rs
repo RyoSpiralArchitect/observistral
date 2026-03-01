@@ -1,19 +1,32 @@
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 };
 
 use super::app::{App, Focus, Role};
+
+// ── Brand palette (mirrors web UI) ────────────────────────────────────────────
+
+const CODER_BLUE: Color = Color::Rgb(96, 165, 250);   // blue-400
+const OBS_MAG:    Color = Color::Rgb(217, 70, 239);   // fuchsia-500
+const ACCENT:     Color = Color::Rgb(45, 212, 191);   // teal-400
+const WARN:       Color = Color::Rgb(251, 191, 36);   // amber-400
+const DANGER:     Color = Color::Rgb(248, 113, 113);  // red-400
+const SUCCESS:    Color = Color::Rgb(74, 222, 128);   // green-400
+const MUTED:      Color = Color::Rgb(100, 116, 139);  // slate-500
+const TEXT_BODY:  Color = Color::Rgb(226, 232, 240);  // slate-200
+const BG_DARK:    Color = Color::Rgb(15, 23, 42);     // slate-950
+const UNFOCUSED:  Color = Color::Rgb(51, 65, 85);     // slate-700
 
 // ── Animation ─────────────────────────────────────────────────────────────────
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
 fn spinner_char(tick: u64) -> char {
-    SPINNER[(tick as usize / 2) % SPINNER.len()] // /2 → each frame lasts 200ms
+    SPINNER[(tick as usize / 2) % SPINNER.len()]
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -24,8 +37,8 @@ pub fn render(frame: &mut Frame, app: &App) {
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header bar
-            Constraint::Min(1),    // pane area
+            Constraint::Length(2), // header (2 rows)
+            Constraint::Min(1),
             Constraint::Length(3), // input box
         ])
         .split(area);
@@ -37,37 +50,76 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 // ── Header ────────────────────────────────────────────────────────────────────
 
-fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let coder_spin = if app.coder.streaming {
-        format!(" {}", spinner_char(app.tick_count))
-    } else {
-        String::new()
-    };
-    let obs_spin = if app.observer.streaming {
-        format!(" {}", spinner_char(app.tick_count))
-    } else {
-        String::new()
-    };
-    let iter_badge = if app.coder_iter > 0 {
-        format!(" [iter {}/12]", app.coder_iter)
-    } else {
-        String::new()
-    };
-    let auto_badge = if app.auto_observe { " AUTO:ON" } else { "" };
-    let coder_model = truncate_model(&app.coder_cfg.model, 18);
-    let obs_model = truncate_model(&app.observer_cfg.model, 18);
+fn iter_progress(n: u32) -> String {
+    const MAX: u32 = 12;
+    let n = n.min(MAX) as usize;
+    let bar: String = (0..MAX as usize)
+        .map(|i| if i < n { '█' } else { '░' })
+        .collect();
+    format!(" {bar} {n}/{MAX}")
+}
 
-    let text = format!(
-        " OBSTRAL  C:{coder_model}{coder_spin}{iter_badge}  O:{obs_model}{obs_spin}{auto_badge}  \
-         Tab=切替  Ctrl+A=自動  Ctrl+K=停止  Ctrl+C=終了"
-    );
-    frame.render_widget(
-        Paragraph::new(text).style(
+fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let c_spin = if app.coder.streaming {
+        format!(" {}", spinner_char(app.tick_count))
+    } else {
+        String::new()
+    };
+    let o_spin = if app.observer.streaming {
+        format!(" {}", spinner_char(app.tick_count))
+    } else {
+        String::new()
+    };
+    let iter = if app.coder_iter > 0 {
+        iter_progress(app.coder_iter)
+    } else {
+        String::new()
+    };
+
+    let c_m = truncate_model(&app.coder_cfg.model, 20);
+    let o_m = truncate_model(&app.observer_cfg.model, 20);
+
+    let row1 = Line::from(vec![
+        Span::styled(
+            "  ◈ OBSTRAL ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled("│ ", Style::default().fg(UNFOCUSED)),
+        Span::styled("C: ", Style::default().fg(MUTED)),
+        Span::styled(
+            format!("{c_m}{c_spin}"),
+            Style::default()
+                .fg(CODER_BLUE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(iter, Style::default().fg(ACCENT)),
+        Span::styled("  │  O: ", Style::default().fg(MUTED)),
+        Span::styled(
+            format!("{o_m}{o_spin}"),
+            Style::default()
+                .fg(OBS_MAG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        if app.auto_observe {
+            Span::styled(
+                "  ◉ AUTO",
+                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("")
+        },
+    ]);
+
+    let row2 = Line::from(Span::styled(
+        "  Tab=切替  Ctrl+A=自動  Ctrl+K=停止  Ctrl+O=実況  Ctrl+L=クリア  Ctrl+C=終了",
+        Style::default().fg(MUTED),
+    ));
+
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![row1, row2]))
+            .style(Style::default().bg(BG_DARK)),
         area,
     );
 }
@@ -98,37 +150,50 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
         Focus::Observer => &app.observer,
     };
     let focused = app.focus == which;
+    let brand = match which {
+        Focus::Coder => CODER_BLUE,
+        Focus::Observer => OBS_MAG,
+    };
+
     let border_style = if focused {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(brand)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(UNFOCUSED)
     };
 
-    let focus_dot = if focused { "◉" } else { "○" };
-    let pane_name = match which {
-        Focus::Coder => "CODER",
-        Focus::Observer => "OBSERVER",
-    };
-
-    // Scroll position badge: show "↑N" when user has scrolled above the bottom.
-    let scroll_badge = if pane.scroll > 0 {
-        let lines = pane.scroll.min(9999);
-        format!(" [↑{lines}]")
-    } else {
-        String::new()
-    };
-
-    // Streaming indicator in pane title.
-    let stream_indicator = if pane.streaming {
+    let spin = if pane.streaming {
         format!(" {}", spinner_char(app.tick_count))
     } else {
         String::new()
     };
+    let scroll_badge = if pane.scroll > 0 {
+        format!(" ↑{}", pane.scroll.min(9999))
+    } else {
+        String::new()
+    };
+    let focus_dot = if focused { "◉" } else { "○" };
+    let label = match which {
+        Focus::Coder => "CODER",
+        Focus::Observer => "OBSERVER",
+    };
 
-    let title = format!(" {focus_dot} {pane_name}{stream_indicator}{scroll_badge} ");
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(focus_dot, Style::default().fg(brand)),
+        Span::raw(" "),
+        Span::styled(
+            label,
+            Style::default().fg(brand).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(spin, Style::default().fg(ACCENT)),
+        Span::styled(scroll_badge, Style::default().fg(WARN)),
+        Span::raw(" "),
+    ]);
+
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style);
 
     let inner = block.inner(area);
@@ -139,58 +204,72 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
         return;
     }
 
-    // Build display lines.
     let mut lines: Vec<Line> = Vec::new();
+
     for msg in &pane.messages {
-        let (prefix, prefix_style, body_style) = match msg.role {
-            Role::User => (
-                "you › ",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                Style::default().fg(Color::Green),
-            ),
-            Role::Assistant => (
-                match which {
-                    Focus::Coder => "coder › ",
-                    Focus::Observer => "obs › ",
-                },
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                Style::default().fg(Color::White),
-            ),
-            Role::Tool => (
-                "  ",
-                Style::default().fg(Color::Yellow),
-                Style::default().fg(Color::Yellow),
-            ),
-        };
-
-        lines.push(Line::from(vec![Span::styled(prefix, prefix_style)]));
-
-        match (&msg.role, which) {
-            (Role::Assistant, Focus::Observer) => {
-                lines.extend(render_observer_content(&msg.content, body_style));
-            }
-            (Role::Assistant, Focus::Coder) => {
-                lines.extend(render_coder_content(&msg.content));
-            }
-            _ => {
+        match msg.role {
+            Role::User => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  you ",
+                        Style::default()
+                            .fg(SUCCESS)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("›", Style::default().fg(MUTED)),
+                ]));
                 for l in msg.content.lines() {
-                    lines.push(Line::from(vec![Span::styled(l.to_string(), body_style)]));
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(l.to_string(), Style::default().fg(SUCCESS)),
+                    ]));
                 }
+            }
+            Role::Assistant => {
+                let (lbl, lbl_color) = match which {
+                    Focus::Coder => ("coder", CODER_BLUE),
+                    Focus::Observer => ("obs", OBS_MAG),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {lbl} "),
+                        Style::default()
+                            .fg(lbl_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("›", Style::default().fg(MUTED)),
+                ]));
+                let content_lines = match which {
+                    Focus::Coder => render_coder_content(&msg.content),
+                    Focus::Observer => render_observer_content(&msg.content),
+                };
+                lines.extend(content_lines);
+            }
+            Role::Tool => {
+                // Tool messages already formatted as "[TOOL] cmd" / "[RESULT] …"
+                lines.extend(render_coder_content(&msg.content));
             }
         }
 
         // Streaming cursor.
         if !msg.complete {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{} ", spinner_char(app.tick_count)),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )]));
+            lines.push(Line::from(Span::styled(
+                format!("  {} ", spinner_char(app.tick_count)),
+                Style::default()
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )));
         }
-        lines.push(Line::default()); // blank separator
+
+        // Thin separator between messages.
+        lines.push(Line::from(Span::styled(
+            "  ·",
+            Style::default().fg(UNFOCUSED),
+        )));
+        lines.push(Line::default());
     }
 
-    // ── Scroll (lines-from-bottom semantics) ──────────────────────────────────
-    // scroll=0 → show bottom (auto-scroll). scroll=N → N lines above bottom.
+    // Scroll: scroll=0 pins to bottom; scroll=N shows N lines above bottom.
     let total = lines.len();
     let visible = inner.height as usize;
     let max_scroll = total.saturating_sub(visible);
@@ -207,82 +286,60 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
 
 // ── Welcome / empty-pane hint ─────────────────────────────────────────────────
 
+fn key_row(key: &'static str, desc: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {key:<18}"),
+            Style::default().fg(ACCENT),
+        ),
+        Span::styled(desc, Style::default().fg(MUTED)),
+    ])
+}
+
 fn render_welcome(frame: &mut Frame, area: Rect, which: Focus) {
-    let lines: Vec<Line> = match which {
-        Focus::Coder => vec![
-            Line::from(vec![Span::styled(
-                "── CODER ──",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )]),
-            Line::default(),
-            Line::from(vec![Span::styled(
-                "タスクを入力して Enter で送信",
-                Style::default().fg(Color::White),
-            )]),
-            Line::from(vec![Span::styled(
-                "例: \"maze game を作って\"",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::default(),
-            Line::from(vec![Span::styled(
-                "  Tab          フォーカス切り替え",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::from(vec![Span::styled(
-                "  Shift+Enter  改行",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::from(vec![Span::styled(
-                "  Ctrl+K       ストリーミング停止",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::from(vec![Span::styled(
-                "  Ctrl+L       履歴クリア",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::from(vec![Span::styled(
-                "  PageUp/Down  スクロール  (End=最下部)",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::from(vec![Span::styled(
-                "  Ctrl+A       自動実況 ON/OFF",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::from(vec![Span::styled(
-                "  Ctrl+C / Esc  終了",
-                Style::default().fg(Color::DarkGray),
-            )]),
-        ],
-        Focus::Observer => vec![
-            Line::from(vec![Span::styled(
-                "── OBSERVER ──",
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-            )]),
-            Line::default(),
-            Line::from(vec![Span::styled(
-                "質問を入力して Enter で送信",
-                Style::default().fg(Color::White),
-            )]),
-            Line::from(vec![Span::styled(
-                "Ctrl+O でコーダーの最新出力を自動レビュー",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::default(),
-            Line::from(vec![Span::styled(
-                "  Ctrl+A  自動実況を ON にすると",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::from(vec![Span::styled(
-                "  コーダーが出力するたびに自動でここに批評が入る",
-                Style::default().fg(Color::DarkGray),
-            )]),
-        ],
+    let (brand, heading, hint1, hint2) = match which {
+        Focus::Coder => (
+            CODER_BLUE,
+            " ◈ CODER",
+            "タスクを入力して Enter で送信",
+            "例: \"maze game を作って\"",
+        ),
+        Focus::Observer => (
+            OBS_MAG,
+            " ◈ OBSERVER",
+            "質問を入力して Enter で送信",
+            "Ctrl+O でコーダーの最新出力をレビュー",
+        ),
     };
 
+    let mut lines = vec![
+        Line::from(Span::styled(
+            heading,
+            Style::default().fg(brand).add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        Line::from(Span::styled(hint1, Style::default().fg(TEXT_BODY))),
+        Line::from(Span::styled(hint2, Style::default().fg(MUTED))),
+        Line::default(),
+    ];
+
+    for (key, desc) in [
+        ("Tab", "フォーカス切り替え"),
+        ("Enter", "送信"),
+        ("Shift+Enter", "改行"),
+        ("Ctrl+K", "ストリーミング停止"),
+        ("Ctrl+L", "履歴クリア"),
+        ("Ctrl+A", "自動実況 ON/OFF"),
+        ("Ctrl+O", "Observer 手動トリガー"),
+        ("PageUp/Down", "スクロール"),
+        ("End", "最下部へ"),
+        ("Ctrl+C / Esc", "終了"),
+    ] {
+        lines.push(key_row(key, desc));
+    }
+
     frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(Alignment::Left)
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
         Rect {
             x: area.x + 1,
             y: area.y + 1,
@@ -293,179 +350,601 @@ fn render_welcome(frame: &mut Frame, area: Rect, which: Focus) {
 }
 
 // ── Observer content renderer ─────────────────────────────────────────────────
+//
+// Sections:
+//   --- phase ---         → ACCENT banner
+//   --- proposals ---     → OBS_MAG banner + card-like rendering
+//   --- critical_path --- → DANGER banner  (⚠ highlights)
+//   --- health ---        → health score bar
 
-fn render_observer_content(content: &str, body_style: Style) -> Vec<Line<'static>> {
+#[derive(Clone, Copy, PartialEq)]
+enum ObsSection {
+    Body,
+    Phase,
+    Proposals,
+    CriticalPath,
+    Health,
+}
+
+fn obs_section_header(label: &'static str, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("── {label} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("─".repeat(18), Style::default().fg(UNFOCUSED)),
+    ])
+}
+
+fn render_observer_content(content: &str) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut in_proposals = false;
+    let mut section = ObsSection::Body;
 
-    for raw_line in content.lines() {
-        let trimmed = raw_line.trim();
-        if trimmed == "--- proposals ---" {
-            in_proposals = true;
-            lines.push(Line::from(vec![Span::styled(
-                "── proposals ──".to_string(),
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-            )]));
-            continue;
+    for raw in content.lines() {
+        let trimmed = raw.trim();
+
+        // Section boundaries.
+        match trimmed {
+            "--- phase ---" => {
+                section = ObsSection::Phase;
+                lines.push(obs_section_header("PHASE", ACCENT));
+                continue;
+            }
+            "--- proposals ---" => {
+                section = ObsSection::Proposals;
+                lines.push(obs_section_header("PROPOSALS", OBS_MAG));
+                continue;
+            }
+            "--- critical_path ---" => {
+                section = ObsSection::CriticalPath;
+                lines.push(obs_section_header("CRITICAL PATH", DANGER));
+                continue;
+            }
+            "--- health ---" => {
+                section = ObsSection::Health;
+                lines.push(obs_section_header("HEALTH", SUCCESS));
+                continue;
+            }
+            _ => {}
         }
-        // Next top-level "--- foo ---" section closes proposals.
-        if in_proposals && trimmed.starts_with("--- ") && trimmed.ends_with(" ---") {
-            in_proposals = false;
+        if trimmed.starts_with("--- ") && trimmed.ends_with(" ---") {
+            section = ObsSection::Body;
         }
 
-        let style = if in_proposals {
-            proposal_line_style(trimmed)
-        } else {
-            body_style
+        let line = match section {
+            ObsSection::Body => {
+                Line::from(Span::styled(raw.to_string(), Style::default().fg(TEXT_BODY)))
+            }
+            ObsSection::Phase => Line::from(vec![
+                Span::styled("  ◈ ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    trimmed.to_string(),
+                    Style::default()
+                        .fg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            ObsSection::Proposals => proposal_line(trimmed),
+            ObsSection::CriticalPath => {
+                if trimmed.is_empty() {
+                    Line::default()
+                } else {
+                    Line::from(vec![
+                        Span::styled(
+                            "  ⚠ ",
+                            Style::default()
+                                .fg(DANGER)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(trimmed.to_string(), Style::default().fg(DANGER)),
+                    ])
+                }
+            }
+            ObsSection::Health => health_line(trimmed),
         };
-        lines.push(Line::from(vec![Span::styled(raw_line.to_string(), style)]));
+        lines.push(line);
     }
     lines
 }
 
-fn proposal_line_style(line: &str) -> Style {
-    let lower = line.to_ascii_lowercase();
-    // Score 80+ or crit severity → red bold
-    if lower.contains("severity: crit")
-        || lower.contains("score: 10")
-        || lower.contains("score: 9")
-        || lower.contains("score: 8")
-    {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-    } else if lower.contains("severity: warn") {
-        Style::default().fg(Color::Yellow)
-    } else if lower.contains("severity: info") {
-        Style::default().fg(Color::Blue)
-    } else if lower.contains("to_coder:") {
-        Style::default().fg(Color::Cyan)
+fn parse_score_from(s: &str) -> Option<u32> {
+    let low = s.to_ascii_lowercase();
+    let idx = low.find("score:")?;
+    low[idx + 6..].trim().split_whitespace().next()?.parse().ok()
+}
+
+fn score_color(score: u32) -> Color {
+    if score >= 70 {
+        DANGER
+    } else if score >= 40 {
+        WARN
     } else {
-        Style::default().fg(Color::Gray)
+        SUCCESS
     }
+}
+
+fn proposal_line(trimmed: &str) -> Line<'static> {
+    let lower = trimmed.to_ascii_lowercase();
+
+    // Numbered header: "1) title: ..."
+    let first_char_digit = trimmed.chars().next().map_or(false, |c| c.is_ascii_digit());
+    if first_char_digit && trimmed.contains(") ") {
+        return Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                trimmed.to_string(),
+                Style::default()
+                    .fg(TEXT_BODY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+
+    // score: N  →  score bar
+    if lower.starts_with("score:") {
+        if let Some(s) = parse_score_from(&lower) {
+            let c = score_color(s);
+            let filled = (s / 10) as usize;
+            let bar: String = (0..10)
+                .map(|i| if i < filled { '█' } else { '░' })
+                .collect();
+            return Line::from(vec![
+                Span::styled(
+                    format!("    score: {s:>3} "),
+                    Style::default().fg(c).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(bar, Style::default().fg(c)),
+            ]);
+        }
+    }
+
+    // severity: crit|warn|info
+    if lower.starts_with("severity:") {
+        let style = if lower.contains("crit") {
+            Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
+        } else if lower.contains("warn") {
+            Style::default().fg(WARN)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        return Line::from(Span::styled(format!("    {trimmed}"), style));
+    }
+
+    // to_coder: msg
+    if lower.starts_with("to_coder:") {
+        let val = trimmed["to_coder:".len()..].trim().to_string();
+        return Line::from(vec![
+            Span::styled(
+                "    ↳ ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(val, Style::default().fg(ACCENT)),
+        ]);
+    }
+
+    // quote: snippet
+    if lower.starts_with("quote:") {
+        let q = trimmed["quote:".len()..].trim().to_string();
+        return Line::from(vec![
+            Span::styled("    ❝ ", Style::default().fg(MUTED)),
+            Span::styled(q, Style::default().fg(WARN).add_modifier(Modifier::ITALIC)),
+        ]);
+    }
+
+    // status: addressed|[UNRESOLVED]|[ESCALATED]
+    if lower.starts_with("status:") {
+        let val = lower["status:".len()..].trim().to_string();
+        let style = if val.contains("unresolved") || val.contains("escalated") {
+            Style::default().fg(DANGER)
+        } else if val.contains("addressed") {
+            Style::default().fg(SUCCESS)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        return Line::from(Span::styled(format!("    {trimmed}"), style));
+    }
+
+    // impact / cost / phase labels (secondary info)
+    if lower.starts_with("impact:") || lower.starts_with("cost:") || lower.starts_with("phase:") {
+        return Line::from(Span::styled(
+            format!("    {trimmed}"),
+            Style::default().fg(MUTED),
+        ));
+    }
+
+    // Default proposal line
+    Line::from(Span::styled(
+        format!("  {trimmed}"),
+        Style::default().fg(TEXT_BODY),
+    ))
+}
+
+fn health_line(trimmed: &str) -> Line<'static> {
+    if trimmed.is_empty() {
+        return Line::default();
+    }
+    if let Some(score) = parse_score_from(&trimmed.to_ascii_lowercase()) {
+        let c = if score >= 70 {
+            SUCCESS
+        } else if score >= 40 {
+            WARN
+        } else {
+            DANGER
+        };
+        let filled = (score / 5) as usize; // 20-block bar
+        let bar: String = (0..20)
+            .map(|i| if i < filled { '█' } else { '░' })
+            .collect();
+        return Line::from(vec![
+            Span::styled("  ❤ ", Style::default().fg(c).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{score:>3}/100 "),
+                Style::default().fg(c).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(bar, Style::default().fg(c)),
+        ]);
+    }
+    Line::from(Span::styled(
+        format!("    {trimmed}"),
+        Style::default().fg(MUTED),
+    ))
 }
 
 // ── Coder content renderer ────────────────────────────────────────────────────
 //
 // Visual zones:
-//   <think>…</think>   DarkGray + Italic + Dim  (scratchpad, low visual weight)
-//   [TOOL] …           Yellow + Bold            (command dispatched to exec)
-//   [RESULT] exit=0    Green                    (success)
-//   [RESULT] exit=N ⚠  Red                     (failure)
-//   [agent] …          DarkGray                 (system annotations)
-//   diff --git / @@    Blue / Cyan              (unified diff header / hunk)
-//   + line             Green                    (diff addition)
-//   - line             Red                      (diff deletion)
-//   everything else    White
+//   <plan>…</plan>      Blue box-drawing frame (CODER_BLUE/UNFOCUSED)
+//   <think>…</think>    Gray box-drawing frame; per-field colors
+//   ```lang…```         Bordered code block
+//   [TOOL] cmd          ▶ EXEC label (WARN)
+//   [RESULT] exit=0     ✓ OK (SUCCESS)
+//   [RESULT] exit=N ⚠   ✗ exit=N (DANGER)
+//   [agent] …           dim annotation (UNFOCUSED)
+//   diff …              unified-diff coloring
+//   else                TEXT_BODY
 
 fn render_coder_content(content: &str) -> Vec<Line<'static>> {
-    let think_style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC | Modifier::DIM);
-    let tool_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let ok_style = Style::default().fg(Color::Green);
-    let err_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
-    let annotation_style = Style::default().fg(Color::DarkGray);
-    let body_style = Style::default().fg(Color::White);
-    // Diff styles
-    let diff_file_style = Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD);
-    let diff_head_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
-    let diff_hunk_style = Style::default().fg(Color::Cyan);
-    let diff_add_style  = Style::default().fg(Color::Green);
-    let diff_del_style  = Style::default().fg(Color::Red);
-
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut in_think = false;
-    let mut in_diff   = false;
+    let mut in_plan = false;
+    let mut in_diff = false;
+    let mut in_code = false;
+    let mut code_lang = String::new();
 
-    for raw_line in content.lines() {
-        let trimmed = raw_line.trim();
+    for raw in content.lines() {
+        let trimmed = raw.trim();
 
-        // ── Think block state machine ─────────────────────────────────────
+        // ── <plan> block ──────────────────────────────────────────────────────
+        if trimmed.starts_with("<plan>") {
+            in_plan = true;
+            in_think = false;
+            lines.push(Line::from(vec![
+                Span::styled("  ╭── ", Style::default().fg(CODER_BLUE)),
+                Span::styled(
+                    "PLAN",
+                    Style::default()
+                        .fg(CODER_BLUE)
+                        .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                ),
+                Span::styled(" ─────────────────", Style::default().fg(UNFOCUSED)),
+            ]));
+            if trimmed.contains("</plan>") {
+                in_plan = false;
+                lines.push(Line::from(Span::styled(
+                    "  ╰─────────────────────────",
+                    Style::default().fg(UNFOCUSED),
+                )));
+            }
+            continue;
+        }
+        if in_plan {
+            if trimmed.contains("</plan>") {
+                in_plan = false;
+                lines.push(Line::from(Span::styled(
+                    "  ╰─────────────────────────",
+                    Style::default().fg(UNFOCUSED),
+                )));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("  │ ", Style::default().fg(UNFOCUSED)),
+                    Span::styled(
+                        trimmed.to_string(),
+                        Style::default()
+                            .fg(MUTED)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            }
+            continue;
+        }
+
+        // ── <think> block ─────────────────────────────────────────────────────
         if trimmed.starts_with("<think>") {
             in_think = true;
             in_diff = false;
-            lines.push(Line::from(vec![Span::styled(raw_line.to_string(), think_style)]));
-            if trimmed.contains("</think>") { in_think = false; }
+            lines.push(Line::from(vec![
+                Span::styled("  ╭── ", Style::default().fg(UNFOCUSED)),
+                Span::styled(
+                    "think",
+                    Style::default()
+                        .fg(MUTED)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+                Span::styled(" ──────────────────", Style::default().fg(UNFOCUSED)),
+            ]));
+            if trimmed.contains("</think>") {
+                in_think = false;
+                lines.push(Line::from(Span::styled(
+                    "  ╰─────────────────────────",
+                    Style::default().fg(UNFOCUSED),
+                )));
+            }
             continue;
         }
         if in_think {
-            lines.push(Line::from(vec![Span::styled(raw_line.to_string(), think_style)]));
-            if trimmed.contains("</think>") { in_think = false; }
+            if trimmed.contains("</think>") {
+                in_think = false;
+                lines.push(Line::from(Span::styled(
+                    "  ╰─────────────────────────",
+                    Style::default().fg(UNFOCUSED),
+                )));
+            } else {
+                let (label, rest) = split_field(trimmed);
+                let (label_style, rest_style) = match label {
+                    "goal" => (
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(ACCENT)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                    "risk" => (
+                        Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                        Style::default().fg(WARN).add_modifier(Modifier::ITALIC),
+                    ),
+                    "next" => (
+                        Style::default()
+                            .fg(CODER_BLUE)
+                            .add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(CODER_BLUE)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                    "verify" => (
+                        Style::default()
+                            .fg(SUCCESS)
+                            .add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(SUCCESS)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                    _ => (
+                        Style::default()
+                            .fg(MUTED)
+                            .add_modifier(Modifier::ITALIC),
+                        Style::default()
+                            .fg(MUTED)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                };
+                if label.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(UNFOCUSED)),
+                        Span::styled(trimmed.to_string(), rest_style),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(UNFOCUSED)),
+                        Span::styled(format!("{label}: "), label_style),
+                        Span::styled(rest.to_string(), rest_style),
+                    ]));
+                }
+            }
             continue;
         }
 
-        // ── Special markers (reset diff mode) ────────────────────────────
-        let style = if trimmed.starts_with("[TOOL]") {
-            in_diff = false;
-            tool_style
-        } else if trimmed.starts_with("[RESULT] exit=0") {
-            in_diff = false;
-            ok_style
-        } else if trimmed.starts_with("[RESULT]") {
-            in_diff = false;
-            err_style
-        } else if trimmed.starts_with("[agent]") {
-            in_diff = false;
-            annotation_style
-        } else {
-            // ── Diff detection ────────────────────────────────────────────
-            if trimmed.starts_with("diff --git ")
-                || trimmed.starts_with("diff -u ")
-                || trimmed.starts_with("diff -r ")
-            {
-                in_diff = true;
-            }
-
-            if in_diff {
-                if trimmed.starts_with("diff ") {
-                    diff_file_style
-                } else if trimmed.starts_with("+++ ")
-                    || trimmed.starts_with("--- ")
-                    || trimmed.starts_with("index ")
-                    || trimmed.starts_with("new file")
-                    || trimmed.starts_with("deleted file")
-                {
-                    diff_head_style
-                } else if trimmed.starts_with("@@ ") {
-                    diff_hunk_style
-                } else if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
-                    diff_add_style
-                } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
-                    diff_del_style
-                } else {
-                    body_style // context lines
-                }
+        // ── Code fences ───────────────────────────────────────────────────────
+        if trimmed.starts_with("```") {
+            if in_code {
+                in_code = false;
+                lines.push(Line::from(Span::styled(
+                    "  ╰──────────────────────────",
+                    Style::default().fg(UNFOCUSED),
+                )));
+                code_lang.clear();
             } else {
-                body_style
+                in_code = true;
+                code_lang = trimmed.trim_start_matches('`').to_string();
+                let lang_label = if code_lang.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", code_lang)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  ╭──{lang_label} "),
+                        Style::default().fg(UNFOCUSED),
+                    ),
+                    Span::styled("──────────────────", Style::default().fg(UNFOCUSED)),
+                ]));
             }
-        };
+            continue;
+        }
+        if in_code {
+            let style = code_line_style(&code_lang, trimmed);
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(UNFOCUSED)),
+                Span::styled(raw.to_string(), style),
+            ]));
+            continue;
+        }
 
-        lines.push(Line::from(vec![Span::styled(raw_line.to_string(), style)]));
+        // ── Special markers ───────────────────────────────────────────────────
+        if trimmed.starts_with("[TOOL]") {
+            in_diff = false;
+            let cmd = trimmed.trim_start_matches("[TOOL]").trim();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  ▶ EXEC ",
+                    Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(cmd.to_string(), Style::default().fg(TEXT_BODY)),
+            ]));
+            continue;
+        }
+        if trimmed.starts_with("[RESULT] exit=0") {
+            in_diff = false;
+            lines.push(Line::from(Span::styled(
+                "  ✓ OK",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+        if trimmed.starts_with("[RESULT]") {
+            in_diff = false;
+            let rest = trimmed.trim_start_matches("[RESULT]").trim();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  ✗ ",
+                    Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(rest.to_string(), Style::default().fg(DANGER)),
+            ]));
+            continue;
+        }
+        if trimmed.starts_with("[agent]") {
+            in_diff = false;
+            lines.push(Line::from(Span::styled(
+                format!("  {trimmed}"),
+                Style::default().fg(UNFOCUSED),
+            )));
+            continue;
+        }
+
+        // ── Diff ──────────────────────────────────────────────────────────────
+        if trimmed.starts_with("diff --git ")
+            || trimmed.starts_with("diff -u ")
+            || trimmed.starts_with("diff -r ")
+        {
+            in_diff = true;
+        }
+        if in_diff {
+            let style = if trimmed.starts_with("diff ") {
+                Style::default()
+                    .fg(CODER_BLUE)
+                    .add_modifier(Modifier::BOLD)
+            } else if trimmed.starts_with("+++ ")
+                || trimmed.starts_with("--- ")
+                || trimmed.starts_with("index ")
+                || trimmed.starts_with("new file")
+                || trimmed.starts_with("deleted file")
+            {
+                Style::default()
+                    .fg(TEXT_BODY)
+                    .add_modifier(Modifier::BOLD)
+            } else if trimmed.starts_with("@@ ") {
+                Style::default().fg(ACCENT)
+            } else if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
+                Style::default().fg(SUCCESS)
+            } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
+                Style::default().fg(DANGER)
+            } else {
+                Style::default().fg(TEXT_BODY)
+            };
+            lines.push(Line::from(Span::styled(raw.to_string(), style)));
+            continue;
+        }
+
+        // Default
+        lines.push(Line::from(Span::styled(
+            raw.to_string(),
+            Style::default().fg(TEXT_BODY),
+        )));
     }
     lines
+}
+
+/// Split "label: rest" into ("label", "rest").  Returns ("", line) if no colon found.
+fn split_field(line: &str) -> (&str, &str) {
+    if let Some(idx) = line.find(':') {
+        (line[..idx].trim(), line[idx + 1..].trim())
+    } else {
+        ("", line)
+    }
+}
+
+/// Minimal per-language code line styling.
+fn code_line_style(lang: &str, line: &str) -> Style {
+    let l = lang.to_ascii_lowercase();
+    if l == "diff" {
+        if line.starts_with('+') {
+            return Style::default().fg(SUCCESS);
+        }
+        if line.starts_with('-') {
+            return Style::default().fg(DANGER);
+        }
+        if line.starts_with('@') {
+            return Style::default().fg(ACCENT);
+        }
+    }
+    if l == "powershell" || l == "ps1" || l == "ps" || l == "pwsh" {
+        if line.trim_start().starts_with('#') {
+            return Style::default()
+                .fg(MUTED)
+                .add_modifier(Modifier::ITALIC);
+        }
+        if line.trim_start().starts_with("$") || line.contains(" $") {
+            return Style::default().fg(CODER_BLUE);
+        }
+    }
+    if l == "bash" || l == "sh" || l == "shell" || l == "console" {
+        if line.trim_start().starts_with('#') {
+            return Style::default()
+                .fg(MUTED)
+                .add_modifier(Modifier::ITALIC);
+        }
+        if line.starts_with("$ ") || line.starts_with("PS> ") {
+            return Style::default()
+                .fg(CODER_BLUE)
+                .add_modifier(Modifier::BOLD);
+        }
+    }
+    Style::default().fg(TEXT_BODY)
 }
 
 // ── Input bar ─────────────────────────────────────────────────────────────────
 
 fn render_input(frame: &mut Frame, area: Rect, app: &App) {
-    let focused_label = match app.focus {
-        Focus::Coder => "CODER",
-        Focus::Observer => "OBSERVER",
-    };
-    let is_streaming = match app.focus {
-        Focus::Coder => app.coder.streaming,
-        Focus::Observer => app.observer.streaming,
-    };
-    let hint = if is_streaming {
-        "  Ctrl+K=停止"
+    let is_coder = app.focus == Focus::Coder;
+    let is_streaming = if is_coder {
+        app.coder.streaming
     } else {
-        "  Enter=送信  Shift+Enter=改行  End=最下部"
+        app.observer.streaming
     };
-    let title = format!(" › {focused_label}{hint} ");
+    let brand = if is_coder { CODER_BLUE } else { OBS_MAG };
+    let label = if is_coder { "CODER" } else { "OBSERVER" };
+    let hint = if is_streaming {
+        "Ctrl+K=停止"
+    } else {
+        "Enter=送信  Shift+Enter=改行  End=最下部"
+    };
+
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("›", Style::default().fg(brand).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(label, Style::default().fg(brand).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(hint, Style::default().fg(MUTED)),
+        Span::raw(" "),
+    ]);
+
+    let border_color = if is_streaming { WARN } else { brand };
 
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if is_streaming { Color::Yellow } else { Color::Cyan }));
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
