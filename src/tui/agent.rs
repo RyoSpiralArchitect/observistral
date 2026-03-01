@@ -110,9 +110,7 @@ If you are done — call exec to verify the result, then say done.\n\
 \n\
 File creation (Windows PowerShell):\n\
   New-Item -ItemType Directory -Path 'src' -Force\n\
-  Set-Content -Path 'main.py' -Value @'\n\
-  print(\"hello\")\n\
-  '@ -Encoding UTF8\n\
+  @('print(\"hello\")') | Set-Content -Path 'main.py' -Encoding UTF8\n\
 \n\
 File creation (Unix sh):\n\
   mkdir -p src && cat > main.py << 'EOF'\n\

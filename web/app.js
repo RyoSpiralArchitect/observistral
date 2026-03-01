@@ -739,9 +739,28 @@
       const l = String(l0 || "");
       if (hasPrompt) {
         if (!promptRe.test(l)) continue; // drop output lines
-        out.push(l.replace(promptRe, ""));
+        let x = l.replace(promptRe, "").trimEnd();
+        // Common model glitch: trailing brace.
+        if (x.endsWith("}") && x.indexOf("{") === -1) x = x.slice(0, -1).trimEnd();
+        if (!x || x === "$") continue;
+        out.push(x);
       } else {
-        out.push(l.replace(/^\s*\$\s+/, ""));
+        let x = l.replace(/^\s*\$\s+/, "").trimEnd();
+        // Common model glitch: trailing brace.
+        if (x.endsWith("}") && x.indexOf("{") === -1) x = x.slice(0, -1).trimEnd();
+        if (!x || x === "$") continue;
+
+        // Heuristic: drop obvious command output lines when the model accidentally pastes them
+        // into a code fence that should contain commands only.
+        if (/^(stdout:|stderr:)\b/i.test(x)) continue;
+        if (/^exit\s*:?\s*-?\d+\b/i.test(x)) continue;
+        if (/^(fatal:|error:|warning:|hint:)\b/i.test(x)) continue;
+        if (/^(initialized empty git repository|on branch|your branch|changes to be committed:|untracked files:|nothing to commit)\b/i.test(x)) continue;
+        if (/^(directory:)\b/i.test(x)) continue;
+        if (/^(mode\s+lastwritetime|----\s+-------------)\b/i.test(x)) continue;
+        if (/^(modified:|new file:|deleted:)\b/i.test(x)) continue;
+
+        out.push(x);
       }
     }
     return out.join("\n").trim();
