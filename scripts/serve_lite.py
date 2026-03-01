@@ -25,8 +25,14 @@ from urllib import request as urlrequest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = REPO_ROOT / "web"
-WORKSPACE_ROOT = REPO_ROOT.resolve()
 DEFAULT_WORKSPACE_ROOT = (Path.home() / "obstral-work").resolve()
+# Default to a safe workspace outside the repo, so local tools never "accidentally"
+# create nested repos or delete tracked files under the source tree.
+WORKSPACE_ROOT = DEFAULT_WORKSPACE_ROOT
+try:
+    WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 MAX_BODY_BYTES = 2 * 1024 * 1024
 ANTHROPIC_VERSION = "2023-06-01"
 DIRECT_OPENER = urlrequest.build_opener(urlrequest.ProxyHandler({}))
@@ -1038,6 +1044,41 @@ def _strip_shell_transcript(text: str) -> str:
     return "\n".join(out).strip()
 
 
+def _sanitize_shellish_command(cmd: str) -> str:
+    """Best-effort cleanup for LLM-produced shell transcripts.
+
+    Common failure modes:
+    - Prompt markers accidentally included in the command: `$ ...`, `PS> ...`, `> ...`
+    - Stray trailing braces when a model mixes tool-call syntax into a shell line.
+
+    This runs on both "tool-call" commands and implied command extraction.
+    """
+    raw = str(cmd or "").replace("\r\n", "\n").strip()
+    if not raw:
+        return ""
+
+    out: list[str] = []
+    for ln0 in raw.split("\n"):
+        ln = str(ln0 or "").rstrip("\r\n")
+        m = _SHELL_PROMPT_RE.match(ln)
+        if m:
+            ln = ln[m.end() :]
+        ln = re.sub(r"^\s*\$\s+", "", ln)
+        out.append(ln)
+
+    s = "\n".join(out).strip()
+
+    # Strip a leading "$" without a following space: "$git status"
+    s = re.sub(r"^\s*\$(?=\S)", "", s).lstrip()
+
+    # Strip trailing unmatched "}" (common artifact).
+    if s.endswith("}") and s.count("{") < s.count("}"):
+        while s.endswith("}") and s.count("{") < s.count("}"):
+            s = s[:-1].rstrip()
+
+    return s
+
+
 _POISON_PROXY_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost):9(?:/|$)", re.IGNORECASE)
 
 
@@ -1517,7 +1558,7 @@ def _apply_mkdir(path: Path, parents: bool) -> dict[str, Any]:
 
 
 def _apply_run_command(command: str, timeout_seconds: int, *, cwd: Path | None = None) -> dict[str, Any]:
-    cmd = str(command or "").strip()
+    cmd = _sanitize_shellish_command(command)
     if not cmd:
         raise RuntimeError("command is required")
 
@@ -1687,7 +1728,7 @@ def _tool_mkdir(args: dict[str, Any], req: dict[str, Any] | None = None) -> dict
 
 
 def _tool_run_command(args: dict[str, Any], req: dict[str, Any] | None = None) -> dict[str, Any]:
-    command = str(args.get("command") or "").strip()
+    command = _sanitize_shellish_command(str(args.get("command") or ""))
     if not command:
         raise RuntimeError("command is required")
     timeout_seconds = int(args.get("timeout_seconds") or 120)
