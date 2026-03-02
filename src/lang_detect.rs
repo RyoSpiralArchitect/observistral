@@ -1,0 +1,146 @@
+// Lightweight language heuristics used for server-side enforcement.
+// This deliberately avoids heavy dependencies (regex) and keeps false positives low.
+//
+// NOTE: This is a heuristic, not a classifier. It is used only to trigger a one-shot
+// "rewrite into requested language" retry for Observer responses.
+
+fn count_japanese_chars(s: &str) -> usize {
+    s.chars()
+        .filter(|&ch| {
+            matches!(ch as u32,
+                0x3040..=0x309F | // Hiragana
+                0x30A0..=0x30FF | // Katakana
+                0x3400..=0x4DBF | // CJK Ext A
+                0x4E00..=0x9FFF   // CJK Unified
+            )
+        })
+        .count()
+}
+
+fn count_latin_letters(s: &str) -> usize {
+    s.chars().filter(|c| c.is_ascii_alphabetic()).count()
+}
+
+fn count_french_accents(s: &str) -> usize {
+    s.chars()
+        .filter(|c| match c {
+            'à' | 'â' | 'ç' | 'é' | 'è' | 'ê' | 'ë' | 'î' | 'ï' | 'ô' | 'ù' | 'û' | 'ü' | 'ÿ'
+            | 'œ' | 'æ' | 'À' | 'Â' | 'Ç' | 'É' | 'È' | 'Ê' | 'Ë' | 'Î' | 'Ï' | 'Ô' | 'Ù'
+            | 'Û' | 'Ü' | 'Ÿ' | 'Œ' | 'Æ' => true,
+            _ => false,
+        })
+        .count()
+}
+
+fn tokenize_words_lower(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+pub fn is_skippable_for_lang_check(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if t.starts_with("[Observer]") {
+        return true;
+    }
+    let lower = t.to_lowercase();
+    if lower.starts_with("[error]") || lower.starts_with("[erreur]") {
+        return true;
+    }
+    // Japanese error prefix used by the UI.
+    if t.starts_with("[エラー]") {
+        return true;
+    }
+    false
+}
+
+pub fn looks_japanese(s: &str) -> bool {
+    let jp = count_japanese_chars(s);
+    let lat = count_latin_letters(s);
+    if jp < 8 {
+        return false;
+    }
+    if lat == 0 {
+        return true;
+    }
+    // Allow some English tokens (code, keys) but avoid "mostly English with a few JP chars".
+    lat <= jp * 3
+}
+
+pub fn looks_french(s: &str) -> bool {
+    let accents = count_french_accents(s);
+    let toks = tokenize_words_lower(s);
+    if toks.is_empty() {
+        return false;
+    }
+
+    const FR: [&str; 18] = [
+        "le", "la", "les", "des", "du", "de", "pour", "avec", "sans", "est", "sont", "pas",
+        "mais", "donc", "sur", "dans", "vous", "nous",
+    ];
+    const EN: [&str; 16] = [
+        "the", "and", "you", "your", "should", "this", "that", "with", "for", "not", "are",
+        "is", "was", "were", "will", "can",
+    ];
+
+    let mut fr = 0usize;
+    let mut en = 0usize;
+    for t in toks {
+        if FR.contains(&t.as_str()) {
+            fr += 1;
+        }
+        if EN.contains(&t.as_str()) {
+            en += 1;
+        }
+    }
+
+    if accents > 0 && fr >= 1 {
+        return true;
+    }
+    fr > en + 1
+}
+
+pub fn needs_language_rewrite(expected: &str, content: &str) -> bool {
+    if is_skippable_for_lang_check(content) {
+        return false;
+    }
+    let e = expected.trim().to_ascii_lowercase();
+    if e == "en" {
+        return false;
+    }
+    if e == "fr" {
+        return !looks_french(content);
+    }
+    // Default: Japanese.
+    !looks_japanese(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn japanese_heuristic_basic() {
+        assert!(looks_japanese("これはテストです。提案します。"));
+        assert!(!looks_japanese("Coder attempted to create a repo but failed."));
+    }
+
+    #[test]
+    fn french_heuristic_basic() {
+        assert!(looks_french("Ceci est un test. Vous devez corriger ce bug."));
+        assert!(!looks_french("This is a test and you should fix it."));
+    }
+
+    #[test]
+    fn skippable_blocks_do_not_trigger_rewrite() {
+        assert!(!needs_language_rewrite("ja", "[Observer] No new critique. Loop detected."));
+        assert!(!needs_language_rewrite("fr", "[error] HTTP 401"));
+        assert!(!needs_language_rewrite("ja", "[エラー] HTTP 401"));
+    }
+}
+

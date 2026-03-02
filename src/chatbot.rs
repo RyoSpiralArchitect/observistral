@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
+use crate::lang_detect;
 use crate::loop_detect;
 use crate::modes::{compose_user_text, mode_prompt, Mode};
 use crate::personas;
@@ -130,6 +131,52 @@ impl ChatBot {
                     } else {
                         // If retry fails, prefer not spamming the same template repeatedly.
                         resp.content = "[Observer] No new critique. Loop detected.".to_string();
+                    }
+                }
+            }
+        }
+
+        // Language enforcement (Observer): if the model ignores the requested language (ja/fr),
+        // retry once with an explicit rewrite instruction. This complements the UI-side retry and
+        // makes non-stream calls more reliable.
+        if matches!(mode, Mode::Observer) {
+            let expected = if lang.unwrap_or("").eq_ignore_ascii_case("fr") {
+                "fr"
+            } else if lang.unwrap_or("").eq_ignore_ascii_case("en") {
+                "en"
+            } else {
+                "ja"
+            };
+
+            if expected != "en" && lang_detect::needs_language_rewrite(expected, &resp.content) {
+                let retry_instr = if expected == "fr" {
+                    "LANGUAGE FIX: Rewrite the assistant's last message in French ONLY. Do not add new content. Output ONLY the rewritten text. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+                } else {
+                    "LANGUAGE FIX: Rewrite the assistant's last message in Japanese ONLY. Do not add new content. Output ONLY the rewritten text. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+                };
+
+                let mut hist2: Vec<ChatMessage> = Vec::with_capacity(history.len() + 2);
+                for m in history {
+                    if m.role == "user" || m.role == "assistant" {
+                        hist2.push(m.clone());
+                    }
+                }
+                hist2.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: user_text.clone(),
+                });
+                hist2.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: resp.content.clone(),
+                });
+
+                let mut request2 = build_request(&hist2, retry_instr);
+                request2.temperature = Some(0.2);
+                if let Ok(resp2) = self.provider.chat(&request2).await {
+                    if !resp2.content.trim().is_empty()
+                        && !lang_detect::needs_language_rewrite(expected, &resp2.content)
+                    {
+                        resp = resp2;
                     }
                 }
             }

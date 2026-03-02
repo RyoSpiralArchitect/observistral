@@ -1,20 +1,17 @@
 param(
-  [Parameter(ValueFromRemainingArguments = $true)]
   [string[]]$Args
 )
 
 $ErrorActionPreference = "Stop"
 
-# On Windows, Cargo can't overwrite a running .exe. If `obstral.exe` is still
-# running (e.g. from a previous TUI/serve session), `cargo run` fails with:
-#   failed to remove file ...\\target\\debug\\obstral.exe (os error 5)
-Get-Process obstral -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+# Prevent the common Windows dev failure:
+# `cargo run` cannot overwrite `target\\debug\\obstral.exe` if it's still running.
+& (Join-Path $PSScriptRoot "kill-obstral.ps1") | Out-Null
 
-$repo = Resolve-Path (Join-Path $PSScriptRoot "..")
-Push-Location $repo
-try {
+Write-Host "[run-tui] cargo run -- tui" -ForegroundColor Cyan
+if ($Args -and $Args.Count -gt 0) {
   cargo run -- tui @Args
-} finally {
-  Pop-Location
+} else {
+  cargo run -- tui
 }
 
