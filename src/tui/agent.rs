@@ -178,6 +178,11 @@ fn prune_old_tool_results(messages: &mut Vec<serde_json::Value>) {
     let prune_count = tool_indices.len() - KEEP_RECENT_TOOL_TURNS;
     for &idx in tool_indices.iter().take(prune_count) {
         if let Some(content) = messages[idx]["content"].as_str() {
+            // Never prune failures: they are the most important context for recovery.
+            // We only prune successful tool outputs we generated ("OK (exit_code: 0) ...").
+            if !content.trim_start().starts_with("OK (exit_code: 0)") {
+                continue;
+            }
             let line_count = content.lines().count();
             if line_count > 2 {
                 let first = content.lines().next().unwrap_or("[done]").to_string();
@@ -404,7 +409,8 @@ Fix: `cd` into the intended repo before `git add .`, or add the nested repo dir 
     {
         return Some(
             "Rust build failed because `obstral.exe` is locked.\n\
-Fix: stop the running process (or close the TUI/serve), then rebuild."
+Fix: stop the running process (or close the TUI/serve), then rebuild.\n\
+Tip (Windows): use `scripts/run-tui.ps1` / `scripts/run-ui.ps1` which build in an isolated CARGO_TARGET_DIR and auto-kill old processes."
                 .to_string(),
         );
     }
@@ -427,6 +433,58 @@ Fix: update the configured API key for the selected provider/model, then retry."
     }
 
     None
+}
+
+fn wants_local_actions(user_text: &str) -> bool {
+    let s = user_text.to_ascii_lowercase();
+    let kws = [
+        "repo",
+        "repository",
+        "scaffold",
+        "bootstrap",
+        "init",
+        "setup",
+        "create",
+        "generate",
+        "implement",
+        "build",
+        "test",
+        "run",
+        "install",
+        "folder",
+        "directory",
+        "file",
+        "git",
+        "commit",
+        "push",
+        // Japanese
+        "リポ",
+        "リポジトリ",
+        "フォルダ",
+        "ディレクトリ",
+        "ファイル",
+        "作成",
+        "作る",
+        "実装",
+        "実行",
+        "コミット",
+        "プッシュ",
+        // French
+        "dépôt",
+        "depot",
+        "répertoire",
+        "repertoire",
+        "fichier",
+        "commande",
+        "créer",
+        "creer",
+        "générer",
+        "generer",
+        "exécuter",
+        "executer",
+        "installer",
+    ];
+    kws.iter().any(|k| s.contains(k))
 }
 
 impl FailureMemory {
@@ -527,6 +585,15 @@ pub async fn run_agentic(
     let mut state = AgentState::Planning;
     let mut mem = FailureMemory::default();
     let mut pending_system_hint: Option<String> = None;
+    let mut forced_tool_once = false;
+
+    let root_user_text = messages_in
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    let goal_wants_actions = wants_local_actions(&root_user_text);
 
     // Keep messages as serde_json::Value throughout to preserve tool_call_id.
     let mut messages: Vec<serde_json::Value> = messages_in
@@ -615,6 +682,26 @@ pub async fn run_agentic(
             }));
         } else {
             messages.push(json!({"role": "assistant", "content": assistant_text}));
+
+            // Common failure mode: model "explains what to do" but never calls exec,
+            // even though the user asked to actually perform local actions.
+            if goal_wants_actions && !forced_tool_once && iter + 1 < MAX_ITERS {
+                forced_tool_once = true;
+                state = AgentState::Recovery;
+                let note = "\
+[Tool enforcement]\n\
+The user asked you to ACT on the local machine (create files/run commands).\n\
+You have an `exec` tool. You MUST call it now.\n\
+Do NOT give instructions. Do NOT say you cannot run commands.\n\
+Start with ONE minimal command that moves toward the goal.\n\
+After it succeeds, verify and continue.";
+                let _ = tx
+                    .send(StreamToken::Delta("\n[governor] tool_call missing; forcing exec\n".to_string()))
+                    .await;
+                messages.push(json!({"role":"system","content": note}));
+                continue;
+            }
+
             state = AgentState::Done;
             let _ = tx
                 .send(StreamToken::Delta(format!("\n[agent] state: {:?}\n", state)))

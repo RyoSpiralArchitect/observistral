@@ -1421,6 +1421,24 @@
     };
   }
 
+  // Observer messages often append long machine-readable blocks (--- proposals --- / --- critical_path --- / --- health ---).
+  // The UI already renders these separately (Proposals panel + banner + badge), so strip them from the main chat bubble
+  // to keep the reading flow clean.
+  function stripObserverMeta(text) {
+    const s = String(text || "");
+    const markers = [
+      /---\s*proposals\s*---/i,
+      /---\s*critical_path\s*---/i,
+      /---\s*health\s*---/i,
+    ];
+    let cut = s.length;
+    for (const re of markers) {
+      const m = re.exec(s);
+      if (m && typeof m.index === "number") cut = Math.min(cut, m.index);
+    }
+    return cut < s.length ? s.slice(0, cut).trimEnd() : s;
+  }
+
   function parseMetaPromptOp(toCoderText) {
     const s = String(toCoderText || "");
     const re = /^\s*META_(SET|APPEND)_(CODER|OBSERVER)\s*:\s*(.*)\s*$/im;
@@ -2157,8 +2175,12 @@
     const renderMessage = (m) => {
       const canExec = !!(status && status.features && status.features.exec);
       const canOpen = !!(status && status.features && status.features.open_file);
-      const s = String(m && m.content ? m.content : "");
+      const raw = String(m && m.content ? m.content : "");
       const pane = (m && (m.pane === "observer" || m.pane === "chat" || m.pane === "coder")) ? m.pane : "coder";
+      const s =
+        (!m.streaming && m.role === "assistant" && pane === "observer")
+          ? stripObserverMeta(raw)
+          : raw;
       const isLong = !m.streaming && (s.length > 2600 || (s.match(/\n/g) || []).length > 40);
       const isExpanded = expandedMsgs.has(m.id);
       const isCollapsed = isLong && !isExpanded;
@@ -2461,6 +2483,8 @@
         const toPrune = toolIdxs.slice(0, toolIdxs.length - KEEP_TOOL_TURNS);
         for (const idx of toPrune) {
           const content = String(msgs[idx].content || "");
+          // Never prune failures: they are the most important recovery context.
+          if (!content.trimStart().startsWith("OK (exit_code: 0)")) continue;
           const lines = content.split("\n");
           if (lines.length > 2) {
             msgs[idx] = { ...msgs[idx], content: lines[0] + ` [pruned ${lines.length}L]` };

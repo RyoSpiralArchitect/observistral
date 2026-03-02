@@ -125,7 +125,38 @@ impl PartialConfig {
             self.hf_local_only = env_trimmed("OBS_HF_LOCAL_ONLY").and_then(|v| parse_bool(&v));
         }
 
-        let provider = self.provider.unwrap_or(ProviderKind::Mistral);
+        // Provider defaulting:
+        // - `--vibe` is a preset that implies Mistral/Codestral unless explicitly overridden.
+        // - Otherwise, prefer an "it just works" default for local dev: infer from base_url/env keys,
+        //   falling back to OpenAI-compatible (so users with only OPENAI_API_KEY don't error out).
+        let provider = if let Some(p) = self.provider.clone() {
+            p
+        } else if self.vibe {
+            ProviderKind::Mistral
+        } else if let Some(u) = self
+            .base_url
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            // Infer from explicit base_url when present.
+            let low = u.to_ascii_lowercase();
+            if low.contains("anthropic") {
+                ProviderKind::Anthropic
+            } else if low.contains("mistral.ai") {
+                ProviderKind::Mistral
+            } else {
+                ProviderKind::OpenAiCompatible
+            }
+        } else if env_trimmed("MISTRAL_API_KEY").is_some() {
+            ProviderKind::Mistral
+        } else if env_trimmed("ANTHROPIC_API_KEY").is_some() {
+            ProviderKind::Anthropic
+        } else if env_trimmed("OPENAI_API_KEY").is_some() || env_trimmed("OBS_API_KEY").is_some() {
+            ProviderKind::OpenAiCompatible
+        } else {
+            ProviderKind::OpenAiCompatible
+        };
 
         let mode = if self.vibe {
             self.mode.unwrap_or(Mode::Vibe)
