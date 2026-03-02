@@ -459,7 +459,14 @@
   const CODER_MODES = MODES.filter((m) => m && m.k !== "Observer");
   const OBSERVER_MODES = MODES.filter((m) => m && m.k === "Observer");
 
-  const PERSONAS = ["default", "novelist", "cynical", "cheerful", "thoughtful"];
+  const PERSONAS = ["default", "novelist", "cynical", "cheerful", "thoughtful", "sensei", "duck"];
+  const CHAT_PERSONAS = [
+    { key: "cheerful",   icon: "😊", ja: "陽気",   en: "Cheerful",    fr: "Enjoué" },
+    { key: "thoughtful", icon: "🤔", ja: "思慮深い", en: "Thoughtful",  fr: "Réfléchi" },
+    { key: "sensei",     icon: "🧙", ja: "師匠",    en: "Sensei",      fr: "Sensei" },
+    { key: "cynical",    icon: "😏", ja: "皮肉屋",  en: "Cynical",     fr: "Cynique" },
+    { key: "duck",       icon: "🦆", ja: "ゴム鴨",  en: "Duck",        fr: "Canard" },
+  ];
 
   const PRESETS = {
     vibe: {
@@ -528,6 +535,7 @@
     observerBaseUrl: "",
     observerModel: "",
     persona: "default",
+    chatPersona: "cheerful",
     observerMode: "Observer",
     observerPersona: "novelist",
     observerIntensity: "critical",
@@ -1410,6 +1418,7 @@
       // Coder pane should never run in Observer mode (it disables autonomy/tooling and looks "broken").
       if (String(cfg.mode || "").trim() === "Observer") cfg.mode = DEFAULT_CONFIG.mode;
       if (!cfg.observerMode) cfg.observerMode = DEFAULT_CONFIG.observerMode;
+      if (!cfg.chatPersona) cfg.chatPersona = DEFAULT_CONFIG.chatPersona;
       if (!cfg.observerPersona) cfg.observerPersona = DEFAULT_CONFIG.observerPersona;
       const oi0 = String(cfg.observerIntensity || "").trim().toLowerCase();
       if (oi0 === "polite" || oi0 === "critical" || oi0 === "brutal") cfg.observerIntensity = oi0;
@@ -3449,7 +3458,7 @@
       if (!activeThread) return;
       const threadId = activeThread.id;
       const apiKey = String(chatApiKey || "").trim() || String(codeApiKey || "").trim() || String(observerApiKey || "").trim();
-      const chatCfg = { ...config, mode: "会話", cot: "off", autonomy: "off" };
+      const chatCfg = { ...config, mode: "会話", cot: "off", autonomy: "off", persona: config.chatPersona || "cheerful" };
       const userMsg = { id: uid(), pane: "chat", role: "user", content: text, ts: Date.now() };
       const asstMsg = { id: uid(), pane: "chat", role: "assistant", content: "", ts: Date.now(), streaming: true };
       setThreadState((s) => ({
@@ -4692,6 +4701,16 @@
                             )
                           )
                         : paneMessages("chat").map(renderMessage)
+                    )
+                  ),
+                  e("div", { className: "chat-persona-bar" },
+                    CHAT_PERSONAS.map((p) =>
+                      e("button", {
+                        key: p.key,
+                        className: "persona-chip" + (config.chatPersona === p.key ? " active" : ""),
+                        onClick: () => setConfig({ ...config, chatPersona: p.key }),
+                        title: lang === "en" ? p.en : lang === "fr" ? p.fr : p.ja,
+                      }, p.icon + "\u00a0" + (lang === "en" ? p.en : lang === "fr" ? p.fr : p.ja))
                     )
                   ),
                   e("div", { className: "composer chat-composer" },
