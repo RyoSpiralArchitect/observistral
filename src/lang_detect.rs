@@ -180,9 +180,21 @@ mod tests {
     }
 
     #[test]
+    fn fenced_code_does_not_break_japanese_detection() {
+        let s = "これはテストです。\n```rust\nfn main() { println!(\"hello world\"); }\n```\nバグを直してください。";
+        assert!(looks_japanese(s));
+    }
+
+    #[test]
     fn french_heuristic_basic() {
         assert!(looks_french("Ceci est un test. Vous devez corriger ce bug."));
         assert!(!looks_french("This is a test and you should fix it."));
+    }
+
+    #[test]
+    fn fenced_code_does_not_break_french_detection() {
+        let s = "Ceci est un test.\n```python\nprint('hello world')\n```\nVous devez corriger ce bug.";
+        assert!(looks_french(s));
     }
 
     #[test]
