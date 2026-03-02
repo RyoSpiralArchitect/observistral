@@ -118,7 +118,12 @@ File creation (Unix sh):\n\
   EOF\n\
 \n\
 After every file write: verify with Get-Content or cat.\n\
-After every build/test: confirm exit_code == 0 before proceeding.";
+After every build/test: confirm exit_code == 0 before proceeding.\n\
+\n\
+When ALL steps from your <plan> are verified complete:\n\
+  call exec one final time to run a smoke test or confirm the deliverable exists,\n\
+  then reply with a brief [DONE] summary: what was built, where it lives, how to run it.\n\
+  Do NOT reply with [DONE] while any command is still failing.";
 
 /// Build the full Coder system prompt: base + scratchpad + OS rules + persona + language.
 pub fn coder_system(persona_prompt: &str, lang_instruction: &str) -> String {

@@ -1285,6 +1285,8 @@
         phase: String(cur.phase || "any").trim().toLowerCase(),
         impact: String(cur.impact || "").trim(),
         cost: String(cur.cost || "").trim().toLowerCase(),
+        status: String(cur.status || "new").trim(),
+        quote: String(cur.quote || "").trim(),
       });
       cur = null;
       lastKey = "";
@@ -1298,6 +1300,10 @@
 
       const start = /^\s*(\d+)\)\s*title\s*:\s*(.*)\s*$/.exec(line);
       if (start) { finish(); cur = { title: start[2], toCoder: "", severity: "info" }; lastKey = "title"; continue; }
+
+      // Also accept proposals that start with bare "title:" (no number prefix)
+      const startBare = !cur && /^\s*title\s*:\s*(.+)\s*$/.exec(line);
+      if (startBare) { finish(); cur = { title: startBare[1], toCoder: "", severity: "info" }; lastKey = "title"; continue; }
 
       if (!cur) continue;
 

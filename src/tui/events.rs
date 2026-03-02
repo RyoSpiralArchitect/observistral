@@ -517,17 +517,20 @@ async fn send_observer_message(
     let coder_history = app.coder.chat_history();
     let cfg = app.observer_cfg.clone();
 
-    // Inject recent Coder context into Observer system prompt.
-    let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
+    // Build Observer system prompt. Persona is intentionally excluded: the Observer mode
+    // has its own strict critique tone ("NO padding, ruthlessly honest") that must not be
+    // softened by a cheerful/novelist/etc persona assigned to the Coder pane.
     let lang = language_instruction(Some(&app.lang), &cfg.mode);
     let obs_mode_prompt = mode_prompt(&cfg.mode);
-    let obs_system = format!("{obs_mode_prompt}\n\n[Language]\n{lang}\n\n[Persona]\n{persona_prompt}");
+    let obs_system = format!("{obs_mode_prompt}\n\n[Language]\n{lang}");
     let obs_system = obs_system.trim_end().to_string();
+    // Inject recent Coder history. Use more messages and wider window than before so
+    // Observer can see the full arc of what the Coder did, not just a narrow snippet.
     let coder_context = if !coder_history.is_empty() {
         let snippet = coder_history
             .iter()
             .rev()
-            .take(6)
+            .take(10)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -535,12 +538,12 @@ async fn send_observer_message(
                 format!(
                     "[{}]: {}",
                     m.role,
-                    m.content.chars().take(500).collect::<String>()
+                    m.content.chars().take(800).collect::<String>()
                 )
             })
             .collect::<Vec<_>>()
             .join("\n");
-        format!("\n\n[Recent Coder activity]\n{snippet}")
+        format!("\n\n[Recent Coder activity — last 10 turns]\n{snippet}")
     } else {
         String::new()
     };
@@ -576,7 +579,7 @@ async fn send_observer_message(
 async fn maybe_auto_observe(app: &mut App, observer_tx: &mpsc::Sender<StreamToken>) {
     if let Some((idx, content)) = app.auto_observe_trigger() {
         app.last_auto_obs_idx = Some(idx);
-        let snippet = content.chars().take(800).collect::<String>();
+        let snippet = content.chars().take(2000).collect::<String>();
         let prompt = match app.lang.as_str() {
             "fr" => format!(
                 "[AUTO-OBSERVE] Le Coder vient de produire une nouvelle sortie. Fais une critique en mode commentaire live.\n\nDernière sortie du Coder:\n{snippet}"
@@ -605,16 +608,15 @@ async fn maybe_observer_loop_retry(app: &mut App, observer_tx: &mpsc::Sender<Str
     let coder_history = app.coder.chat_history();
     let cfg = app.observer_cfg.clone();
 
-    let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
     let lang = language_instruction(Some(&app.lang), &cfg.mode);
     let obs_mode_prompt = mode_prompt(&cfg.mode);
-    let obs_system = format!("{obs_mode_prompt}\n\n[Language]\n{lang}\n\n[Persona]\n{persona_prompt}");
+    let obs_system = format!("{obs_mode_prompt}\n\n[Language]\n{lang}");
     let obs_system = obs_system.trim_end().to_string();
     let coder_context = if !coder_history.is_empty() {
         let snippet = coder_history
             .iter()
             .rev()
-            .take(6)
+            .take(10)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -622,12 +624,12 @@ async fn maybe_observer_loop_retry(app: &mut App, observer_tx: &mpsc::Sender<Str
                 format!(
                     "[{}]: {}",
                     m.role,
-                    m.content.chars().take(500).collect::<String>()
+                    m.content.chars().take(800).collect::<String>()
                 )
             })
             .collect::<Vec<_>>()
             .join("\n");
-        format!("\n\n[Recent Coder activity]\n{snippet}")
+        format!("\n\n[Recent Coder activity — last 10 turns]\n{snippet}")
     } else {
         String::new()
     };
