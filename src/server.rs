@@ -19,6 +19,7 @@ use crate::types::ChatMessage;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const STYLES_CSS: &str = include_str!("../web/styles.css");
+const CORE_SANDBOX_JS: &str = include_str!("../web/core/sandbox.js");
 const REACT_JS: &str = include_str!("../web/vendor/react.production.min.js");
 const REACT_DOM_JS: &str = include_str!("../web/vendor/react-dom.production.min.js");
 
@@ -42,6 +43,84 @@ fn read_dev_asset(rel: &str) -> Option<Vec<u8>> {
     let root = dev_assets_root()?;
     let path = root.join(rel);
     std::fs::read(path).ok()
+}
+
+fn asset_content_type(rel: &str) -> &'static str {
+    let low = rel.trim().to_ascii_lowercase();
+    if low.ends_with(".js") {
+        "text/javascript; charset=utf-8"
+    } else if low.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if low.ends_with(".html") {
+        "text/html; charset=utf-8"
+    } else if low.ends_with(".png") {
+        "image/png"
+    } else if low.ends_with(".svg") {
+        "image/svg+xml"
+    } else if low.ends_with(".woff2") {
+        "font/woff2"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn is_safe_asset_rel(rel: &str) -> bool {
+    if rel.trim().is_empty() {
+        return false;
+    }
+    if rel.contains('\0') {
+        return false;
+    }
+    // Be strict: accept only normal path components (no absolute paths, no "..").
+    let p = Path::new(rel);
+    for c in p.components() {
+        match c {
+            Component::Normal(_) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+async fn serve_asset(stream: &mut TcpStream, req_path: &str) -> Result<()> {
+    let rel = req_path.trim_start_matches("/assets/");
+    if !is_safe_asset_rel(rel) {
+        return write_text(
+            stream,
+            400,
+            "Bad Request",
+            "text/plain; charset=utf-8",
+            "invalid asset path\n",
+        )
+        .await;
+    }
+
+    let ctype = asset_content_type(rel);
+    if let Some(bytes) = read_dev_asset(rel) {
+        return write_response(stream, 200, "OK", ctype, &bytes).await;
+    }
+
+    let bytes: Option<&'static [u8]> = match rel {
+        "app.js" => Some(APP_JS.as_bytes()),
+        "styles.css" => Some(STYLES_CSS.as_bytes()),
+        "core/sandbox.js" => Some(CORE_SANDBOX_JS.as_bytes()),
+        "vendor/react.production.min.js" => Some(REACT_JS.as_bytes()),
+        "vendor/react-dom.production.min.js" => Some(REACT_DOM_JS.as_bytes()),
+        _ => None,
+    };
+
+    if let Some(b) = bytes {
+        return write_response(stream, 200, "OK", ctype, b).await;
+    }
+
+    write_text(
+        stream,
+        404,
+        "Not Found",
+        "text/plain; charset=utf-8",
+        "not found\n",
+    )
+    .await
 }
 
 fn openai_compat_chat_urls(base_url: &str) -> Vec<String> {
@@ -235,86 +314,7 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
             )
             .await
         }
-        ("GET", "/assets/app.js") => {
-            if let Some(bytes) = read_dev_asset("app.js") {
-                return write_response(
-                    &mut stream,
-                    200,
-                    "OK",
-                    "text/javascript; charset=utf-8",
-                    &bytes,
-                )
-                .await;
-            }
-            write_response(
-                &mut stream,
-                200,
-                "OK",
-                "text/javascript; charset=utf-8",
-                APP_JS.as_bytes(),
-            )
-            .await
-        }
-        ("GET", "/assets/styles.css") => {
-            if let Some(bytes) = read_dev_asset("styles.css") {
-                return write_response(
-                    &mut stream,
-                    200,
-                    "OK",
-                    "text/css; charset=utf-8",
-                    &bytes,
-                )
-                .await;
-            }
-            write_response(
-                &mut stream,
-                200,
-                "OK",
-                "text/css; charset=utf-8",
-                STYLES_CSS.as_bytes(),
-            )
-            .await
-        }
-        ("GET", "/assets/vendor/react.production.min.js") => {
-            if let Some(bytes) = read_dev_asset("vendor/react.production.min.js") {
-                return write_response(
-                    &mut stream,
-                    200,
-                    "OK",
-                    "text/javascript; charset=utf-8",
-                    &bytes,
-                )
-                .await;
-            }
-            write_response(
-                &mut stream,
-                200,
-                "OK",
-                "text/javascript; charset=utf-8",
-                REACT_JS.as_bytes(),
-            )
-            .await
-        }
-        ("GET", "/assets/vendor/react-dom.production.min.js") => {
-            if let Some(bytes) = read_dev_asset("vendor/react-dom.production.min.js") {
-                return write_response(
-                    &mut stream,
-                    200,
-                    "OK",
-                    "text/javascript; charset=utf-8",
-                    &bytes,
-                )
-                .await;
-            }
-            write_response(
-                &mut stream,
-                200,
-                "OK",
-                "text/javascript; charset=utf-8",
-                REACT_DOM_JS.as_bytes(),
-            )
-            .await
-        }
+        ("GET", p) if p.starts_with("/assets/") => serve_asset(&mut stream, p).await,
         ("GET", "/api/status") => api_status(&mut stream, state).await,
         ("POST", "/api/models") => api_models(&mut stream, state, &req.body).await,
         ("POST", "/api/chat") => api_chat(&mut stream, state, &req.body).await,
