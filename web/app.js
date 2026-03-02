@@ -2187,10 +2187,10 @@
                   return next;
                 }),
               }, isExpanded ? tr(lang, "less") : tr(lang, "more")),
-              (!m.streaming && m.role === "assistant" && m.pane === "observer") ? e("button", {
+              (!m.streaming && m.role === "assistant" && (m.pane === "observer" || isLong)) ? e("button", {
                 onClick: () => setReaderModal({
                   id: m.id,
-                  title: whoLabel(m, lang),
+                  title: whoLabel(m, lang) + (activeThread && activeThread.title ? (" · " + activeThread.title) : ""),
                   ts: m.ts,
                   content: String(m.content || ""),
                 }),
@@ -3463,18 +3463,31 @@
         // One-shot language retry: if the response ignores the requested language (ja/fr),
         // retry once with an explicit rewrite instruction.
          const countRe = (re, s) => (String(s || "").match(re) || []).length;
+         const stripFencesForLang = (s) => {
+           const raw = String(s || "").replace(/\r\n/g, "\n");
+           const out = [];
+           let inFence = false;
+           for (const line of raw.split("\n")) {
+             if (/^\s*```/.test(line)) { inFence = !inFence; continue; }
+             if (inFence) continue;
+             out.push(line);
+           }
+           return out.join("\n");
+         };
          const looksJapanese = (s) => {
-           const jp = countRe(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g, s);
-           const lat = countRe(/[A-Za-z]/g, s);
-           if (jp < 4) return false;
+           const x = stripFencesForLang(s);
+           const jp = countRe(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g, x);
+           const lat = countRe(/[A-Za-z]/g, x);
+           if (jp < 8) return false;
            if (lat <= 0) return true;
            // Allow some English tokens (code, keys) but avoid "mostly English with a few JP chars".
-           return lat <= jp * 3;
+           return lat <= jp * 2;
          };
         const looksFrench = (s) => {
-          const a = countRe(/[\u00C0-\u017F]/g, s);
-          const fr = countRe(/\b(le|la|les|des|du|de|pour|avec|sans|est|sont|pas|mais|donc|sur|dans|vous|tu|je|nous|votre)\b/gi, s);
-          const en = countRe(/\b(the|and|you|your|should|this|that|with|for|not|are|is|was|were|will|can|cannot|do|does)\b/gi, s);
+          const x = stripFencesForLang(s);
+          const a = countRe(/[\u00C0-\u017F]/g, x);
+          const fr = countRe(/\b(le|la|les|des|du|de|pour|avec|sans|est|sont|pas|mais|donc|sur|dans|vous|tu|je|nous|votre)\b/gi, x);
+          const en = countRe(/\b(the|and|you|your|should|this|that|with|for|not|are|is|was|were|will|can|cannot|do|does)\b/gi, x);
           if (a > 0 && fr >= 1) return true;
           return fr > en + 1;
         };
@@ -4050,6 +4063,24 @@
                   const activeStyle = active
                     ? { borderColor: "rgba(96,165,250,0.60)", background: "rgba(96,165,250,0.10)" }
                     : null;
+                  const msgs = (t.messages || []);
+                  const lastMsg = msgs.length ? msgs[msgs.length - 1] : null;
+                  const workdirLabel = t.workdir ? (" · wd:" + String(t.workdir)) : "";
+                  const snippet = (() => {
+                    if (!lastMsg || !lastMsg.content) return "";
+                    const raw = String(lastMsg.content || "").replace(/\r\n/g, "\n").trim();
+                    if (!raw) return "";
+                    const firstLine = raw.split("\n").find((x) => String(x || "").trim()) || raw;
+                    const oneLine = String(firstLine).replace(/\s+/g, " ").trim();
+                    const max = 120;
+                    return oneLine.length > max ? (oneLine.slice(0, max) + "...") : oneLine;
+                  })();
+                  const snippetPrefix = (() => {
+                    if (!lastMsg) return "";
+                    const p = lastMsg.pane === "observer" ? "O" : lastMsg.pane === "chat" ? "H" : "C";
+                    const r = lastMsg.role === "user" ? "U" : "A";
+                    return p + r + ": ";
+                  })();
                   const isEditing = editingThreadId === t.id;
                   const isConfirmDel = confirmDeleteId === t.id;
                   return e(
@@ -4092,8 +4123,11 @@
                           e(
                             "div",
                             { className: "preset-sub" },
-                            `${new Date(t.updatedAt).toLocaleString()} · ${(t.messages || []).length} msgs`
-                          )
+                            `${new Date(t.updatedAt).toLocaleString()} · ${msgs.length} msgs${workdirLabel}`
+                          ),
+                          snippet
+                            ? e("div", { className: "preset-snippet" }, snippetPrefix + snippet)
+                            : null
                         ),
                     !isEditing && !isConfirmDel && e("button", { className: "btn", style: { padding: "8px 10px" }, onClick: () => renameThread(t.id) }, "✎"),
                     !isEditing && !isConfirmDel && e(

@@ -44,6 +44,30 @@ fn tokenize_words_lower(s: &str) -> Vec<String> {
         .collect()
 }
 
+fn strip_fenced_code_blocks(s: &str) -> String {
+    // Remove fenced code blocks (```...```) because they are often English-heavy and can
+    // overwhelm lightweight language heuristics.
+    //
+    // This is only used for Observer language enforcement (rewrite retry trigger).
+    let mut out = String::with_capacity(s.len());
+    let mut in_fence = false;
+
+    for line in s.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    out
+}
+
 pub fn is_skippable_for_lang_check(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() {
@@ -64,21 +88,23 @@ pub fn is_skippable_for_lang_check(s: &str) -> bool {
 }
 
 pub fn looks_japanese(s: &str) -> bool {
-    let jp = count_japanese_chars(s);
-    let lat = count_latin_letters(s);
-    if jp < 4 {
+    let stripped = strip_fenced_code_blocks(s);
+    let jp = count_japanese_chars(&stripped);
+    let lat = count_latin_letters(&stripped);
+    if jp < 8 {
         return false;
     }
     if lat == 0 {
         return true;
     }
     // Allow some English tokens (code, keys) but avoid "mostly English with a few JP chars".
-    lat <= jp * 3
+    lat <= jp * 2
 }
 
 pub fn looks_french(s: &str) -> bool {
-    let accents = count_french_accents(s);
-    let toks = tokenize_words_lower(s);
+    let stripped = strip_fenced_code_blocks(s);
+    let accents = count_french_accents(&stripped);
+    let toks = tokenize_words_lower(&stripped);
     if toks.is_empty() {
         return false;
     }
