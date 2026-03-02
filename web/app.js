@@ -48,6 +48,7 @@
       observerHint: "Type a message below to start observing, or enable Auto-observe in settings.",
       forceAgent: "Agent mode",
       toolRoot: "Tool root",
+      workdir: "Workdir",
       findInThread: "Find in thread…",
       noMatches: "No matches",
       pendingEdits: "Pending edits",
@@ -94,6 +95,7 @@
       error: "error",
       fetchFailed: "Failed to fetch (is OBSTRAL serve running?)",
       copy: "Copy",
+      reader: "Read",
       refresh: "Refresh",
       keys: "API keys",
       loopDetected: "Loop detected",
@@ -176,6 +178,7 @@
       observerHint: "下の入力欄にメッセージを送信するか、設定で「自動実況」をONにしてください。",
       forceAgent: "エージェント常時ON",
       toolRoot: "作業ルート",
+      workdir: "作業ディレクトリ",
       findInThread: "スレッド内検索…",
       noMatches: "一致するメッセージがありません",
       on: "ON",
@@ -189,6 +192,7 @@
       error: "error",
       fetchFailed: "通信できません（obstral serve が起動してる？ポート合ってる？）",
       copy: "コピー",
+      reader: "読む",
       refresh: "更新",
       keys: "APIキー状況",
       loopDetected: "ループ検出",
@@ -247,6 +251,7 @@
       editApproval: "Approbation édition",
       commandApproval: "Approbation commande",
       toolRoot: "Racine outils",
+      workdir: "Répertoire de travail",
       findInThread: "Rechercher dans le fil…",
       noMatches: "Aucun résultat",
       pendingEdits: "Éditions en attente",
@@ -293,6 +298,7 @@
       error: "erreur",
       fetchFailed: "Échec de requête (OBSTRAL serve est-il lancé ?)",
       copy: "Copier",
+      reader: "Lire",
       refresh: "Rafraîchir",
       keys: "Clés API",
       loopDetected: "Boucle détectée",
@@ -616,6 +622,7 @@
       title: title || "Untitled",
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      workdir: "",
       messages: [],
       tasks: [],
     };
@@ -797,7 +804,19 @@
     return String(id || "").replace(/[^a-zA-Z0-9_-]/g, "");
   }
 
-  function resolvedCwd(toolRoot, threadId) {
+  function safeWorkdir(workdir) {
+    const w0 = normalizePathSep(String(workdir || "")).trim();
+    const w = w0.replace(/^\/+|\/+$/g, "");
+    if (!w) return "";
+    if (/^\//.test(w)) return "";
+    if (/^[a-zA-Z]:[\\/]/.test(w)) return "";
+    if (/(^|\/)\.\.(\/|$)/.test(w)) return "";
+    // Avoid confusing control characters.
+    if (/[\u0000-\u001f]/.test(w)) return "";
+    return w;
+  }
+
+  function resolvedThreadRoot(toolRoot, threadId) {
     const root0 = String(toolRoot || "").trim();
     if (!root0) return undefined;
     const root = normalizePathSep(root0).replace(/\/+$/g, "");
@@ -808,6 +827,15 @@
       return `.tmp/${tid}`;
     }
     return root0;
+  }
+
+  function resolvedCwd(toolRoot, threadId, workdir) {
+    const root0 = resolvedThreadRoot(toolRoot, threadId);
+    if (!root0) return undefined;
+    const wd = safeWorkdir(workdir);
+    if (!wd) return root0;
+    const base = normalizePathSep(String(root0)).replace(/\/+$/g, "");
+    return base + "/" + wd;
   }
 
   function stripShellTranscript(text) {
@@ -1499,6 +1527,7 @@
     const [sendingChat, setSendingChat] = useState(false);
     const [proposalModal, setProposalModal] = useState(null);
     const [proposalModalText, setProposalModalText] = useState("");
+    const [readerModal, setReaderModal] = useState(null);
     const [planningTasks, setPlanningTasks] = useState(false);
 
     const [threadState, setThreadState] = useState(() => {
@@ -1511,6 +1540,7 @@
           title: typeof t.title === "string" && t.title.trim() ? t.title : "Untitled",
           createdAt: typeof t.createdAt === "number" ? t.createdAt : Date.now(),
           updatedAt: typeof t.updatedAt === "number" ? t.updatedAt : Date.now(),
+          workdir: typeof t.workdir === "string" ? t.workdir : "",
           messages: Array.isArray(t.messages)
             ? t.messages
                 .filter((m) => m && typeof m === "object")
@@ -1625,6 +1655,8 @@
         }
         if (e.key === "Escape") {
           setShowShortcuts(false);
+          setProposalModal(null);
+          setReaderModal(null);
           setEditingThreadId(null);
           setConfirmDeleteId(null);
         }
@@ -1771,18 +1803,28 @@
       if (!status || !status.features || !status.features.exec) return;
       if (!activeThread || !activeThread.id) return;
       const root0 = String(config.toolRoot || "").trim();
-      const wd = resolvedCwd(root0, activeThread.id);
-      if (!root0 || !wd) return;
-      const rootNorm = normalizePathSep(root0).replace(/\/+$/g, "");
-      const wdNorm = normalizePathSep(wd).replace(/\/+$/g, "");
-      if (rootNorm === wdNorm) return;
-      if (ensuredWorkdirRef.current[wdNorm]) return;
-      ensuredWorkdirRef.current[wdNorm] = true;
-      const cmd = isWindowsHost()
-        ? ("New-Item -ItemType Directory -Force -Path " + psSingleQuote(wd) + " | Out-Null")
-        : ("mkdir -p " + JSON.stringify(wd));
-      postJson("/api/exec", { command: cmd }).catch(() => {});
-    }, [status && status.features && status.features.exec, config.toolRoot, activeThread && activeThread.id]);
+      const root = resolvedThreadRoot(root0, activeThread.id);
+      const wd = resolvedCwd(root0, activeThread.id, activeThread.workdir);
+      if (!root0 || !root) return;
+
+      const ensureDir = (p) => {
+        if (!p) return;
+        const norm = normalizePathSep(p).replace(/\/+$/g, "");
+        if (ensuredWorkdirRef.current[norm]) return;
+        ensuredWorkdirRef.current[norm] = true;
+        const cmd = isWindowsHost()
+          ? ("New-Item -ItemType Directory -Force -Path " + psSingleQuote(p) + " | Out-Null")
+          : ("mkdir -p " + JSON.stringify(p));
+        postJson("/api/exec", { command: cmd }).catch(() => {});
+      };
+
+      // Always ensure the per-thread root exists (e.g. .tmp/<threadId>).
+      ensureDir(root);
+      // Also ensure the per-thread workdir exists, if set (e.g. .tmp/<threadId>/<repo>).
+      if (wd && normalizePathSep(wd).replace(/\/+$/g, "") !== normalizePathSep(root).replace(/\/+$/g, "")) {
+        ensureDir(wd);
+      }
+    }, [status && status.features && status.features.exec, config.toolRoot, activeThread && activeThread.id, activeThread && activeThread.workdir]);
 
     const refreshStatus = () => {
       fetch("/api/status")
@@ -2072,7 +2114,7 @@
         [msgId]: { ...(prev[msgId] || {}), [blockIdx]: { stdout: "", stderr: "", exit_code: 0, running: true } },
       }));
       try {
-        const cwd = resolvedCwd(config.toolRoot, activeThread && activeThread.id);
+        const cwd = resolvedCwd(config.toolRoot, activeThread && activeThread.id, activeThread && activeThread.workdir);
         const command = normalizeExecScript(langHint, codeText);
         const danger = dangerousCommandReason(command);
         if (danger && !confirmDangerous(lang, danger)) {
@@ -2104,7 +2146,7 @@
 
     const openFile = async (path) => {
       try {
-        const cwd = resolvedCwd(config.toolRoot, activeThread && activeThread.id);
+        const cwd = resolvedCwd(config.toolRoot, activeThread && activeThread.id, activeThread && activeThread.workdir);
         await postJson("/api/open", { path, cwd });
       } catch (_) {}
     };
@@ -2145,6 +2187,14 @@
                   return next;
                 }),
               }, isExpanded ? tr(lang, "less") : tr(lang, "more")),
+              (!m.streaming && m.role === "assistant" && m.pane === "observer") ? e("button", {
+                onClick: () => setReaderModal({
+                  id: m.id,
+                  title: whoLabel(m, lang),
+                  ts: m.ts,
+                  content: String(m.content || ""),
+                }),
+              }, tr(lang, "reader")) : null,
               e("button", {
                 className: copiedId === m.id ? "copied" : "",
                 onClick: () => copyText(m.content || "", m.id),
@@ -2372,7 +2422,7 @@
       parts.push("observer_view: You can inspect coder outputs and code snippets below.");
       parts.push(`coder_mode: ${String(config.mode || "")}`);
       parts.push(`coder_model: ${coderActiveModel()}`);
-      const cwdNow = resolvedCwd(config.toolRoot, activeThread && activeThread.id);
+      const cwdNow = resolvedCwd(config.toolRoot, activeThread && activeThread.id, activeThread && activeThread.workdir);
       parts.push(`tool_root: ${cwdNow ? String(cwdNow) : ""}`);
       if (lastUser) parts.push("last_user:\n" + cut(lastUser.content, 1200));
       if (lastAsst) parts.push("last_assistant:\n" + cut(lastAsst.content, 2600));
@@ -2387,7 +2437,7 @@
       return parts.join("\n");
     };
 
-    const runCoderAgentic = async (text, threadId, asstMsgId, reqCfg, resolvedKey, history, ac) => {
+    const runCoderAgentic = async (text, threadId, asstMsgId, reqCfg, resolvedKey, history, ac, threadWorkdir) => {
       const MAX_ITERS = 10;
       const TRUNC_STDOUT = 2000;
       const TRUNC_STDERR = 800;
@@ -2413,7 +2463,7 @@
         }
       };
 
-      const cwd = resolvedCwd(config.toolRoot, threadId);
+      const cwd = resolvedCwd(config.toolRoot, threadId, threadWorkdir);
       const cwdLabel = cwd ? String(cwd) : "(workspace root)";
 
       // UI-side loop breaker: if the model repeats the exact same failing command,
@@ -2446,6 +2496,72 @@
         }
         cmdStats.set(k, st);
         return st;
+      };
+
+      const fnv1a64 = (s) => {
+        // FNV-1a 64-bit (BigInt) hash. Cheap and stable for stuck detection.
+        let h = 0xcbf29ce484222325n;
+        const prime = 0x100000001b3n;
+        const str = String(s || "");
+        for (let i = 0; i < str.length; i++) {
+          h ^= BigInt(str.charCodeAt(i) & 0xff);
+          h = (h * prime) & 0xffffffffffffffffn;
+        }
+        return h;
+      };
+
+      const governor = {
+        consecutiveFailures: 0,
+        lastErrSig: "",
+        sameErrRepeats: 0,
+        lastOutHash: 0n,
+        sameOutRepeats: 0,
+        pendingHint: "",
+      };
+
+      const deriveGovernorHint = (stderr, stdout) => {
+        const sErr = String(stderr || "");
+        const sOut = String(stdout || "");
+        const s = (sErr || sOut || "").toLowerCase();
+        if (!s) return "";
+
+        // Poison proxy: github push/connect fails via 127.0.0.1:9
+        if (s.includes("port 443 via 127.0.0.1") || s.includes("127.0.0.1:9")) {
+          return [
+            "Detected a poisoned proxy env (127.0.0.1:9).",
+            "Fix (PowerShell):",
+            "$env:HTTP_PROXY=''; $env:HTTPS_PROXY=''; $env:ALL_PROXY=''; $env:GIT_HTTP_PROXY=''; $env:GIT_HTTPS_PROXY=''",
+            "Then retry. For GitHub push, prefer: .\\scripts\\push.ps1 (with $env:GITHUB_TOKEN).",
+          ].join("\n");
+        }
+
+        // WDAC-ish: msys tools like head.exe fail with Win32 error 5.
+        if (s.includes("win32 error 5") && s.includes("head.exe")) {
+          return [
+            "This environment blocks some MSYS/Unix tools (Win32 error 5).",
+            "Avoid `head`, `sed`, `nl`, pipes into MSYS tools. Use PowerShell equivalents:",
+            "Get-Content file | Select-Object -First 40",
+          ].join("\n");
+        }
+
+        // Cargo exe lock (binary is running).
+        if (s.includes("failed to remove file") && s.includes("obstral.exe") && (s.includes("access is denied") || s.includes("アクセスが拒否"))) {
+          return [
+            "obstral.exe is locked (running). Stop the process before rebuilding.",
+            "Fix: .\\scripts\\kill-obstral.ps1 ; then re-run build (or use .\\scripts\\run-tui.ps1 / run-ui.ps1).",
+          ].join("\n");
+        }
+
+        // Embedded repo hint (also covered elsewhere).
+        if (s.includes("embedded git repository") || s.includes("does not have a commit checked out")) {
+          return [
+            "You are mixing repos (nested git repo).",
+            "Fix: operate inside the project directory only, or move it under tool_root (.tmp/<threadId>).",
+            "Do NOT run `git add .` from the OBSTRAL repo root.",
+          ].join("\n");
+        }
+
+        return "";
       };
 
       const isWindows = isWindowsHost();
@@ -2511,7 +2627,7 @@
         "  and propose a completely different strategy. Never repeat a failing command.",
       ].join("\n");
 
-      const SYSTEM = SYSTEM_BASE + SYSTEM_REASONING;
+      const SYSTEM_BASE_TEXT = SYSTEM_BASE + SYSTEM_REASONING;
 
       const execTool = {
         type: "function",
@@ -2547,7 +2663,7 @@
       };
 
       const messages = [
-        { role: "system", content: SYSTEM },
+        { role: "system", content: SYSTEM_BASE_TEXT },
         ...history,
         { role: "user", content: text },
       ];
@@ -2629,6 +2745,14 @@
       for (let iter = 0; iter < MAX_ITERS; iter++) {
         if (ac.signal.aborted) break;
         pruneToolMessages(messages);
+        // One-shot governor hint injection (outer-loop behavioral control).
+        messages[0] = {
+          role: "system",
+          content: governor.pendingHint
+            ? (SYSTEM_BASE_TEXT + "\n\n[Governor]\n" + governor.pendingHint.trim())
+            : SYSTEM_BASE_TEXT,
+        };
+        governor.pendingHint = "";
 
         let streamResult;
         try {
@@ -2711,9 +2835,39 @@
                 const stdout = truncTool(execRes.stdout, TRUNC_STDOUT);
                 const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
                 const exitCode = execRes.exit_code;
-                const failed = exitCode !== 0 || (stderr && !stdout);
+                const looksHardError = (t) => /(^|\n)\s*(fatal:|error:|exception|traceback)\b/i.test(String(t || ""));
+                const failed = exitCode !== 0 || looksHardError(stderr);
                 noteCmd(k, failed, cmdSig(stderr, stdout));
-                const hint = failed ? gitRepoHint(stderr) : "";
+                const hintGit = failed ? gitRepoHint(stderr) : "";
+                const hintGov = failed ? deriveGovernorHint(stderr, stdout) : "";
+                const hint = [hintGit, hintGov].filter(Boolean).join("\n\n");
+
+                if (failed) {
+                  governor.consecutiveFailures++;
+                  const sig = cmdSig(stderr, stdout);
+                  if (sig && sig === governor.lastErrSig) governor.sameErrRepeats++;
+                  else { governor.lastErrSig = sig; governor.sameErrRepeats = 1; }
+                  const outHash = fnv1a64(String(stderr || "") + "\n" + String(stdout || ""));
+                  if (outHash === governor.lastOutHash) governor.sameOutRepeats++;
+                  else { governor.lastOutHash = outHash; governor.sameOutRepeats = 1; }
+
+                  // Escalate: if we're stuck, inject a hint to force a strategy change.
+                  if (governor.sameErrRepeats >= 2 || governor.sameOutRepeats >= 2 || governor.consecutiveFailures >= 3) {
+                    governor.pendingHint = [
+                      "You are stuck in a failure loop.",
+                      governor.lastErrSig ? ("last_error_signature: " + governor.lastErrSig) : "",
+                      "STOP repeating the same approach. Change strategy.",
+                      hintGov || hintGit || "",
+                      "First verify cwd/tool_root, then pick a different command.",
+                    ].filter(Boolean).join("\n");
+                  }
+                } else {
+                  governor.consecutiveFailures = 0;
+                  governor.lastErrSig = "";
+                  governor.sameErrRepeats = 0;
+                  governor.lastOutHash = 0n;
+                  governor.sameOutRepeats = 0;
+                }
 
                 toolResult = failed
                   ? `FAILED (exit_code: ${exitCode}).\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}\n⚠ The command failed. Diagnose the error above and call exec again with the fix. Do NOT continue to the next step until this succeeds.`
@@ -2848,9 +3002,38 @@
               const stdout = truncTool(execRes.stdout, TRUNC_STDOUT);
               const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
               const exitCode = execRes.exit_code;
-              const failed = exitCode !== 0 || (stderr && !stdout);
+              const looksHardError = (t) => /(^|\n)\s*(fatal:|error:|exception|traceback)\b/i.test(String(t || ""));
+              const failed = exitCode !== 0 || looksHardError(stderr);
               noteCmd(k, failed, cmdSig(stderr, stdout));
-              const hint = failed ? gitRepoHint(stderr) : "";
+              const hintGit = failed ? gitRepoHint(stderr) : "";
+              const hintGov = failed ? deriveGovernorHint(stderr, stdout) : "";
+              const hint = [hintGit, hintGov].filter(Boolean).join("\n\n");
+
+              if (failed) {
+                governor.consecutiveFailures++;
+                const sig = cmdSig(stderr, stdout);
+                if (sig && sig === governor.lastErrSig) governor.sameErrRepeats++;
+                else { governor.lastErrSig = sig; governor.sameErrRepeats = 1; }
+                const outHash = fnv1a64(String(stderr || "") + "\n" + String(stdout || ""));
+                if (outHash === governor.lastOutHash) governor.sameOutRepeats++;
+                else { governor.lastOutHash = outHash; governor.sameOutRepeats = 1; }
+
+                if (governor.sameErrRepeats >= 2 || governor.sameOutRepeats >= 2 || governor.consecutiveFailures >= 3) {
+                  governor.pendingHint = [
+                    "You are stuck in a failure loop.",
+                    governor.lastErrSig ? ("last_error_signature: " + governor.lastErrSig) : "",
+                    "STOP repeating the same approach. Change strategy.",
+                    hintGov || hintGit || "",
+                    "First verify cwd/tool_root, then pick a different command.",
+                  ].filter(Boolean).join("\n");
+                }
+              } else {
+                governor.consecutiveFailures = 0;
+                governor.lastErrSig = "";
+                governor.sameErrRepeats = 0;
+                governor.lastOutHash = 0n;
+                governor.sameOutRepeats = 0;
+              }
 
               resultText = failed
                 ? `FAILED (exit_code: ${exitCode}).\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}`
@@ -2950,32 +3133,72 @@
               return;
             }
 
-            const baseCwd = resolvedCwd(config.toolRoot, activeThread && activeThread.id);
-            const readmeLines = [
+            const baseCwd = resolvedThreadRoot(config.toolRoot, activeThread && activeThread.id);
+            const readmeEn = [
               `# ${safe}`,
               "",
               "Generated by OBSTRAL /scaffold.",
               "",
-              "## 日本語",
-              "このリポジトリはOBSTRALで自動生成された最小テンプレートです。",
-              "",
-              "## English",
               "This repository is a minimal template generated by OBSTRAL.",
               "",
-              "## Français",
-              "Ce dépôt est un modèle minimal généré par OBSTRAL.",
+              "Readme translations:",
+              "- Japanese: README.ja.md",
+              "- French: README.fr.md",
               "",
             ];
-            const readmePs = "@(" + readmeLines.map(psSingleQuote).join(",") + ") | Set-Content -LiteralPath 'README.md' -Encoding UTF8";
+            const readmeJa = [
+              `# ${safe}`,
+              "",
+              "OBSTRAL /scaffold により生成されました。",
+              "",
+              "このリポジトリはOBSTRALで自動生成された最小テンプレートです。",
+              "",
+              "README翻訳:",
+              "- English: README.md",
+              "- French: README.fr.md",
+              "",
+            ];
+            const readmeFr = [
+              `# ${safe}`,
+              "",
+              "Généré par OBSTRAL /scaffold.",
+              "",
+              "Ce dépôt est un modèle minimal généré par OBSTRAL.",
+              "",
+              "Traductions du README :",
+              "- Anglais : README.md",
+              "- Japonais : README.ja.md",
+              "",
+            ];
+            const readmeEnPs = "@(" + readmeEn.map(psSingleQuote).join(",") + ") | Set-Content -LiteralPath 'README.md' -Encoding UTF8";
+            const readmeJaPs = "@(" + readmeJa.map(psSingleQuote).join(",") + ") | Set-Content -LiteralPath 'README.ja.md' -Encoding UTF8";
+            const readmeFrPs = "@(" + readmeFr.map(psSingleQuote).join(",") + ") | Set-Content -LiteralPath 'README.fr.md' -Encoding UTF8";
+            const gitignoreLines = [
+              "# OBSTRAL scaffold",
+              ".DS_Store",
+              "node_modules/",
+              "dist/",
+              "target/",
+              ".venv/",
+              "__pycache__/",
+              "*.log",
+              "",
+            ];
+            const gitignorePs = "@(" + gitignoreLines.map(psSingleQuote).join(",") + ") | Set-Content -LiteralPath '.gitignore' -Encoding UTF8";
             const cmdPs = [
               "$ErrorActionPreference = 'Stop'",
               `New-Item -ItemType Directory -Force -Path ${psSingleQuote(safe)} | Out-Null`,
               `Set-Location ${psSingleQuote(safe)}`,
-              readmePs,
+              "New-Item -ItemType Directory -Force -Path 'src' | Out-Null",
+              "New-Item -ItemType Directory -Force -Path 'docs' | Out-Null",
+              readmeEnPs,
+              readmeJaPs,
+              readmeFrPs,
+              gitignorePs,
               "git init | Out-Null",
               "$n = (git config user.name); if (-not $n) { git config user.name 'OBSTRAL' }",
               "$e = (git config user.email); if (-not $e) { git config user.email 'obstral@local' }",
-              "git add README.md | Out-Null",
+              "git add README.md README.ja.md README.fr.md .gitignore | Out-Null",
               "git commit -m 'Initial commit' | Out-Null",
             ].join("; ");
 
@@ -2988,7 +3211,11 @@
               const msg = { id: uid(), pane: "coder", role: "assistant", content: out, ts: Date.now() };
               setThreadState((s) => ({
                 ...s,
-                threads: s.threads.map((t) => (t.id === activeThread.id ? { ...t, updatedAt: Date.now(), messages: [...(t.messages || []), msg] } : t)),
+                threads: s.threads.map((t) => (
+                  t.id === activeThread.id
+                    ? { ...t, updatedAt: Date.now(), workdir: ok ? safe : (t.workdir || ""), messages: [...(t.messages || []), msg] }
+                    : t
+                )),
               }));
             } catch (err) {
               const msg = { id: uid(), pane: "coder", role: "assistant", content: `[OBSTRAL] scaffold error: ${prettyErr(err)}`, ts: Date.now() };
@@ -3041,7 +3268,7 @@
       setSendingCoder(true);
       requestAnimationFrame(() => scrollBottom(coderBodyRef));
 
-      const toolRootResolved = resolvedCwd(config.toolRoot, threadId);
+      const toolRootResolved = resolvedCwd(config.toolRoot, threadId, activeThread && activeThread.workdir);
       const reqCfg2 = toolRootResolved ? { ...reqCfg, toolRoot: toolRootResolved } : reqCfg;
       const reqBody = buildReq(reqCfg2, resolvedKey, history, text, diff);
       reqBody.lang = lang;
@@ -3050,11 +3277,11 @@
       abortCoderRef.current = ac;
 
       try {
-        const supportsTools = resolvedProvider === "openai-compatible" || resolvedProvider === "mistral" || resolvedProvider === "openai";
-        const serverChatTools = !!(status && status.features && status.features.chat_tools);
-        if ((config.forceAgent || wantsMaterial) && supportsTools && serverChatTools) {
-          await runCoderAgentic(text, threadId, asstMsg.id, reqCfg, resolvedKey, history, ac);
-        } else if (config.stream) {
+          const supportsTools = resolvedProvider === "openai-compatible" || resolvedProvider === "mistral" || resolvedProvider === "openai";
+          const serverChatTools = !!(status && status.features && status.features.chat_tools);
+          if ((config.forceAgent || wantsMaterial) && supportsTools && serverChatTools) {
+            await runCoderAgentic(text, threadId, asstMsg.id, reqCfg, resolvedKey, history, ac, activeThread && activeThread.workdir);
+          } else if (config.stream) {
           await streamChat(
             reqBody,
             (evt) => {
@@ -3224,7 +3451,7 @@
       const sendText = config.includeCoderContext
         ? (text + "\n\n" + observerBridge + "\n\n" + coderContextPacket())
         : (text + "\n\n" + observerBridge);
-      const toolRootResolved = resolvedCwd(config.toolRoot, threadId);
+      const toolRootResolved = resolvedCwd(config.toolRoot, threadId, activeThread && activeThread.workdir);
       const obsCfg2 = toolRootResolved ? { ...obsCfg, toolRoot: toolRootResolved } : obsCfg;
       const reqBody = buildReq(obsCfg2, obsKey, history, sendText, diff);
       reqBody.lang = lang;
@@ -4348,6 +4575,23 @@
                   placeholder: "(optional) subdir (e.g. myrepo)",
                 })
               ),
+              e(
+                "div",
+                { className: "field", style: { marginTop: "10px" } },
+                e("label", null, tr(lang, "workdir")),
+                e("input", {
+                  className: "input",
+                  value: String((activeThread && activeThread.workdir) || ""),
+                  onChange: (ev) => {
+                    const v = String(ev.target.value || "");
+                    setThreadState((s) => ({
+                      ...s,
+                      threads: s.threads.map((t) => (t.id === (activeThread && activeThread.id) ? { ...t, updatedAt: Date.now(), workdir: v } : t)),
+                    }));
+                  },
+                  placeholder: "(optional) subdir inside tool_root (e.g. myrepo)",
+                })
+              ),
               (String(config.provider || "").trim() === "mistral-cli" ||
                 String(config.codeProvider || "").trim() === "mistral-cli" ||
                 String(config.observerProvider || "").trim() === "mistral-cli")
@@ -5128,6 +5372,30 @@
                 setProposalModal(null);
               },
             }, tr(lang, "sendToCoder"))
+          )
+        )
+      ),
+
+      // Reader modal (for readable long messages, especially Observer critiques)
+      readerModal && e(
+        "div",
+        { className: "modal-overlay", onClick: () => setReaderModal(null) },
+        e(
+          "div",
+          { className: "modal-box reader-modal", onClick: (ev) => ev.stopPropagation() },
+          e("div", { className: "modal-header" },
+            e("div", { style: { display: "flex", flexDirection: "column", gap: 3 } },
+              e("h3", null, String(readerModal.title || tr(lang, "observer"))),
+              readerModal.ts ? e("span", { style: { fontSize: 11, fontFamily: "var(--mono)", color: "var(--muted)" } }, relativeTime(readerModal.ts, lang)) : null
+            ),
+            e("button", { className: "btn btn-icon", title: tr(lang, "close"), onClick: () => setReaderModal(null) }, "×")
+          ),
+          e("div", { className: "reader-body" },
+            renderWithThink(String(readerModal.content || ""), {}, null, null)
+          ),
+          e("div", { className: "modal-footer" },
+            e("button", { className: "btn", onClick: () => setReaderModal(null) }, tr(lang, "close")),
+            e("button", { className: "btn btn-primary", onClick: () => copyText(String(readerModal.content || "")) }, tr(lang, "copy"))
           )
         )
       ),
