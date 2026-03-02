@@ -8,9 +8,14 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $repoRoot
 
+# Build/run from an isolated target dir so it can coexist with `run-tui.ps1`.
+$env:CARGO_TARGET_DIR = (Join-Path $repoRoot ".tmp\\cargo-target-ui")
+New-Item -ItemType Directory -Force -Path $env:CARGO_TARGET_DIR | Out-Null
+& (Join-Path $PSScriptRoot "kill-obstral.ps1") -PathContains $env:CARGO_TARGET_DIR | Out-Null
+
 $cargoBin = Join-Path $env:USERPROFILE ".cargo\\bin"
 $cargoExe = Join-Path $cargoBin "cargo.exe"
-$exe = Join-Path $repoRoot "target\\debug\\obstral.exe"
+$exe = Join-Path $env:CARGO_TARGET_DIR "debug\\obstral.exe"
 
 if (Test-Path $cargoExe) {
   & $cargoExe build

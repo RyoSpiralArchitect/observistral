@@ -1,5 +1,5 @@
 // Lightweight language heuristics used for server-side enforcement.
-// This deliberately avoids heavy dependencies (regex) and keeps false positives low.
+// This deliberately avoids heavy dependencies and keeps false positives low.
 //
 // NOTE: This is a heuristic, not a classifier. It is used only to trigger a one-shot
 // "rewrite into requested language" retry for Observer responses.
@@ -7,11 +7,12 @@
 fn count_japanese_chars(s: &str) -> usize {
     s.chars()
         .filter(|&ch| {
-            matches!(ch as u32,
+            matches!(
+                ch as u32,
                 0x3040..=0x309F | // Hiragana
                 0x30A0..=0x30FF | // Katakana
                 0x3400..=0x4DBF | // CJK Ext A
-                0x4E00..=0x9FFF   // CJK Unified
+                0x4E00..=0x9FFF // CJK Unified
             )
         })
         .count()
@@ -21,15 +22,18 @@ fn count_latin_letters(s: &str) -> usize {
     s.chars().filter(|c| c.is_ascii_alphabetic()).count()
 }
 
+fn is_latin_accent(ch: char) -> bool {
+    // Keep this broad and dependency-free. Latin-1 Supplement + Latin Extended-A covers
+    // common French diacritics and ligatures.
+    matches!(
+        ch as u32,
+        0x00C0..=0x00FF | // Latin-1 Supplement
+        0x0100..=0x017F // Latin Extended-A
+    )
+}
+
 fn count_french_accents(s: &str) -> usize {
-    s.chars()
-        .filter(|c| match c {
-            'à' | 'â' | 'ç' | 'é' | 'è' | 'ê' | 'ë' | 'î' | 'ï' | 'ô' | 'ù' | 'û' | 'ü' | 'ÿ'
-            | 'œ' | 'æ' | 'À' | 'Â' | 'Ç' | 'É' | 'È' | 'Ê' | 'Ë' | 'Î' | 'Ï' | 'Ô' | 'Ù'
-            | 'Û' | 'Ü' | 'Ÿ' | 'Œ' | 'Æ' => true,
-            _ => false,
-        })
-        .count()
+    s.chars().filter(|&c| is_latin_accent(c)).count()
 }
 
 fn tokenize_words_lower(s: &str) -> Vec<String> {
@@ -62,7 +66,7 @@ pub fn is_skippable_for_lang_check(s: &str) -> bool {
 pub fn looks_japanese(s: &str) -> bool {
     let jp = count_japanese_chars(s);
     let lat = count_latin_letters(s);
-    if jp < 8 {
+    if jp < 4 {
         return false;
     }
     if lat == 0 {
@@ -79,13 +83,32 @@ pub fn looks_french(s: &str) -> bool {
         return false;
     }
 
-    const FR: [&str; 18] = [
-        "le", "la", "les", "des", "du", "de", "pour", "avec", "sans", "est", "sont", "pas",
-        "mais", "donc", "sur", "dans", "vous", "nous",
+    const FR: [&str; 21] = [
+        "le",
+        "la",
+        "les",
+        "des",
+        "du",
+        "de",
+        "pour",
+        "avec",
+        "sans",
+        "est",
+        "sont",
+        "pas",
+        "mais",
+        "donc",
+        "sur",
+        "dans",
+        "vous",
+        "tu",
+        "je",
+        "nous",
+        "votre",
     ];
     const EN: [&str; 16] = [
-        "the", "and", "you", "your", "should", "this", "that", "with", "for", "not", "are",
-        "is", "was", "were", "will", "can",
+        "the", "and", "you", "your", "should", "this", "that", "with", "for", "not", "are", "is",
+        "was", "were", "will", "can",
     ];
 
     let mut fr = 0usize;
@@ -126,7 +149,7 @@ mod tests {
 
     #[test]
     fn japanese_heuristic_basic() {
-        assert!(looks_japanese("これはテストです。提案します。"));
+        assert!(looks_japanese("これはテストです。バグを直してください。"));
         assert!(!looks_japanese("Coder attempted to create a repo but failed."));
     }
 
@@ -138,9 +161,11 @@ mod tests {
 
     #[test]
     fn skippable_blocks_do_not_trigger_rewrite() {
-        assert!(!needs_language_rewrite("ja", "[Observer] No new critique. Loop detected."));
+        assert!(!needs_language_rewrite(
+            "ja",
+            "[Observer] No new critique. Loop detected."
+        ));
         assert!(!needs_language_rewrite("fr", "[error] HTTP 401"));
         assert!(!needs_language_rewrite("ja", "[エラー] HTTP 401"));
     }
 }
-

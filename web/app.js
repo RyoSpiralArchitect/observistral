@@ -3239,13 +3239,13 @@
          const looksJapanese = (s) => {
            const jp = countRe(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g, s);
            const lat = countRe(/[A-Za-z]/g, s);
-           if (jp < 8) return false;
+           if (jp < 4) return false;
            if (lat <= 0) return true;
            // Allow some English tokens (code, keys) but avoid "mostly English with a few JP chars".
            return lat <= jp * 3;
          };
         const looksFrench = (s) => {
-          const a = countRe(/[àâçéèêëîïôùûüÿœæ]/gi, s);
+          const a = countRe(/[\u00C0-\u017F]/g, s);
           const fr = countRe(/\b(le|la|les|des|du|de|pour|avec|sans|est|sont|pas|mais|donc|sur|dans|vous|tu|je|nous|votre)\b/gi, s);
           const en = countRe(/\b(the|and|you|your|should|this|that|with|for|not|are|is|was|were|will|can|cannot|do|does)\b/gi, s);
           if (a > 0 && fr >= 1) return true;

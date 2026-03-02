@@ -149,29 +149,43 @@ impl ChatBot {
             };
 
             if expected != "en" && lang_detect::needs_language_rewrite(expected, &resp.content) {
-                let retry_instr = if expected == "fr" {
-                    "LANGUAGE FIX: Rewrite the assistant's last message in French ONLY. Do not add new content. Output ONLY the rewritten text. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+                // IMPORTANT: Do NOT reuse the full system prompt (persona/mode) for the rewrite.
+                // Some personas strongly bias language/tone; use a minimal translator system prompt.
+                let system_fix = if expected == "fr" {
+                    "You are a strict translator.\n\
+Rewrite the provided text into French ONLY.\n\
+Do not add new content.\n\
+Output ONLY the rewritten text.\n\
+Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
                 } else {
-                    "LANGUAGE FIX: Rewrite the assistant's last message in Japanese ONLY. Do not add new content. Output ONLY the rewritten text. Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+                    "You are a strict translator.\n\
+Rewrite the provided text into Japanese ONLY.\n\
+Do not add new content.\n\
+Output ONLY the rewritten text.\n\
+Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
                 };
 
-                let mut hist2: Vec<ChatMessage> = Vec::with_capacity(history.len() + 2);
-                for m in history {
-                    if m.role == "user" || m.role == "assistant" {
-                        hist2.push(m.clone());
-                    }
-                }
-                hist2.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: user_text.clone(),
-                });
-                hist2.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: resp.content.clone(),
-                });
+                let user_fix = format!(
+                    "TEXT:\n```text\n{}\n```",
+                    resp.content.trim_end()
+                );
 
-                let mut request2 = build_request(&hist2, retry_instr);
-                request2.temperature = Some(0.2);
+                let request2 = ChatRequest {
+                    messages: vec![
+                        ChatMessage {
+                            role: "system".to_string(),
+                            content: system_fix.to_string(),
+                        },
+                        ChatMessage {
+                            role: "user".to_string(),
+                            content: user_fix,
+                        },
+                    ],
+                    temperature: Some(0.0),
+                    max_tokens: Some(max_tokens),
+                    metadata: None,
+                };
+
                 if let Ok(resp2) = self.provider.chat(&request2).await {
                     if !resp2.content.trim().is_empty()
                         && !lang_detect::needs_language_rewrite(expected, &resp2.content)
