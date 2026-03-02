@@ -77,6 +77,234 @@ fn sanitize_shellish_command(cmd: &str) -> String {
     s
 }
 
+fn split_args_simple(s: &str) -> Vec<String> {
+    // Minimal tokeniser good enough for short command snippets.
+    // Supports single and double quotes. In double quotes, \" and \\ are handled.
+    let src = s.trim();
+    if src.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut q: Option<char> = None;
+    let mut chars = src.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if let Some(qq) = q {
+            if ch == qq {
+                q = None;
+                continue;
+            }
+            if qq == '"' && ch == '\\' {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                    continue;
+                }
+            }
+            cur.push(ch);
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            q = Some(ch);
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            if !cur.is_empty() {
+                out.push(cur.clone());
+                cur.clear();
+            }
+            continue;
+        }
+
+        cur.push(ch);
+    }
+
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn ps_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+#[cfg(target_os = "windows")]
+fn looks_bashish_windows_script(s: &str) -> bool {
+    let x = s.to_ascii_lowercase();
+    // Windows PowerShell 5.x doesn't support `&&`.
+    if x.contains("&&") {
+        return true;
+    }
+    // Common bash snippets produced by models.
+    if x.contains("mkdir -p") || x.contains("mkdir --parents") {
+        return true;
+    }
+    if x.contains("\ntouch ")
+        || x.starts_with("touch ")
+        || x.contains("; touch ")
+        || x.contains("&& touch ")
+    {
+        return true;
+    }
+    if x.contains("rm -rf") || x.contains("rm -r ") || x.contains("rm -r\t") {
+        return true;
+    }
+    if x.contains("\nexport ") || x.starts_with("export ") || x.contains("; export ") {
+        return true;
+    }
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn bash_to_powershell_script(script: &str) -> String {
+    // Port of the UI-side translator: convert common bash commands into a
+    // Windows PowerShell script, so models can paste bash snippets and still run.
+    let raw = script.replace("\r\n", "\n");
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    out.push("$ErrorActionPreference = 'Stop'".to_string());
+
+    for line0 in raw.split('\n') {
+        let mut line = line0.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+
+        // Common model glitch: trailing brace.
+        if line.ends_with('}') && !line.contains('{') {
+            line.pop();
+            line = line.trim().to_string();
+        }
+
+        // Replace `&&` (unsupported in Windows PowerShell 5.x) with `;`
+        // then split into segments (naive, but good enough for typical snippets).
+        let line = line.replace("&&", ";");
+        for seg0 in line.split(';') {
+            let seg = seg0.trim();
+            if seg.is_empty() {
+                continue;
+            }
+
+            let toks = split_args_simple(seg);
+            if toks.is_empty() {
+                continue;
+            }
+            let head = toks[0].as_str();
+
+            if head == "mkdir" {
+                let mut parents = false;
+                let mut paths: Vec<String> = Vec::new();
+                for t in toks.iter().skip(1) {
+                    if t == "-p" || t == "--parents" {
+                        parents = true;
+                        continue;
+                    }
+                    if t.starts_with('-') {
+                        continue;
+                    }
+                    paths.push(t.to_string());
+                }
+                if parents {
+                    for p in paths {
+                        out.push(format!(
+                            "[System.IO.Directory]::CreateDirectory({}) | Out-Null",
+                            ps_single_quote(&p)
+                        ));
+                    }
+                } else {
+                    // `mkdir` is an alias in PowerShell; keep it if there's no -p.
+                    out.push(seg.to_string());
+                }
+                continue;
+            }
+
+            if head == "touch" {
+                let mut paths: Vec<String> = Vec::new();
+                for t in toks.iter().skip(1) {
+                    if t.starts_with('-') {
+                        continue;
+                    }
+                    paths.push(t.to_string());
+                }
+                for p in paths {
+                    let q = ps_single_quote(&p);
+                    out.push(format!(
+                        "if (-not (Test-Path -LiteralPath {q})) {{ New-Item -ItemType File -Force -Path {q} | Out-Null }} else {{ (Get-Item -LiteralPath {q}).LastWriteTime = Get-Date }}"
+                    ));
+                }
+                continue;
+            }
+
+            if head == "rm" {
+                let mut recurse = false;
+                let mut paths: Vec<String> = Vec::new();
+                for t in toks.iter().skip(1) {
+                    if t.starts_with('-') {
+                        if t.contains('r') || t.contains('R') {
+                            recurse = true;
+                        }
+                        continue;
+                    }
+                    paths.push(t.to_string());
+                }
+                for p in paths {
+                    let q = ps_single_quote(&p);
+                    out.push(format!(
+                        "Remove-Item -Force {}-ErrorAction SilentlyContinue -LiteralPath {}",
+                        if recurse { "-Recurse " } else { "" },
+                        q
+                    ));
+                }
+                continue;
+            }
+
+            if head == "cp" && toks.len() >= 3 {
+                out.push(format!(
+                    "Copy-Item -Force -LiteralPath {} -Destination {}",
+                    ps_single_quote(&toks[1]),
+                    ps_single_quote(&toks[2])
+                ));
+                continue;
+            }
+
+            if head == "mv" && toks.len() >= 3 {
+                out.push(format!(
+                    "Move-Item -Force -LiteralPath {} -Destination {}",
+                    ps_single_quote(&toks[1]),
+                    ps_single_quote(&toks[2])
+                ));
+                continue;
+            }
+
+            if head == "export" && toks.len() >= 2 {
+                let kv = &toks[1];
+                if let Some(idx) = kv.find('=') {
+                    let k = kv[..idx].to_string();
+                    let v = kv[idx + 1..].to_string();
+                    if !k.trim().is_empty() {
+                        out.push(format!("$env:{k} = {}", ps_single_quote(&v)));
+                        continue;
+                    }
+                }
+            }
+
+            out.push(seg.to_string());
+        }
+    }
+
+    out.join("\n").trim().to_string()
+}
+
 fn is_poison_proxy(v: &str) -> bool {
     let s = v.trim().to_ascii_lowercase();
     // Known-bad proxy setting: forces all HTTPS traffic into a dead local proxy.
@@ -160,6 +388,13 @@ pub fn check_dangerous_command(cmd: &str) -> Option<&'static str> {
     }
 
     // Windows destructive patterns
+    // Note: OpenSSH / PowerShell variants can permute arg order; keep these checks flexible.
+    if s.contains("remove-item") && s.contains("-recurse") {
+        if s.contains("c:\\") || s.contains("c:/") {
+            return Some("recursive remove of C: drive");
+        }
+    }
+
     let win_dangerous = [
         ("format ", "format command can erase drives"),
         ("del /s /q c:\\", "recursive delete of C: drive"),
@@ -217,6 +452,24 @@ pub async fn run_command(command: &str, cwd: Option<&str>) -> Result<ExecResult>
             exit_code: -1,
         });
     }
+
+    // Windows: many models paste bash snippets. Translate common bash commands into PowerShell
+    // so the tool works reliably in a PowerShell-only runtime.
+    #[cfg(target_os = "windows")]
+    let cleaned = if looks_bashish_windows_script(&cleaned) {
+        bash_to_powershell_script(&cleaned)
+    } else {
+        cleaned
+    };
+
+    if let Some(reason) = check_dangerous_command(&cleaned) {
+        return Ok(ExecResult {
+            stdout: String::new(),
+            stderr: format!("[BLOCKED] dangerous command: {reason}"),
+            exit_code: -1,
+        });
+    }
+
     let cmd_str = cleaned.trim();
 
     let mut cmd = build_command(cmd_str).await?;
@@ -325,5 +578,43 @@ pub fn decode_output(bytes: &[u8]) -> String {
     #[cfg(not(target_os = "windows"))]
     {
         String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_prompt_markers() {
+        let s = sanitize_shellish_command("$ mkdir -p foo\nPS> cd foo\n> touch a.txt");
+        assert!(!s.contains("$ mkdir"));
+        assert!(s.contains("mkdir -p foo"));
+        assert!(s.contains("cd foo"));
+        assert!(s.contains("touch a.txt"));
+    }
+
+    #[test]
+    fn split_args_simple_handles_quotes() {
+        let t = split_args_simple("cp 'a b.txt' \"c d.txt\"");
+        assert_eq!(t, vec!["cp", "a b.txt", "c d.txt"]);
+    }
+
+    #[test]
+    fn ps_single_quote_escapes() {
+        assert_eq!(ps_single_quote("a'b"), "'a''b'");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn bash_translation_basic() {
+        let s = "$ mkdir -p repo && cd repo && touch README.md";
+        let cleaned = sanitize_shellish_command(s);
+        assert!(looks_bashish_windows_script(&cleaned));
+        let ps = bash_to_powershell_script(&cleaned);
+        assert!(ps.contains("$ErrorActionPreference = 'Stop'"));
+        assert!(ps.contains("[System.IO.Directory]::CreateDirectory('repo')"));
+        assert!(ps.contains("cd repo") || ps.contains("Set-Location 'repo'"));
+        assert!(ps.contains("New-Item -ItemType File"));
     }
 }
