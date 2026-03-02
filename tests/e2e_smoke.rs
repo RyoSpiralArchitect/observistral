@@ -94,6 +94,42 @@ async fn serve_smoke_assets() {
         .expect("read styles.css body");
     assert!(styles.contains(".bubble"), "styles.css should include .bubble rules");
 
+    let status_json: serde_json::Value = client
+        .get(format!("{base}/api/status"))
+        .send()
+        .await
+        .expect("GET /api/status")
+        .json()
+        .await
+        .expect("parse /api/status JSON");
+    assert!(
+        status_json.get("host_os").and_then(|v| v.as_str()).unwrap_or("") != "",
+        "/api/status should include host_os"
+    );
+    assert_eq!(
+        status_json.pointer("/features/pending_edits").and_then(|v| v.as_bool()).unwrap_or(false),
+        true,
+        "/api/status features.pending_edits should be true"
+    );
+    assert_eq!(
+        status_json.pointer("/features/meta_prompts").and_then(|v| v.as_bool()).unwrap_or(false),
+        true,
+        "/api/status features.meta_prompts should be true"
+    );
+
+    let pending_json: serde_json::Value = client
+        .get(format!("{base}/api/pending_edits"))
+        .send()
+        .await
+        .expect("GET /api/pending_edits")
+        .json()
+        .await
+        .expect("parse /api/pending_edits JSON");
+    assert!(
+        pending_json.get("pending").map(|v| v.is_array()).unwrap_or(false),
+        "/api/pending_edits should return {{ pending: [] }}"
+    );
+
     let _ = child.kill();
     let _ = child.wait();
 }
