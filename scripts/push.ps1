@@ -32,5 +32,10 @@ $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
 $hdr = "AUTHORIZATION: basic $b64"
 
 Write-Host ("[push] git push {0} {1}" -f $Remote, $Branch) -ForegroundColor Cyan
-git -c http.sslBackend=openssl -c ("http.extraheader=" + $hdr) push $Remote $Branch
-
+# Force-disable proxy even if it was set via git config.
+git `
+  -c http.proxy= `
+  -c https.proxy= `
+  -c http.sslBackend=openssl `
+  -c ("http.extraheader=" + $hdr) `
+  push $Remote $Branch
