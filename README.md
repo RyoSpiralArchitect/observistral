@@ -121,9 +121,50 @@ quote: user_input = input()
 
 `Ctrl+A`（TUI）または設定の **Auto-observe** をONにすると、Coder がレスポンスを出すたびに Observer が自動でレビューを開始します。
 
+#### ヘルスバッジ `❤ N`
+
+Observer が `--- health ---` ブロックを出力すると、ステータスバーにスコアが表示されます:
+
+| スコア | 色 | 意味 |
+|---|---|---|
+| ≥ 70 | 緑 | 本番相当 |
+| 40–69 | 橙 | 開発・デモ可 |
+| < 40 | 赤 | 即対応が必要 |
+
+#### 提案ステータスのライフサイクル
+
+Observer が同じ提案を繰り返し出した場合、スルーした回数に応じてステータスが昇格します:
+
+| status | 意味 | スコア補正 |
+|---|---|---|
+| `new` | 初回出現 | ±0 |
+| `[UNRESOLVED]` | 1回スルー | +10 |
+| `[ESCALATED]` | 2回以上スルー・先頭強制表示 | +20 合計 |
+| `addressed` | 対応済み（シアン表示） | — |
+
+#### `quote` フィールド
+
+`warn` / `critical` 提案には `quote` フィールドが必須です。該当コードをカード上にシアンのモノスペースで表示します:
+
+```
+❝ user_input = input()
+```
+
 ---
 
 ### UX のポイント
+
+#### Chat タブ — ペルソナチップバー
+
+Chat コンポーザーの上に5つのペルソナチップが並びます。セッション中いつでも切り替え可能で、Coder / Observer のペルソナとは完全に独立しています（デフォルト: 😊 陽気）:
+
+| チップ | スタイル |
+|---|---|
+| 😊 陽気 (cheerful) | 明るく前向きに応答 |
+| 🤔 思慮深い (thoughtful) | 前提を確認しながら丁寧に |
+| 🧙 師匠 (sensei) | 問いかけで気づかせるスタイル |
+| 😏 皮肉屋 (cynical) | 核心を鋭く指摘 |
+| 🦆 ゴム鴨 (duck) | 答えを出さず「なぜ？」で思考整理 |
 
 #### デュアルペイン（ドラッグでリサイズ）
 
@@ -400,9 +441,50 @@ Proposals auto-sort by score. **"Send to Coder"** routes the proposal through a 
 
 `Ctrl+A` (TUI) or **Auto-observe** in settings fires Observer automatically after every Coder response.
 
+#### Health badge `❤ N`
+
+When Observer emits a `--- health ---` block, the score appears in the status bar:
+
+| Score | Colour | Meaning |
+|---|---|---|
+| ≥ 70 | Green | Production-ready |
+| 40–69 | Amber | OK for dev / demo |
+| < 40 | Red | Immediate action needed |
+
+#### Proposal status lifecycle
+
+If Observer surfaces the same proposal repeatedly and it is not addressed, the status escalates:
+
+| Status | Meaning | Score bonus |
+|---|---|---|
+| `new` | First appearance | ±0 |
+| `[UNRESOLVED]` | Ignored once | +10 |
+| `[ESCALATED]` | Ignored twice or more — forced to top | +20 total |
+| `addressed` | Resolved (shown in cyan) | — |
+
+#### `quote` field
+
+Required for `warn` / `critical` proposals. Displays the offending snippet in cyan monospace on the card:
+
+```
+❝ user_input = input()
+```
+
 ---
 
 ### UX Highlights
+
+#### Chat tab — Persona chip bar
+
+Five persona chips sit above the Chat composer. Switch at any time during a session — completely independent from Coder and Observer personas (default: 😊 Cheerful):
+
+| Chip | Style |
+|---|---|
+| 😊 Cheerful | Upbeat and encouraging |
+| 🤔 Thoughtful | Checks assumptions, answers carefully |
+| 🧙 Sensei | Guides with questions, not answers |
+| 😏 Cynical | Points straight to the uncomfortable truth |
+| 🦆 Duck | Never answers — just asks "Why?" to unblock your thinking |
 
 #### Drag-to-resize panes
 
@@ -673,9 +755,50 @@ Les propositions sont triées par score. **"Send to Coder"** envoie la propositi
 
 `Ctrl+A` (TUI) ou **Auto-observer** dans les paramètres déclenche l'Observer automatiquement après chaque réponse du Coder.
 
+#### Badge de santé `❤ N`
+
+Quand l'Observer émet un bloc `--- health ---`, le score apparaît dans la barre d'état:
+
+| Score | Couleur | Signification |
+|---|---|---|
+| ≥ 70 | Vert | Prêt pour la production |
+| 40–69 | Ambre | OK pour dev / démo |
+| < 40 | Rouge | Action immédiate requise |
+
+#### Cycle de vie du statut de proposition
+
+Si l'Observer soulève la même proposition à plusieurs reprises sans qu'elle soit traitée, le statut monte en grade:
+
+| Statut | Signification | Bonus de score |
+|---|---|---|
+| `new` | Première apparition | ±0 |
+| `[UNRESOLVED]` | Ignorée une fois | +10 |
+| `[ESCALATED]` | Ignorée deux fois ou plus — forcée en tête | +20 au total |
+| `addressed` | Traitée (affichée en cyan) | — |
+
+#### Champ `quote`
+
+Obligatoire pour les propositions `warn` / `critical`. Affiche l'extrait incriminé en monospace cyan sur la carte:
+
+```
+❝ user_input = input()
+```
+
 ---
 
 ### Points forts UX
+
+#### Onglet Chat — Barre de chips de persona
+
+Cinq chips de persona se trouvent au-dessus du compositeur Chat. Changez à tout moment pendant une session — entièrement indépendant des personas du Coder et de l'Observer (défaut: 😊 Enjoué):
+
+| Chip | Style |
+|---|---|
+| 😊 Enjoué (cheerful) | Enthousiaste et encourageant |
+| 🤔 Réfléchi (thoughtful) | Vérifie les prémisses, répond avec soin |
+| 🧙 Sensei | Guide par les questions, pas les réponses |
+| 😏 Cynique (cynical) | Va droit à la vérité qui dérange |
+| 🦆 Canard (duck) | Ne répond jamais — pose juste « Pourquoi ? » |
 
 #### Redimensionnement des panneaux
 

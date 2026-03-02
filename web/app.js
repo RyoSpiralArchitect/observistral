@@ -424,18 +424,30 @@
       return "[AUTO-OBSERVE] Le Coder vient de produire une nouvelle sortie. Fais une critique en mode commentaire live.\n"
         + "1) Commence par UNE phrase: qu'est-ce qui vient d'arriver.\n"
         + "2) Analyse les risques sur 5 axes: exactitude, sécurité, fiabilité, performance, maintenabilité.\n"
-        + "3) Termine par un bloc --- proposals --- avec des actions concrètes.";
+        + "3) Termine par LES QUATRE blocs structurés dans cet ordre exact:\n"
+        + "   --- phase ---          (core | feature | polish)\n"
+        + "   --- proposals ---      (scorées, avec quote pour warn/crit)\n"
+        + "   --- critical_path ---\n"
+        + "   --- health ---         (score: N  rationale: une phrase)";
     }
     if (l === "en") {
       return "[AUTO-OBSERVE] The Coder produced new output. Commentate and critique live.\n"
         + "1) Start with ONE sentence: what just happened.\n"
         + "2) Risk scan across 5 axes: correctness, security, reliability, performance, maintainability.\n"
-        + "3) End with a --- proposals --- block with concrete actions.";
+        + "3) End with ALL FOUR structured blocks in this exact order:\n"
+        + "   --- phase ---          (core | feature | polish)\n"
+        + "   --- proposals ---      (scored, with quote for warn/crit)\n"
+        + "   --- critical_path ---\n"
+        + "   --- health ---         (score: N  rationale: one sentence)";
     }
     return "[AUTO-OBSERVE] コーダーが新しいアウトプットを生成した。実況しながら批評せよ。\n"
       + "1) まず一文で「何が起きたか」を述べる。\n"
       + "2) 5軸（正しさ/セキュリティ/信頼性/性能/保守性）でリスクを洗い出す。\n"
-      + "3) 最後に --- proposals --- ブロックで具体的な手を出す。";
+      + "3) 最後に以下の4ブロックを必ず順番通りに出力する:\n"
+      + "   --- phase ---          (core | feature | polish)\n"
+      + "   --- proposals ---      (スコア付き、warn/crit には quote 必須)\n"
+      + "   --- critical_path ---\n"
+      + "   --- health ---         (score: N  rationale: 一文)";
   }
 
   const PROVIDERS = [
