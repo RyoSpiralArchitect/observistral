@@ -90,6 +90,17 @@ Clear it for the current PowerShell session:
 Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY,Env:GIT_HTTP_PROXY,Env:GIT_HTTPS_PROXY -ErrorAction SilentlyContinue
 ```
 
+### Push without interactive prompts (WDAC-safe)
+
+Some environments break interactive git prompts (e.g. `sh.exe` fails with Win32 error 5).
+
+If you can use a GitHub token, do a one-shot non-interactive push:
+
+```powershell
+$env:GITHUB_TOKEN = "ghp_..."
+.\scripts\push.ps1
+```
+
 ### `cargo run` fails with "access denied" on `obstral.exe`
 
 That means the binary is still running from the same target directory.
@@ -102,4 +113,3 @@ Use:
 ## License
 
 MIT
-

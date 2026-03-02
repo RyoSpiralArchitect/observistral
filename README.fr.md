@@ -88,6 +88,17 @@ Dans PowerShell:
 Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY,Env:GIT_HTTP_PROXY,Env:GIT_HTTPS_PROXY -ErrorAction SilentlyContinue
 ```
 
+### Push sans invite interactive (compatible WDAC)
+
+Dans certains environnements, les invites git interactives cassent (par ex. `sh.exe` echoue avec Win32 error 5).
+
+Si vous avez un token GitHub, vous pouvez push en non-interactif:
+
+```powershell
+$env:GITHUB_TOKEN = "ghp_..."
+.\scripts\push.ps1
+```
+
 ### `cargo run` echoue: "access denied" sur `obstral.exe`
 
 Le binaire est encore en cours d'execution depuis le meme target dir.
@@ -100,4 +111,3 @@ Utilisez:
 ## Licence
 
 MIT
-

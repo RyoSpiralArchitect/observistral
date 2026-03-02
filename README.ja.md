@@ -90,6 +90,17 @@ PowerShellセッション内で解除:
 Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY,Env:GIT_HTTP_PROXY,Env:GIT_HTTPS_PROXY -ErrorAction SilentlyContinue
 ```
 
+### 対話プロンプト無しでpushする（WDAC回避）
+
+環境によっては、gitの対話プロンプトが壊れます（例: `sh.exe` が Win32 error 5 で落ちる）。
+
+GitHubトークンが使えるなら、1回だけ非対話でpushできます:
+
+```powershell
+$env:GITHUB_TOKEN = "ghp_..."
+.\scripts\push.ps1
+```
+
 ### `cargo run` が `obstral.exe` を消せず失敗する（アクセス拒否）
 
 同じターゲットのEXEが実行中です。
@@ -100,4 +111,3 @@ Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY,Env:GIT_HTTP_PROXY,Env:
 ## License
 
 MIT
-
