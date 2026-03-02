@@ -47,6 +47,51 @@ Si vous ne pouvez pas executer le binaire Rust (par ex. WDAC bloque les nouveaux
 python .\scripts\serve_lite.py
 ```
 
+## Fonctionnalites
+
+### Onglet Chat — Barre de chips de persona
+
+Cinq chips de persona se trouvent au-dessus du compositeur Chat. Changez a tout moment — independant des personas du Coder et de l'Observer (defaut: 😊 Enjoue):
+
+| Chip | Style |
+|---|---|
+| 😊 Enjoue (cheerful) | Enthousiaste et encourageant |
+| 🤔 Reflechi (thoughtful) | Verifie les premisses, repond avec soin |
+| 🧙 Sensei | Guide par les questions, pas les reponses |
+| 😏 Cynique (cynical) | Va droit a la verite qui derange |
+| 🦆 Canard (duck) | Ne repond jamais — pose juste « Pourquoi ? » |
+
+### Observer — Badge de sante `❤ N`
+
+Quand l'Observer emet un bloc `--- health ---`, le score apparait dans la barre d'etat:
+
+| Score | Couleur | Signification |
+|---|---|---|
+| ≥ 70 | Vert | Pret pour la production |
+| 40–69 | Ambre | OK pour dev / demo |
+| < 40 | Rouge | Action immediate requise |
+
+### Observer — Cycle de vie du statut de proposition
+
+Si l'Observer souleve la meme proposition a plusieurs reprises sans qu'elle soit traitee, le statut monte en grade:
+
+| Statut | Signification | Bonus de score |
+|---|---|---|
+| `new` | Premiere apparition | ±0 |
+| `[UNRESOLVED]` | Ignoree une fois | +10 |
+| `[ESCALATED]` | Ignoree deux fois ou plus — forcee en tete | +20 au total |
+| `addressed` | Traitee (affichee en cyan) | — |
+
+### Champ `quote`
+
+Obligatoire pour les propositions `warn` / `critical`. Affiche l'extrait incrimine en monospace cyan sur la carte:
+
+```
+❝ user_input = input()
+```
+
+---
+
 ## Concepts
 
 ### tool_root

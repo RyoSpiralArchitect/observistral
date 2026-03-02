@@ -2,17 +2,19 @@
 /// and loops until finish_reason == "stop" or max iterations are reached.
 ///
 /// Reasoning improvements applied here:
-///   1. Scratchpad protocol  — model outputs <think>goal/risk/next</think> before every
-///      tool call (~30 tokens).  Prevents wrong-direction errors that cost 300+ tokens to
-///      recover from.
+///   1. Scratchpad protocol  — model outputs <think>goal/risk/doubt/next/verify</think>
+///      before every tool call (~50 tokens).  Prevents wrong-direction errors.
 ///   2. Tool output truncation  — stdout > 1500 chars / stderr > 600 chars are trimmed.
 ///      This is the single largest token-saver on long runs.
 ///   3. Context pruning  — tool results older than KEEP_RECENT_TOOL_TURNS are collapsed
 ///      to their first line.  Keeps the context window from exploding across sessions.
-///   4. Error amplification  — on exit_code != 0, a structured diagnosis prompt is
-///      injected so the model must identify the root cause before its next action.
+///   4. Error classification  — on exit_code != 0, `classify_error()` identifies the
+///      error type (env/syntax/path/dep/network/logic) and injects a targeted recovery
+///      hint before the generic diagnosis protocol.
 ///   5. tool_call_id preserved  — messages stay as serde_json::Value all the way to the
 ///      provider, so the id field is never silently dropped.
+///   6. Progress checkpoints  — at iter 3/6/9 the model self-evaluates goal distance
+///      (DONE / REMAINING / ON_TRACK) before continuing.
 use anyhow::{Result, anyhow};
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
@@ -63,12 +65,13 @@ assumptions: <what you are taking as given>\n\
 \n\
 [Reasoning Protocol — emit before EVERY exec call]\n\
 <think>\n\
-goal: <≤12 words: what must succeed right now>\n\
-risk: <≤12 words: most likely failure mode>\n\
-next: <≤12 words: exact command or step>\n\
+goal:   <≤12 words: what must succeed right now>\n\
+risk:   <≤12 words: most likely failure mode>\n\
+doubt:  <≤12 words: one reason this approach could be wrong>\n\
+next:   <≤12 words: exact command or step>\n\
 verify: <≤12 words: how to confirm this step succeeded>\n\
 </think>\n\
-Keep each field under 15 words. This 4-line check (~40 tokens) prevents\n\
+Keep each field under 15 words. This 5-line check (~50 tokens) prevents\n\
 wrong-direction errors that cost 300+ tokens to recover from.\n\
 \n\
 [Error Protocol]\n\
@@ -199,12 +202,116 @@ fn prune_old_tool_results(messages: &mut Vec<serde_json::Value>) {
     }
 }
 
+// ── Error classification ──────────────────────────────────────────────────────
+
+/// Classifies the kind of error from stderr/stdout so that targeted recovery
+/// hints can be injected before the generic diagnosis protocol.
+#[derive(Debug, Clone, PartialEq)]
+enum ErrorClass {
+    Environment, // command not found, permission denied, not recognized
+    Syntax,      // parse error, unexpected token, syntax error
+    Path,        // no such file, cannot find path, path not found
+    Dependency,  // module not found, missing package/crate
+    Network,     // connection refused, timeout, could not connect
+    Logic,       // assertion failed, test failed, expected X got Y
+    Unknown,
+}
+
+impl Default for ErrorClass {
+    fn default() -> Self {
+        ErrorClass::Unknown
+    }
+}
+
+fn classify_error(stderr: &str, stdout: &str) -> ErrorClass {
+    let combined = format!("{stderr}\n{stdout}");
+    let low = combined.to_ascii_lowercase();
+
+    if low.contains("command not found")
+        || low.contains("is not recognized as the name")
+        || low.contains("is not recognized as an internal")
+        || low.contains("permission denied")
+        || low.contains("access is denied")
+        || low.contains("access denied")
+        || low.contains("commandnotfoundexception")
+    {
+        ErrorClass::Environment
+    } else if low.contains("syntax error")
+        || low.contains("unexpected token")
+        || low.contains("parse error")
+        || low.contains("parsererror")
+        || low.contains("invalid syntax")
+        || low.contains("missing expression")
+        || low.contains("unexpected end of")
+    {
+        ErrorClass::Syntax
+    } else if low.contains("no such file")
+        || low.contains("cannot find path")
+        || low.contains("path not found")
+        || (low.contains("does not exist") && !low.contains("package"))
+    {
+        ErrorClass::Path
+    } else if low.contains("modulenotfounderror")
+        || low.contains("cannot find module")
+        || low.contains("no module named")
+        || low.contains("package not found")
+        || low.contains("no such package")
+        || (low.contains("could not find")
+            && (low.contains("package") || low.contains("crate")))
+    {
+        ErrorClass::Dependency
+    } else if low.contains("connection refused")
+        || low.contains("timed out")
+        || low.contains("network unreachable")
+        || low.contains("could not connect")
+        || low.contains("name resolution failed")
+    {
+        ErrorClass::Network
+    } else if low.contains("assertion")
+        || low.contains("test failed")
+        || (low.contains("expected") && low.contains("actual"))
+    {
+        ErrorClass::Logic
+    } else {
+        ErrorClass::Unknown
+    }
+}
+
+/// Returns a targeted one-line recovery hint for each error class,
+/// or an empty string for Unknown (no hint injected).
+fn error_class_hint(class: &ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Environment =>
+            "⚠ ENVIRONMENT ERROR: The binary/permission is missing. Fix the environment first — do NOT modify source code.",
+        ErrorClass::Syntax =>
+            "⚠ SYNTAX ERROR: There is a language/parser mistake. Fix the exact line — do NOT change unrelated code.",
+        ErrorClass::Path =>
+            "⚠ PATH ERROR: A file or directory is missing. Verify paths with ls/Get-ChildItem before creating or reading.",
+        ErrorClass::Dependency =>
+            "⚠ DEPENDENCY ERROR: A required package is missing. Install it first, then retry the original command.",
+        ErrorClass::Network =>
+            "⚠ NETWORK ERROR: Cannot reach a remote service. Check if the service is running and proxy vars are clear.",
+        ErrorClass::Logic =>
+            "⚠ LOGIC ERROR: The code ran but produced wrong results. Re-read the relevant logic before re-running.",
+        ErrorClass::Unknown => "",
+    }
+}
+
+// ── Tool output builders ──────────────────────────────────────────────────────
+
 /// Build the tool result string for a failed command with structured
 /// diagnosis guidance.  Forces the model to reason about the error rather
 /// than blindly retrying or continuing.
 fn build_failed_tool_output(stdout: &str, stderr: &str, exit_code: i32) -> String {
+    let class = classify_error(stderr, stdout);
+    let hint = error_class_hint(&class);
+    let hint_prefix = if hint.is_empty() {
+        String::new()
+    } else {
+        format!("{hint}\n\n")
+    };
     let mut out = format!(
-        "FAILED (exit_code: {exit_code})\n\
+        "{hint_prefix}FAILED (exit_code: {exit_code})\n\
          \n\
          ⚠ STOP — diagnosis required before your next action:\n\
          1. Quote the exact line causing the error.\n\
@@ -361,6 +468,8 @@ struct FailureMemory {
 
     last_output_hash: Option<u64>,
     same_output_repeats: usize,
+
+    last_error_class: ErrorClass,
 }
 
 fn normalize_for_signature(s: &str) -> String {
@@ -629,10 +738,12 @@ impl FailureMemory {
             self.consecutive_failures = 0;
             self.last_error_sig = None;
             self.same_error_repeats = 0;
+            self.last_error_class = ErrorClass::Unknown;
             return None;
         }
 
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_error_class = classify_error(stderr, stdout);
 
         let sig = error_signature(command, stdout, stderr, effective_exit_code);
         if self.last_error_sig.as_deref() == Some(&sig) {
@@ -663,11 +774,16 @@ Action: abandon this approach and try a different strategy (different cwd, diffe
         }
 
         if self.consecutive_failures >= 3 {
-            return Some(
-                "3 consecutive failures.\n\
+            let class_ctx = error_class_hint(&self.last_error_class);
+            let context = if class_ctx.is_empty() {
+                String::new()
+            } else {
+                format!("\nLast error type: {class_ctx}")
+            };
+            return Some(format!(
+                "3 consecutive failures.{context}\n\
 Action: change strategy now; do NOT retry the same approach again."
-                    .to_string(),
-            );
+            ));
         }
 
         if self.same_output_repeats >= 2 && self.same_command_repeats >= 2 {
@@ -739,6 +855,19 @@ NEVER create a git repo inside another git repo. If you see 'embedded git reposi
     for iter in 0..MAX_ITERS {
         // ── Prune old tool results before sending to save context tokens ───
         prune_old_tool_results(&mut messages);
+
+        // ── Progress checkpoint every 3 iterations ────────────────────────
+        // Asks the model to self-evaluate goal distance before the next command.
+        // Only fires when no higher-priority failure hint is already pending.
+        if iter > 0 && iter % 3 == 0 && pending_system_hint.is_none() {
+            pending_system_hint = Some(format!(
+                "[Progress Check — iter {iter}/{MAX_ITERS}]\n\
+Before your next command, answer in ONE line each:\n\
+1. DONE: which steps from your <plan> are verified complete (exit_code=0)?\n\
+2. REMAINING: which steps are left?\n\
+3. ON_TRACK: yes/no — if no, re-evaluate your plan before proceeding."
+            ));
+        }
 
         // ── Stream from model ──────────────────────────────────────────────
         // Inject a one-shot governor hint if we detected a repeated failure pattern.

@@ -7,7 +7,9 @@
   const e = React.createElement;
   const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
-  // SECTION: constants
+  // ╔══════════════════════════════════════════════════════════╗
+  // ║  SECTION: Constants & i18n                               ║
+  // ╚══════════════════════════════════════════════════════════╝
   const LS = {
     lang: "obstral.lang.v1",
     config: "obstral.config.v1",
@@ -16,7 +18,7 @@
     splitPct: "obstral.splitPct.v1",
   };
 
-  // SECTION: i18n (filled below)
+  // ── i18n strings (en / ja / fr) ──────────────────────────────────────────────
   const I18N = {
     en: {
       threads: "Threads",
@@ -333,7 +335,24 @@
     return (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key;
   }
 
-  // SECTION: utils
+  // ── Plugin Registry ───────────────────────────────────────────────────────────
+  // Extend OBSTRAL without forking the source.
+  //
+  // Usage — load your plugin via <script src="my-plugin.js"></script> before app.js:
+  //   registerObserverPlugin({ name, onProposal, onHealth, onPhase })
+  //   registerPhase(key, { label, color, description })
+  //   registerValidator(fn)   // fn(proposals[]) -> proposals[]
+  //
+  // Hooks are currently scaffolded (no-op). Integration points will be added
+  // in parseProposals() and parseHealthScore() as Phase C matures.
+  const _OBSTRAL_PLUGINS = { observer: [], phases: {}, validators: [] };
+  function registerObserverPlugin(p) { _OBSTRAL_PLUGINS.observer.push(p); }
+  function registerPhase(key, cfg)   { _OBSTRAL_PLUGINS.phases[key] = cfg; }
+  function registerValidator(fn)     { _OBSTRAL_PLUGINS.validators.push(fn); }
+
+  // ╔══════════════════════════════════════════════════════════╗
+  // ║  SECTION: Utils                                          ║
+  // ╚══════════════════════════════════════════════════════════╝
   function safeJsonParse(s, fallback) {
     try {
       return JSON.parse(s);
@@ -669,7 +688,9 @@
     });
   }
 
-  // SECTION: api (filled below)
+  // ╔══════════════════════════════════════════════════════════╗
+  // ║  SECTION: API & Streaming                                ║
+  // ╚══════════════════════════════════════════════════════════╝
   async function postJson(url, body, signal) {
     const resp = await fetch(url, {
       method: "POST",
@@ -751,7 +772,7 @@
     }
   }
 
-  // SECTION: provider colors
+  // ── Provider colors ───────────────────────────────────────────────────────────
   const PROVIDER_COLORS = {
     "mistral":           "#2dd4bf",
     "codestral":         "#14b8a6",
@@ -762,7 +783,9 @@
     "hf":                "#fbbf24",
   };
 
-  // SECTION: markdown renderer
+  // ╔══════════════════════════════════════════════════════════╗
+  // ║  SECTION: Markdown Renderer                              ║
+  // ╚══════════════════════════════════════════════════════════╝
   function renderInlineMd(text, baseKey) {
     const parts = [];
     const re = /(\*\*(.+?)\*\*|`([^`]+)`)/g;
@@ -961,6 +984,7 @@
     return "'" + String(s || "").replace(/'/g, "''") + "'";
   }
 
+  // ── Exec & Shell ─────────────────────────────────────────────────────────────
   function bashToPowerShell(script) {
     const raw = stripShellTranscript(script);
     if (!raw) return "";
@@ -1248,6 +1272,8 @@
     return l === "fr" ? `il y a ${days}j` : (l === "en" ? `${days}d ago` : `${days}日前`);
   }
 
+  // ── UI Render helpers ─────────────────────────────────────────────────────────
+
   // Renders message content with <think>…</think> blocks dimmed separately.
   function renderWithThink(text, execRes, onRun, onOpen) {
     const re = /<think>([\s\S]*?)<\/think>/gi;
@@ -1310,6 +1336,7 @@
     return `選択: ${n} ${t}`;
   }
 
+  // ── Observer Logic ────────────────────────────────────────────────────────────
   function parseProposals(text) {
     const s = String(text || "");
     const m = /---\s*proposals\s*---/i.exec(s);
@@ -1463,7 +1490,9 @@
     return word === "core" || word === "feature" || word === "polish" ? word : null;
   }
 
-  // SECTION: app (filled below)
+  // ╔══════════════════════════════════════════════════════════╗
+  // ║  SECTION: App Shell (React state + event handlers)       ║
+  // ╚══════════════════════════════════════════════════════════╝
   function App() {
     const [lang, setLang] = useState(() => {
       const v = (localStorage.getItem(LS.lang) || "").trim();
@@ -5718,7 +5747,9 @@
     );
   }
 
-  // SECTION: render
+  // ╔══════════════════════════════════════════════════════════╗
+  // ║  SECTION: Render                                         ║
+  // ╚══════════════════════════════════════════════════════════╝
   try {
     if (ReactDOM.createRoot) {
       ReactDOM.createRoot(root).render(e(App));
