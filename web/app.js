@@ -848,13 +848,15 @@
       const l = String(l0 || "");
       if (hasPrompt) {
         if (!promptRe.test(l)) continue; // drop output lines
-        let x = l.replace(promptRe, "").trimEnd();
+        let x = l.replace(promptRe, "").trim();
         // Common model glitch: trailing brace.
         if (x.endsWith("}") && x.indexOf("{") === -1) x = x.slice(0, -1).trimEnd();
         if (!x || x === "$") continue;
         out.push(x);
       } else {
-        let x = l.replace(/^\s*\$\s+/, "").trimEnd();
+        // No explicit prompts found: some models paste command+output without `$`/`PS>`.
+        // Trim leading whitespace to make output-line filters robust.
+        let x = l.replace(/^\s*\$\s+/, "").trim();
         // Common model glitch: trailing brace.
         if (x.endsWith("}") && x.indexOf("{") === -1) x = x.slice(0, -1).trimEnd();
         if (!x || x === "$") continue;
@@ -866,6 +868,7 @@
         if (/^(fatal:|error:|warning:|hint:)\b/i.test(x)) continue;
         if (/^(initialized empty git repository|on branch|your branch|changes to be committed:|untracked files:|nothing to commit)\b/i.test(x)) continue;
         if (/^(directory:)\b/i.test(x)) continue;
+        if (/^ディレクトリ\s*:/i.test(x)) continue;
         if (/^(mode\s+lastwritetime|----\s+-------------)\b/i.test(x)) continue;
         if (/^(modified:|new file:|deleted:)\b/i.test(x)) continue;
 
@@ -3596,6 +3599,60 @@
               proposalKeysLine,
               "proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。",
             ].join("\n");
+
+      // Lightweight proposal memory: provide the Observer with a compact list of recent proposals and approvals
+      // so it can avoid repeating the same template critique and can mark items UNRESOLVED/ESCALATED accurately.
+      const priorProposalsSummary = (() => {
+        try {
+          const normTitle = (s) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+          const approved = new Set();
+          const coderMsgs = paneMessages("coder");
+          for (const m of coderMsgs || []) {
+            if (!m || m.role !== "user") continue;
+            const t = String(m.content || "");
+            if (!t.startsWith("[Observer proposal approved]")) continue;
+            const mm = t.match(/^Title:\s*(.+)$/im);
+            const title = mm ? mm[1] : "";
+            const k = normTitle(title);
+            if (k) approved.add(k);
+          }
+
+          const obsMsgs = paneMessages("observer");
+          const map = new Map(); // normTitle -> proposal
+          let scanned = 0;
+          for (let i = (obsMsgs || []).length - 1; i >= 0 && scanned < 12; i--) {
+            const m = obsMsgs[i];
+            if (!m || m.role !== "assistant" || m.streaming) continue;
+            scanned++;
+            const props = parseProposals(String(m.content || ""));
+            for (const p of props || []) {
+              const k = normTitle(p.title);
+              if (!k) continue;
+              const prev = map.get(k);
+              // Keep the latest/highest-score version (they can differ per turn).
+              if (!prev || (p.score || 0) >= (prev.score || 0)) {
+                map.set(k, { ...p, _approved: approved.has(k) });
+              }
+            }
+          }
+
+          const arr = Array.from(map.values())
+            .sort((a, b) => (b.score || 50) - (a.score || 50))
+            .slice(0, 6);
+
+          if (!arr.length) return "";
+          const lines = arr.map((p) => {
+            const tag = p._approved ? "[APPROVED]" : "[OPEN]";
+            const sev = String(p.severity || "info");
+            const sc = typeof p.score === "number" ? p.score : 50;
+            const ph = String(p.phase || "any");
+            return `- ${tag} ${p.title} (sev:${sev} score:${sc} phase:${ph})`;
+          });
+          return ["prior_proposals:", ...lines].join("\n");
+        } catch (_) {
+          return "";
+        }
+      })();
       const observerBridge = [
         "[Observer bridge]",
         langLine,
@@ -3606,6 +3663,7 @@
         "Review the coder's artifacts below. Check each dimension: CORRECTNESS, SECURITY, RELIABILITY, PERFORMANCE, MAINTAINABILITY.",
         "Code citation: for every warn/crit proposal, add a quote: field containing an exact function name,",
         "  variable name, or ≤40-char code snippet from the coder's output. Use n/a only if no code is visible.",
+        priorProposalsSummary,
         "Follow-through: scan for prior proposals in the conversation.",
         "  If addressed by the Coder: mark status: addressed.",
         "  If still unresolved: mark status: [UNRESOLVED] and add +10 to the score.",
