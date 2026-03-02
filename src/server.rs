@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,19 +15,6 @@ use crate::modes::Mode;
 use crate::personas;
 use crate::providers;
 use crate::types::ChatMessage;
-
-#[cfg(target_os = "windows")]
-#[link(name = "kernel32")]
-extern "system" {
-    fn MultiByteToWideChar(
-        CodePage: u32,
-        dwFlags: u32,
-        lpMultiByteStr: *const i8,
-        cbMultiByte: i32,
-        lpWideCharStr: *mut u16,
-        cchWideChar: i32,
-    ) -> i32;
-}
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
@@ -153,6 +140,8 @@ pub struct ServeArgs {
 struct AppState {
     client: reqwest::Client,
     defaults: PartialConfig,
+    pending_edits: crate::pending_edits::PendingEditStore,
+    workspace_root: PathBuf,
 }
 
 pub async fn run(args: ServeArgs, defaults: PartialConfig) -> Result<()> {
@@ -164,9 +153,12 @@ pub async fn run(args: ServeArgs, defaults: PartialConfig) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
 
+    let workspace_root = std::env::current_dir().unwrap_or_default();
     let state = AppState {
         client: reqwest::Client::new(),
         defaults,
+        pending_edits: crate::pending_edits::PendingEditStore::new(),
+        workspace_root,
     };
 
     println!("OBSTRAL UI: http://{addr}/");
@@ -323,7 +315,7 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
             )
             .await
         }
-        ("GET", "/api/status") => api_status(&mut stream).await,
+        ("GET", "/api/status") => api_status(&mut stream, state).await,
         ("POST", "/api/models") => api_models(&mut stream, state, &req.body).await,
         ("POST", "/api/chat") => api_chat(&mut stream, state, &req.body).await,
         ("POST", "/api/chat_stream") => api_chat_stream(&mut stream, state, &req.body).await,
@@ -331,6 +323,13 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/open") => api_open(&mut stream, &req.body).await,
         ("POST", "/api/chat_tools") => api_chat_tools(&mut stream, state, &req.body).await,
         ("POST", "/api/chat_tools_stream") => api_chat_tools_stream(&mut stream, state, &req.body).await,
+        ("GET", "/api/pending_edits") => api_pending_edits(&mut stream, state).await,
+        ("POST", "/api/queue_edit") => api_queue_edit(&mut stream, state, &req.body).await,
+        ("POST", "/api/approve_edit") => api_approve_edit(&mut stream, state, &req.body).await,
+        ("POST", "/api/reject_edit") => api_reject_edit(&mut stream, state, &req.body).await,
+        ("GET", "/api/meta_prompts") => api_meta_prompts_get(&mut stream, state).await,
+        ("POST", "/api/meta_prompts") => api_meta_prompts_post(&mut stream, state, &req.body).await,
+        ("POST", "/api/write_file") => api_write_file(&mut stream, state, &req.body).await,
         _ => {
             write_text(
                 &mut stream,
@@ -865,60 +864,6 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     #[derive(Serialize)]
     struct Res { stdout: String, stderr: String, exit_code: i32 }
 
-    fn decode_output(bytes: &[u8]) -> String {
-        if bytes.is_empty() {
-            return String::new();
-        }
-        // On Windows, stdout/stderr are often not UTF-8 (e.g., CP932). Decode them
-        // so the UI doesn't show mojibake. Fall back to UTF-8 on other platforms.
-        #[cfg(target_os = "windows")]
-        {
-            if let Ok(s) = std::str::from_utf8(bytes) {
-                return s.to_string();
-            }
-            // CP932 (Windows-31J / Shift-JIS) via Win32 API.
-            const CP_932: u32 = 932;
-            const MB_ERR_INVALID_CHARS: u32 = 0x0000_0008;
-
-            unsafe {
-                let src = bytes.as_ptr() as *const i8;
-                let src_len = if bytes.len() > i32::MAX as usize {
-                    i32::MAX
-                } else {
-                    bytes.len() as i32
-                };
-
-                let needed = MultiByteToWideChar(CP_932, MB_ERR_INVALID_CHARS, src, src_len, std::ptr::null_mut(), 0);
-                if needed <= 0 {
-                    // Fallback: allow invalid bytes.
-                    let needed2 = MultiByteToWideChar(CP_932, 0, src, src_len, std::ptr::null_mut(), 0);
-                    if needed2 <= 0 {
-                        return String::from_utf8_lossy(bytes).into_owned();
-                    }
-                    let mut buf = vec![0u16; needed2 as usize];
-                    let written = MultiByteToWideChar(CP_932, 0, src, src_len, buf.as_mut_ptr(), needed2);
-                    if written <= 0 {
-                        return String::from_utf8_lossy(bytes).into_owned();
-                    }
-                    buf.truncate(written as usize);
-                    return String::from_utf16_lossy(&buf);
-                }
-
-                let mut buf = vec![0u16; needed as usize];
-                let written = MultiByteToWideChar(CP_932, MB_ERR_INVALID_CHARS, src, src_len, buf.as_mut_ptr(), needed);
-                if written <= 0 {
-                    return String::from_utf8_lossy(bytes).into_owned();
-                }
-                buf.truncate(written as usize);
-                return String::from_utf16_lossy(&buf);
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            String::from_utf8_lossy(bytes).into_owned()
-        }
-    }
-
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(_) => {
@@ -937,23 +882,6 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
             &E { error: "command is empty".into() }).await;
     }
 
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = Command::new("powershell");
-        // Prepend UTF-8 encoding setup to avoid garbled Japanese output.
-        let wrapped = format!(
-            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
-             [Console]::InputEncoding=[System.Text.Encoding]::UTF8; \
-             $OutputEncoding=[System.Text.Encoding]::UTF8; {}",
-            cmd_str
-        );
-        c.args(["-NoProfile", "-NonInteractive", "-Command", &wrapped]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", cmd_str]);
-        c
-    };
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(cwd) = req.cwd.as_deref().filter(|s| !s.trim().is_empty()) {
         let cwd_path = Path::new(cwd);
         if let Err(err) = std::fs::create_dir_all(cwd_path) {
@@ -967,24 +895,287 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
             )
             .await;
         }
-        cmd.current_dir(cwd);
     }
 
-    let output = match cmd.output().await {
-        Ok(o) => o,
-        Err(err) => {
-            #[derive(Serialize)]
-            struct E { error: String }
-            return write_json(stream, 500, "Internal Server Error",
-                &E { error: format!("spawn failed: {err}") }).await;
+    // Delegate to shared command runner for:
+    // - prompt marker stripping ($ / PS> / >)
+    // - dangerous command blocklist
+    // - poison proxy env scrubbing
+    // - Windows output decoding (CP932 fallback)
+    let r = crate::exec::run_command(&req.command, req.cwd.as_deref()).await;
+    let out = match r {
+        Ok(r) => Res { stdout: r.stdout, stderr: r.stderr, exit_code: r.exit_code },
+        Err(e) => Res { stdout: String::new(), stderr: format!("spawn failed: {e:#}"), exit_code: -1 },
+    };
+    write_json(stream, 200, "OK", &out).await
+}
+
+async fn api_pending_edits(stream: &mut TcpStream, state: AppState) -> Result<()> {
+    #[derive(Serialize)]
+    struct Res {
+        pending: Vec<crate::pending_edits::PendingEditView>,
+    }
+    let pending = state.pending_edits.list().await;
+    write_json(stream, 200, "OK", &Res { pending }).await
+}
+
+async fn api_queue_edit(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        action: Option<String>,
+        path: String,
+        content: String,
+    }
+    #[derive(Serialize)]
+    struct Res {
+        ok: bool,
+        approval_id: String,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
         }
     };
 
-    write_json(stream, 200, "OK", &Res {
-        stdout: decode_output(&output.stdout),
-        stderr: decode_output(&output.stderr),
-        exit_code: output.status.code().unwrap_or(-1),
-    }).await
+    let action = req.action.unwrap_or_else(|| "write_file".to_string());
+    let path = req.path.trim();
+    if path.is_empty() {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: "path is required".into() }).await;
+    }
+    let approval_id = match state
+        .pending_edits
+        .queue_write_file(&state.workspace_root, path, &req.content, &action)
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+
+    write_json(stream, 200, "OK", &Res { ok: true, approval_id }).await
+}
+
+async fn api_approve_edit(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        id: String,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+    let id = req.id.trim();
+    if id.is_empty() {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: "id is required".into() }).await;
+    }
+
+    let item = match state.pending_edits.approve(&state.workspace_root, id).await {
+        Ok(it) => it,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+    write_json(
+        stream,
+        200,
+        "OK",
+        &crate::pending_edits::PendingEditResolveResponse { ok: true, item },
+    )
+    .await
+}
+
+async fn api_reject_edit(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        id: String,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+    let id = req.id.trim();
+    if id.is_empty() {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: "id is required".into() }).await;
+    }
+
+    let item = match state.pending_edits.reject(id).await {
+        Ok(it) => it,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+    write_json(
+        stream,
+        200,
+        "OK",
+        &crate::pending_edits::PendingEditResolveResponse { ok: true, item },
+    )
+    .await
+}
+
+fn meta_prompts_rel_path() -> &'static str {
+    ".obstral/meta_prompts.json"
+}
+
+fn load_meta_prompts(workspace_root: &Path) -> serde_json::Value {
+    let p = workspace_root.join(meta_prompts_rel_path());
+    let Ok(s) = std::fs::read_to_string(&p) else {
+        return serde_json::json!({});
+    };
+    serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+async fn api_meta_prompts_get(stream: &mut TcpStream, state: AppState) -> Result<()> {
+    #[derive(Serialize)]
+    struct Res {
+        ok: bool,
+        path: &'static str,
+        prompts: serde_json::Value,
+    }
+    let prompts = load_meta_prompts(&state.workspace_root);
+    write_json(
+        stream,
+        200,
+        "OK",
+        &Res {
+            ok: true,
+            path: meta_prompts_rel_path(),
+            prompts,
+        },
+    )
+    .await
+}
+
+async fn api_meta_prompts_post(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        op: String,     // set | append
+        target: String, // coder | observer
+        text: String,
+    }
+    #[derive(Serialize)]
+    struct Res {
+        ok: bool,
+        approval_id: String,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+
+    let op = req.op.trim().to_ascii_lowercase();
+    let target = req.target.trim().to_ascii_lowercase();
+    let text = req.text;
+    if op != "set" && op != "append" {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: "op must be 'set' or 'append'".into() }).await;
+    }
+    if target != "coder" && target != "observer" {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: "target must be 'coder' or 'observer'".into() }).await;
+    }
+    if text.len() > 20000 {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: "text too large".into() }).await;
+    }
+
+    let mut cur = load_meta_prompts(&state.workspace_root);
+    if !cur.is_object() {
+        cur = serde_json::json!({});
+    }
+    let key = if target == "observer" {
+        "observer_system_append"
+    } else {
+        "coder_system_append"
+    };
+    let base = cur.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let text = text.trim().to_string();
+    let new_val = if op == "append" {
+        if base.trim().is_empty() {
+            text
+        } else {
+            format!("{}\n{}", base.trim_end(), text)
+        }
+    } else {
+        text
+    };
+    cur[key] = serde_json::Value::String(new_val);
+    let new_json = serde_json::to_string_pretty(&cur).unwrap_or_else(|_| "{}".to_string());
+
+    let approval_id = match state
+        .pending_edits
+        .queue_write_file(
+            &state.workspace_root,
+            meta_prompts_rel_path(),
+            &new_json,
+            "meta_prompts",
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+
+    write_json(stream, 200, "OK", &Res { ok: true, approval_id }).await
+}
+
+async fn api_write_file(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        path: String,
+        content: String,
+    }
+    #[derive(Serialize)]
+    struct Res {
+        ok: bool,
+        bytes_written: usize,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+    let rel_path = req.path.trim();
+    if rel_path.is_empty() {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: "path is required".into() }).await;
+    }
+    let rel = Path::new(rel_path);
+    // Local path safety (keep consistent with pending store).
+    if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: format!("unsafe path: {rel_path}") }).await;
+    }
+    let abs = state.workspace_root.join(rel);
+    if let Some(parent) = abs.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: format!("create_dir_all failed: {e}") }).await;
+        }
+    }
+    if let Err(e) = std::fs::write(&abs, req.content.as_bytes()) {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: format!("write failed: {e}") }).await;
+    }
+    write_json(
+        stream,
+        200,
+        "OK",
+        &Res {
+            ok: true,
+            bytes_written: req.content.as_bytes().len(),
+        },
+    )
+    .await
 }
 
 async fn api_open(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
@@ -1035,7 +1226,7 @@ async fn api_open(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     }
 }
 
-async fn api_status(stream: &mut TcpStream) -> Result<()> {
+async fn api_status(stream: &mut TcpStream, state: AppState) -> Result<()> {
     fn env_present(key: &str) -> bool {
         std::env::var(key)
             .ok()
@@ -1043,14 +1234,19 @@ async fn api_status(stream: &mut TcpStream) -> Result<()> {
             .unwrap_or(false)
     }
 
-    let workspace_root = std::env::current_dir()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
+    let workspace_root = state.workspace_root.to_string_lossy().into_owned();
+    let host_os = if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    };
 
     let resp = ApiStatusResponse {
         ok: true,
         version: env!("CARGO_PKG_VERSION"),
+        host_os,
         providers: ApiStatusProviders {
             mistral: ApiProviderStatus {
                 api_key_present: env_present("MISTRAL_API_KEY") || env_present("OBS_API_KEY"),
@@ -1062,7 +1258,13 @@ async fn api_status(stream: &mut TcpStream) -> Result<()> {
                 api_key_present: env_present("OBS_API_KEY") || env_present("OPENAI_API_KEY"),
             },
         },
-        features: ApiFeatures { exec: true, chat_tools: true, open_file: true },
+        features: ApiFeatures {
+            exec: true,
+            pending_edits: true,
+            chat_tools: true,
+            meta_prompts: true,
+            open_file: true,
+        },
         workspace_root,
     };
 
@@ -1445,6 +1647,7 @@ struct ApiChatResponse {
 struct ApiStatusResponse {
     ok: bool,
     version: &'static str,
+    host_os: &'static str,
     providers: ApiStatusProviders,
     features: ApiFeatures,
     workspace_root: String,
@@ -1453,7 +1656,9 @@ struct ApiStatusResponse {
 #[derive(Serialize)]
 struct ApiFeatures {
     exec: bool,
+    pending_edits: bool,
     chat_tools: bool,
+    meta_prompts: bool,
     open_file: bool,
 }
 

@@ -95,6 +95,8 @@ fn scrub_poison_proxy_env(cmd: &mut Command) {
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "ALL_PROXY",
+        "GIT_HTTP_PROXY",
+        "GIT_HTTPS_PROXY",
         "http_proxy",
         "https_proxy",
         "all_proxy",
@@ -111,6 +113,30 @@ fn scrub_poison_proxy_env(cmd: &mut Command) {
 /// Returns `Some(reason)` if blocked, `None` if safe to run.
 pub fn check_dangerous_command(cmd: &str) -> Option<&'static str> {
     let s = cmd.trim().to_ascii_lowercase();
+
+    // Git destructive patterns (cross-platform).
+    let git_dangerous = [
+        ("git reset --hard", "git reset --hard discards local changes"),
+        ("git clean -fd", "git clean -fd removes untracked files/dirs"),
+        ("git clean -xdf", "git clean -xdf removes ignored files too"),
+    ];
+    for (pat, reason) in &git_dangerous {
+        if s.contains(pat) {
+            return Some(reason);
+        }
+    }
+    // Block "remove everything from index" variants.
+    // Examples:
+    // - git rm --cached -r .
+    // - git rm -r --cached .
+    // - git rm --cached -r ./
+    if s.contains("git rm")
+        && (s.contains("--cached") || s.contains("--cache"))
+        && (s.contains(" -r") || s.contains("--recursive"))
+        && (s.ends_with(" .") || s.ends_with(" ./") || s.contains(" . "))
+    {
+        return Some("git rm --cached -r . would remove the entire repo from the index");
+    }
 
     // Unix destructive patterns
     let unix_dangerous = [

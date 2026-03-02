@@ -4,6 +4,7 @@ mod exec;
 mod lang_detect;
 mod loop_detect;
 mod modes;
+mod pending_edits;
 mod personas;
 mod repl;
 mod server;

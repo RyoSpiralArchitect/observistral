@@ -778,6 +778,8 @@
 
   function isWindowsHost() {
     try {
+      const ho = String((window && window.__OBSTRAL_HOST_OS) || "").trim().toLowerCase();
+      if (ho) return ho === "windows";
       return typeof navigator !== "undefined" && /Windows/i.test(String(navigator.userAgent || ""));
     } catch (_) {
       return false;
@@ -1441,6 +1443,7 @@
       if (typeof cfg.autoObserve !== "boolean") cfg.autoObserve = !!DEFAULT_CONFIG.autoObserve;
       if (typeof cfg.forceAgent !== "boolean") cfg.forceAgent = !!DEFAULT_CONFIG.forceAgent;
       if (typeof cfg.toolRoot !== "string") cfg.toolRoot = String(cfg.toolRoot || "");
+      if (!String(cfg.toolRoot || "").trim()) cfg.toolRoot = DEFAULT_CONFIG.toolRoot;
       if (typeof cfg.mistralCliAgent !== "string") cfg.mistralCliAgent = String(cfg.mistralCliAgent || "");
       if (typeof cfg.mistralCliMaxTurns !== "string") cfg.mistralCliMaxTurns = String(cfg.mistralCliMaxTurns || "");
       if (typeof cfg.codeProvider !== "string") cfg.codeProvider = String(cfg.codeProvider || "");
@@ -1784,7 +1787,10 @@
     const refreshStatus = () => {
       fetch("/api/status")
         .then((r) => r.json())
-        .then((j) => setStatus(j))
+        .then((j) => {
+          try { window.__OBSTRAL_HOST_OS = j && j.host_os ? String(j.host_os) : ""; } catch (_) {}
+          setStatus(j);
+        })
         .catch(() => {});
     };
 
@@ -2442,13 +2448,13 @@
         return st;
       };
 
-      const isWindows = navigator.userAgent.includes("Windows");
+      const isWindows = isWindowsHost();
       const SYSTEM_BASE = isWindows ? [
         "You are an autonomous coding agent with DIRECT access to the user's Windows machine.",
         `Working directory (tool_root): ${cwdLabel}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "0. NEVER create a git repo inside another git repo. If you see 'embedded git repository' warnings, STOP and relocate to a clean directory under tool_root.",
-        "1. ALWAYS use the `exec` tool to create files, directories, and run commands. NEVER just show code.",
+        "1. ALWAYS use tools to act: use `write_file` to create/edit files, and `exec` to run commands. NEVER just show code.",
         "   Fallback (if tool calls are not supported): output ONE ```powershell``` code block containing ONLY commands (no `$ ` or `PS>` prompts).",
         "2. Use PowerShell syntax ONLY (cmd.exe is NOT used):",
         "   - Create directory tree: New-Item -ItemType Directory -Force -Path 'a/b/c'",
@@ -2465,7 +2471,7 @@
         `Working directory (tool_root): ${cwdLabel}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "0. NEVER create a git repo inside another git repo. If you see 'embedded git repository' warnings, STOP and relocate to a clean directory under tool_root.",
-        "1. ALWAYS use the `exec` tool to create files, directories, and run commands. NEVER just show code.",
+        "1. ALWAYS use tools to act: use `write_file` to create/edit files, and `exec` to run commands. NEVER just show code.",
         "   Fallback (if tool calls are not supported): output ONE ```bash``` code block containing ONLY commands (no `$ ` prompts).",
         "2. Use Unix shell commands:",
         "   - Create directory: mkdir -p path/to/dir",
@@ -2522,6 +2528,24 @@
         },
       };
 
+      const writeFileTool = {
+        type: "function",
+        function: {
+          name: "write_file",
+          description: isWindows
+            ? "Write a UTF-8 text file under tool_root. Use this tool for ALL file creation/edits. Provide a relative path (no drive letters, no '..')."
+            : "Write a text file under tool_root. Use this tool for ALL file creation/edits. Provide a relative path (no '..').",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "Relative file path under tool_root (e.g. src/main.py)" },
+              content: { type: "string", description: "Full file content (UTF-8 text)" },
+            },
+            required: ["path", "content"],
+          },
+        },
+      };
+
       const messages = [
         { role: "system", content: SYSTEM },
         ...history,
@@ -2529,6 +2553,7 @@
       ];
 
       let display = "";
+      let awaitingApproval = false;
       const flush = (extra) => {
         setMsg(threadId, asstMsgId, (display + (extra || "")).trim() || "…", coderBodyRef);
       };
@@ -2609,13 +2634,13 @@
         try {
           // Separate text tokens from previous turn with a blank line.
           if (display) display += "\n\n";
-          streamResult = await streamChatTools({
-            messages,
-            tools: [execTool],
-            model: String(reqCfg.codeModel || reqCfg.model || ""),
-            base_url: String(reqCfg.baseUrl || ""),
-            api_key: resolvedKey || undefined,
-            temperature: numOrUndef(reqCfg.temperature),
+           streamResult = await streamChatTools({
+             messages,
+            tools: [execTool, writeFileTool],
+             model: String(reqCfg.codeModel || reqCfg.model || ""),
+             base_url: String(reqCfg.baseUrl || ""),
+             api_key: resolvedKey || undefined,
+             temperature: numOrUndef(reqCfg.temperature),
             max_tokens: numOrUndef(reqCfg.maxTokens) || 4096,
             timeout_seconds: numOrUndef(reqCfg.timeoutSeconds),
           }, ac.signal, (delta) => {
@@ -2639,70 +2664,141 @@
         if (finishReason === "tool_calls" && asstToolCalls.length > 0) {
           for (const tc of asstToolCalls) {
             if (ac.signal.aborted) break;
-            if (tc.type !== "function" || tc.function.name !== "exec") continue;
+            if (tc.type !== "function" || !tc.function || !tc.function.name) continue;
 
-            let args;
-            try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
-            const command = stripShellTranscript(String(args.command || ""));
-            const commandToRun = normalizeExecScript("", command);
-            const k = cmdKey(commandToRun);
-            const repeatBlock = blockedByRepeatFailure(k);
-            const danger = dangerousCommandReason(commandToRun);
+            const toolName = String(tc.function.name || "").trim();
 
-            const win = isWindowsHost();
-            const fenceLang = win ? "powershell" : "bash";
-            const prompt = win ? "PS> " : "$ ";
-            display += (display ? "\n\n" : "") + "```" + fenceLang + "\n" + prompt + command;
-            flush("\n```");
+            if (toolName === "exec") {
+              let args;
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+              const command = stripShellTranscript(String(args.command || ""));
+              const commandToRun = normalizeExecScript("", command);
+              const k = cmdKey(commandToRun);
+              const repeatBlock = blockedByRepeatFailure(k);
+              const danger = dangerousCommandReason(commandToRun);
 
-            let toolResult;
-            try {
-              if (repeatBlock) {
-                toolResult = `error: blocked repeated failing command (${repeatBlock}). You MUST choose a different command/strategy.`;
-                display += `\n(blocked: ${repeatBlock})\n\`\`\`\nexit: -1`;
-                flush();
-                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
-                continue;
+              const win = isWindowsHost();
+              const fenceLang = win ? "powershell" : "bash";
+              const prompt = win ? "PS> " : "$ ";
+              display += (display ? "\n\n" : "") + "```" + fenceLang + "\n" + prompt + command;
+              flush("\n```");
+
+              let toolResult;
+              try {
+                if (repeatBlock) {
+                  toolResult = `error: blocked repeated failing command (${repeatBlock}). You MUST choose a different command/strategy.`;
+                  display += `\n(blocked: ${repeatBlock})\n\`\`\`\nexit: -1`;
+                  flush();
+                  messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                  continue;
+                }
+                if (danger) {
+                  toolResult = `error: blocked dangerous command (${danger}). Ask the user to run it manually if truly intended.`;
+                  display += `\n(blocked: ${danger})\n\`\`\`\nexit: -1`;
+                  flush();
+                  messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                  continue;
+                }
+                if (config.requireCommandApproval && !window.confirm("Run command?\n\n" + commandToRun)) {
+                  toolResult = "error: command rejected by user";
+                  display += "\n(rejected)\n```\nexit: -1";
+                  flush();
+                  messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                  continue;
+                }
+
+                const execRes = await postJson("/api/exec", { command: commandToRun, cwd }, ac.signal);
+                const stdout = truncTool(execRes.stdout, TRUNC_STDOUT);
+                const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
+                const exitCode = execRes.exit_code;
+                const failed = exitCode !== 0 || (stderr && !stdout);
+                noteCmd(k, failed, cmdSig(stderr, stdout));
+                const hint = failed ? gitRepoHint(stderr) : "";
+
+                toolResult = failed
+                  ? `FAILED (exit_code: ${exitCode}).\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}\n⚠ The command failed. Diagnose the error above and call exec again with the fix. Do NOT continue to the next step until this succeeds.`
+                  : `OK (exit_code: 0)\nstdout: ${stdout || "(empty)"}`;
+
+                if (stdout) display += "\n" + stdout;
+                if (stderr) display += "\nstderr: " + stderr;
+                display += "\n```\nexit: " + exitCode;
+              } catch (execErr) {
+                noteCmd(k, true, cmdSig(execErr.message || "", ""));
+                toolResult = `error: ${execErr.message}`;
+                display += "\nerror: " + execErr.message + "\n```";
               }
-              if (danger) {
-                toolResult = `error: blocked dangerous command (${danger}). Ask the user to run it manually if truly intended.`;
-                display += `\n(blocked: ${danger})\n\`\`\`\nexit: -1`;
-                flush();
-                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
-                continue;
-              }
-              if (config.requireCommandApproval && !window.confirm("Run command?\n\n" + commandToRun)) {
-                toolResult = "error: command rejected by user";
-                display += "\n(rejected)\n```\nexit: -1";
-                flush();
-                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
-                continue;
-              }
+              flush();
 
-              const execRes = await postJson("/api/exec", { command: commandToRun, cwd }, ac.signal);
-              const stdout = truncTool(execRes.stdout, TRUNC_STDOUT);
-              const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
-              const exitCode = execRes.exit_code;
-              const failed = exitCode !== 0 || (stderr && !stdout);
-              noteCmd(k, failed, cmdSig(stderr, stdout));
-              const hint = failed ? gitRepoHint(stderr) : "";
-
-              toolResult = failed
-                ? `FAILED (exit_code: ${exitCode}).\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}\n⚠ The command failed. Diagnose the error above and call exec again with the fix. Do NOT continue to the next step until this succeeds.`
-                : `OK (exit_code: 0)\nstdout: ${stdout || "(empty)"}`;
-
-              if (stdout) display += "\n" + stdout;
-              if (stderr) display += "\nstderr: " + stderr;
-              display += "\n```\nexit: " + exitCode;
-            } catch (execErr) {
-              noteCmd(k, true, cmdSig(execErr.message || "", ""));
-              toolResult = `error: ${execErr.message}`;
-              display += "\nerror: " + execErr.message + "\n```";
+              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              continue;
             }
-            flush();
 
-            messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+            if (toolName === "write_file") {
+              let args;
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+              const path0 = normalizePathSep(String(args.path || args.file_path || args.filename || ""));
+              const content = String(args.content || args.text || "");
+
+              const unsafePath =
+                !path0 ||
+                /^\//.test(path0) ||
+                /^[a-zA-Z]:[\\/]/.test(path0) ||
+                /(^|\/)\.\.(\/|$)/.test(path0);
+
+              const win = isWindowsHost();
+              const relShown = String(path0 || "(missing path)");
+              const shown = truncTool(content, 2600);
+              display += (display ? "\n\n" : "") + "```text " + relShown + "\n" + (shown || "(empty)") + "\n```";
+              flush();
+
+              let toolResult;
+              try {
+                if (unsafePath) {
+                  toolResult = "error: unsafe path (must be relative, no '..', no drive letters)";
+                  messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                  continue;
+                }
+                if (!content) {
+                  toolResult = "error: write_file content is empty";
+                  messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                  continue;
+                }
+
+                const base = cwd ? normalizePathSep(String(cwd)).replace(/\/+$/g, "") : "";
+                const fullPath = base ? (base + "/" + path0.replace(/^\/+/g, "")) : path0;
+
+                if (config.requireEditApproval) {
+                  const q = await postJson("/api/queue_edit", {
+                    action: "write_file",
+                    path: fullPath,
+                    content,
+                  }, ac.signal);
+                  const aid = String((q && q.approval_id) || "");
+                  refreshPendingEdits();
+                  toolResult = aid
+                    ? `Awaiting approval via /api/approve_edit\napproval_id: ${aid}`
+                    : "Awaiting approval via /api/approve_edit";
+                  messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                  awaitingApproval = true;
+                  break;
+                }
+
+                const wr = await postJson("/api/write_file", { path: fullPath, content }, ac.signal);
+                toolResult = `OK write_file\nbytes_written: ${wr && wr.bytes_written != null ? wr.bytes_written : content.length}`;
+                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              } catch (e2) {
+                toolResult = `error: ${prettyErr(e2)}`;
+                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              }
+              flush();
+              if (awaitingApproval) break;
+              continue;
+            }
+
+            // Unknown tool — ignore, but keep the model informed.
+            messages.push({ role: "tool", tool_call_id: tc.id, content: `error: unknown tool: ${toolName}` });
           }
+          if (awaitingApproval) break;
         } else {
           // finish_reason === "stop" — if the model didn't produce tool calls, try implied scripts.
           const implied = extractImpliedExecScripts(asstText);
