@@ -3,15 +3,18 @@ use crossterm::event::{
     MouseButton, MouseEvent, MouseEventKind,
 };
 use futures_util::StreamExt;
+use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::modes::{mode_prompt, language_instruction};
 use crate::personas::resolve_persona;
+use crate::providers;
 use crate::streaming::StreamToken;
-use crate::types::ChatMessage;
+use crate::types::{ChatMessage, ChatRequest};
 
 use super::agent;
-use super::app::{App, Focus, Message, Role};
+use super::app::{App, Focus, RightTab, Task, TaskPhase, TaskTarget, Message, Role};
 
 // ── Clipboard ─────────────────────────────────────────────────────────────────
 
@@ -26,21 +29,31 @@ fn copy_to_clipboard(_text: &str) {}
 
 // ── Slash command handler ─────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneId {
+    Coder,
+    Observer,
+    Chat,
+}
+
 /// Returns true if `text` was a slash command (caller should NOT send to AI).
-fn handle_slash_command(text: &str, app: &mut App, focus: Focus) -> bool {
-    if !text.starts_with('/') { return false; }
+fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
+    if !text.starts_with('/') {
+        return false;
+    }
 
     let (cmd, arg) = match text.find(' ') {
         Some(i) => (&text[..i], text[i + 1..].trim()),
-        None    => (text, ""),
+        None => (text, ""),
     };
     let cmd_lc = cmd.to_ascii_lowercase();
 
     macro_rules! push {
         ($msg:expr) => {
-            match focus {
-                Focus::Coder    => app.coder.push_tool($msg),
-                Focus::Observer => app.observer.push_tool($msg),
+            match pane {
+                PaneId::Coder => app.coder.push_tool($msg),
+                PaneId::Observer => app.observer.push_tool($msg),
+                PaneId::Chat => app.chat.push_tool($msg),
             }
         };
     }
@@ -48,102 +61,122 @@ fn handle_slash_command(text: &str, app: &mut App, focus: Focus) -> bool {
     match cmd_lc.as_str() {
         "/model" => {
             if arg.is_empty() {
-                let m = match focus {
-                    Focus::Coder    => app.coder_cfg.model.clone(),
-                    Focus::Observer => app.observer_cfg.model.clone(),
+                let m = match pane {
+                    PaneId::Coder => app.coder_cfg.model.clone(),
+                    PaneId::Observer => app.observer_cfg.model.clone(),
+                    PaneId::Chat => app.chat_cfg.model.clone(),
                 };
-                push!(format!("現在のモデル: {m}"));
+                push!(format!("model: {m}"));
             } else {
-                match focus {
-                    Focus::Coder => {
+                match pane {
+                    PaneId::Coder => {
                         app.coder_cfg.model = arg.to_string();
-                        app.coder.push_tool(format!("✓ Coder モデル → {arg}"));
+                        push!(format!("coder model <- {arg}"));
                     }
-                    Focus::Observer => {
+                    PaneId::Observer => {
                         app.observer_cfg.model = arg.to_string();
-                        app.observer.push_tool(format!("✓ Observer モデル → {arg}"));
+                        push!(format!("observer model <- {arg}"));
+                    }
+                    PaneId::Chat => {
+                        app.chat_cfg.model = arg.to_string();
+                        push!(format!("chat model <- {arg}"));
                     }
                 }
             }
         }
         "/persona" => {
             if arg.is_empty() {
-                push!(format!("現在のペルソナ: {}", app.coder_cfg.persona));
+                let p = match pane {
+                    PaneId::Coder => app.coder_cfg.persona.as_str(),
+                    PaneId::Observer => app.observer_cfg.persona.as_str(),
+                    PaneId::Chat => app.chat_cfg.persona.as_str(),
+                };
+                push!(format!("persona: {p}"));
             } else {
                 match resolve_persona(arg) {
                     Ok(p) => {
                         let key = p.key.to_string();
-                        app.coder_cfg.persona    = key.clone();
-                        app.observer_cfg.persona = key.clone();
-                        push!(format!("✓ ペルソナ → {key} (両ペイン)"));
+                        match pane {
+                            PaneId::Coder => app.coder_cfg.persona = key.clone(),
+                            PaneId::Observer => app.observer_cfg.persona = key.clone(),
+                            PaneId::Chat => app.chat_cfg.persona = key.clone(),
+                        }
+                        push!(format!("persona <- {key}"));
                     }
-                    Err(e) => push!(format!("✗ {e}")),
+                    Err(e) => push!(format!("error: {e}")),
                 }
             }
         }
         "/temp" | "/temperature" => {
-            if let Ok(t) = arg.parse::<f64>() {
-                let t = t.clamp(0.0, 2.0);
-                match focus {
-                    Focus::Coder => {
-                        app.coder_cfg.temperature = t;
-                        app.coder.push_tool(format!("✓ 温度 → {t:.2}"));
-                    }
-                    Focus::Observer => {
-                        app.observer_cfg.temperature = t;
-                        app.observer.push_tool(format!("✓ 温度 → {t:.2}"));
-                    }
+            if arg.is_empty() {
+                let t = match pane {
+                    PaneId::Coder => app.coder_cfg.temperature,
+                    PaneId::Observer => app.observer_cfg.temperature,
+                    PaneId::Chat => app.chat_cfg.temperature,
+                };
+                push!(format!("temperature: {t:.2}"));
+            } else if let Ok(t0) = arg.parse::<f64>() {
+                let t = t0.clamp(0.0, 2.0);
+                match pane {
+                    PaneId::Coder => app.coder_cfg.temperature = t,
+                    PaneId::Observer => app.observer_cfg.temperature = t,
+                    PaneId::Chat => app.chat_cfg.temperature = t,
                 }
+                push!(format!("temperature <- {t:.2}"));
             } else {
-                push!("使い方: /temp 0.0〜2.0".to_string());
+                push!("usage: /temp 0.0-2.0".to_string());
             }
         }
         "/lang" => {
             if arg.is_empty() {
-                push!(format!("言語: {}", app.lang));
+                push!(format!("lang: {}", app.lang));
             } else {
                 let v = arg.trim().to_ascii_lowercase();
                 if v == "ja" || v == "en" || v == "fr" {
                     app.lang = v.clone();
-                    push!(format!("✓ 言語 → {v}"));
+                    push!(format!("lang <- {v}"));
                 } else {
-                    push!("使い方: /lang ja|en|fr".to_string());
+                    push!("usage: /lang ja|en|fr".to_string());
                 }
             }
         }
         "/root" | "/wd" => {
             if arg.is_empty() {
-                let r = app.tool_root.as_deref().unwrap_or("(未設定 = カレントディレクトリ)").to_string();
-                push!(format!("作業ディレクトリ: {r}"));
+                let r = app.tool_root.as_deref().unwrap_or("(default: current dir)");
+                push!(format!("tool_root: {r}"));
             } else {
                 app.tool_root = Some(arg.to_string());
-                push!(format!("✓ 作業ディレクトリ → {arg}"));
+                push!(format!("tool_root <- {arg}"));
             }
         }
         "/find" => {
             let q = arg.to_string();
-            match focus {
-                Focus::Coder => app.coder.find_query = q.clone(),
-                Focus::Observer => app.observer.find_query = q.clone(),
+            match pane {
+                PaneId::Coder => app.coder.find_query = q.clone(),
+                PaneId::Observer => app.observer.find_query = q.clone(),
+                PaneId::Chat => app.chat.find_query = q.clone(),
             }
             if q.trim().is_empty() {
-                push!("✓ 検索フィルタ OFF".to_string());
+                push!("find: off".to_string());
             } else {
-                push!(format!("✓ 検索フィルタ → {q}"));
+                push!(format!("find: {q}"));
             }
         }
         "/help" | "/?" => {
-            push!("\
- /model <name>       モデル変更 (例: /model gpt-4o)\n\
- /persona <name>     ペルソナ (default/cynical/cheerful/thoughtful/novelist)\n\
- /temp <0.0-2.0>     温度変更\n\
- /lang <ja|en|fr>    言語変更\n\
- /root <path>        作業ディレクトリ変更\n\
- /find <text>        履歴を検索フィルタ (空でOFF)\n\
- Ctrl+Y              最後のAI返答をクリップボードにコピー".to_string());
+            push!(
+                "/model <name>       set model\n\
+/persona <name>     set persona\n\
+/temp <0.0-2.0>     set temperature\n\
+/lang <ja|en|fr>    set language\n\
+/root <path>        set tool_root\n\
+/find <text>        filter history\n\
+Ctrl+R              cycle right tab\n"
+                    .to_string()
+            );
         }
-        _ => push!(format!("不明なコマンド: {cmd}  /help で一覧")),
+        _ => push!(format!("unknown command: {cmd} (try /help)")),
     }
+
     true
 }
 
@@ -152,7 +185,24 @@ pub enum AppEvent {
     Mouse(MouseEvent),
     CoderToken(StreamToken),
     ObserverToken(StreamToken),
+    ChatToken(StreamToken),
+    TasksPlanned(Vec<Task>),
+    TaskPlanError(String),
     Tick,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlannedTasks {
+    tasks: Vec<PlannedTask>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlannedTask {
+    target: String,
+    title: String,
+    body: String,
+    phase: Option<String>,
+    priority: Option<u8>,
 }
 
 pub async fn run_event_loop(
@@ -161,6 +211,9 @@ pub async fn run_event_loop(
 ) -> anyhow::Result<()> {
     let (coder_tx, mut coder_rx) = mpsc::channel::<StreamToken>(256);
     let (observer_tx, mut observer_rx) = mpsc::channel::<StreamToken>(256);
+    let (chat_tx, mut chat_rx) = mpsc::channel::<StreamToken>(256);
+    // Internal app events (background planners, etc.).
+    let (internal_tx, mut internal_rx) = mpsc::channel::<AppEvent>(64);
     let mut event_stream = EventStream::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
 
@@ -178,18 +231,23 @@ pub async fn run_event_loop(
             }
             Some(token) = coder_rx.recv() => AppEvent::CoderToken(token),
             Some(token) = observer_rx.recv() => AppEvent::ObserverToken(token),
+            Some(token) = chat_rx.recv() => AppEvent::ChatToken(token),
+            Some(ev2) = internal_rx.recv() => ev2,
             _ = tick.tick() => AppEvent::Tick,
         };
 
         match ev {
             AppEvent::Key(key) => {
-                if handle_key(key, app, &coder_tx, &observer_tx).await? {
+                if handle_key(key, app, &coder_tx, &observer_tx, &chat_tx, &internal_tx).await? {
                     break;
                 }
             }
             AppEvent::Mouse(m)                  => handle_mouse(m, app),
             AppEvent::CoderToken(token)         => handle_coder_token(token, app),
             AppEvent::ObserverToken(token)      => handle_observer_token(token, app),
+            AppEvent::ChatToken(token)          => handle_chat_token(token, app),
+            AppEvent::TasksPlanned(tasks)       => handle_tasks_planned(tasks, app),
+            AppEvent::TaskPlanError(e)          => handle_task_plan_error(e, app),
             AppEvent::Tick => {
                 app.tick_count = app.tick_count.wrapping_add(1);
                 maybe_auto_observe(app, &observer_tx).await;
@@ -203,6 +261,7 @@ pub async fn run_event_loop(
     // Abort any in-flight tasks on clean exit.
     if let Some(t) = app.coder_task.take() { t.abort(); }
     if let Some(t) = app.observer_task.take() { t.abort(); }
+    if let Some(t) = app.chat_task.take() { t.abort(); }
 
     Ok(())
 }
@@ -217,7 +276,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     //   row 0-1    → header (2 rows)
     //   row 2..h-4 → body panes
     //   row h-3..h → input box (3 rows)
-    // Horizontal: left 55 % = Coder, right 45 % = Observer.
+    // Horizontal: left 55 % = Coder, right 45 % = Right tab (Observer/Chat/Tasks).
     let coder_w = (term_w as u32 * 55 / 100) as u16;
     let body_start: u16 = 2;
     let body_end: u16 = term_h.saturating_sub(3);
@@ -225,30 +284,36 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     match mouse.kind {
         // Scroll wheel: scroll whichever pane the cursor is over.
         MouseEventKind::ScrollUp => {
-            let pane = if mouse.column < coder_w {
-                &mut app.coder
+            if mouse.column < coder_w {
+                app.coder.scroll = app.coder.scroll.saturating_add(3);
             } else {
-                &mut app.observer
-            };
-            pane.scroll = pane.scroll.saturating_add(3);
+                match app.right_tab {
+                    RightTab::Observer => app.observer.scroll = app.observer.scroll.saturating_add(3),
+                    RightTab::Chat => app.chat.scroll = app.chat.scroll.saturating_add(3),
+                    RightTab::Tasks => app.tasks_cursor = app.tasks_cursor.saturating_sub(1),
+                }
+            }
         }
         MouseEventKind::ScrollDown => {
-            let pane = if mouse.column < coder_w {
-                &mut app.coder
+            if mouse.column < coder_w {
+                app.coder.scroll = app.coder.scroll.saturating_sub(3);
             } else {
-                &mut app.observer
-            };
-            pane.scroll = pane.scroll.saturating_sub(3);
+                match app.right_tab {
+                    RightTab::Observer => app.observer.scroll = app.observer.scroll.saturating_sub(3),
+                    RightTab::Chat => app.chat.scroll = app.chat.scroll.saturating_sub(3),
+                    RightTab::Tasks => {
+                        if !app.tasks.is_empty() {
+                            app.tasks_cursor = (app.tasks_cursor + 1).min(app.tasks.len().saturating_sub(1));
+                        }
+                    }
+                }
+            }
         }
 
         // Left-click in the body: focus that pane.
         MouseEventKind::Down(MouseButton::Left) => {
             if mouse.row >= body_start && mouse.row < body_end {
-                app.focus = if mouse.column < coder_w {
-                    Focus::Coder
-                } else {
-                    Focus::Observer
-                };
+                app.focus = if mouse.column < coder_w { Focus::Coder } else { Focus::Right };
             }
         }
 
@@ -264,6 +329,8 @@ async fn handle_key(
     app: &mut App,
     coder_tx: &mpsc::Sender<StreamToken>,
     observer_tx: &mpsc::Sender<StreamToken>,
+    chat_tx: &mpsc::Sender<StreamToken>,
+    internal_tx: &mpsc::Sender<AppEvent>,
 ) -> anyhow::Result<bool> {
     use crossterm::event::KeyEventKind;
     if key.kind == KeyEventKind::Release { return Ok(false); }
@@ -279,10 +346,20 @@ async fn handle_key(
         // Switch focus
         KeyCode::Tab => app.toggle_focus(),
 
+        // Cycle right-side tab (Observer/Chat/Tasks)
+        KeyCode::Char('r') if ctrl => app.cycle_right_tab(),
+
         // Yank (copy) last assistant message to clipboard
         KeyCode::Char('y') if ctrl => {
             let content = {
-                let pane = match app.focus { Focus::Coder => &app.coder, Focus::Observer => &app.observer };
+                let pane = match app.focus {
+                    Focus::Coder => &app.coder,
+                    Focus::Right => match app.right_tab {
+                        RightTab::Observer => &app.observer,
+                        RightTab::Chat => &app.chat,
+                        RightTab::Tasks => &app.observer,
+                    },
+                };
                 pane.messages.iter().rev()
                     .find(|m| matches!(m.role, Role::Assistant) && m.complete)
                     .map(|m| m.content.clone())
@@ -311,6 +388,14 @@ async fn handle_key(
         }
 
         // Stop streaming (Ctrl+K)
+        KeyCode::Char('k') if ctrl && app.focus == Focus::Right && app.right_tab == RightTab::Chat => {
+            if let Some(handle) = app.chat_task.take() {
+                handle.abort();
+            }
+            app.ignore_chat_tokens = true;
+            app.chat.finish_stream();
+            app.chat.push_tool("(stream canceled)".to_string());
+        }
         KeyCode::Char('k') if ctrl => {
             match app.focus {
                 Focus::Coder => {
@@ -321,7 +406,7 @@ async fn handle_key(
                     app.coder.finish_stream();
                     app.coder.push_tool("(ストリーミング停止)".to_string());
                 }
-                Focus::Observer => {
+                Focus::Right => {
                     if let Some(handle) = app.observer_task.take() {
                         handle.abort();
                     }
@@ -334,34 +419,93 @@ async fn handle_key(
 
         // Scroll (lines-from-bottom semantics: 0 = pinned, N = above)
         KeyCode::PageUp => {
-            app.focused_pane_mut().scroll = app.focused_pane_mut().scroll.saturating_add(5);
+            if app.focus == Focus::Right && app.right_tab == RightTab::Tasks {
+                app.tasks_cursor = app.tasks_cursor.saturating_sub(5);
+            } else {
+                app.focused_pane_mut().scroll = app.focused_pane_mut().scroll.saturating_add(5);
+            }
         }
         KeyCode::PageDown => {
-            app.focused_pane_mut().scroll = app.focused_pane_mut().scroll.saturating_sub(5);
+            if app.focus == Focus::Right && app.right_tab == RightTab::Tasks {
+                if !app.tasks.is_empty() {
+                    app.tasks_cursor = (app.tasks_cursor + 5).min(app.tasks.len().saturating_sub(1));
+                }
+            } else {
+                app.focused_pane_mut().scroll = app.focused_pane_mut().scroll.saturating_sub(5);
+            }
         }
         KeyCode::Home => {
-            app.focused_pane_mut().scroll = usize::MAX; // jump to very top
+            if app.focus == Focus::Right && app.right_tab == RightTab::Tasks {
+                app.tasks_cursor = 0;
+            } else {
+                app.focused_pane_mut().scroll = usize::MAX; // jump to very top
+            }
         }
         KeyCode::End => {
-            app.focused_pane_mut().scroll = 0; // re-pin to bottom
+            if app.focus == Focus::Right && app.right_tab == RightTab::Tasks {
+                if !app.tasks.is_empty() {
+                    app.tasks_cursor = app.tasks.len().saturating_sub(1);
+                }
+            } else {
+                app.focused_pane_mut().scroll = 0; // re-pin to bottom
+            }
+        }
+
+        // Tasks selection
+        KeyCode::Up if app.focus == Focus::Right && app.right_tab == RightTab::Tasks => {
+            app.tasks_cursor = app.tasks_cursor.saturating_sub(1);
+        }
+        KeyCode::Down if app.focus == Focus::Right && app.right_tab == RightTab::Tasks => {
+            if !app.tasks.is_empty() {
+                app.tasks_cursor = (app.tasks_cursor + 1).min(app.tasks.len().saturating_sub(1));
+            }
+        }
+        KeyCode::Char(' ') if app.focus == Focus::Right && app.right_tab == RightTab::Tasks => {
+            if let Some(t) = app.tasks.get_mut(app.tasks_cursor) {
+                t.done = !t.done;
+            }
         }
 
         // Send message
         KeyCode::Enter if !shift => {
             match app.focus {
                 Focus::Coder => send_coder_message(app, coder_tx).await,
-                Focus::Observer => send_observer_message(app, observer_tx, None).await,
+                Focus::Right => match app.right_tab {
+                    RightTab::Observer => send_observer_message(app, observer_tx, None).await,
+                    RightTab::Chat => send_chat_message(app, chat_tx, internal_tx).await,
+                    RightTab::Tasks => dispatch_selected_task(app, coder_tx, observer_tx).await,
+                },
             }
         }
 
         // Insert newline
         KeyCode::Enter if shift => {
-            app.focused_pane_mut().textarea.insert_newline();
+            match app.focus {
+                Focus::Coder => app.coder.textarea.insert_newline(),
+                Focus::Right => match app.right_tab {
+                    RightTab::Observer => app.observer.textarea.insert_newline(),
+                    RightTab::Chat => app.chat.textarea.insert_newline(),
+                    RightTab::Tasks => {}
+                },
+            }
         }
 
         // Pass everything else to tui-textarea
         _ => {
-            app.focused_pane_mut().textarea.input(key);
+            match app.focus {
+                Focus::Coder => {
+                    app.coder.textarea.input(key);
+                }
+                Focus::Right => match app.right_tab {
+                    RightTab::Observer => {
+                        app.observer.textarea.input(key);
+                    }
+                    RightTab::Chat => {
+                        app.chat.textarea.input(key);
+                    }
+                    RightTab::Tasks => {}
+                },
+            }
         }
     }
 
@@ -430,15 +574,54 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
 
 // ── Send helpers ──────────────────────────────────────────────────────────────
 
-async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
-    let lines = app.coder.textarea.lines();
-    let text = lines.join("\n");
+fn handle_chat_token(token: StreamToken, app: &mut App) {
+    if app.ignore_chat_tokens {
+        return;
+    }
+    match token {
+        StreamToken::Delta(s) => {
+            app.chat.push_delta(&s);
+        }
+        StreamToken::ToolCall(_) => {}
+        StreamToken::Done => {
+            app.chat.finish_stream();
+        }
+        StreamToken::Error(e) => {
+            app.chat.push_tool(format!("ERROR: {e}"));
+            app.chat.finish_stream();
+        }
+    }
+}
+
+fn handle_tasks_planned(tasks: Vec<Task>, app: &mut App) {
+    app.planning_tasks = false;
+    if tasks.is_empty() {
+        app.chat.push_tool("(task router) no tasks planned".to_string());
+        return;
+    }
+    let n = tasks.len();
+    app.tasks.extend(tasks);
+    if app.tasks_cursor >= app.tasks.len() {
+        app.tasks_cursor = app.tasks.len().saturating_sub(1);
+    }
+    app.chat.push_tool(format!(
+        "(task router) planned {n} task(s) - Ctrl+R to view Tasks"
+    ));
+}
+
+fn handle_task_plan_error(e: String, app: &mut App) {
+    app.planning_tasks = false;
+    app.chat.push_tool(format!("(task router error) {e}"));
+}
+
+async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, text: String) {
     let text = text.trim().to_string();
-    if text.is_empty() || app.coder.streaming { return; }
+    if text.is_empty() || app.coder.streaming {
+        return;
+    }
 
     // Handle slash commands before sending to AI.
-    if handle_slash_command(&text, app, Focus::Coder) {
-        app.coder.textarea = tui_textarea::TextArea::default();
+    if handle_slash_command(&text, app, PaneId::Coder) {
         return;
     }
 
@@ -446,7 +629,6 @@ async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
     if let Some(handle) = app.coder_task.take() { handle.abort(); }
 
     // Reset state for the new send.
-    app.coder.textarea = tui_textarea::TextArea::default();
     app.coder_iter = 0;
     app.coder.scroll = 0;         // pin to bottom for new output
     app.ignore_coder_tokens = false;
@@ -481,6 +663,22 @@ async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
     app.coder_task = Some(handle);
 }
 
+async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
+    let text = app.coder.textarea.lines().join("\n").trim().to_string();
+    if text.is_empty() || app.coder.streaming {
+        return;
+    }
+
+    // Handle slash commands before sending to AI.
+    if handle_slash_command(&text, app, PaneId::Coder) {
+        app.coder.textarea = tui_textarea::TextArea::default();
+        return;
+    }
+
+    app.coder.textarea = tui_textarea::TextArea::default();
+    send_coder_with_text(app, tx, text).await;
+}
+
 async fn send_observer_message(
     app: &mut App,
     tx: &mpsc::Sender<StreamToken>,
@@ -492,7 +690,7 @@ async fn send_observer_message(
             let t = app.observer.textarea.lines().join("\n").trim().to_string();
             if t.is_empty() { return; }
             // Handle slash commands before sending to AI.
-            if handle_slash_command(&t, app, Focus::Observer) {
+            if handle_slash_command(&t, app, PaneId::Observer) {
                 app.observer.textarea = tui_textarea::TextArea::default();
                 return;
             }
@@ -575,6 +773,239 @@ async fn send_observer_message(
 }
 
 // ── Auto-observe ──────────────────────────────────────────────────────────────
+
+async fn send_chat_message(
+    app: &mut App,
+    tx: &mpsc::Sender<StreamToken>,
+    internal_tx: &mpsc::Sender<AppEvent>,
+) {
+    let text = app.chat.textarea.lines().join("\n").trim().to_string();
+    if text.is_empty() || app.chat.streaming {
+        return;
+    }
+
+    // Handle slash commands before sending to AI.
+    if handle_slash_command(&text, app, PaneId::Chat) {
+        app.chat.textarea = tui_textarea::TextArea::default();
+        return;
+    }
+
+    // Abort any previous chat task before starting a new one.
+    if let Some(handle) = app.chat_task.take() {
+        handle.abort();
+    }
+
+    // Reset state for the new send.
+    app.chat.textarea = tui_textarea::TextArea::default();
+    app.chat.scroll = 0;
+    app.ignore_chat_tokens = false;
+
+    app.chat.push_user(text.clone());
+    app.chat.streaming = true;
+    app.chat.messages.push(Message::new_streaming(Role::Assistant));
+
+    // Start background task planning (TaskRouter) in parallel.
+    spawn_task_planner(app, internal_tx);
+
+    let history = app.chat.chat_history();
+    let cfg = app.chat_cfg.clone();
+    let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
+    let lang = language_instruction(Some(&app.lang), &cfg.mode);
+    let mode = mode_prompt(&cfg.mode);
+
+    let mut system = mode.to_string();
+    if !lang.trim().is_empty() {
+        system.push_str("\n\n[Language]\n");
+        system.push_str(lang);
+    }
+    if !persona_prompt.trim().is_empty() {
+        system.push_str("\n\n[Persona]\n");
+        system.push_str(persona_prompt);
+    }
+
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: system,
+    }];
+    let hist_len = history.len();
+    for m in history.iter().take(hist_len.saturating_sub(1)) {
+        messages.push(m.clone());
+    }
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: text,
+    });
+
+    let tx = tx.clone();
+    let handle = tokio::spawn(async move {
+        use crate::config::ProviderKind;
+        use crate::streaming::{stream_anthropic, stream_openai_compat};
+        let client = reqwest::Client::new();
+        let result = match cfg.provider {
+            ProviderKind::Anthropic => stream_anthropic(&client, &cfg, &messages, tx.clone()).await,
+            _ => stream_openai_compat(&client, &cfg, &messages, None, tx.clone()).await,
+        };
+        if let Err(e) = result {
+            let _ = tx.send(StreamToken::Error(e.to_string())).await;
+        }
+    });
+    app.chat_task = Some(handle);
+}
+
+fn spawn_task_planner(app: &mut App, internal_tx: &mpsc::Sender<AppEvent>) {
+    if app.planning_tasks {
+        return;
+    }
+    app.planning_tasks = true;
+
+    let cfg = app.chat_cfg.clone();
+    let lang = app.lang.clone();
+    let chat_hist = app.chat.chat_history();
+    let coder_hist = app.coder.chat_history();
+    let observer_hist = app.observer.chat_history();
+    let tx = internal_tx.clone();
+
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let provider = providers::build_provider(client, &cfg);
+
+        let lang_instr = language_instruction(Some(&lang), &cfg.mode);
+        let system = format!(
+            "You are TaskRouter.\n\
+Return STRICT JSON only (no markdown, no commentary).\n\
+Schema: {{\"tasks\":[{{\"target\":\"coder|observer\",\"title\":\"...\",\"body\":\"...\",\"phase\":\"core|feature|polish|any\",\"priority\":0..100}}]}}\n\
+Rules:\n\
+- Prefer concrete next actions (files/commands) over abstract advice.\n\
+- If there is no actionable work, return {{\"tasks\":[]}}.\n\n\
+[Language]\n{lang_instr}"
+        );
+
+        let mut messages: Vec<ChatMessage> = Vec::new();
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: system,
+        });
+
+        fn fmt_recent(label: &str, hist: &[ChatMessage], take: usize) -> String {
+            let recent = hist
+                .iter()
+                .rev()
+                .take(take)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>();
+            let joined = recent
+                .iter()
+                .map(|m| format!("[{}] {}", m.role, m.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{label}:\n{joined}")
+        }
+
+        let state = format!(
+            "{}\n\n{}\n\n{}",
+            fmt_recent("Recent chat", &chat_hist, 6),
+            fmt_recent("Recent coder", &coder_hist, 6),
+            fmt_recent("Recent observer", &observer_hist, 3),
+        );
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: state,
+        });
+
+        let req = ChatRequest {
+            messages,
+            temperature: Some(0.2),
+            max_tokens: Some(512),
+            metadata: Some(json!({"response_format": {"type": "json_object"}})),
+        };
+
+        let resp = match provider.chat(&req).await {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(AppEvent::TaskPlanError(e.to_string())).await;
+                return;
+            }
+        };
+
+        let raw = resp.content;
+        let json_str = extract_first_json_object(&raw).unwrap_or(raw);
+        let parsed: PlannedTasks = match serde_json::from_str(&json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tx
+                    .send(AppEvent::TaskPlanError(format!("invalid JSON: {e}")))
+                    .await;
+                return;
+            }
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+
+        let mut out: Vec<Task> = Vec::new();
+        for (i, t) in parsed.tasks.into_iter().enumerate() {
+            let target = match t.target.to_ascii_lowercase().as_str() {
+                "observer" | "obs" => TaskTarget::Observer,
+                _ => TaskTarget::Coder,
+            };
+            let phase = match t
+                .phase
+                .unwrap_or_else(|| "any".to_string())
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "core" => TaskPhase::Core,
+                "feature" => TaskPhase::Feature,
+                "polish" => TaskPhase::Polish,
+                _ => TaskPhase::Any,
+            };
+            let prio = t.priority.unwrap_or(50).min(100);
+            out.push(Task {
+                id: format!("t{now_ms}-{i}"),
+                target,
+                title: t.title,
+                body: t.body,
+                phase,
+                priority: prio,
+                done: false,
+            });
+        }
+
+        let _ = tx.send(AppEvent::TasksPlanned(out)).await;
+    });
+}
+
+fn extract_first_json_object(s: &str) -> Option<String> {
+    let start = s.find('{')?;
+    let end = s.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    Some(s[start..=end].to_string())
+}
+
+async fn dispatch_selected_task(
+    app: &mut App,
+    coder_tx: &mpsc::Sender<StreamToken>,
+    observer_tx: &mpsc::Sender<StreamToken>,
+) {
+    let Some(t) = app.tasks.get(app.tasks_cursor).cloned() else {
+        return;
+    };
+    let msg = format!(
+        "[TASK]\nphase: {:?}\npriority: {}\ntitle: {}\n\n{}",
+        t.phase, t.priority, t.title, t.body
+    );
+    match t.target {
+        TaskTarget::Coder => send_coder_with_text(app, coder_tx, msg).await,
+        TaskTarget::Observer => send_observer_message(app, observer_tx, Some(msg)).await,
+    }
+}
 
 async fn maybe_auto_observe(app: &mut App, observer_tx: &mpsc::Sender<StreamToken>) {
     if let Some((idx, content)) = app.auto_observe_trigger() {

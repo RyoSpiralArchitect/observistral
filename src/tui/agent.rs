@@ -15,6 +15,8 @@
 ///      provider, so the id field is never silently dropped.
 use anyhow::{Result, anyhow};
 use serde_json::json;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use tokio::sync::mpsc;
 
 use crate::config::RunConfig;
@@ -219,6 +221,297 @@ fn build_ok_tool_output(stdout: &str) -> String {
     }
 }
 
+// ── Loop Governor (Coder strengthening) ────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentState {
+    Planning,
+    Executing,
+    Verifying,
+    Recovery,
+    Done,
+}
+
+#[derive(Debug, Default)]
+struct FailureMemory {
+    consecutive_failures: usize,
+
+    last_command_sig: Option<String>,
+    same_command_repeats: usize,
+
+    last_error_sig: Option<String>,
+    same_error_repeats: usize,
+
+    last_output_hash: Option<u64>,
+    same_output_repeats: usize,
+}
+
+fn normalize_for_signature(s: &str) -> String {
+    // Keep this tiny: lowercased + digits collapsed removes most "At line:123" noise.
+    let mut out = String::with_capacity(s.len().min(160));
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            out.push('#');
+        } else {
+            out.push(ch.to_ascii_lowercase());
+        }
+        if out.len() >= 160 {
+            break;
+        }
+    }
+    out
+}
+
+fn command_sig(command: &str) -> String {
+    // Single line, trimmed, collapsed whitespace.
+    let normalized = command.replace("\r\n", "\n");
+    let one = normalized
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let collapsed = one.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalize_for_signature(&collapsed)
+}
+
+fn pick_interesting_error_line(stdout: &str, stderr: &str) -> String {
+    let keywords = [
+        "error",
+        "fatal",
+        "exception",
+        "traceback",
+        "parsererror",
+        "unexpected token",
+        "not recognized",
+        "commandnotfoundexception",
+        "missing expression",
+        "unable to",
+        "could not",
+        "access is denied",
+        "permission denied",
+    ];
+
+    for src in [stderr, stdout] {
+        for ln in src.lines() {
+            let t = ln.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let low = t.to_ascii_lowercase();
+            if keywords.iter().any(|k| low.contains(k)) {
+                return normalize_for_signature(t);
+            }
+        }
+    }
+
+    // Fall back to the first non-empty line.
+    for src in [stderr, stdout] {
+        for ln in src.lines() {
+            let t = ln.trim();
+            if !t.is_empty() {
+                return normalize_for_signature(t);
+            }
+        }
+    }
+
+    String::new()
+}
+
+fn error_signature(command: &str, stdout: &str, stderr: &str, exit_code: i32) -> String {
+    let cmd = command_sig(command);
+    let line = pick_interesting_error_line(stdout, stderr);
+    format!("exit={exit_code}|cmd={cmd}|err={line}")
+}
+
+fn hash_output(stdout: &str, stderr: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    stdout.trim_end().hash(&mut h);
+    stderr.trim_end().hash(&mut h);
+    h.finish()
+}
+
+fn suspicious_success_reason(stdout: &str, stderr: &str) -> Option<String> {
+    // PowerShell often exits 0 even when it printed errors (non-terminating error records).
+    // Cargo warnings also go to stderr, so we only trigger on strong error markers.
+    let bad = [
+        "parsererror",
+        "unexpected token",
+        "missing expression",
+        "commandnotfoundexception",
+        "not recognized",
+        "error:",
+        "fatal:",
+        "exception",
+        "traceback",
+        "access is denied",
+        "permission denied",
+        "does not have a commit checked out",
+        "unable to index file",
+        "could not find a part of the path",
+    ];
+
+    for src in [stderr, stdout] {
+        let low = src.to_ascii_lowercase();
+        if bad.iter().any(|k| low.contains(k)) {
+            // Return just enough to explain why we treated this as failure.
+            let line = pick_interesting_error_line(stdout, stderr);
+            if !line.is_empty() {
+                return Some(format!(
+                    "exit_code was 0, but output contained error markers (e.g. `{line}`)"
+                ));
+            }
+            return Some("exit_code was 0, but output contained error markers".to_string());
+        }
+    }
+
+    None
+}
+
+fn hint_for_known_failure(command: &str, stdout: &str, stderr: &str) -> Option<String> {
+    let mut s = String::new();
+    s.push_str(stdout);
+    s.push('\n');
+    s.push_str(stderr);
+    let low = s.to_ascii_lowercase();
+    let cmd_low = command.to_ascii_lowercase();
+
+    if low.contains("the term '$' is not recognized")
+        || (low.contains("the term '$'") && low.contains("not recognized"))
+    {
+        return Some(
+            "Your command includes a transcript prompt marker like `$` / `PS>`.\n\
+Fix: send ONLY the command (e.g. `git status`), not `$ git status`."
+                .to_string(),
+        );
+    }
+    if low.contains("unexpected token '}'") || (low.contains("unexpected token") && low.contains('}')) {
+        return Some(
+            "PowerShell saw a stray `}` in the command.\n\
+Fix: remove the trailing `}` and retry."
+                .to_string(),
+        );
+    }
+    if low.contains("adding embedded git repository") || low.contains("does not have a commit checked out") {
+        return Some(
+            "You are trying to `git add` a nested repo directory.\n\
+Fix: `cd` into the intended repo before `git add .`, or add the nested repo dir to `.gitignore` (or use `git submodule add ...`)."
+                .to_string(),
+        );
+    }
+    if low.contains("failed to remove file")
+        && (low.contains("access is denied") || low.contains("permission denied"))
+        && cmd_low.contains("cargo")
+    {
+        return Some(
+            "Rust build failed because `obstral.exe` is locked.\n\
+Fix: stop the running process (or close the TUI/serve), then rebuild."
+                .to_string(),
+        );
+    }
+    if low.contains("could not connect to server") && low.contains("127.0.0.1") && cmd_low.contains("git") {
+        return Some(
+            "Git network failed via a dead local proxy (127.0.0.1).\n\
+Fix: clear proxy env vars: `Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY -ErrorAction SilentlyContinue`."
+                .to_string(),
+        );
+    }
+    if low.contains("incorrect api key")
+        || low.contains("invalid_api_key")
+        || (low.contains("http 401") && low.contains("api key"))
+    {
+        return Some(
+            "Provider returned HTTP 401 (bad/missing API key).\n\
+Fix: update the configured API key for the selected provider/model, then retry."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+impl FailureMemory {
+    fn on_tool_result(
+        &mut self,
+        command: &str,
+        stdout: &str,
+        stderr: &str,
+        effective_exit_code: i32,
+    ) -> Option<String> {
+        // Track repeated identical commands (common loop symptom).
+        let cmd_sig = command_sig(command);
+        if self.last_command_sig.as_deref() == Some(&cmd_sig) {
+            self.same_command_repeats = self.same_command_repeats.saturating_add(1);
+        } else {
+            self.last_command_sig = Some(cmd_sig);
+            self.same_command_repeats = 1;
+        }
+
+        // Track output hash (stuck detection).
+        let oh = hash_output(stdout, stderr);
+        if self.last_output_hash == Some(oh) {
+            self.same_output_repeats = self.same_output_repeats.saturating_add(1);
+        } else {
+            self.last_output_hash = Some(oh);
+            self.same_output_repeats = 1;
+        }
+
+        if effective_exit_code == 0 {
+            self.consecutive_failures = 0;
+            self.last_error_sig = None;
+            self.same_error_repeats = 0;
+            return None;
+        }
+
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+
+        let sig = error_signature(command, stdout, stderr, effective_exit_code);
+        if self.last_error_sig.as_deref() == Some(&sig) {
+            self.same_error_repeats = self.same_error_repeats.saturating_add(1);
+        } else {
+            self.last_error_sig = Some(sig);
+            self.same_error_repeats = 1;
+        }
+
+        // Emit hints only when crossing key thresholds to avoid spamming context.
+        if self.same_error_repeats == 2 {
+            if let Some(h) = hint_for_known_failure(command, stdout, stderr) {
+                return Some(h);
+            }
+            return Some(
+                "The SAME error happened twice.\n\
+Action: stop repeating; gather diagnostics (`pwd`, `ls`, `git status`) then change strategy."
+                    .to_string(),
+            );
+        }
+
+        if self.same_command_repeats == 3 {
+            return Some(
+                "You ran the SAME command 3 times.\n\
+Action: abandon this approach and try a different strategy (different cwd, different command, or add diagnostics)."
+                    .to_string(),
+            );
+        }
+
+        if self.consecutive_failures >= 3 {
+            return Some(
+                "3 consecutive failures.\n\
+Action: change strategy now; do NOT retry the same approach again."
+                    .to_string(),
+            );
+        }
+
+        if self.same_output_repeats >= 2 && self.same_command_repeats >= 2 {
+            return Some(
+                "Stuck detected: repeated identical output.\n\
+Action: print diagnostics and change strategy; do not repeat the same command."
+                    .to_string(),
+            );
+        }
+
+        None
+    }
+}
+
 // ── Agentic loop ──────────────────────────────────────────────────────────────
 
 /// Run the agentic loop.  Sends StreamToken events to `tx` for the TUI to display.
@@ -231,6 +524,9 @@ pub async fn run_agentic(
 ) -> Result<()> {
     let client = reqwest::Client::new();
     let tools = json!([exec_tool_def()]);
+    let mut state = AgentState::Planning;
+    let mut mem = FailureMemory::default();
+    let mut pending_system_hint: Option<String> = None;
 
     // Keep messages as serde_json::Value throughout to preserve tool_call_id.
     let mut messages: Vec<serde_json::Value> = messages_in
@@ -243,11 +539,22 @@ pub async fn run_agentic(
         prune_old_tool_results(&mut messages);
 
         // ── Stream from model ──────────────────────────────────────────────
+        // Inject a one-shot governor hint if we detected a repeated failure pattern.
+        let mut msgs_for_call = messages.clone();
+        if let Some(h) = pending_system_hint.take() {
+            let note = format!(
+                "[Loop Governor]\nstate: {:?}\n{}\n\nYou MUST incorporate this hint in your next exec call.\nDo not repeat the same failing command.",
+                state, h
+            );
+            let _ = tx.send(StreamToken::Delta(format!("\n[governor] {h}\n"))).await;
+            msgs_for_call.push(json!({"role":"system","content": note}));
+        }
+
         let (token_tx, mut token_rx) = mpsc::channel::<StreamToken>(256);
         let cfg_clone = cfg.clone();
         let tools_clone = tools.clone();
         let client_clone = client.clone();
-        let msgs_clone = messages.clone();
+        let msgs_clone = msgs_for_call;
 
         let stream_task = tokio::spawn(async move {
             stream_openai_compat_json(
@@ -293,6 +600,7 @@ pub async fn run_agentic(
 
         // ── Append assistant turn ──────────────────────────────────────────
         if let Some(ref tc) = tool_call {
+            state = AgentState::Executing;
             messages.push(json!({
                 "role": "assistant",
                 "content": assistant_text,
@@ -307,6 +615,10 @@ pub async fn run_agentic(
             }));
         } else {
             messages.push(json!({"role": "assistant", "content": assistant_text}));
+            state = AgentState::Done;
+            let _ = tx
+                .send(StreamToken::Delta(format!("\n[agent] state: {:?}\n", state)))
+                .await;
             break; // Model finished without tool call
         }
 
@@ -325,7 +637,12 @@ pub async fn run_agentic(
             .or_else(|| tool_root.map(|r| r.to_string()));
 
         // Emit tool-call annotation to TUI (dim line the UI will colour differently).
-        let _ = tx.send(StreamToken::Delta(format!("\n\n[TOOL] {command}\n"))).await;
+        let _ = tx
+            .send(StreamToken::Delta(format!(
+                "\n\n[TOOL][{:?}] {command}\n",
+                state
+            )))
+            .await;
 
         let exec_result = exec::run_command(&command, cwd.as_deref()).await;
 
@@ -334,16 +651,34 @@ pub async fn run_agentic(
             Err(e) => (String::new(), e.to_string(), -1),
         };
 
-        let tool_output = if exit_code == 0 {
-            build_ok_tool_output(&stdout)
+        state = AgentState::Verifying;
+        let suspicious_reason = if exit_code == 0 {
+            suspicious_success_reason(&stdout, &stderr)
         } else {
-            build_failed_tool_output(&stdout, &stderr, exit_code)
+            None
+        };
+        let effective_exit_code = if exit_code == 0 && suspicious_reason.is_some() {
+            1
+        } else {
+            exit_code
         };
 
-        let result_label = if exit_code == 0 {
-            format!("[RESULT] exit=0\n")
+        let tool_output = if effective_exit_code == 0 {
+            build_ok_tool_output(&stdout)
         } else {
-            format!("[RESULT] exit={exit_code} ⚠\n")
+            let mut out = build_failed_tool_output(&stdout, &stderr, effective_exit_code);
+            if let Some(reason) = suspicious_reason {
+                out = format!(
+                    "NOTE: command returned exit_code=0 but was treated as failure.\nreason: {reason}\n\n{out}"
+                );
+            }
+            out
+        };
+
+        let result_label = if effective_exit_code == 0 {
+            format!("[RESULT][{:?}] exit=0\n", state)
+        } else {
+            format!("[RESULT][{:?}] exit={effective_exit_code} !\n", state)
         };
         let _ = tx.send(StreamToken::Delta(result_label)).await;
 
@@ -353,6 +688,14 @@ pub async fn run_agentic(
             "tool_call_id": tc.id,
             "content": tool_output,
         }));
+
+        // Update failure memory + possibly inject a system hint on repeated failures.
+        if effective_exit_code != 0 {
+            state = AgentState::Recovery;
+        } else {
+            state = AgentState::Planning;
+        }
+        pending_system_hint = mem.on_tool_result(&command, &stdout, &stderr, effective_exit_code);
 
         // Safety: stop if we've hit the iteration cap.
         if iter + 1 == MAX_ITERS {

@@ -21,6 +21,92 @@ pub struct ExecResult {
     pub exit_code: i32,
 }
 
+/// Best-effort cleanup for LLM-produced shell transcripts.
+///
+/// Common failure modes:
+/// - Prompt markers accidentally included in the command: `$ ...`, `PS> ...`, `> ...`
+/// - Stray trailing braces when a model mixes tool-call syntax into a shell line.
+fn sanitize_shellish_command(cmd: &str) -> String {
+    let raw = cmd.replace("\r\n", "\n").trim().to_string();
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for ln0 in raw.split('\n') {
+        let mut ln = ln0.trim_end_matches('\r').to_string();
+        let ltrim = ln.trim_start();
+
+        // PowerShell prompt markers.
+        if let Some(rest) = ltrim.strip_prefix("PS> ") {
+            ln = rest.to_string();
+        } else if let Some(rest) = ltrim.strip_prefix("PS>") {
+            // Handle "PS>cmd" / "PS>cmd args"
+            ln = rest.trim_start().to_string();
+        } else if let Some(rest) = ltrim.strip_prefix("> ") {
+            ln = rest.to_string();
+        } else if let Some(rest) = ltrim.strip_prefix("$ ") {
+            ln = rest.to_string();
+        } else {
+            // Strip "$" prompt with multiple spaces: "$   git status"
+            let lt = ltrim;
+            if lt.starts_with('$') && lt[1..].starts_with(char::is_whitespace) {
+                ln = lt.trim_start_matches('$').trim_start().to_string();
+            }
+        }
+
+        out.push(ln);
+    }
+
+    let mut s = out.join("\n").trim().to_string();
+
+    // Strip a leading "$" without a following space: "$git status"
+    let t = s.trim_start();
+    if let Some(rest) = t.strip_prefix('$') {
+        if rest.chars().next().is_some_and(|c| !c.is_whitespace()) {
+            s = rest.trim_start().to_string();
+        }
+    }
+
+    // Strip trailing unmatched "}" (common artifact).
+    while s.ends_with('}') && s.matches('{').count() < s.matches('}').count() {
+        s.pop();
+        s = s.trim_end().to_string();
+    }
+
+    s
+}
+
+fn is_poison_proxy(v: &str) -> bool {
+    let s = v.trim().to_ascii_lowercase();
+    // Known-bad proxy setting: forces all HTTPS traffic into a dead local proxy.
+    // Example from Git: "port 443 via 127.0.0.1 ... Could not connect to server"
+    let prefixes = [
+        "http://127.0.0.1:9",
+        "https://127.0.0.1:9",
+        "http://localhost:9",
+        "https://localhost:9",
+    ];
+    prefixes.iter().any(|p| s.starts_with(p))
+}
+
+fn scrub_poison_proxy_env(cmd: &mut Command) {
+    for k in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.trim().is_empty() && is_poison_proxy(&v) {
+                cmd.env_remove(k);
+            }
+        }
+    }
+}
+
 /// Check whether a command matches the dangerous-command blocklist.
 /// Returns `Some(reason)` if blocked, `None` if safe to run.
 pub fn check_dangerous_command(cmd: &str) -> Option<&'static str> {
@@ -67,6 +153,19 @@ pub fn check_dangerous_command(cmd: &str) -> Option<&'static str> {
         }
     }
 
+    // Repo-destructive git patterns (avoid self-sabotage in agentic runs).
+    let git_dangerous = [
+        ("git reset --hard", "git reset --hard discards local changes"),
+        ("git clean -fdx", "git clean -fdx deletes untracked files/directories"),
+        ("git rm --cached -r .", "git rm --cached -r . can remove the entire repo from the index"),
+        ("git rm -r --cached .", "git rm -r --cached . can remove the entire repo from the index"),
+    ];
+    for (pat, reason) in &git_dangerous {
+        if s.contains(pat) {
+            return Some(reason);
+        }
+    }
+
     None
 }
 
@@ -76,16 +175,26 @@ pub fn check_dangerous_command(cmd: &str) -> Option<&'static str> {
 /// handled by writing a temp `.ps1` file and invoking with `-File`, which avoids
 /// the column-0 terminator constraint when passing via `-Command`.
 pub async fn run_command(command: &str, cwd: Option<&str>) -> Result<ExecResult> {
-    if let Some(reason) = check_dangerous_command(command) {
+    let cleaned = sanitize_shellish_command(command);
+    if cleaned.trim().is_empty() {
+        return Ok(ExecResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+        });
+    }
+
+    if let Some(reason) = check_dangerous_command(&cleaned) {
         return Ok(ExecResult {
             stdout: String::new(),
             stderr: format!("[BLOCKED] dangerous command: {reason}"),
             exit_code: -1,
         });
     }
-    let cmd_str = command.trim();
+    let cmd_str = cleaned.trim();
 
     let mut cmd = build_command(cmd_str).await?;
+    scrub_poison_proxy_env(&mut cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(cwd) = cwd.filter(|s| !s.trim().is_empty()) {
         cmd.current_dir(cwd);

@@ -6,7 +6,39 @@ use crate::config::RunConfig;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Coder,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightTab {
     Observer,
+    Chat,
+    Tasks,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskTarget {
+    Coder,
+    Observer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPhase {
+    Core,
+    Feature,
+    Polish,
+    Any,
+}
+
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub id: String,
+    pub target: TaskTarget,
+    pub title: String,
+    pub body: String,
+    pub phase: TaskPhase,
+    pub priority: u8,
+    pub done: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,13 +136,16 @@ impl Pane {
 pub struct App {
     pub coder: Pane,
     pub observer: Pane,
+    pub chat: Pane,
     pub focus: Focus,
+    pub right_tab: RightTab,
     /// UI / response language hint (ja/en/fr).
     pub lang: String,
     pub auto_observe: bool,
     pub last_auto_obs_idx: Option<usize>,
     pub coder_cfg: RunConfig,
     pub observer_cfg: RunConfig,
+    pub chat_cfg: RunConfig,
     pub tool_root: Option<String>,
     pub quit: bool,
 
@@ -124,11 +159,13 @@ pub struct App {
     /// Running task handles used for Ctrl+K cancellation.
     pub coder_task: Option<JoinHandle<()>>,
     pub observer_task: Option<JoinHandle<()>>,
+    pub chat_task: Option<JoinHandle<()>>,
 
     /// When true, incoming stream tokens for that pane are silently discarded
     /// (set after Ctrl+K, cleared on the next send).
     pub ignore_coder_tokens: bool,
     pub ignore_observer_tokens: bool,
+    pub ignore_chat_tokens: bool,
 
     /// One-shot anti-loop retry budget for the Observer pane.
     /// Reset to 1 on each new Observer send (manual or auto-observe).
@@ -136,12 +173,18 @@ pub struct App {
     /// When set, the next Tick will re-run the Observer with a diff-only instruction
     /// and overwrite the last assistant message (value = similarity 0..1).
     pub observer_loop_pending: Option<f64>,
+
+    /// Background task planning state (Chat -> TaskRouter -> Tasks tab).
+    pub planning_tasks: bool,
+    pub tasks: Vec<Task>,
+    pub tasks_cursor: usize,
 }
 
 impl App {
     pub fn new(
         coder_cfg: RunConfig,
         observer_cfg: RunConfig,
+        chat_cfg: RunConfig,
         tool_root: Option<String>,
         auto_observe: bool,
         lang: String,
@@ -151,36 +194,57 @@ impl App {
         Self {
             coder: Pane::new(),
             observer: Pane::new(),
+            chat: Pane::new(),
             focus: Focus::Coder,
+            right_tab: RightTab::Observer,
             lang,
             auto_observe,
             last_auto_obs_idx: None,
             coder_cfg,
             observer_cfg,
+            chat_cfg,
             tool_root,
             quit: false,
             tick_count: 0,
             coder_iter: 0,
             coder_task: None,
             observer_task: None,
+            chat_task: None,
             ignore_coder_tokens: false,
             ignore_observer_tokens: false,
+            ignore_chat_tokens: false,
             observer_loop_retry_budget: 0,
             observer_loop_pending: None,
+            planning_tasks: false,
+            tasks: Vec::new(),
+            tasks_cursor: 0,
         }
     }
 
     pub fn focused_pane_mut(&mut self) -> &mut Pane {
         match self.focus {
             Focus::Coder => &mut self.coder,
-            Focus::Observer => &mut self.observer,
+            Focus::Right => match self.right_tab {
+                RightTab::Observer => &mut self.observer,
+                RightTab::Chat => &mut self.chat,
+                // Tasks tab is read-only; fall back to Observer for generic actions (copy, clear, etc.).
+                RightTab::Tasks => &mut self.observer,
+            },
         }
     }
 
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
-            Focus::Coder => Focus::Observer,
-            Focus::Observer => Focus::Coder,
+            Focus::Coder => Focus::Right,
+            Focus::Right => Focus::Coder,
+        };
+    }
+
+    pub fn cycle_right_tab(&mut self) {
+        self.right_tab = match self.right_tab {
+            RightTab::Observer => RightTab::Chat,
+            RightTab::Chat => RightTab::Tasks,
+            RightTab::Tasks => RightTab::Observer,
         };
     }
 

@@ -13,6 +13,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::PartialConfig;
+use crate::modes::Mode;
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct TuiArgs {
@@ -53,6 +54,13 @@ fn default_tui_tool_root() -> String {
 pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
     // Resolve the Coder config from the shared partial config.
     let coder_cfg = partial_cfg.clone().resolve().context("failed to resolve coder config")?;
+
+    // Chat uses Chat mode (no tools) and should default to chat_model (not code_model).
+    let chat_cfg = {
+        let mut chat_partial = partial_cfg.clone();
+        chat_partial.mode = Some(Mode::Chat);
+        chat_partial.resolve().context("failed to resolve chat config")?
+    };
 
     // For the Observer we allow a different model via --observer-model.
     let observer_cfg = {
@@ -108,7 +116,7 @@ pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
     // ── Run ───────────────────────────────────────────────────────────────────
-    let mut app = app::App::new(coder_cfg, observer_cfg, tool_root, auto_observe, lang);
+    let mut app = app::App::new(coder_cfg, observer_cfg, chat_cfg, tool_root, auto_observe, lang);
     let result = events::run_event_loop(&mut app, &mut terminal).await;
 
     // ── Restore terminal ──────────────────────────────────────────────────────

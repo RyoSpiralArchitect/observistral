@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 };
 
-use super::app::{App, Focus, Message, Role};
+use super::app::{App, Focus, RightTab, TaskPhase, TaskTarget, Message, Role};
 
 // ── Brand palette (mirrors web UI) ────────────────────────────────────────────
 
@@ -30,6 +30,13 @@ fn spinner_char(tick: u64) -> char {
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneView {
+    Coder,
+    Observer,
+    Chat,
+}
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -144,19 +151,27 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
-    render_pane(frame, horiz[0], app, Focus::Coder);
-    render_pane(frame, horiz[1], app, Focus::Observer);
+    render_message_pane(frame, horiz[0], app, PaneView::Coder, app.focus == Focus::Coder);
+
+    let right_focused = app.focus == Focus::Right;
+    match app.right_tab {
+        RightTab::Observer => {
+            render_message_pane(frame, horiz[1], app, PaneView::Observer, right_focused);
+        }
+        RightTab::Chat => {
+            render_message_pane(frame, horiz[1], app, PaneView::Chat, right_focused);
+        }
+        RightTab::Tasks => {
+            render_tasks_pane(frame, horiz[1], app, right_focused);
+        }
+    }
 }
 
-fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
-    let pane = match which {
-        Focus::Coder => &app.coder,
-        Focus::Observer => &app.observer,
-    };
-    let focused = app.focus == which;
-    let brand = match which {
-        Focus::Coder => CODER_BLUE,
-        Focus::Observer => OBS_MAG,
+fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView, focused: bool) {
+    let (pane, brand, label) = match view {
+        PaneView::Coder => (&app.coder, CODER_BLUE, "CODER"),
+        PaneView::Observer => (&app.observer, OBS_MAG, "OBSERVER"),
+        PaneView::Chat => (&app.chat, ACCENT, "CHAT"),
     };
 
     let border_style = if focused {
@@ -186,10 +201,7 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
         String::new()
     };
     let focus_dot = if focused { "◉" } else { "○" };
-    let label = match which {
-        Focus::Coder => "CODER",
-        Focus::Observer => "OBSERVER",
-    };
+    // `label` is determined by PaneView.
 
     let title = Line::from(vec![
         Span::raw(" "),
@@ -215,14 +227,14 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
     frame.render_widget(block, area);
 
     if pane.messages.is_empty() {
-        render_welcome(frame, inner, which);
+        render_welcome(frame, inner, view);
         return;
     }
 
     let mut lines: Vec<Line> = Vec::new();
 
     let q = pane.find_query.trim();
-    let view: Vec<&Message> = if q.is_empty() {
+    let messages_view: Vec<&Message> = if q.is_empty() {
         pane.messages.iter().collect()
     } else {
         let ql = q.to_ascii_lowercase();
@@ -232,7 +244,7 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
             .collect()
     };
 
-    if view.is_empty() {
+    if messages_view.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (一致なし)  /find <text> でフィルタ, /find で解除",
             Style::default().fg(MUTED),
@@ -240,7 +252,7 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
         lines.push(Line::default());
     }
 
-    for msg in view {
+    for msg in messages_view {
         match msg.role {
             Role::User => {
                 lines.push(Line::from(vec![
@@ -260,9 +272,10 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
                 }
             }
             Role::Assistant => {
-                let (lbl, lbl_color) = match which {
-                    Focus::Coder => ("coder", CODER_BLUE),
-                    Focus::Observer => ("obs", OBS_MAG),
+                let (lbl, lbl_color) = match view {
+                    PaneView::Coder => ("coder", CODER_BLUE),
+                    PaneView::Observer => ("obs", OBS_MAG),
+                    PaneView::Chat => ("chat", ACCENT),
                 };
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -273,9 +286,10 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
                     ),
                     Span::styled("›", Style::default().fg(MUTED)),
                 ]));
-                let content_lines = match which {
-                    Focus::Coder => render_coder_content(&msg.content),
-                    Focus::Observer => render_observer_content(&msg.content),
+                let content_lines = match view {
+                    PaneView::Coder => render_coder_content(&msg.content),
+                    PaneView::Observer => render_observer_content(&msg.content),
+                    PaneView::Chat => render_coder_content(&msg.content),
                 };
                 lines.extend(content_lines);
             }
@@ -320,6 +334,95 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, which: Focus) {
 
 // ── Welcome / empty-pane hint ─────────────────────────────────────────────────
 
+fn render_tasks_pane(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
+    let border_style = if focused {
+        Style::default().fg(WARN)
+    } else {
+        Style::default().fg(UNFOCUSED)
+    };
+
+    let spin = if app.planning_tasks {
+        format!(" {}", spinner_char(app.tick_count))
+    } else {
+        String::new()
+    };
+    let count = format!("  {} task(s)", app.tasks.len());
+
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("TASKS", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+        Span::styled(spin, Style::default().fg(ACCENT)),
+        Span::styled(count, Style::default().fg(MUTED)),
+        Span::raw(" "),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style);
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    if app.tasks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no tasks yet) Use Chat tab to plan tasks.",
+            Style::default().fg(MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Enter=dispatch  Space=toggle done",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        let total = app.tasks.len();
+        let cur = app.tasks_cursor.min(total.saturating_sub(1));
+
+        // Window around cursor (no separate scroll state yet).
+        let visible = inner.height as usize;
+        let start = cur.saturating_sub(visible / 2);
+        let end = (start + visible).min(total);
+
+        for i in start..end {
+            let t = &app.tasks[i];
+            let selected = i == cur;
+            let prefix = if selected { ">" } else { " " };
+            let done = if t.done { "x" } else { " " };
+
+            let tgt = match t.target {
+                TaskTarget::Coder => "C",
+                TaskTarget::Observer => "O",
+            };
+            let ph = match t.phase {
+                TaskPhase::Core => "core",
+                TaskPhase::Feature => "feat",
+                TaskPhase::Polish => "pol",
+                TaskPhase::Any => "any",
+            };
+
+            let mut title = t.title.clone();
+            if title.chars().count() > 46 {
+                title = title.chars().take(46).collect::<String>() + "...";
+            }
+
+            let line = format!(" {prefix}[{done}] {tgt} {ph} P{:02} {title}", t.priority);
+            let style = if selected {
+                Style::default().fg(TEXT_BODY).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT_BODY)
+            };
+            lines.push(Line::from(Span::styled(line, style)));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
 fn key_row(key: &'static str, desc: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
@@ -330,19 +433,25 @@ fn key_row(key: &'static str, desc: &'static str) -> Line<'static> {
     ])
 }
 
-fn render_welcome(frame: &mut Frame, area: Rect, which: Focus) {
-    let (brand, heading, hint1, hint2) = match which {
-        Focus::Coder => (
+fn render_welcome(frame: &mut Frame, area: Rect, view: PaneView) {
+    let (brand, heading, hint1, hint2) = match view {
+        PaneView::Coder => (
             CODER_BLUE,
             " ◈ CODER",
             "タスクを入力して Enter で送信",
             "例: \"maze game を作って\"",
         ),
-        Focus::Observer => (
+        PaneView::Observer => (
             OBS_MAG,
             " ◈ OBSERVER",
             "質問を入力して Enter で送信",
             "Ctrl+O でコーダーの最新出力をレビュー",
+        ),
+        PaneView::Chat => (
+            ACCENT,
+            " CHAT",
+            "Use Chat for brainstorming. Enter to send.",
+            "Ctrl+R cycles right tab (Observer/Chat/Tasks).",
         ),
     };
 
@@ -948,23 +1057,26 @@ fn code_line_style(lang: &str, line: &str) -> Style {
 // ── Input bar ─────────────────────────────────────────────────────────────────
 
 fn render_input(frame: &mut Frame, area: Rect, app: &App) {
-    let is_coder = app.focus == Focus::Coder;
-    let is_streaming = if is_coder {
-        app.coder.streaming
-    } else {
-        app.observer.streaming
+    let (label, brand, is_streaming, read_only) = match app.focus {
+        Focus::Coder => ("CODER", CODER_BLUE, app.coder.streaming, false),
+        Focus::Right => match app.right_tab {
+            RightTab::Observer => ("OBSERVER", OBS_MAG, app.observer.streaming, false),
+            RightTab::Chat => ("CHAT", ACCENT, app.chat.streaming, false),
+            RightTab::Tasks => ("TASKS", WARN, false, true),
+        },
     };
-    let brand = if is_coder { CODER_BLUE } else { OBS_MAG };
-    let label = if is_coder { "CODER" } else { "OBSERVER" };
+
     let hint = if is_streaming {
-        "Ctrl+K=停止"
+        "Ctrl+K=cancel"
+    } else if read_only {
+        "Enter=dispatch  Space=done  Ctrl+R=tab"
     } else {
-        "Enter=送信  Shift+Enter=改行  End=最下部"
+        "Enter=send  Shift+Enter=newline"
     };
 
     let title = Line::from(vec![
         Span::raw(" "),
-        Span::styled("›", Style::default().fg(brand).add_modifier(Modifier::BOLD)),
+        Span::styled(">", Style::default().fg(brand).add_modifier(Modifier::BOLD)),
         Span::raw(" "),
         Span::styled(label, Style::default().fg(brand).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
@@ -983,8 +1095,40 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if read_only {
+        let mut lines: Vec<Line> = Vec::new();
+        if app.tasks.is_empty() {
+            lines.push(Line::from(Span::styled("  (no tasks)", Style::default().fg(MUTED))));
+        } else {
+            let idx = app.tasks_cursor.min(app.tasks.len().saturating_sub(1));
+            let t = &app.tasks[idx];
+            lines.push(Line::from(Span::styled(
+                format!("  {}", t.title),
+                Style::default().fg(TEXT_BODY).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  priority: {}", t.priority),
+                Style::default().fg(MUTED),
+            )));
+            lines.push(Line::default());
+            for l in t.body.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {l}"),
+                    Style::default().fg(TEXT_BODY),
+                )));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        return;
+    }
+
     match app.focus {
         Focus::Coder => frame.render_widget(&app.coder.textarea, inner),
-        Focus::Observer => frame.render_widget(&app.observer.textarea, inner),
+        Focus::Right => match app.right_tab {
+            RightTab::Observer => frame.render_widget(&app.observer.textarea, inner),
+            RightTab::Chat => frame.render_widget(&app.chat.textarea, inner),
+            RightTab::Tasks => {}
+        },
     };
 }
+
