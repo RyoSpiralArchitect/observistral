@@ -51,7 +51,15 @@ impl Mode {
 }
 
 pub fn supported_modes() -> Vec<&'static str> {
-    vec!["実況", "壁打ち", "Observer", "diff批評", "VIBE", "ログ解析", "会話"]
+    vec![
+        "実況",
+        "壁打ち",
+        "Observer",
+        "diff批評",
+        "VIBE",
+        "ログ解析",
+        "会話",
+    ]
 }
 
 pub fn mode_prompt(mode: &Mode) -> &'static str {
@@ -60,7 +68,8 @@ pub fn mode_prompt(mode: &Mode) -> &'static str {
         Mode::Kabeuchi => "あなたは壁打ち相手です。アイデアを構造化し、次の具体的アクションを提案してください。",
         Mode::Observer => "\
 You are a staff-level software engineer who has shipped production systems at scale. \
-IMPORTANT: Always follow the [Language] instruction below; write the critique in that language. \
+IMPORTANT: Always follow the [Language] instruction; write the critique in that language. \
+If you violate it (e.g. output English when Language is Japanese/French), your response will be rejected and retried. \
 Your job: observe the Coder's work and deliver ruthlessly honest, specific, actionable critique. \
 Only cite issues visible in the provided [Recent Coder activity] or conversation — never invent problems.
 
@@ -279,7 +288,10 @@ mod tests {
     fn diff_is_injected_only_for_diff_review() {
         let user = "Review";
         let diff = "diff --git a/a b/a\n+hi\n";
-        assert_eq!(compose_user_text(user, &Mode::Kabeuchi, Some(diff), None), user);
+        assert_eq!(
+            compose_user_text(user, &Mode::Kabeuchi, Some(diff), None),
+            user
+        );
         let out = compose_user_text(user, &Mode::DiffReview, Some(diff), None);
         assert!(out.contains("```diff"));
         assert!(out.contains("diff --git"));
@@ -289,7 +301,10 @@ mod tests {
     fn logs_are_injected_only_for_log_analysis() {
         let user = "Analyze";
         let logs = "ERROR boom";
-        assert_eq!(compose_user_text(user, &Mode::Kabeuchi, None, Some(logs)), user);
+        assert_eq!(
+            compose_user_text(user, &Mode::Kabeuchi, None, Some(logs)),
+            user
+        );
         let out = compose_user_text(user, &Mode::LogAnalysis, None, Some(logs));
         assert!(out.contains("Log output:"));
         assert!(out.contains("ERROR boom"));

@@ -1,11 +1,11 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::modes::{Mode, compose_user_text, mode_prompt};
+use crate::loop_detect;
+use crate::modes::{compose_user_text, mode_prompt, Mode};
 use crate::personas;
 use crate::providers::ChatProvider;
 use crate::types::{ChatMessage, ChatRequest, ChatResponse};
-use crate::loop_detect;
 
 pub struct ChatBot {
     provider: Arc<dyn ChatProvider>,
@@ -33,10 +33,10 @@ impl ChatBot {
         let cot_instr = crate::modes::cot_instruction(cot, mode);
         let lang_instr = crate::modes::language_instruction(lang, mode);
         let system_text = format!(
-            "{}{}\n\n[Language]\n{}\n\n[Persona]\n{}",
+            "[Language]\n{}\n\n{}{}\n\n[Persona]\n{}",
+            lang_instr,
             mode_prompt(mode),
             cot_instr,
-            lang_instr,
             persona_def.prompt
         );
 

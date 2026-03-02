@@ -128,8 +128,8 @@
       settings: "設定",
       presets: "プリセット",
       chat: "チャット",
-      coder: "Coder",
-      observer: "Observer",
+      coder: "コーダー",
+      observer: "オブザーバー",
       proposals: "提案",
       tasks: "タスク",
       planningTasks: "タスク生成中…",
@@ -607,7 +607,7 @@
     const L = String(lang || "ja").trim().toLowerCase();
     if (m && m.role === "user") return L === "fr" ? "Vous" : L === "en" ? "You" : "あなた";
     if (m && m.pane === "chat") return "AI";
-    return m && m.pane === "observer" ? "Observer" : "Coder";
+    return tr(L, m && m.pane === "observer" ? "observer" : "coder");
   }
 
   function makeThread(title) {
@@ -2107,6 +2107,7 @@
       const canExec = !!(status && status.features && status.features.exec);
       const canOpen = !!(status && status.features && status.features.open_file);
       const s = String(m && m.content ? m.content : "");
+      const pane = (m && (m.pane === "observer" || m.pane === "chat" || m.pane === "coder")) ? m.pane : "coder";
       const isLong = !m.streaming && (s.length > 2600 || (s.match(/\n/g) || []).length > 40);
       const isExpanded = expandedMsgs.has(m.id);
       const isCollapsed = isLong && !isExpanded;
@@ -2120,11 +2121,11 @@
       const fileChips = (canOpen && isCoderAsst) ? extractPathHints(s, 10) : [];
       return e(
         "div",
-        { key: m.id, className: "msg" + (m.role === "user" ? " msg-user" : " msg-assistant") + (m.pane === "chat" ? " chat-msg" : "") },
+        { key: m.id, className: "msg msg-pane-" + pane + (m.role === "user" ? " msg-user" : " msg-assistant") + (m.pane === "chat" ? " chat-msg" : "") },
         e("div", { className: "avatar" }, avatarLabel(m)),
         e(
           "div",
-          { className: "bubble " + (m.role === "user" ? "user" : "assistant") },
+          { className: "bubble " + (m.role === "user" ? "user" : "assistant") + " pane-" + pane },
           e(
             "div",
             { className: "msg-meta" },
@@ -3142,10 +3143,10 @@
          const looksJapanese = (s) => {
            const jp = countRe(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g, s);
            const lat = countRe(/[A-Za-z]/g, s);
-           if (jp <= 0) return false;
+           if (jp < 8) return false;
            if (lat <= 0) return true;
-           const ratio = jp / (jp + lat);
-           return jp >= 6 && ratio >= 0.25;
+           // Allow some English tokens (code, keys) but avoid "mostly English with a few JP chars".
+           return lat <= jp * 3;
          };
         const looksFrench = (s) => {
           const a = countRe(/[àâçéèêëîïôùûüÿœæ]/gi, s);

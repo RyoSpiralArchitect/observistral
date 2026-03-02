@@ -12,6 +12,7 @@
   --accent: #2dd4bf;
   --accent2: #60a5fa;
   --warn: #fb7185;
+  --chatAccent: #fbbf24;
 
   --radius: 14px;
   --radius2: 18px;
@@ -352,6 +353,51 @@ a {
 .bubble.assistant {
   border-color: rgba(45, 212, 191, 0.30);
   background: rgba(45, 212, 191, 0.06);
+}
+
+/* Pane accents: make it obvious what you're reading (Coder vs Observer vs Chat). */
+.bubble.pane-coder.assistant {
+  border-color: rgba(45, 212, 191, 0.30);
+  background: rgba(45, 212, 191, 0.06);
+}
+
+.bubble.pane-observer.assistant {
+  border-color: rgba(251, 113, 133, 0.34);
+  background: rgba(251, 113, 133, 0.07);
+  box-shadow: 0 0 0 1px rgba(251, 113, 133, 0.08) inset;
+}
+
+.bubble.pane-chat.assistant {
+  border-color: rgba(251, 191, 36, 0.34);
+  background: rgba(251, 191, 36, 0.06);
+  box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.08) inset;
+}
+
+.msg-pane-observer .avatar {
+  border-color: rgba(251, 113, 133, 0.42);
+  background: rgba(251, 113, 133, 0.10);
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.msg-pane-chat .avatar {
+  border-color: rgba(251, 191, 36, 0.38);
+  background: rgba(251, 191, 36, 0.08);
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.msg-pane-observer .who {
+  color: rgba(251, 113, 133, 0.98);
+}
+
+.msg-pane-chat .who {
+  color: rgba(251, 191, 36, 0.98);
+}
+
+.msg-pane-observer .content {
+  /* Keep long critiques readable by limiting line length on wide panes. */
+  max-width: 92ch;
+  margin-left: auto;
+  margin-right: auto;
 }
 
 body.looping .bubble.assistant {

@@ -1358,10 +1358,10 @@ async fn api_chat_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -
     let cot_instr = crate::modes::cot_instruction(cot_str, &cfg.mode);
     let lang_instr = crate::modes::language_instruction(lang.as_deref(), &cfg.mode);
     let system_text = format!(
-        "{}{}\n\n[Language]\n{}\n\n[Persona]\n{}",
+        "[Language]\n{}\n\n{}{}\n\n[Persona]\n{}",
+        lang_instr,
         crate::modes::mode_prompt(&cfg.mode),
         cot_instr,
-        lang_instr,
         persona_def.prompt
     );
     let user_text =
