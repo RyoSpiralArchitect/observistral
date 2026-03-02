@@ -180,8 +180,9 @@ fn bash_to_powershell_script(script: &str) -> String {
             continue;
         }
 
-        // Common model glitch: trailing brace.
-        if line.ends_with('}') && !line.contains('{') {
+        // Common model glitch: trailing brace (e.g. `New-Item ... }`).
+        // Do NOT drop a standalone closing brace line (`}`): wrappers may use try/finally blocks.
+        if line.len() > 1 && line.ends_with('}') && !line.contains('{') {
             line.pop();
             line = line.trim().to_string();
         }

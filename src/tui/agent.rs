@@ -31,6 +31,12 @@ const MAX_STDOUT_CHARS: usize = 1500;
 const MAX_STDERR_CHARS: usize = 600;
 const KEEP_RECENT_TOOL_TURNS: usize = 4;
 
+/// Marker appended to every exec call so we can persist working directory across tool runs.
+///
+/// IMPORTANT: Each `exec` runs in a fresh process. Without this, `cd` is lost between calls,
+/// which causes nested-git disasters and "why did it run in the repo root?" failures.
+const PWD_MARKER: &str = "__OBSTRAL_PWD__=";
+
 // ── System prompt addons ──────────────────────────────────────────────────────
 
 /// Injected for Windows PowerShell environments.
@@ -224,6 +230,112 @@ fn build_ok_tool_output(stdout: &str) -> String {
     } else {
         format!("OK (exit_code: 0)\nstdout:\n{stdout_t}")
     }
+}
+
+fn wrap_exec_with_pwd(cmd: &str) -> String {
+    let raw = cmd.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    if cfg!(target_os = "windows") {
+        // Emit marker even on failures to keep recovery loops from losing cwd.
+        // NOTE: if this wrapped script triggers bash->PowerShell translation, the translator MUST
+        // preserve standalone `}` lines (see exec.rs).
+        return [
+            "$ErrorActionPreference = 'Stop'",
+            "try {",
+            raw,
+            "} finally {",
+            &format!("Write-Output (\"{}\" + (Get-Location).Path)", PWD_MARKER),
+            "}",
+        ]
+        .join("\n");
+    }
+
+    // POSIX: keep behavior simple (do not `set -e`).
+    format!("{raw}\necho \"{PWD_MARKER}$(pwd)\"")
+}
+
+fn strip_pwd_marker(stdout_raw: &str) -> (String, Option<String>) {
+    let raw = stdout_raw.replace("\r\n", "\n");
+    if raw.is_empty() {
+        return (String::new(), None);
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut pwd: Option<String> = None;
+    for ln in raw.split('\n') {
+        if let Some(rest) = ln.strip_prefix(PWD_MARKER) {
+            let p = rest.trim();
+            if !p.is_empty() {
+                pwd = Some(p.to_string());
+            }
+            continue;
+        }
+        kept.push(ln);
+    }
+    (kept.join("\n").trim_end().to_string(), pwd)
+}
+
+fn normalize_path_sep(s: &str) -> String {
+    s.replace('\\', "/")
+}
+
+fn is_within_root(path: &str, root: &str) -> bool {
+    let p = normalize_path_sep(path).replace('\u{0}', "").trim().trim_end_matches('/').to_string();
+    let r = normalize_path_sep(root).replace('\u{0}', "").trim().trim_end_matches('/').to_string();
+    if p.is_empty() || r.is_empty() {
+        return false;
+    }
+    if cfg!(target_os = "windows") {
+        let p = p.to_ascii_lowercase();
+        let r = r.to_ascii_lowercase();
+        p == r || p.starts_with(&(r + "/"))
+    } else {
+        p == r || p.starts_with(&(r + "/"))
+    }
+}
+
+fn absolutize_path(path: &str) -> Option<String> {
+    let p = path.trim();
+    if p.is_empty() {
+        return None;
+    }
+    let pb = std::path::PathBuf::from(p);
+    let abs = if pb.is_absolute() {
+        pb
+    } else {
+        let cwd = std::env::current_dir().ok()?;
+        cwd.join(pb)
+    };
+    Some(abs.to_string_lossy().into_owned())
+}
+
+fn inject_cwd(tool_output: &str, cwd_line: &str, note: Option<&str>) -> String {
+    let t = tool_output.trim_end_matches('\n');
+    if t.is_empty() {
+        return String::new();
+    }
+    let (first, rest) = match t.split_once('\n') {
+        Some((a, b)) => (a, b),
+        None => (t, ""),
+    };
+
+    let mut out = String::new();
+    out.push_str(first);
+    out.push('\n');
+    out.push_str(cwd_line);
+    if let Some(n) = note {
+        if !n.trim().is_empty() {
+            out.push('\n');
+            out.push_str(n.trim_end());
+        }
+    }
+    if !rest.trim().is_empty() {
+        out.push('\n');
+        out.push_str(rest);
+    }
+    out
 }
 
 // ── Loop Governor (Coder strengthening) ────────────────────────────────────────
@@ -601,6 +713,29 @@ pub async fn run_agentic(
         .map(|m| json!({"role": m.role, "content": m.content}))
         .collect();
 
+    // Resolve tool_root once (absolute path) and track cwd across tool calls.
+    // This prevents the classic "cd didn't persist, so git add ran in the wrong repo" failure.
+    let tool_root_abs = tool_root
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .and_then(absolutize_path);
+    if let Some(ref root) = tool_root_abs {
+        let _ = std::fs::create_dir_all(root);
+        let note = format!(
+            "[Working directory]\n\
+Working directory (tool_root): {root}\n\
+IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the tool reports cwd.\n\
+Always operate under tool_root. Create new repos under tool_root (fresh directory).\n\
+NEVER create a git repo inside another git repo. If you see 'embedded git repository', STOP and relocate."
+        );
+        if messages.first().and_then(|m| m["role"].as_str()) == Some("system") {
+            messages.insert(1, json!({"role":"system","content": note}));
+        } else {
+            messages.insert(0, json!({"role":"system","content": note}));
+        }
+    }
+    let mut cur_cwd: Option<String> = tool_root_abs.clone();
+
     for iter in 0..MAX_ITERS {
         // ── Prune old tool results before sending to save context tokens ───
         prune_old_tool_results(&mut messages);
@@ -718,24 +853,97 @@ After it succeeds, verify and continue.";
         let args: serde_json::Value = serde_json::from_str(&tc.arguments)
             .unwrap_or(json!({"command": tc.arguments}));
         let command = args["command"].as_str().unwrap_or("").to_string();
-        let cwd = args["cwd"]
+
+        // Resolve an optional cwd (absolute or relative). Relative cwd is resolved against
+        // the current tracked directory (or tool_root).
+        let mut cwd_note: Option<String> = None;
+        let cwd_used: Option<String> = if let Some(c0) = args["cwd"]
             .as_str()
-            .map(|s| s.to_string())
-            .or_else(|| tool_root.map(|r| r.to_string()));
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            let pb = std::path::PathBuf::from(c0);
+            let candidate = if pb.is_absolute() {
+                pb
+            } else if let Some(base) = cur_cwd.as_deref().or(tool_root_abs.as_deref()) {
+                std::path::PathBuf::from(base).join(pb)
+            } else {
+                pb
+            };
+            let cand_str = candidate.to_string_lossy().into_owned();
+            if let Some(ref root) = tool_root_abs {
+                if is_within_root(&cand_str, root) {
+                    Some(cand_str)
+                } else {
+                    cwd_note = Some(format!(
+                        "NOTE: requested cwd is outside tool_root; ignoring: {c0}"
+                    ));
+                    cur_cwd.clone().or_else(|| tool_root_abs.clone())
+                }
+            } else {
+                Some(cand_str)
+            }
+        } else {
+            cur_cwd.clone().or_else(|| tool_root_abs.clone())
+        };
+        let cwd_used_label = cwd_used
+            .as_deref()
+            .unwrap_or("(workspace root)")
+            .to_string();
 
         // Emit tool-call annotation to TUI (dim line the UI will colour differently).
         let _ = tx
             .send(StreamToken::Delta(format!(
-                "\n\n[TOOL][{:?}] {command}\n",
+                "\n\n[TOOL][{:?}] {command}\n[cwd] {cwd_used_label}\n",
                 state
             )))
             .await;
 
-        let exec_result = exec::run_command(&command, cwd.as_deref()).await;
+        let exec_cmd = wrap_exec_with_pwd(&command);
+        let exec_result = exec::run_command(&exec_cmd, cwd_used.as_deref()).await;
 
         let (stdout, stderr, exit_code) = match exec_result {
             Ok(r) => (r.stdout, r.stderr, r.exit_code),
             Err(e) => (String::new(), e.to_string(), -1),
+        };
+
+        // Update cwd from marker output.
+        let (stdout, pwd_after) = strip_pwd_marker(&stdout);
+        let mut cwd_after_note: Option<String> = None;
+        if let Some(p) = pwd_after {
+            if let Some(ref root) = tool_root_abs {
+                if is_within_root(&p, root) {
+                    cur_cwd = Some(p);
+                } else {
+                    cwd_after_note = Some(format!(
+                        "NOTE: cwd_after was outside tool_root; ignored: {p}"
+                    ));
+                }
+            } else {
+                cur_cwd = Some(p);
+            }
+        }
+        let cwd_after_label = cur_cwd
+            .as_deref()
+            .unwrap_or(cwd_used_label.as_str())
+            .to_string();
+        let cwd_line = if cwd_used_label == cwd_after_label {
+            format!("cwd: {cwd_used_label}")
+        } else {
+            format!("cwd: {cwd_used_label}\ncwd_after: {cwd_after_label}")
+        };
+
+        let mut note_lines: Vec<String> = Vec::new();
+        if let Some(n) = cwd_note.take() {
+            note_lines.push(n);
+        }
+        if let Some(n) = cwd_after_note.take() {
+            note_lines.push(n);
+        }
+        let note = if note_lines.is_empty() {
+            None
+        } else {
+            Some(note_lines.join("\n"))
         };
 
         state = AgentState::Verifying;
@@ -751,7 +959,8 @@ After it succeeds, verify and continue.";
         };
 
         let tool_output = if effective_exit_code == 0 {
-            build_ok_tool_output(&stdout)
+            let base = build_ok_tool_output(&stdout);
+            inject_cwd(&base, &cwd_line, note.as_deref())
         } else {
             let mut out = build_failed_tool_output(&stdout, &stderr, effective_exit_code);
             if let Some(reason) = suspicious_reason {
@@ -759,7 +968,7 @@ After it succeeds, verify and continue.";
                     "NOTE: command returned exit_code=0 but was treated as failure.\nreason: {reason}\n\n{out}"
                 );
             }
-            out
+            inject_cwd(&out, &cwd_line, note.as_deref())
         };
 
         let result_label = if effective_exit_code == 0 {
