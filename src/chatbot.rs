@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::lang_detect;
@@ -74,19 +75,149 @@ impl ChatBot {
         // Anti-loop (Observer): if the model repeats the same critique with no new signal,
         // retry once with an explicit diff-only instruction. If it still repeats, suppress it.
         if matches!(mode, Mode::Observer) {
-            let prev_asst = history
-                .iter()
-                .rev()
-                .find(|m| m.role == "assistant" && !m.content.trim().is_empty());
-            if let Some(prev) = prev_asst {
-                let prev_text = prev.content.trim();
-                let cur_text = resp.content.trim();
-                let sim = if !loop_detect::is_skippable_for_loop(cur_text) {
-                    loop_detect::similarity(prev_text, cur_text)
+            fn loop_threshold_for_len(max_len: usize) -> f64 {
+                // Longer critiques tend to share more boilerplate (section headers, repeated terms).
+                // Lower the threshold slightly to detect "same template again" for long outputs.
+                if max_len >= 1200 {
+                    0.75
+                } else if max_len >= 800 {
+                    0.78
+                } else if max_len >= 500 {
+                    0.80
+                } else if max_len >= 300 {
+                    0.82
                 } else {
-                    0.0
+                    0.85
+                }
+            }
+
+            fn collect_prev_asst_texts<'a>(history: &'a [ChatMessage], max_n: usize) -> Vec<&'a str> {
+                let mut prev: Vec<&'a str> = Vec::new();
+                for m in history.iter().rev() {
+                    if m.role != "assistant" {
+                        continue;
+                    }
+                    let t = m.content.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if loop_detect::is_skippable_for_loop(t) {
+                        continue;
+                    }
+                    prev.push(t);
+                    if prev.len() >= max_n {
+                        break;
+                    }
+                }
+                prev
+            }
+
+            fn max_similarity(prev_texts: &[&str], cur_text: &str) -> (f64, usize) {
+                let mut max_sim = 0.0f64;
+                let mut max_prev_len = 0usize;
+                for prev in prev_texts.iter().copied() {
+                    let sim = loop_detect::similarity(prev, cur_text);
+                    if sim > max_sim {
+                        max_sim = sim;
+                        max_prev_len = prev.len();
+                    }
+                }
+                (max_sim, max_prev_len)
+            }
+
+            fn extract_proposal_titles(s: &str) -> Vec<String> {
+                let mut titles: Vec<String> = Vec::new();
+                let mut in_props = false;
+                for line in s.lines() {
+                    let t = line.trim();
+                    if t == "--- proposals ---" {
+                        in_props = true;
+                        continue;
+                    }
+                    if t.starts_with("--- ") && t.ends_with(" ---") && t != "--- proposals ---" {
+                        in_props = false;
+                    }
+                    if !in_props {
+                        continue;
+                    }
+
+                    let low = t.to_ascii_lowercase();
+                    if low.starts_with("title:") {
+                        let v = t["title:".len()..].trim();
+                        if !v.is_empty() {
+                            titles.push(v.to_string());
+                        }
+                        continue;
+                    }
+                    // Accept "1) title: ..." as well.
+                    if let Some(idx) = low.find("title:") {
+                        if idx <= 6 {
+                            let v = t[idx + "title:".len()..].trim();
+                            if !v.is_empty() {
+                                titles.push(v.to_string());
+                            }
+                        }
+                    }
+                }
+                titles
+            }
+
+            fn loop_suppressed_message(history: &[ChatMessage], lang: Option<&str>) -> String {
+                let mut titles: Vec<String> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+
+                for m in history.iter().rev() {
+                    if m.role != "assistant" {
+                        continue;
+                    }
+                    for title in extract_proposal_titles(&m.content) {
+                        let key = title.trim().to_ascii_lowercase();
+                        if key.is_empty() {
+                            continue;
+                        }
+                        if seen.insert(key) {
+                            titles.push(title.trim().to_string());
+                            if titles.len() >= 6 {
+                                break;
+                            }
+                        }
+                    }
+                    if titles.len() >= 6 {
+                        break;
+                    }
+                }
+
+                if titles.is_empty() {
+                    return "[Observer] No new critique. Loop detected.".to_string();
+                }
+
+                let header = if lang.unwrap_or("").eq_ignore_ascii_case("fr") {
+                    "Points ouverts:"
+                } else if lang.unwrap_or("").eq_ignore_ascii_case("en") {
+                    "Open issues:"
+                } else {
+                    "未解決:"
                 };
-                let loopish = prev_text.len() >= 120 && cur_text.len() >= 180 && sim >= 0.82;
+
+                let mut out = String::new();
+                out.push_str("[Observer] No new critique. Loop detected.\n");
+                out.push_str(header);
+                out.push('\n');
+                for t in titles.iter().take(5) {
+                    out.push_str("- ");
+                    out.push_str(t);
+                    out.push('\n');
+                }
+                out.trim_end().to_string()
+            }
+
+            let prev_texts = collect_prev_asst_texts(history, 4);
+            let cur_text = resp.content.trim();
+            if !prev_texts.is_empty() && !loop_detect::is_skippable_for_loop(cur_text) {
+                let (max_sim, max_prev_len) = max_similarity(&prev_texts, cur_text);
+                let threshold = loop_threshold_for_len(max_prev_len.max(cur_text.len()));
+                let loopish =
+                    max_prev_len >= 120 && cur_text.len() >= 180 && max_sim >= threshold;
                 if loopish {
                     let loop_fix = if lang.unwrap_or("").eq_ignore_ascii_case("fr") {
                         "CORRECTION BOUCLE: Ton dernier message se répète. Fais une critique NOUVELLE basée UNIQUEMENT sur les informations NOUVELLES depuis le message précédent. Ne répète pas les mêmes proposals. S'il n'y a rien de nouveau, réponds exactement: [Observer] No new critique. Loop detected."
@@ -117,20 +248,23 @@ impl ChatBot {
                     request2.temperature = Some(0.2);
                     if let Ok(resp2) = self.provider.chat(&request2).await {
                         let cur2 = resp2.content.trim();
-                        let sim2 = if !loop_detect::is_skippable_for_loop(cur2) {
-                            loop_detect::similarity(prev_text, cur2)
+                        let (max_sim2, max_prev_len2) = if !loop_detect::is_skippable_for_loop(cur2)
+                        {
+                            max_similarity(&prev_texts, cur2)
                         } else {
-                            0.0
+                            (0.0, 0)
                         };
-                        let loopish2 = prev_text.len() >= 120 && cur2.len() >= 180 && sim2 >= 0.82;
+                        let threshold2 = loop_threshold_for_len(max_prev_len2.max(cur2.len()));
+                        let loopish2 =
+                            max_prev_len2 >= 120 && cur2.len() >= 180 && max_sim2 >= threshold2;
                         if loopish2 {
-                            resp.content = "[Observer] No new critique. Loop detected.".to_string();
+                            resp.content = loop_suppressed_message(history, lang);
                         } else {
                             resp = resp2;
                         }
                     } else {
                         // If retry fails, prefer not spamming the same template repeatedly.
-                        resp.content = "[Observer] No new critique. Loop detected.".to_string();
+                        resp.content = loop_suppressed_message(history, lang);
                     }
                 }
             }
