@@ -2442,6 +2442,8 @@
       const TRUNC_STDOUT = 2000;
       const TRUNC_STDERR = 800;
       const KEEP_TOOL_TURNS = 4;
+      const WANTS_REPO_GOAL = /(?:\brepo\b|\brepository\b|\bgit\b|scaffold|bootstrap|init|setup|create\s+(?:a\s+)?repo|create\s+(?:a\s+)?repository|リポ|リポジトリ|雛形|ひな形|プロジェクト|git\s+init)/i.test(String(text || ""));
+      let goalChecks = 0;
 
       const truncTool = (s, max) => {
         const t = String(s || "").trim();
@@ -2463,8 +2465,80 @@
         }
       };
 
-      const cwd = resolvedCwd(config.toolRoot, threadId, threadWorkdir);
-      const cwdLabel = cwd ? String(cwd) : "(workspace root)";
+      // IMPORTANT: `exec` runs in a fresh process each time — `cd` does NOT persist across tool calls.
+      // Track the agent's current working directory and pass it as `cwd` on every exec/write_file.
+      // This prevents nested-git disasters and "why did it run in the repo root?" failures.
+      const threadRoot = resolvedThreadRoot(config.toolRoot, threadId);
+      const threadRootNorm = threadRoot ? normalizePathSep(String(threadRoot)).replace(/\/+$/g, "") : "";
+      let curWorkdir = safeWorkdir(threadWorkdir);
+
+      const cwdNow = () => resolvedCwd(config.toolRoot, threadId, curWorkdir);
+      const cwdLabelNow = () => {
+        const c = cwdNow();
+        return c ? String(c) : "(workspace root)";
+      };
+
+      const setWorkdir = (nextWorkdir) => {
+        const safe = safeWorkdir(nextWorkdir);
+        if (safe === curWorkdir) return;
+        curWorkdir = safe;
+        // Persist to thread state so subsequent manual runs start in the right directory.
+        setThreadState((s) => ({
+          ...s,
+          threads: s.threads.map((t) => (
+            t.id === threadId ? { ...t, updatedAt: Date.now(), workdir: safe } : t
+          )),
+        }));
+      };
+
+      const PWD_MARKER = "__OBSTRAL_PWD__=";
+      const wrapExecWithPwd = (cmd) => {
+        const raw = String(cmd || "").trim();
+        if (!raw) return raw;
+        if (isWindowsHost()) {
+          // Always emit a trailing marker so the UI can update curWorkdir even when `cd` is used.
+          // Use try/finally so we still emit on most failures (helps stuck recovery).
+          return [
+            "$ErrorActionPreference = 'Stop'",
+            "try {",
+            raw,
+            "} finally {",
+            `Write-Output ("${PWD_MARKER}" + (Get-Location).Path)`,
+            "}",
+          ].join("\n");
+        }
+        // POSIX: keep behavior simple (do not `set -e`).
+        return raw + `\necho "${PWD_MARKER}$(pwd)"`;
+      };
+
+      const stripPwdMarker = (stdoutRaw) => {
+        const raw = String(stdoutRaw || "");
+        if (!raw) return { stdout: "", pwd: "" };
+        const lines = raw.replace(/\r\n/g, "\n").split("\n");
+        let pwd = "";
+        const kept = [];
+        for (const l of lines) {
+          if (l.startsWith(PWD_MARKER)) {
+            pwd = l.slice(PWD_MARKER.length).trim();
+            continue;
+          }
+          kept.push(l);
+        }
+        return { stdout: kept.join("\n").trimEnd(), pwd };
+      };
+
+      const maybeUpdateWorkdirFromPwd = (pwdAfter) => {
+        const p0 = String(pwdAfter || "").trim();
+        if (!p0 || !threadRootNorm) return;
+        const p = normalizePathSep(p0).replace(/\/+$/g, "");
+        const idx = p.toLowerCase().lastIndexOf(threadRootNorm.toLowerCase());
+        if (idx === -1) return;
+        const rel0 = p.slice(idx + threadRootNorm.length).replace(/^\/+/g, "");
+        const safeRel = safeWorkdir(rel0);
+        // If rel0 is non-empty but unsafe, ignore (avoid escaping tool_root).
+        if (rel0 && !safeRel) return;
+        setWorkdir(safeRel);
+      };
 
       // UI-side loop breaker: if the model repeats the exact same failing command,
       // block it and force a different strategy.
@@ -2567,7 +2641,7 @@
       const isWindows = isWindowsHost();
       const SYSTEM_BASE = isWindows ? [
         "You are an autonomous coding agent with DIRECT access to the user's Windows machine.",
-        `Working directory (tool_root): ${cwdLabel}. Always create new projects under this directory. Do NOT cd to parent directories.`,
+        `Working directory (tool_root): ${cwdLabelNow()}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "0. NEVER create a git repo inside another git repo. If you see 'embedded git repository' warnings, STOP and relocate to a clean directory under tool_root.",
         "1. ALWAYS use tools to act: use `write_file` to create/edit files, and `exec` to run commands. NEVER just show code.",
@@ -2584,7 +2658,7 @@
         "5. End with a brief summary listing every file created/modified and any remaining steps.",
       ].join("\n") : [
         "You are an autonomous coding agent with DIRECT access to the user's local machine.",
-        `Working directory (tool_root): ${cwdLabel}. Always create new projects under this directory. Do NOT cd to parent directories.`,
+        `Working directory (tool_root): ${cwdLabelNow()}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "0. NEVER create a git repo inside another git repo. If you see 'embedded git repository' warnings, STOP and relocate to a clean directory under tool_root.",
         "1. ALWAYS use tools to act: use `write_file` to create/edit files, and `exec` to run commands. NEVER just show code.",
@@ -2831,8 +2905,12 @@
                   continue;
                 }
 
-                const execRes = await postJson("/api/exec", { command: commandToRun, cwd }, ac.signal);
-                const stdout = truncTool(execRes.stdout, TRUNC_STDOUT);
+                const cwdUsed = cwdNow();
+                const execCmd = wrapExecWithPwd(commandToRun);
+                const execRes = await postJson("/api/exec", { command: execCmd, cwd: cwdUsed }, ac.signal);
+                const parsed = stripPwdMarker(execRes.stdout);
+                maybeUpdateWorkdirFromPwd(parsed.pwd);
+                const stdout = truncTool(parsed.stdout, TRUNC_STDOUT);
                 const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
                 const exitCode = execRes.exit_code;
                 const looksHardError = (t) => /(^|\n)\s*(fatal:|error:|exception|traceback)\b/i.test(String(t || ""));
@@ -2841,6 +2919,13 @@
                 const hintGit = failed ? gitRepoHint(stderr) : "";
                 const hintGov = failed ? deriveGovernorHint(stderr, stdout) : "";
                 const hint = [hintGit, hintGov].filter(Boolean).join("\n\n");
+
+                const cwdUsedLabel = cwdUsed ? String(cwdUsed) : "(workspace root)";
+                const cwdAfter = cwdNow();
+                const cwdAfterLabel = cwdAfter ? String(cwdAfter) : "(workspace root)";
+                const cwdLine = cwdUsedLabel === cwdAfterLabel
+                  ? `cwd: ${cwdUsedLabel}`
+                  : `cwd: ${cwdUsedLabel}\ncwd_after: ${cwdAfterLabel}`;
 
                 if (failed) {
                   governor.consecutiveFailures++;
@@ -2870,8 +2955,8 @@
                 }
 
                 toolResult = failed
-                  ? `FAILED (exit_code: ${exitCode}).\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}\n⚠ The command failed. Diagnose the error above and call exec again with the fix. Do NOT continue to the next step until this succeeds.`
-                  : `OK (exit_code: 0)\nstdout: ${stdout || "(empty)"}`;
+                  ? `FAILED (exit_code: ${exitCode}).\n${cwdLine}\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}\n⚠ The command failed. Diagnose the error above and call exec again with the fix. Do NOT continue to the next step until this succeeds.`
+                  : `OK (exit_code: 0)\n${cwdLine}\nstdout: ${stdout || "(empty)"}`;
 
                 if (stdout) display += "\n" + stdout;
                 if (stderr) display += "\nstderr: " + stderr;
@@ -2918,7 +3003,8 @@
                   continue;
                 }
 
-                const base = cwd ? normalizePathSep(String(cwd)).replace(/\/+$/g, "") : "";
+                const cwdUsed = cwdNow();
+                const base = cwdUsed ? normalizePathSep(String(cwdUsed)).replace(/\/+$/g, "") : "";
                 const fullPath = base ? (base + "/" + path0.replace(/^\/+/g, "")) : path0;
 
                 if (config.requireEditApproval) {
@@ -2957,6 +3043,76 @@
           // finish_reason === "stop" — if the model didn't produce tool calls, try implied scripts.
           const implied = extractImpliedExecScripts(asstText);
           if (!implied.length) {
+            // Goal delta check: the model may "stop" even though the repo/task isn't actually complete.
+            // For repo-scaffolding style prompts, run ONE lightweight sanity probe and continue if goals are missing.
+            const canExec = !!(status && status.features && status.features.exec);
+            if (WANTS_REPO_GOAL && goalChecks < 1 && canExec) {
+              goalChecks++;
+
+              const win = isWindowsHost();
+              const fenceLang = win ? "powershell" : "bash";
+              const prompt = win ? "PS> " : "$ ";
+              const probeCmd = win
+                ? [
+                    "$inRepo = Test-Path -LiteralPath '.git'",
+                    "$head = ''",
+                    "try { $head = (git rev-parse HEAD 2>$null).Trim() } catch { $head = '' }",
+                    "$readme = Test-Path -LiteralPath 'README.md'",
+                    "Write-Output ('in_repo=' + $inRepo)",
+                    "Write-Output ('head=' + $head)",
+                    "Write-Output ('readme=' + $readme)",
+                  ].join('; ')
+                : [
+                    "test -d .git && echo in_repo=true || echo in_repo=false",
+                    "h=$(git rev-parse HEAD 2>/dev/null || true); echo head=$h",
+                    "test -f README.md && echo readme=true || echo readme=false",
+                  ].join("; ");
+
+              display += (display ? "\n\n" : "") + "```" + fenceLang + "\n" + prompt + "# [auto] goal check (repo)\n" + probeCmd;
+              flush("\n```");
+
+              try {
+                const cwdUsed = cwdNow();
+                const execCmd = wrapExecWithPwd(probeCmd);
+                const execRes = await postJson("/api/exec", { command: execCmd, cwd: cwdUsed }, ac.signal);
+                const parsed = stripPwdMarker(execRes.stdout);
+                maybeUpdateWorkdirFromPwd(parsed.pwd);
+                const stdout = String(parsed.stdout || "").trim();
+
+                const mRepo = stdout.match(/(^|\n)in_repo=(true|false)\b/i);
+                const mHead = stdout.match(/(^|\n)head=([0-9a-f]{6,40})\b/i);
+                const mReadme = stdout.match(/(^|\n)readme=(true|false)\b/i);
+
+                const inRepo = !!(mRepo && String(mRepo[2] || "").toLowerCase() === "true");
+                const hasHead = !!(mHead && mHead[2]);
+                const hasReadme = !!(mReadme && String(mReadme[2] || "").toLowerCase() === "true");
+
+                const missing = [];
+                if (!inRepo) missing.push("git init (no .git)");
+                if (inRepo && !hasHead) missing.push("initial commit");
+                if (!hasReadme) missing.push("README.md");
+
+                display += (stdout ? ("\n" + truncTool(stdout, TRUNC_STDOUT)) : "\n(stdout empty)") + "\n```";
+                flush();
+
+                if (missing.length) {
+                  messages.push({
+                    role: "user",
+                    content: [
+                      "[goal_check]",
+                      "The task is NOT complete yet.",
+                      "Missing: " + missing.join(", "),
+                      "Fix it by using exec/write_file. Do NOT stop until the goals are satisfied.",
+                    ].join("\n"),
+                  });
+                  continue;
+                }
+              } catch (e2) {
+                display += "\nerror: " + prettyErr(e2) + "\n```";
+                flush();
+                // If probe fails, don't hard-block completion; fall through to break.
+              }
+            }
             break;
           }
           for (const im of implied) {
@@ -2998,8 +3154,12 @@
                 break;
               }
 
-              const execRes = await postJson("/api/exec", { command: commandToRun, cwd }, ac.signal);
-              const stdout = truncTool(execRes.stdout, TRUNC_STDOUT);
+              const cwdUsed = cwdNow();
+              const execCmd = wrapExecWithPwd(commandToRun);
+              const execRes = await postJson("/api/exec", { command: execCmd, cwd: cwdUsed }, ac.signal);
+              const parsed = stripPwdMarker(execRes.stdout);
+              maybeUpdateWorkdirFromPwd(parsed.pwd);
+              const stdout = truncTool(parsed.stdout, TRUNC_STDOUT);
               const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
               const exitCode = execRes.exit_code;
               const looksHardError = (t) => /(^|\n)\s*(fatal:|error:|exception|traceback)\b/i.test(String(t || ""));
@@ -3008,6 +3168,13 @@
               const hintGit = failed ? gitRepoHint(stderr) : "";
               const hintGov = failed ? deriveGovernorHint(stderr, stdout) : "";
               const hint = [hintGit, hintGov].filter(Boolean).join("\n\n");
+
+              const cwdUsedLabel = cwdUsed ? String(cwdUsed) : "(workspace root)";
+              const cwdAfter = cwdNow();
+              const cwdAfterLabel = cwdAfter ? String(cwdAfter) : "(workspace root)";
+              const cwdLine = cwdUsedLabel === cwdAfterLabel
+                ? `cwd: ${cwdUsedLabel}`
+                : `cwd: ${cwdUsedLabel}\ncwd_after: ${cwdAfterLabel}`;
 
               if (failed) {
                 governor.consecutiveFailures++;
@@ -3036,8 +3203,8 @@
               }
 
               resultText = failed
-                ? `FAILED (exit_code: ${exitCode}).\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}`
-                : `OK (exit_code: 0)\nstdout: ${stdout || "(empty)"}`;
+                ? `FAILED (exit_code: ${exitCode}).\n${cwdLine}\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}`
+                : `OK (exit_code: 0)\n${cwdLine}\nstdout: ${stdout || "(empty)"}`;
 
               if (stdout) display += "\n" + stdout;
               if (stderr) display += "\nstderr: " + stderr;

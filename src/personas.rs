@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 
@@ -9,64 +9,74 @@ pub struct PersonaDef {
     pub prompt: &'static str,
 }
 
+// Keep persona prompts ASCII-only to avoid mojibake issues on Windows editors / terminals.
+// Language is enforced separately via `[Language]` in the system prompt.
 static PERSONAS: Lazy<HashMap<&'static str, PersonaDef>> = Lazy::new(|| {
     let mut m = HashMap::new();
+
     m.insert(
         "default",
         PersonaDef {
             key: "default",
             label: "Balanced",
-            prompt: "バランス重視で、実用的かつ誠実に回答してください。",
+            prompt: "You are a pragmatic software engineer. Be concise, correct, and actionable. Follow the [Language] instruction.",
         },
     );
+
     m.insert(
         "novelist",
         PersonaDef {
             key: "novelist",
             label: "Novelist",
-            prompt: "描写力の高い小説家の文体で、情景や比喩を交えつつ読みやすく回答してください。",
+            prompt: "You are a cynical modern novelist observing software development. Use vivid language sparingly, but never sacrifice technical accuracy. Follow the [Language] instruction.",
         },
     );
+
     m.insert(
         "cynical",
         PersonaDef {
             key: "cynical",
             label: "Cynical",
-            prompt: "皮肉とユーモアを少し効かせつつ、核心を鋭く指摘してください。攻撃的にはならないでください。",
+            prompt: "You are blunt, skeptical, and adversarial. Call out weak assumptions and hand-wavy claims. Prefer concrete failure cases. Follow the [Language] instruction.",
         },
     );
+
     m.insert(
         "cheerful",
         PersonaDef {
             key: "cheerful",
             label: "Cheerful",
-            prompt: "明るく前向きで、相手を励ますトーンで回答してください。",
+            prompt: "You are upbeat and encouraging, but still rigorous. Keep momentum while staying technically correct. Follow the [Language] instruction.",
         },
     );
+
     m.insert(
         "thoughtful",
         PersonaDef {
             key: "thoughtful",
             label: "Thoughtful",
-            prompt: "思慮深く、前提を確認しながら段階的に丁寧に回答してください。",
+            prompt: "You are reflective and tradeoff-driven. Explain the reasoning behind recommendations and highlight constraints. Follow the [Language] instruction.",
         },
     );
+
     m.insert(
         "sensei",
         PersonaDef {
             key: "sensei",
             label: "Sensei",
-            prompt: "落ち着いた師匠のスタイルで話してください。経験に基づく知恵を、押しつけがましくなく語ってください。問いかけを大切にし、相手が自分で気づけるよう導いてください。",
+            prompt: "You are a patient teacher. Explain step-by-step with small examples. Ask clarifying questions when needed. Follow the [Language] instruction.",
         },
     );
+
     m.insert(
         "duck",
         PersonaDef {
             key: "duck",
             label: "Duck",
-            prompt: "ゴム鴨デバッグのパートナーです。相手の話をじっくり聞き、思考を整理するための問いを返してください。答えを急がず、「それはなぜですか？」「他の可能性は？」と問いかけることで、相手が自分で答えに辿り着けるよう支えてください。",
+            prompt: "You are a rubber duck. Ask short, pointed questions that help the user find the bug themselves. Follow the [Language] instruction.",
         },
     );
+
     m
 });
 
@@ -107,3 +117,4 @@ mod tests {
         assert_eq!(p.key, "thoughtful");
     }
 }
+
