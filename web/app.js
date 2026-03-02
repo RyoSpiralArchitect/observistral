@@ -2099,7 +2099,7 @@
       const fileChips = (canOpen && isCoderAsst) ? extractPathHints(s, 10) : [];
       return e(
         "div",
-        { key: m.id, className: "msg" + (m.role === "user" ? " msg-user" : " msg-assistant") },
+        { key: m.id, className: "msg" + (m.role === "user" ? " msg-user" : " msg-assistant") + (m.pane === "chat" ? " chat-msg" : "") },
         e("div", { className: "avatar" }, avatarLabel(m)),
         e(
           "div",
@@ -3449,7 +3449,7 @@
       if (!activeThread) return;
       const threadId = activeThread.id;
       const apiKey = String(chatApiKey || "").trim() || String(codeApiKey || "").trim() || String(observerApiKey || "").trim();
-      const chatCfg = { ...config, mode: "壁打ち", cot: "off", autonomy: "off" };
+      const chatCfg = { ...config, mode: "会話", cot: "off", autonomy: "off" };
       const userMsg = { id: uid(), pane: "chat", role: "user", content: text, ts: Date.now() };
       const asstMsg = { id: uid(), pane: "chat", role: "assistant", content: "", ts: Date.now(), streaming: true };
       setThreadState((s) => ({
@@ -4675,23 +4675,30 @@
             ),
             observerSubTab === "chat"
               ? e(React.Fragment, { key: "chat" },
-                  e("div", { className: "chat-body", ref: chatBodyRef },
-                    paneMessages("chat").length === 0
-                      ? e("div", { className: "pane-empty" },
-                          e("div", { className: "pane-empty-icon" }, "💬"),
-                          e("p", { className: "pane-empty-hint" },
-                            lang === "en" ? "Ask anything about the implementation"
-                            : lang === "fr" ? "Posez vos questions sur l'implémentation"
-                            : "実装について何でも聞いてください"
+                  e("div", { className: "obs-scroll-zone chat-scroll-zone" },
+                    e("div", { className: "chat-body", ref: chatBodyRef },
+                      paneMessages("chat").length === 0
+                        ? e("div", { className: "pane-empty chat-empty" },
+                            e("div", { className: "pane-empty-icon" }, "💬"),
+                            e("div", { className: "chat-empty-title" },
+                              lang === "en" ? "Free chat"
+                              : lang === "fr" ? "Discussion libre"
+                              : "会話モード"
+                            ),
+                            e("p", { className: "pane-empty-hint" },
+                              lang === "en" ? "Ask anything — code questions, design decisions, or just think out loud"
+                              : lang === "fr" ? "Posez n'importe quelle question — code, design, ou simple réflexion"
+                              : "なんでも聞いてください — 実装の疑問、設計の相談、ゴム鴨モード"
+                            )
                           )
-                        )
-                      : paneMessages("chat").map(renderMessage)
+                        : paneMessages("chat").map(renderMessage)
+                    )
                   ),
-                  e("div", { className: "composer" },
+                  e("div", { className: "composer chat-composer" },
                     e("textarea", {
                       className: "textarea",
                       value: chatInput,
-                      placeholder: tr(lang, "placeholder"),
+                      placeholder: lang === "en" ? "Chat…" : lang === "fr" ? "Discuter…" : "話しかける…",
                       rows: Math.max(2, Math.min(8, (chatInput.match(/\n/g) || []).length + 1)),
                       style: { resize: "none" },
                       onChange: (ev) => setChatInput(ev.target.value),

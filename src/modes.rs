@@ -26,6 +26,10 @@ pub enum Mode {
     #[serde(rename = "ログ解析")]
     #[value(name = "ログ解析", alias = "log", alias = "analyze")]
     LogAnalysis,
+
+    #[serde(rename = "会話")]
+    #[value(name = "会話", alias = "chat", alias = "conversation")]
+    Chat,
 }
 
 impl Mode {
@@ -37,6 +41,7 @@ impl Mode {
             Mode::DiffReview => "diff批評",
             Mode::Vibe => "VIBE",
             Mode::LogAnalysis => "ログ解析",
+            Mode::Chat => "会話",
         }
     }
 
@@ -46,7 +51,7 @@ impl Mode {
 }
 
 pub fn supported_modes() -> Vec<&'static str> {
-    vec!["実況", "壁打ち", "Observer", "diff批評", "VIBE", "ログ解析"]
+    vec!["実況", "壁打ち", "Observer", "diff批評", "VIBE", "ログ解析", "会話"]
 }
 
 pub fn mode_prompt(mode: &Mode) -> &'static str {
@@ -140,6 +145,18 @@ rationale: <one sentence citing the most significant risk or strength>",
 You are an expert site-reliability engineer and observability specialist. \
 When given log output or metrics, identify errors, anomalies, performance bottlenecks, \
 and actionable remediation steps. Be concise and structured.",
+
+        Mode::Chat => "\
+You are a friendly, knowledgeable AI companion helping a developer with their coding project. \
+Your job is to have a natural, relaxed conversation — not structured critique or analysis.\n\
+\n\
+Style:\n\
+- Warm and conversational. Think thoughtful pair-programmer, not code reviewer.\n\
+- Answer questions directly. A quick question gets a quick answer.\n\
+- Explore ideas together; it's fine to say \"I'm not sure, let's think it through.\"\n\
+- Use code snippets when they genuinely help, but skip report-style structure.\n\
+- No 5-axis analysis, no proposal blocks, no bullet summary unless explicitly asked.\n\
+- When the user describes what they're building, engage with genuine curiosity.",
     }
 }
 

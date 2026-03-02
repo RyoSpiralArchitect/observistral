@@ -1054,6 +1054,41 @@ body.looping .bubble.assistant {
   pointer-events: all;
   user-select: auto;
 }
+
+/* --- Chat subtab — warm conversation feel --- */
+.chat-scroll-zone {
+  /* inherits obs-scroll-zone layout; adds no visual change */
+}
+
+.chat-empty .pane-empty-icon {
+  font-size: 36px;
+  margin-bottom: 6px;
+}
+.chat-empty-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  opacity: 0.85;
+  margin-bottom: 4px;
+}
+
+/* Warm left border on AI responses in chat */
+.chat-msg.msg-assistant .bubble.assistant {
+  border-left: 2px solid rgba(201, 125, 78, 0.55);
+  background: rgba(201, 125, 78, 0.04);
+}
+
+/* Slightly relaxed avatar for chat */
+.chat-msg .avatar {
+  background: rgba(201, 125, 78, 0.18);
+  color: #d4935e;
+}
+
+/* Softer composer border when in chat mode */
+.chat-composer {
+  border-top-color: rgba(201, 125, 78, 0.25);
+}
+
 .obs-quick-trigger {
   margin-top: 4px;
   font-size: 12px;
