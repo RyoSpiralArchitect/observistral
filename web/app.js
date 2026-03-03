@@ -2093,10 +2093,12 @@
     };
 
     const runCoderAgentic = async (text, threadId, asstMsgId, reqCfg, resolvedKey, history, ac, threadWorkdir) => {
-      const MAX_ITERS = 10;
+      const autonomy = String((reqCfg && reqCfg.autonomy) || "longrun").trim().toLowerCase();
+      const longrun = autonomy !== "off";
+      const MAX_ITERS = longrun ? 14 : 8;
       const TRUNC_STDOUT = 2000;
       const TRUNC_STDERR = 800;
-      const KEEP_TOOL_TURNS = 4;
+      const KEEP_TOOL_TURNS = longrun ? 6 : 3;
       const WANTS_REPO_GOAL = /(?:\brepo\b|\brepository\b|\bgit\b|scaffold|bootstrap|init|setup|create\s+(?:a\s+)?repo|create\s+(?:a\s+)?repository|リポ|リポジトリ|雛形|ひな形|プロジェクト|git\s+init)/i.test(String(text || ""));
       let goalChecks = 0;
 
@@ -2489,10 +2491,21 @@
         if (ac.signal.aborted) break;
         pruneToolMessages(messages);
         // One-shot governor hint injection (outer-loop behavioral control).
+        // Also inject periodic progress checkpoints in longrun mode so the agent doesn't drift.
+        let govHint = governor.pendingHint ? String(governor.pendingHint || "").trim() : "";
+        if (longrun && (iter === 3 || iter === 6 || iter === 9 || iter === 12)) {
+          const cp = [
+            "Progress checkpoint:",
+            "- State: DONE / REMAINING / ON_TRACK.",
+            "- If REMAINING: list the next 1-3 concrete commands.",
+            "- If stuck: run diagnostics (pwd/ls/git status) before changing strategy.",
+          ].join("\n");
+          govHint = govHint ? (govHint + "\n\n" + cp) : cp;
+        }
         messages[0] = {
           role: "system",
-          content: governor.pendingHint
-            ? (SYSTEM_BASE_TEXT + "\n\n[Governor]\n" + governor.pendingHint.trim())
+          content: govHint
+            ? (SYSTEM_BASE_TEXT + "\n\n[Governor]\n" + govHint)
             : SYSTEM_BASE_TEXT,
         };
         governor.pendingHint = "";
