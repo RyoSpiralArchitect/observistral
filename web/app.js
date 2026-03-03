@@ -106,6 +106,7 @@
       polite: "polite",
       critical: "critical",
       brutal: "brutal",
+      coderMaxIters: "Coder max iters",
       vibeAgent: "Vibe agent",
       vibeMaxTurns: "Vibe max turns",
       details: "details",
@@ -203,6 +204,7 @@
       polite: "丁寧",
       critical: "批評",
       brutal: "容赦なし",
+      coderMaxIters: "Coder最大反復",
       vibeAgent: "Vibe agent",
       vibeMaxTurns: "Vibe max turns",
       details: "詳細",
@@ -311,6 +313,7 @@
       polite: "poli",
       critical: "critique",
       brutal: "brutal",
+      coderMaxIters: "Iters max codeur",
       vibeAgent: "Agent Vibe",
       vibeMaxTurns: "Tours max Vibe",
       details: "détails",
@@ -523,6 +526,7 @@
     requireCommandApproval: true,
     autoObserve: false,
     forceAgent: true,
+    coderMaxIters: "14",
     toolRoot: ".tmp",
     mistralCliAgent: "",
     mistralCliMaxTurns: "",
@@ -604,6 +608,7 @@
       workdir: "",
       messages: [],
       tasks: [],
+      coderMem: { cmdStats: [] },
     };
   }
 
@@ -1124,6 +1129,12 @@
       if (typeof cfg.requireCommandApproval !== "boolean") cfg.requireCommandApproval = !!DEFAULT_CONFIG.requireCommandApproval;
       if (typeof cfg.autoObserve !== "boolean") cfg.autoObserve = !!DEFAULT_CONFIG.autoObserve;
       if (typeof cfg.forceAgent !== "boolean") cfg.forceAgent = !!DEFAULT_CONFIG.forceAgent;
+      if (typeof cfg.coderMaxIters !== "string") cfg.coderMaxIters = String(cfg.coderMaxIters || "");
+      {
+        const n = numOrUndef(cfg.coderMaxIters);
+        if (!n) cfg.coderMaxIters = DEFAULT_CONFIG.coderMaxIters;
+        else cfg.coderMaxIters = String(Math.max(1, Math.min(64, Math.round(n))));
+      }
       if (typeof cfg.toolRoot !== "string") cfg.toolRoot = String(cfg.toolRoot || "");
       if (!String(cfg.toolRoot || "").trim()) cfg.toolRoot = DEFAULT_CONFIG.toolRoot;
       if (typeof cfg.mistralCliAgent !== "string") cfg.mistralCliAgent = String(cfg.mistralCliAgent || "");
@@ -1222,6 +1233,21 @@
                   createdAt: typeof x.createdAt === "number" ? x.createdAt : Date.now(),
                 }))
             : [],
+          coderMem: (() => {
+            const m = t.coderMem && typeof t.coderMem === "object" ? t.coderMem : null;
+            const rows = m && Array.isArray(m.cmdStats) ? m.cmdStats : [];
+            const cmdStats = rows
+              .filter((r) => r && typeof r === "object" && typeof r.k === "string")
+              .map((r) => ({
+                k: String(r.k || "").slice(0, 220),
+                attempts: typeof r.attempts === "number" ? r.attempts : Number(r.attempts) || 0,
+                fails: typeof r.fails === "number" ? r.fails : Number(r.fails) || 0,
+                lastErr: typeof r.lastErr === "string" ? String(r.lastErr || "").slice(0, 220) : "",
+                lastTs: typeof r.lastTs === "number" ? r.lastTs : Number(r.lastTs) || 0,
+              }))
+              .slice(0, 60);
+            return { cmdStats };
+          })(),
         }));
       if (!threads.length) threads = [makeThread("Thread 1")];
       const active0 = (localStorage.getItem(LS.active) || "").trim();
@@ -2135,10 +2161,16 @@
       return parts.join("\n");
     };
 
-    const runCoderAgentic = async (text, threadId, asstMsgId, reqCfg, resolvedKey, history, ac, threadWorkdir) => {
+      const runCoderAgentic = async (text, threadId, asstMsgId, reqCfg, resolvedKey, history, ac, threadWorkdir) => {
       const autonomy = String((reqCfg && reqCfg.autonomy) || "longrun").trim().toLowerCase();
       const longrun = autonomy !== "off";
-      const MAX_ITERS = longrun ? 14 : 8;
+      const MAX_ITERS = (() => {
+        const d = longrun ? 14 : 8;
+        const n = numOrUndef(reqCfg && reqCfg.coderMaxIters);
+        if (!n) return d;
+        const clamped = Math.max(1, Math.min(64, Math.round(n)));
+        return longrun ? clamped : Math.min(clamped, 16);
+      })();
       const TRUNC_STDOUT = 2000;
       const TRUNC_STDERR = 800;
       const KEEP_TOOL_TURNS = longrun ? 6 : 3;
@@ -2254,8 +2286,38 @@
 
       // UI-side loop breaker: if the model repeats the exact same failing command,
       // block it and force a different strategy.
-      const cmdStats = new Map(); // key -> { attempts, fails, lastErr }
+      const cmdStats = new Map(); // key -> { attempts, fails, lastErr, lastTs }
       const cmdKey = (cmd) => String(cmd || "").toLowerCase().replace(/\s+/g, " ").trim();
+
+      // Failure memory (persisted per thread): prevents "forget and repeat" across runs.
+      // Soft-load rule: a past failure counts as 1 fail (so we don't hard-block immediately).
+      const MEM_TTL_MS = 12 * 60 * 60 * 1000;
+      try {
+        const t0 = (threadState && Array.isArray(threadState.threads))
+          ? threadState.threads.find((t) => t && t.id === threadId)
+          : null;
+        const mem = t0 && t0.coderMem && typeof t0.coderMem === "object" ? t0.coderMem : null;
+        const rows = mem && Array.isArray(mem.cmdStats) ? mem.cmdStats : [];
+        const nowMs = Date.now();
+        for (const r of rows) {
+          if (!r || typeof r !== "object") continue;
+          const k = String(r.k || "").trim();
+          if (!k) continue;
+          const lastTs = typeof r.lastTs === "number" ? r.lastTs : Number(r.lastTs) || 0;
+          if (lastTs && nowMs - lastTs > MEM_TTL_MS) continue;
+          const fails0 = typeof r.fails === "number" ? r.fails : Number(r.fails) || 0;
+          const fails = Math.max(0, Math.min(1, Math.round(fails0)));
+          if (fails <= 0) continue;
+          const attempts0 = typeof r.attempts === "number" ? r.attempts : Number(r.attempts) || 0;
+          const st = {
+            attempts: Math.max(0, Math.round(attempts0)),
+            fails,
+            lastErr: typeof r.lastErr === "string" ? String(r.lastErr || "").slice(0, 220) : "",
+            lastTs: lastTs || 0,
+          };
+          cmdStats.set(k, st);
+        }
+      } catch (_) {}
 
       // Failure signatures (noise-resistant): collapse digits, lowercase, collapse whitespace.
       // This improves loop detection vs messages that differ only by line numbers / timestamps.
@@ -2335,17 +2397,47 @@
         return "";
       };
       const noteCmd = (k, failed, sig) => {
-        const st = cmdStats.get(k) || { attempts: 0, fails: 0, lastErr: "" };
+        const st = cmdStats.get(k) || { attempts: 0, fails: 0, lastErr: "", lastTs: 0 };
         st.attempts++;
         if (failed) {
           st.fails++;
           if (sig) st.lastErr = sig;
+          st.lastTs = Date.now();
         } else {
           st.fails = 0;
           st.lastErr = "";
+          st.lastTs = Date.now();
         }
         cmdStats.set(k, st);
         return st;
+      };
+
+      const persistFailureMemory = () => {
+        try {
+          const rows = [];
+          for (const [k, st] of cmdStats.entries()) {
+            if (!k || !st) continue;
+            const fails = Number(st.fails) || 0;
+            if (fails <= 0) continue;
+            rows.push({
+              k: String(k).slice(0, 220),
+              attempts: Number(st.attempts) || 0,
+              fails: fails,
+              lastErr: typeof st.lastErr === "string" ? String(st.lastErr || "").slice(0, 220) : "",
+              lastTs: typeof st.lastTs === "number" ? st.lastTs : Date.now(),
+            });
+          }
+          rows.sort((a, b) => (Number(b.lastTs) || 0) - (Number(a.lastTs) || 0));
+          const trimmed = rows.slice(0, 60);
+          setThreadState((s) => ({
+            ...s,
+            threads: s.threads.map((t) => (
+              t.id === threadId
+                ? { ...t, updatedAt: Date.now(), coderMem: { cmdStats: trimmed } }
+                : t
+            )),
+          }));
+        } catch (_) {}
       };
 
       const fnv1a64 = (s) => {
@@ -3115,6 +3207,8 @@
         }
       }
 
+      // Persist per-thread failure memory once per run to avoid re-render churn.
+      persistFailureMemory();
       finishStreaming(threadId, asstMsgId);
     };
 
@@ -4700,6 +4794,18 @@
                     tr(lang, "off")
                   )
                 )
+              ),
+              e(
+                "div",
+                { className: "field", style: { marginTop: "10px" } },
+                e("label", null, tr(lang, "coderMaxIters")),
+                e("input", {
+                  className: "input",
+                  value: String(config.coderMaxIters || ""),
+                  onChange: (ev) => setConfig({ ...config, coderMaxIters: ev.target.value }),
+                  placeholder: String(DEFAULT_CONFIG.coderMaxIters || "14"),
+                  inputMode: "numeric",
+                })
               ),
               e(
                 "div",
