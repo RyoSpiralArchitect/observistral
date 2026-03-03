@@ -8,6 +8,18 @@
 
 Languages: [English](README.md) | [Japanese](README.ja.md) | [French](README.fr.md)
 
+![OBSTRAL UI](docs/ui.png)
+
+## 見どころ（ユニークポイント）
+
+OBSTRALは「チャットUI」ではなく、**LLMの実行ループを制御するランタイム**です。
+
+- **実行ファースト**: `write_file` / `exec` を承認ゲート付きで運用（human-in-the-loop）
+- **デュアルエージェント**: Coderが実行、Observerが監査（提案をスコアリング）
+- **ループ検出**: 同じ批評を繰り返すとUIが色相シフトして警告、同じ失敗コマンドの反復も抑止
+- **サンドボックス**: `.tmp/<thread-id>` に隔離して「ネストgit地獄」を避ける
+- **Windows実戦耐性**: PowerShellネイティブ、WDACでEXEが動かない環境向けPython Liteあり
+
 ## これは何？
 
 多くのLLMツールは「会話」を最適化します。
@@ -144,6 +156,14 @@ GitHubトークンが使えるなら、1回だけ非対話でpushできます:
 ```powershell
 $env:GITHUB_TOKEN = "ghp_..."
 .\scripts\push.ps1
+```
+
+### SSH(443)でpushする（企業ネットワーク向け）
+
+ネットワークやプロキシ制限がある環境では、SSH over 443 を使うのが安定です:
+
+```powershell
+.\scripts\push_ssh.ps1
 ```
 
 ### `cargo run` が `obstral.exe` を消せず失敗する（アクセス拒否）

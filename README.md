@@ -8,6 +8,20 @@ Dual-pane "dual brain" coding cockpit:
 
 Languages: [English](README.md) | [Japanese](README.ja.md) | [French](README.fr.md)
 
+![OBSTRAL UI](docs/ui.png)
+
+## Highlights (What Makes It Different)
+
+OBSTRAL is not just a chat client. It's a **development control engine** for agentic coding.
+
+- **Execution-first**: tools (`write_file`, `exec`) + approvals (human-in-the-loop)
+- **Dual-agent tension**: Coder acts, Observer audits (and refuses repeated loops)
+- **Proposal engine**: structured `--- proposals ---` cards with score/phase/cost/impact
+- **Loop detection**: repeated critiques trigger warnings (and a UI hue-shift), repeated failing commands trigger a governor hint
+- **Sandboxed by default**: per-thread `tool_root` isolation prevents nested-git disasters
+- **Windows-realistic**: PowerShell-native, handles WDAC/blocked binaries with a Python Lite server
+- **Provider-agnostic**: OpenAI-compatible + multiple providers; handles real-world API quirks
+
 ## What This Is
 
 Most LLM tools optimize for conversation.
@@ -18,6 +32,15 @@ OBSTRAL optimizes for **controlled execution loops**:
 - proposal scoring + phase gating (core/feature/polish)
 - loop detection (repeated critique / repeated failing commands)
 - safety rails (edit approval, command approval, tool_root isolation)
+
+## Observer Output Contract (Structured Critique)
+
+Observer is not "another chat bot". It speaks a structured format that the UI parses into cards:
+
+- `--- phase ---` (`core | feature | polish`)
+- `--- proposals ---` (scored, actionable, can be sent back to Coder)
+- `--- critical_path ---` (one-line "what to do next")
+- `--- health ---` (a numeric score + short rationale)
 
 ## Quickstart (Rust Server)
 
@@ -88,6 +111,14 @@ Clear it for the current PowerShell session:
 
 ```powershell
 Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY,Env:GIT_HTTP_PROXY,Env:GIT_HTTPS_PROXY -ErrorAction SilentlyContinue
+```
+
+### Push via SSH over 443 (locked-down networks)
+
+If `git push` fails in corporate Windows environments, try:
+
+```powershell
+.\scripts\push_ssh.ps1
 ```
 
 ### Push without interactive prompts (WDAC-safe)

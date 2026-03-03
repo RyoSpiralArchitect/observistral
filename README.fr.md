@@ -8,6 +8,19 @@ Un cockpit de code "double cerveau" (deux panneaux):
 
 Languages: [English](README.md) | [Japanese](README.ja.md) | [French](README.fr.md)
 
+![OBSTRAL UI](docs/ui.png)
+
+## Points Forts (Ce Qui Est Unique)
+
+OBSTRAL n'est pas juste un client de chat. C'est un **moteur de controle de developpement** pour du "agentic coding".
+
+- **Execution d'abord**: outils (`write_file`, `exec`) + approbations (human-in-the-loop)
+- **Tension a deux agents**: Coder agit, Observer audite (et casse les boucles)
+- **Moteur de proposals**: blocs `--- proposals ---` structures, scores, phases, impact/cout
+- **Detection de boucle**: critiques repetitives (warning + effet visuel), commandes en echec repetitives (gouverneur)
+- **Sandbox**: `tool_root` isole par thread pour eviter les depots git imbriques
+- **Windows-reel**: PowerShell natif + serveur Lite Python (WDAC)
+
 ## Qu'est-ce que c'est ?
 
 La plupart des outils LLM optimisent la conversation.
@@ -131,6 +144,14 @@ Dans PowerShell:
 
 ```powershell
 Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY,Env:GIT_HTTP_PROXY,Env:GIT_HTTPS_PROXY -ErrorAction SilentlyContinue
+```
+
+### Push via SSH sur le port 443
+
+Dans des reseaux verrouilles, SSH over 443 est souvent le plus fiable:
+
+```powershell
+.\scripts\push_ssh.ps1
 ```
 
 ### Push sans invite interactive (compatible WDAC)
