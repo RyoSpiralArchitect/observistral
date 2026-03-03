@@ -68,6 +68,34 @@ fn strip_fenced_code_blocks(s: &str) -> String {
     out
 }
 
+fn strip_structured_observer_blocks(s: &str) -> String {
+    // Observer responses append machine-readable blocks that intentionally contain
+    // English-heavy keys (e.g. title/to_coder/severity/score). Those keys should not
+    // cause a Japanese/French response to be rejected.
+    //
+    // Keep only the "human" critique portion before any structured block header.
+    let mut out = String::with_capacity(s.len());
+    for line in s.lines() {
+        let t = line.trim();
+        if t.starts_with("---") {
+            let low = t
+                .trim_matches('-')
+                .trim()
+                .to_ascii_lowercase();
+            if low.starts_with("phase")
+                || low.starts_with("proposals")
+                || low.starts_with("critical_path")
+                || low.starts_with("health")
+            {
+                break;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 pub fn is_skippable_for_lang_check(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() {
@@ -88,7 +116,8 @@ pub fn is_skippable_for_lang_check(s: &str) -> bool {
 }
 
 pub fn looks_japanese(s: &str) -> bool {
-    let stripped = strip_fenced_code_blocks(s);
+    let stripped = strip_structured_observer_blocks(s);
+    let stripped = strip_fenced_code_blocks(&stripped);
     let jp = count_japanese_chars(&stripped);
     let lat = count_latin_letters(&stripped);
     if jp < 8 {
@@ -102,7 +131,8 @@ pub fn looks_japanese(s: &str) -> bool {
 }
 
 pub fn looks_french(s: &str) -> bool {
-    let stripped = strip_fenced_code_blocks(s);
+    let stripped = strip_structured_observer_blocks(s);
+    let stripped = strip_fenced_code_blocks(&stripped);
     let accents = count_french_accents(&stripped);
     let toks = tokenize_words_lower(&stripped);
     if toks.is_empty() {
@@ -186,6 +216,12 @@ mod tests {
     }
 
     #[test]
+    fn structured_blocks_do_not_break_japanese_detection() {
+        let s = "これは日本語の批評です。改善点を指摘します。\n\n--- phase ---\ncore\n\n--- proposals ---\n1) title: Fix error handling\n   to_coder: Add retries.\n   severity: warn\n   score: 70\n   phase: core\n   impact: stability\n   cost: low\n";
+        assert!(looks_japanese(s));
+    }
+
+    #[test]
     fn french_heuristic_basic() {
         assert!(looks_french("Ceci est un test. Vous devez corriger ce bug."));
         assert!(!looks_french("This is a test and you should fix it."));
@@ -194,6 +230,12 @@ mod tests {
     #[test]
     fn fenced_code_does_not_break_french_detection() {
         let s = "Ceci est un test.\n```python\nprint('hello world')\n```\nVous devez corriger ce bug.";
+        assert!(looks_french(s));
+    }
+
+    #[test]
+    fn structured_blocks_do_not_break_french_detection() {
+        let s = "Ceci est une critique en français.\n\n--- phase ---\ncore\n\n--- proposals ---\n1) title: Fix retries\n   to_coder: Implement exponential backoff.\n   severity: warn\n   score: 80\n   phase: core\n   impact: reliability\n   cost: medium\n";
         assert!(looks_french(s));
     }
 
