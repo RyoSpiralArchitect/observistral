@@ -103,6 +103,7 @@
       keys: "API keys",
       loopDetected: "Loop detected",
       observerIntensity: "Observer intensity",
+      observerLang: "Observer language",
       polite: "polite",
       critical: "critical",
       brutal: "brutal",
@@ -540,6 +541,7 @@
     observerMode: "Observer",
     observerPersona: "novelist",
     observerIntensity: "critical",
+    observerLang: "ui",
     includeCoderContext: true,
     temperature: "0.7",
     maxTokens: "1024",
@@ -1124,6 +1126,11 @@
       const oi0 = String(cfg.observerIntensity || "").trim().toLowerCase();
       if (oi0 === "polite" || oi0 === "critical" || oi0 === "brutal") cfg.observerIntensity = oi0;
       else cfg.observerIntensity = DEFAULT_CONFIG.observerIntensity;
+      {
+        const ol0 = String(cfg.observerLang || "").trim().toLowerCase();
+        if (ol0 === "ui" || ol0 === "ja" || ol0 === "en" || ol0 === "fr") cfg.observerLang = ol0;
+        else cfg.observerLang = DEFAULT_CONFIG.observerLang;
+      }
       if (typeof cfg.includeCoderContext !== "boolean") cfg.includeCoderContext = !!DEFAULT_CONFIG.includeCoderContext;
       if (typeof cfg.requireEditApproval !== "boolean") cfg.requireEditApproval = !!DEFAULT_CONFIG.requireEditApproval;
       if (typeof cfg.requireCommandApproval !== "boolean") cfg.requireCommandApproval = !!DEFAULT_CONFIG.requireCommandApproval;
@@ -3541,7 +3548,11 @@
         loopInfo && loopInfo.depth > 0
           ? `ui_loop_detected: depth=${loopInfo.depth} sim=${Math.round((loopInfo.score || 0) * 100)}%`
           : "";
-      const outLang = String(lang || "ja").trim().toLowerCase();
+      const outLang = (() => {
+        const ol0 = String(config.observerLang || "ui").trim().toLowerCase();
+        if (ol0 === "ja" || ol0 === "en" || ol0 === "fr") return ol0;
+        return String(lang || "ja").trim().toLowerCase();
+      })();
       const proposalKeysLine = "Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).";
       const langLine = outLang === "fr"
         ? [
@@ -3651,7 +3662,7 @@
       const toolRootResolved = resolvedCwd(config.toolRoot, threadId, activeThread && activeThread.workdir);
       const obsCfg2 = toolRootResolved ? { ...obsCfg, toolRoot: toolRootResolved } : obsCfg;
       const reqBody = buildReq(obsCfg2, obsKey, history, sendText, diff);
-      reqBody.lang = lang;
+      reqBody.lang = outLang;
       reqBody.force_tools = false;
       const ac = new AbortController();
       abortObserverRef.current = ac;
@@ -3753,7 +3764,7 @@
             { role: "assistant", content: finalText },
           ];
           const retryBody = buildReq(obsCfg, obsKey, extHistory, retryInstr + "\n\n" + observerBridge, diff);
-          retryBody.lang = lang;
+          retryBody.lang = outLang;
           retryBody.force_tools = false;
           // Make the rewrite more deterministic (language fix should not "drift").
           retryBody.temperature = 0.2;
@@ -3811,7 +3822,7 @@
               { role: "assistant", content: finalText },
             ];
             const retryBody2 = buildReq(obsCfg, obsKey, extHistory2, loopFixInstr + "\n\n" + observerBridge, diff);
-            retryBody2.lang = lang;
+            retryBody2.lang = outLang;
             retryBody2.force_tools = false;
             retryBody2.temperature = 0.2;
             try {
@@ -4566,6 +4577,23 @@
                     },
                     tr(lang, "brutal")
                   )
+                )
+              ),
+              e(
+                "div",
+                { className: "field", style: { marginTop: "10px" } },
+                e("label", null, tr(lang, "observerLang")),
+                e(
+                  "select",
+                  {
+                    className: "select",
+                    value: String(config.observerLang || "ui"),
+                    onChange: (ev) => setConfig({ ...config, observerLang: ev.target.value }),
+                  },
+                  e("option", { value: "ui" }, "UI"),
+                  e("option", { value: "ja" }, "JA"),
+                  e("option", { value: "en" }, "EN"),
+                  e("option", { value: "fr" }, "FR"),
                 )
               ),
               e(
