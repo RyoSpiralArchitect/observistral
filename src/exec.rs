@@ -32,9 +32,118 @@ fn sanitize_shellish_command(cmd: &str) -> String {
         return String::new();
     }
 
+    // If the input contains shell prompt markers, treat it as a transcript and keep ONLY
+    // the prompt lines. This prevents accidentally executing copied stdout/stderr (e.g.
+    // `Initialized empty Git repository...`) which is a common LLM failure mode.
+    fn is_prompt_line(s: &str) -> bool {
+        let t = s.trim_start();
+        if t.starts_with("PS>") {
+            return true;
+        }
+        if t.starts_with("PS ") {
+            if let Some(idx) = t.find('>') {
+                // "PS C:\path>" or "PS C:\path> cmd"
+                let after = &t[idx + 1..];
+                return after.is_empty() || after.chars().next().is_some_and(|c| c.is_whitespace());
+            }
+        }
+        if t.starts_with('>') {
+            return t.chars().nth(1).is_some_and(|c| c.is_whitespace());
+        }
+        if t.starts_with('$') {
+            return t.chars().nth(1).is_some_and(|c| c.is_whitespace());
+        }
+        false
+    }
+
+    fn strip_prompt(s: &str) -> String {
+        let t = s.trim_start();
+        if let Some(rest) = t.strip_prefix("PS>") {
+            return rest.trim_start().to_string();
+        }
+        if t.starts_with("PS ") {
+            if let Some(idx) = t.find('>') {
+                return t[idx + 1..].trim_start().to_string();
+            }
+        }
+        if t.starts_with('>') && t.chars().nth(1).is_some_and(|c| c.is_whitespace()) {
+            return t[1..].trim_start().to_string();
+        }
+        if t.starts_with('$') && t.chars().nth(1).is_some_and(|c| c.is_whitespace()) {
+            return t[1..].trim_start().to_string();
+        }
+        s.trim().to_string()
+    }
+
+    fn looks_like_output_line_no_prompt(s: &str) -> bool {
+        let t = s.trim();
+        if t.is_empty() {
+            return true;
+        }
+        let low = t.to_ascii_lowercase();
+
+        if low.starts_with("stdout:") || low.starts_with("stderr:") {
+            return true;
+        }
+        if low.starts_with("exit") {
+            // "exit 1" / "exit: 0"
+            if low == "exit" {
+                return true;
+            }
+            if low.starts_with("exit ") || low.starts_with("exit:") {
+                return true;
+            }
+        }
+        if low.starts_with("fatal:")
+            || low.starts_with("error:")
+            || low.starts_with("warning:")
+            || low.starts_with("hint:")
+        {
+            return true;
+        }
+        if low.starts_with("initialized empty git repository")
+            || low.starts_with("on branch")
+            || low.starts_with("your branch")
+            || low.starts_with("changes to be committed:")
+            || low.starts_with("untracked files:")
+            || low.starts_with("nothing to commit")
+        {
+            return true;
+        }
+        if low.starts_with("directory:") {
+            return true;
+        }
+        // Japanese "ディレクトリ:"
+        if t.starts_with("ディレクトリ") {
+            return true;
+        }
+        if low.starts_with("mode ") && low.contains("lastwritetime") {
+            return true;
+        }
+        if low.starts_with("----") {
+            return true;
+        }
+        if low.starts_with("modified:") || low.starts_with("new file:") || low.starts_with("deleted:") {
+            return true;
+        }
+
+        false
+    }
+
+    let has_prompt = raw.lines().any(is_prompt_line);
+
     let mut out: Vec<String> = Vec::new();
     for ln0 in raw.split('\n') {
-        let mut ln = ln0.trim_end_matches('\r').to_string();
+        let ln0 = ln0.trim_end_matches('\r');
+        if has_prompt && !is_prompt_line(ln0) {
+            continue; // drop output lines
+        }
+
+        let mut ln = if has_prompt {
+            strip_prompt(ln0)
+        } else {
+            ln0.to_string()
+        };
         let ltrim = ln.trim_start();
 
         // PowerShell prompt markers.
@@ -53,6 +162,12 @@ fn sanitize_shellish_command(cmd: &str) -> String {
             if lt.starts_with('$') && lt[1..].starts_with(char::is_whitespace) {
                 ln = lt.trim_start_matches('$').trim_start().to_string();
             }
+        }
+
+        // When we don't have explicit prompts, drop obvious tool output lines that models
+        // sometimes paste into code fences.
+        if !has_prompt && looks_like_output_line_no_prompt(&ln) {
+            continue;
         }
 
         // Some models leak tool-call syntax into code fences (e.g. "assistant to=...").
@@ -642,6 +757,16 @@ mod tests {
         let s = "New-Item -ItemType Directory -Force -Path 'src/'}}]} assistant to=multi_tool_use.parallel 0";
         let cleaned = sanitize_shellish_command(s);
         assert_eq!(cleaned, "New-Item -ItemType Directory -Force -Path 'src/'");
+    }
+
+    #[test]
+    fn sanitize_drops_transcript_output_lines() {
+        let s = "PS> git init MazeGame\nInitialized empty Git repository in C:/x/.git/\nPS> git status\nOn branch main";
+        let cleaned = sanitize_shellish_command(s);
+        assert!(cleaned.contains("git init MazeGame"));
+        assert!(cleaned.contains("git status"));
+        assert!(!cleaned.contains("Initialized empty Git repository"));
+        assert!(!cleaned.contains("On branch"));
     }
 
     #[test]
