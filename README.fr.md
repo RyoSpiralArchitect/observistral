@@ -1,70 +1,210 @@
 # OBSTRAL
 
-Un cockpit de code "double cerveau" (deux panneaux):
+![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
+![License](https://img.shields.io/badge/license-MIT-green)
+![UI](https://img.shields.io/badge/UI-web%20%2B%20TUI-2dd4bf)
 
-- **Coder**: agit (fichiers + commandes) avec des approbations
-- **Observer**: critique + propose les prochaines actions (avec score)
-- **Chat**: brainstorming / narration sans casser l'execution
+> **Une seule boite de dialogue ne suffit pas.**
+> OBSTRAL donne a votre IA un deuxieme cerveau — et les fait se disputer.
 
-Languages: [English](README.md) | [Japanese](README.ja.md) | [French](README.fr.md)
+Languages: [English](README.md) | [日本語](README.ja.md) | [Français](README.fr.md)
 
-![OBSTRAL UI](docs/ui.png)
+---
 
-## Points Forts (Ce Qui Est Unique)
+Tous les outils de code IA ont le meme probleme : le modele qui ecrit votre code est aussi celui qui le relit.
 
-OBSTRAL n'est pas juste un client de chat. C'est un **moteur de controle de developpement** pour du "agentic coding".
+Ce n'est pas une revue de code. C'est un monologue de defense.
 
-- **Execution d'abord**: outils (`write_file`, `exec`) + approbations (human-in-the-loop)
-- **Tension a deux agents**: Coder agit, Observer audite (et casse les boucles)
-- **Moteur de proposals**: blocs `--- proposals ---` structures, scores, phases, impact/cout
-- **Detection de boucle**: critiques repetitives (warning + effet visuel), commandes en echec repetitives (gouverneur)
-- **Sandbox**: `tool_root` isole par thread pour eviter les depots git imbriques
-- **Windows-reel**: PowerShell natif + serveur Lite Python (WDAC)
+OBSTRAL resout ca en faisant tourner Coder et Observer dans des **contextes entierement separes**. L'Observer n'a vu aucune ligne de votre code en cours d'ecriture. Il ne connait que le resultat. C'est ce qui le rend honnete.
 
-## Qu'est-ce que c'est ?
+---
 
-La plupart des outils LLM optimisent la conversation.
+## Trois roles. Trois contextes. Zero conflit.
 
-OBSTRAL optimise des **boucles d'execution controlees**:
+| Role | Ce qu'il fait | Ce qu'il ne fait jamais |
+|---|---|---|
+| **Coder** | Agit — fichiers, commandes shell, boucle agentique (12 etapes max) | Relire ou remettre en question son propre travail |
+| **Observer** | Critique — score chaque proposition, escalade ce que vous ignorez | Toucher au code. Il lit seulement. |
+| **Chat** | Reflechit avec vous — conception, canard en plastique, compromis | Interrompre la boucle d'execution |
 
-- tension a deux agents (Coder vs Observer)
-- scoring des proposals + phase gating (core/feature/polish)
-- detection de boucle (critiques repetitives / commandes en echec repetitives)
-- garde-fous (approbation d'edition, approbation de commande, isolation via tool_root)
+Roles distincts. Modeles distincts si vous le souhaitez. Contextes toujours distincts.
 
-## Demarrage (serveur Rust)
+---
 
-### UI (Web)
+## Ce qui rend OBSTRAL different
 
-```powershell
-.\scripts\run-ui.ps1
+### L'Observer n'a rien a defendre
+
+Autres outils : meme modele ecrit le code → meme modele le relit → modele defend ses propres choix.
+
+OBSTRAL : contexte vierge a chaque execution de l'Observer. Il ne sait pas ce qu'il *aurait* ecrit. Il juge uniquement ce qu'il voit.
+
+Resultat : feedbacks plus tranchants, evaluation de risques honnete, pas de demi-mesures.
+
+### Les propositions ne disparaissent pas
+
+Quand l'Observer signale un probleme que vous ignorez, la proposition monte en grade :
+
+```
+new  →  [UNRESOLVED] +10pts  →  [ESCALATED] +20pts, epinglee en haut
 ```
 
-Ouvrir:
+L'Observer se souvient de ce qu'il a dit. Si vous ignorez un avertissement `critical` deux fois, il devient la carte la plus visible du tableau.
 
-- `http://127.0.0.1:18080/`
+### Classification d'erreur, pas juste des codes de sortie
 
-### TUI
+Quand une commande echoue, OBSTRAL ne donne pas au modele un brut `exit_code: 1` en esperant le mieux. Il classe l'erreur d'abord :
 
+| Type d'erreur | Hint injecte |
+|---|---|
+| `ENVIRONMENT` | Corrigez l'environnement. Ne touchez pas au code source. |
+| `SYNTAX` | Corrigez le fichier exact. Ne changez pas d'autre code. |
+| `PATH` | Verifiez les chemins d'abord. Ne creez pas avant de confirmer. |
+| `DEPENDENCY` | Installez le package d'abord. Puis reessayez. |
+| `NETWORK` | Verifiez le service et les variables proxy. |
+| `LOGIC` | Relisez la logique. Ne relancez pas juste pour relancer. |
+
+### Le Coder se remet en question
+
+Avant chaque commande, le Coder remplit un bloc de 5 lignes :
+
+```
+<think>
+goal:   ce qui doit reussir maintenant
+risk:   le mode d'echec le plus probable
+doubt:  une raison pour laquelle cette approche pourrait etre fausse   ← le champ inhabituel
+next:   commande exacte
+verify: comment confirmer que ca a fonctionne
+</think>
+```
+
+Le champ `doubt:` force le modele a formuler un doute avant d'agir. ~50 tokens. Ca empeche le mode d'echec ou le modele est confiant et faux.
+
+### Phase gating : taire le bon bruit
+
+Dites a l'Observer la phase dans laquelle vous etes (`core` / `feature` / `polish`). Les propositions qui ne correspondent pas sont automatiquement estompees. Les retouches CSS ne vous interrompent pas quand votre auth est cassee.
+
+### Sante en un coup d'oeil
+
+Chaque reponse de l'Observer se termine par un score :
+
+```
+--- health ---
+score: 74  rationale: auth is solid, tests cover happy path only
+```
+
+❤ **74** → vert (zone production). Le badge se met a jour en direct.
+
+### Points de controle de progression
+
+Aux iterations 3, 6 et 9, le Coder s'arrete pour une auto-evaluation :
+
+```
+1. DONE: quelles etapes du plan sont verifiees completes (exit_code=0) ?
+2. REMAINING: qu'est-ce qui reste ?
+3. ON_TRACK: oui/non — si non, reevalu le plan avant la prochaine commande.
+```
+
+C'est la difference entre un agent qui tourne en rond et un qui sait quand il est perdu.
+
+### Windows en premier (vraiment)
+
+La plupart des outils de code IA sont concus sur Mac, testes sur Linux, et "devrait marcher" sur Windows.
+
+OBSTRAL a ete construit sur Windows. Il gere :
+- Binaires bloques par WDAC → serveur de secours Python Lite (stdlib pure)
+- Traduction automatique de syntaxe PowerShell (bash → PS)
+- L'enfer des proxies d'entreprise
+- `sh.exe` Win32 error 5 sur les invites git interactives
+
+### Registre de plugins
+
+Etendez OBSTRAL sans le forker :
+
+```js
+registerObserverPlugin({ name: "mon-plugin", onProposal, onHealth, onPhase })
+registerPhase("security-review", { label: "Revue securite", color: "#f97316" })
+registerValidator(propositions => propositions.filter(p => p.score > 20))
+```
+
+Chargez votre plugin via `<script>` avant `app.js`. C'est tout.
+
+---
+
+## Le contrat de sortie de l'Observer
+
+L'Observer n'ecrit pas librement. Il parle un format structure que l'UI transforme en cartes :
+
+```
+--- phase ---
+core
+
+--- proposals ---
+title: Validation des entrees manquante
+toCoder: Validez la longueur et le type avant de traiter l'entree utilisateur.
+severity: critical
+score: 88
+phase: core
+cost: low
+impact: empeche le crash sur entree malformee
+quote: user_input = input()
+
+--- critical_path ---
+Corrigez la validation des entrees avant d'ajouter de nouvelles fonctionnalites.
+
+--- health ---
+score: 41  rationale: la logique centrale fonctionne mais la surface d'injection est grande ouverte
+```
+
+Chaque champ est intentionnel. `quote` epingle la ligne exacte incriminee sur la carte. `cost` dit si la correction est facile avant de lire les details. `phase` controle la visibilite.
+
+---
+
+## Demarrage rapide
+
+**UI Web (recommande)**
+```powershell
+.\scripts\run-ui.ps1
+# → http://127.0.0.1:18080/
+```
+
+**TUI (terminal)**
 ```powershell
 .\scripts\run-tui.ps1
 ```
 
-Note: les scripts utilisent un `CARGO_TARGET_DIR` isole pour que UI et TUI puissent coexister.
-
-## Serveur Lite (Python)
-
-Si vous ne pouvez pas executer le binaire Rust (par ex. WDAC bloque les nouveaux EXE), il y a un fallback Python:
-
+**Python Lite (WDAC / pas de binaire Rust)**
 ```powershell
 python .\scripts\serve_lite.py
+# → http://127.0.0.1:18080/
 ```
 
-## Fonctionnalites
+---
 
-### Onglet Chat — Barre de chips de persona
+## Concepts cles
 
-Cinq chips de persona se trouvent au-dessus du compositeur Chat. Changez a tout moment — independant des personas du Coder et de l'Observer (defaut: 😊 Enjoue):
+### tool_root
+
+Chaque action de l'agent s'execute dans un repertoire scratch. Par defaut : `.tmp/<thread-id>`.
+
+Ca empeche les depots git imbriques, les fichiers egares a la racine du projet, et le mode d'echec classique "pourquoi ca a tourne dans le mauvais repertoire ?". Chaque thread est completement isole.
+
+### Approbations
+
+- **Edit approval** : les appels `write_file` sont mis en file d'attente comme pending edits. Vous approuvez ou rejetez chacun.
+- **Command approval** : les appels `exec` peuvent etre gates de la meme maniere (optionnel). Le Coder attend votre decision puis reprend.
+
+Aucun mode ne vous force a vous arreter — ils se mettent en file d'attente silencieusement.
+
+### Providers
+
+OBSTRAL parle les APIs OpenAI-compatibles. Il supporte aussi Mistral, Anthropic, Gemini et les modeles HF locaux via un trait `ChatProvider`.
+
+Definissez un modele different par role : modele rapide pour les iterations du Coder, modele puissant pour l'analyse de l'Observer. Erreurs courantes : `401` (cle incorrecte), `429` (rate limit), mismatch `max_tokens` vs `max_completion_tokens`.
+
+### Personas Chat
+
+Cinq chips au-dessus du compositeur Chat — changez a tout moment, independant du Coder/Observer :
 
 | Chip | Style |
 |---|---|
@@ -74,105 +214,40 @@ Cinq chips de persona se trouvent au-dessus du compositeur Chat. Changez a tout 
 | 😏 Cynique (cynical) | Va droit a la verite qui derange |
 | 🦆 Canard (duck) | Ne repond jamais — pose juste « Pourquoi ? » |
 
-### Observer — Badge de sante `❤ N`
-
-Quand l'Observer emet un bloc `--- health ---`, le score apparait dans la barre d'etat:
-
-| Score | Couleur | Signification |
-|---|---|---|
-| ≥ 70 | Vert | Pret pour la production |
-| 40–69 | Ambre | OK pour dev / demo |
-| < 40 | Rouge | Action immediate requise |
-
-### Observer — Cycle de vie du statut de proposition
-
-Si l'Observer souleve la meme proposition a plusieurs reprises sans qu'elle soit traitee, le statut monte en grade:
-
-| Statut | Signification | Bonus de score |
-|---|---|---|
-| `new` | Premiere apparition | ±0 |
-| `[UNRESOLVED]` | Ignoree une fois | +10 |
-| `[ESCALATED]` | Ignoree deux fois ou plus — forcee en tete | +20 au total |
-| `addressed` | Traitee (affichee en cyan) | — |
-
-### Champ `quote`
-
-Obligatoire pour les propositions `warn` / `critical`. Affiche l'extrait incrimine en monospace cyan sur la carte:
-
-```
-❝ user_input = input()
-```
-
 ---
 
-## Concepts
+## Securite
 
-### tool_root
-
-OBSTRAL execute toutes les actions de l'agent sous un dossier "scratch" (`tool_root`).
-
-Par defaut: `.tmp/<thread-id>` pour isoler chaque thread et eviter les depots git imbriques.
-
-### Approbations
-
-- **Edit approval**: `write_file` est mis en file d'attente (pending edits) et applique apres approbation.
-- **Command approval**: `exec` est mis en file d'attente (pending commands) et approuve/rejete (le Coder reprend apres approbation).
-
-## Providers
-
-OBSTRAL parle des APIs "OpenAI-compatible" et supporte plusieurs providers via un trait `ChatProvider`.
-
-Erreurs frequentes:
-
-- `401 Unauthorized`: cle API manquante/incorrecte
-- `429 Too Many Requests`: rate limit (backoff)
-- `max_tokens` vs `max_completion_tokens`: differences selon le modele
-
-## Securite (local-first)
-
-OBSTRAL est concu pour `127.0.0.1`.
+`127.0.0.1` uniquement par defaut. L'execution shell est reelle — gardez les approbations activees.
 
 Si vous l'exposez sur un reseau, ajoutez une authentification et durcissez l'execution d'outils.
 
+---
+
 ## Depannage
 
-### "Failed to connect to github.com via 127.0.0.1"
-
-Votre environnement force probablement un proxy mort (`HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`).
-
-Dans PowerShell:
-
+**"Failed to connect to github.com via 127.0.0.1"** — proxy mort dans les variables d'environnement :
 ```powershell
 Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY,Env:GIT_HTTP_PROXY,Env:GIT_HTTPS_PROXY -ErrorAction SilentlyContinue
 ```
 
-### Push via SSH sur le port 443
-
-Dans des reseaux verrouilles, SSH over 443 est souvent le plus fiable:
-
-```powershell
-.\scripts\push_ssh.ps1
-```
-
-### Push sans invite interactive (compatible WDAC)
-
-Dans certains environnements, les invites git interactives cassent (par ex. `sh.exe` echoue avec Win32 error 5).
-
-Si vous avez un token GitHub, vous pouvez push en non-interactif:
-
+**Push sans invite interactive** (WDAC / sh.exe Win32 error 5) :
 ```powershell
 $env:GITHUB_TOKEN = "ghp_..."
 .\scripts\push.ps1
 ```
 
-### `cargo run` echoue: "access denied" sur `obstral.exe`
+**Push via SSH sur le port 443** (reseau d'entreprise) :
+```powershell
+.\scripts\push_ssh.ps1
+```
 
-Le binaire est encore en cours d'execution depuis le meme target dir.
+**"access denied" sur obstral.exe** — binaire encore en cours d'execution :
+```powershell
+.\scripts\kill-obstral.ps1
+```
 
-Utilisez:
-
-- `.\scripts\kill-obstral.ps1`
-- ou `.\scripts\run-ui.ps1` / `.\scripts\run-tui.ps1`
+---
 
 ## Licence
 
