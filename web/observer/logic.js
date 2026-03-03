@@ -214,6 +214,7 @@
   function stripObserverMeta(text) {
     const s = String(text || "");
     const markers = [
+      /---\s*phase\s*---/i,
       /---\s*proposals\s*---/i,
       /---\s*critical_path\s*---/i,
       /---\s*health\s*---/i,
@@ -237,4 +238,3 @@
     stripObserverMeta,
   };
 })();
-

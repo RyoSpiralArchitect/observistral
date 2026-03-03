@@ -3569,22 +3569,22 @@
              out.push(line);
            }
            return out.join("\n");
-         };
-         const looksJapanese = (s) => {
-           const x = stripFencesForLang(s);
-           const jp = countRe(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g, x);
-           const lat = countRe(/[A-Za-z]/g, x);
-           if (jp < 8) return false;
-           if (lat <= 0) return true;
+          };
+          const looksJapanese = (s) => {
+            const x = stripFencesForLang(stripObserverMeta(s));
+            const jp = countRe(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g, x);
+            const lat = countRe(/[A-Za-z]/g, x);
+            if (jp < 8) return false;
+            if (lat <= 0) return true;
            // Allow some English tokens (code, keys) but avoid "mostly English with a few JP chars".
            return lat <= jp * 2;
-         };
-        const looksFrench = (s) => {
-          const x = stripFencesForLang(s);
-          const a = countRe(/[\u00C0-\u017F]/g, x);
-          const fr = countRe(/\b(le|la|les|des|du|de|pour|avec|sans|est|sont|pas|mais|donc|sur|dans|vous|tu|je|nous|votre)\b/gi, x);
-          const en = countRe(/\b(the|and|you|your|should|this|that|with|for|not|are|is|was|were|will|can|cannot|do|does)\b/gi, x);
-          if (a > 0 && fr >= 1) return true;
+          };
+         const looksFrench = (s) => {
+          const x = stripFencesForLang(stripObserverMeta(s));
+           const a = countRe(/[\u00C0-\u017F]/g, x);
+           const fr = countRe(/\b(le|la|les|des|du|de|pour|avec|sans|est|sont|pas|mais|donc|sur|dans|vous|tu|je|nous|votre)\b/gi, x);
+           const en = countRe(/\b(the|and|you|your|should|this|that|with|for|not|are|is|was|were|will|can|cannot|do|does)\b/gi, x);
+           if (a > 0 && fr >= 1) return true;
           return fr > en + 1;
         };
         const skippable = (s) => {
