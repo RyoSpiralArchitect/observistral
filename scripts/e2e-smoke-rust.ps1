@@ -77,9 +77,31 @@ try {
     throw "expected git dir missing: $gitDir"
   }
 
+  # Transcript sanitization: models often paste prompts + output lines into code fences.
+  # The server should execute ONLY the prompt lines and ignore output.
+  $cwd2 = Join-Path $ws "work2"
+  $cmd2 = @"
+PS> New-Item -ItemType Directory -Force -Path 'demo-repo2' | Out-Null
+ディレクトリ: C:\fake\output\should\be\ignored
+PS> Set-Location 'demo-repo2'
+PS> git init
+Initialized empty Git repository in C:/fake/output/ignored/.git/
+"@.Trim()
+  $body2 = @{
+    command = $cmd2
+    cwd = $cwd2
+  } | ConvertTo-Json
+  $ex2 = Invoke-RestMethod -Method Post -Uri "http://$ListenHost`:$Port/api/exec" -ContentType "application/json" -Body $body2 -TimeoutSec 20
+  if ($ex2.exit_code -ne 0) {
+    throw "exec (transcript sanitize) failed: exit_code=$($ex2.exit_code) stderr=$($ex2.stderr)"
+  }
+  $gitDir2 = Join-Path (Join-Path $cwd2 "demo-repo2") ".git"
+  if (-not (Test-Path $gitDir2)) {
+    throw "expected git dir missing (transcript sanitize): $gitDir2"
+  }
+
   Write-Host "E2E smoke (Rust) OK: $gitDir" -ForegroundColor Green
   exit 0
 } finally {
   try { Stop-Process -Id $p.Id -Force } catch {}
 }
-
