@@ -29,6 +29,10 @@ pub struct TuiArgs {
     #[arg(long)]
     pub tool_root: Option<String>,
 
+    /// Max iterations for the Coder agent loop (default: 12). Increase for long runs.
+    #[arg(long)]
+    pub max_iters: Option<usize>,
+
     /// Enable auto-observe (Observer auto-fires after each Coder response).
     #[arg(long)]
     pub auto_observe: bool,
@@ -83,6 +87,7 @@ pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
     }
     let auto_observe = args.auto_observe;
     let lang = args.lang.clone();
+    let max_iters = args.max_iters;
 
     // Windows: force UTF-8 so Japanese/French and box-drawing characters don't mojibake.
     #[cfg(target_os = "windows")]
@@ -116,7 +121,7 @@ pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
     // ── Run ───────────────────────────────────────────────────────────────────
-    let mut app = app::App::new(coder_cfg, observer_cfg, chat_cfg, tool_root, auto_observe, lang);
+    let mut app = app::App::new(coder_cfg, observer_cfg, chat_cfg, tool_root, auto_observe, lang, max_iters);
     let result = events::run_event_loop(&mut app, &mut terminal).await;
 
     // ── Restore terminal ──────────────────────────────────────────────────────

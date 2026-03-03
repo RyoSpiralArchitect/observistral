@@ -643,6 +643,7 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
     let tool_root = app.tool_root.clone().or_else(|| {
         std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())
     });
+    let max_iters = app.coder_max_iters.unwrap_or(agent::DEFAULT_MAX_ITERS);
 
     let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
     let lang = language_instruction(Some(&app.lang), &cfg.mode);
@@ -656,7 +657,7 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
 
     let tx = tx.clone();
     let handle = tokio::spawn(async move {
-        if let Err(e) = agent::run_agentic(messages, &cfg, tool_root.as_deref(), tx.clone()).await {
+        if let Err(e) = agent::run_agentic(messages, &cfg, tool_root.as_deref(), max_iters, tx.clone()).await {
             let _ = tx.send(StreamToken::Error(format!("{e:#}"))).await;
         }
     });

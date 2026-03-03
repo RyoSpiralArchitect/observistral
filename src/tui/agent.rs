@@ -28,7 +28,7 @@ use crate::types::ChatMessage;
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
-const MAX_ITERS: usize = 12;
+pub const DEFAULT_MAX_ITERS: usize = 12;
 const MAX_STDOUT_CHARS: usize = 1500;
 const MAX_STDERR_CHARS: usize = 600;
 const KEEP_RECENT_TOOL_TURNS: usize = 4;
@@ -708,6 +708,123 @@ fn wants_local_actions(user_text: &str) -> bool {
     kws.iter().any(|k| s.contains(k))
 }
 
+#[derive(Debug, Clone)]
+struct ImpliedExecScript {
+    lang_hint: String,
+    script: String,
+}
+
+fn is_shell_fence_lang(lang_hint: &str) -> bool {
+    matches!(
+        lang_hint,
+        "bash" | "sh" | "shell" | "zsh" | "powershell" | "pwsh" | "ps1" | "ps" | "console"
+    )
+}
+
+fn looks_like_shell_command(script: &str) -> bool {
+    let low = script.to_ascii_lowercase();
+    let pats = [
+        // PowerShell
+        "new-item",
+        "set-content",
+        "add-content",
+        "remove-item",
+        "copy-item",
+        "move-item",
+        "get-content",
+        "test-path",
+        // Common CLIs
+        "\ngit ",
+        "git ",
+        "\ncargo ",
+        "cargo ",
+        "\npython",
+        "python ",
+        "\nnode ",
+        "node ",
+        "\nnpm ",
+        "npm ",
+        "\npnpm ",
+        "pnpm ",
+        "\nyarn ",
+        "yarn ",
+        // Shell-ish
+        "\ncd ",
+        "\nmkdir",
+        "mkdir ",
+    ];
+    pats.iter().any(|p| low.contains(p))
+}
+
+fn extract_implied_exec_scripts(text: &str) -> Vec<ImpliedExecScript> {
+    let raw = text.replace("\r\n", "\n");
+    let mut out: Vec<ImpliedExecScript> = Vec::new();
+
+    let mut in_fence = false;
+    let mut fence_lang = String::new();
+    let mut buf: Vec<String> = Vec::new();
+
+    for line0 in raw.lines() {
+        let line = line0.trim_end_matches('\r');
+        let t = line.trim_start();
+        if !in_fence {
+            if let Some(rest) = t.strip_prefix("```") {
+                in_fence = true;
+                fence_lang = rest.trim().to_ascii_lowercase();
+                buf.clear();
+            }
+            continue;
+        }
+
+        // in_fence
+        if t.starts_with("```") {
+            let body = buf.join("\n");
+            let script = body.trim().to_string();
+            if !script.is_empty() {
+                let lang = fence_lang.trim().to_string();
+                if is_shell_fence_lang(lang.as_str()) || looks_like_shell_command(&script) {
+                    out.push(ImpliedExecScript {
+                        lang_hint: lang,
+                        script,
+                    });
+                    if out.len() >= 3 {
+                        return out;
+                    }
+                }
+            }
+            in_fence = false;
+            fence_lang.clear();
+            buf.clear();
+            continue;
+        }
+
+        buf.push(line.to_string());
+    }
+
+    // Fallback: some models omit code fences but still paste PS prompt lines.
+    if out.is_empty() {
+        let mut lines: Vec<String> = Vec::new();
+        for line0 in raw.lines() {
+            let t = line0.trim_start();
+            if t.starts_with("PS>") || t.starts_with("$ ") || t.starts_with("> ") {
+                lines.push(t.to_string());
+                if lines.len() >= 24 {
+                    break;
+                }
+            }
+        }
+        let joined = lines.join("\n").trim().to_string();
+        if !joined.is_empty() && looks_like_shell_command(&joined) {
+            out.push(ImpliedExecScript {
+                lang_hint: "powershell".to_string(),
+                script: joined,
+            });
+        }
+    }
+
+    out
+}
+
 impl FailureMemory {
     fn on_tool_result(
         &mut self,
@@ -806,6 +923,7 @@ pub async fn run_agentic(
     messages_in: Vec<ChatMessage>,
     cfg: &RunConfig,
     tool_root: Option<&str>,
+    max_iters: usize,
     tx: mpsc::Sender<StreamToken>,
 ) -> Result<()> {
     let client = reqwest::Client::new();
@@ -852,7 +970,8 @@ NEVER create a git repo inside another git repo. If you see 'embedded git reposi
     }
     let mut cur_cwd: Option<String> = tool_root_abs.clone();
 
-    for iter in 0..MAX_ITERS {
+    let max_iters = max_iters.max(1).min(64);
+    for iter in 0..max_iters {
         // ── Prune old tool results before sending to save context tokens ───
         prune_old_tool_results(&mut messages);
 
@@ -861,11 +980,11 @@ NEVER create a git repo inside another git repo. If you see 'embedded git reposi
         // Only fires when no higher-priority failure hint is already pending.
         if iter > 0 && iter % 3 == 0 && pending_system_hint.is_none() {
             pending_system_hint = Some(format!(
-                "[Progress Check — iter {iter}/{MAX_ITERS}]\n\
-Before your next command, answer in ONE line each:\n\
-1. DONE: which steps from your <plan> are verified complete (exit_code=0)?\n\
-2. REMAINING: which steps are left?\n\
-3. ON_TRACK: yes/no — if no, re-evaluate your plan before proceeding."
+                "[Progress Check — iter {iter}/{max_iters}]\n\
+ Before your next command, answer in ONE line each:\n\
+ 1. DONE: which steps from your <plan> are verified complete (exit_code=0)?\n\
+ 2. REMAINING: which steps are left?\n\
+ 3. ON_TRACK: yes/no — if no, re-evaluate your plan before proceeding."
             ));
         }
 
@@ -947,9 +1066,149 @@ Before your next command, answer in ONE line each:\n\
         } else {
             messages.push(json!({"role": "assistant", "content": assistant_text}));
 
+            // Model didn't call tools. If the user asked for local actions, try implied scripts
+            // (PowerShell/bash code fences) as a fallback so non-tool-calling models can still act.
+            if goal_wants_actions && iter + 1 < max_iters {
+                let implied = extract_implied_exec_scripts(&assistant_text);
+                if !implied.is_empty() {
+                    let _ = tx
+                        .send(StreamToken::Delta(
+                            "\n[governor] tool_call missing; executing implied commands\n".to_string(),
+                        ))
+                        .await;
+
+                    for im in implied {
+                        let command = im.script.trim().to_string();
+                        if command.is_empty() {
+                            continue;
+                        }
+
+                        state = AgentState::Executing;
+                        let cwd_used: Option<String> = cur_cwd.clone().or_else(|| tool_root_abs.clone());
+                        let cwd_used_label = cwd_used
+                            .as_deref()
+                            .unwrap_or("(workspace root)")
+                            .to_string();
+
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "\n\n[IMPLIED_TOOL][{:?}] lang={}\n{command}\n[cwd] {cwd_used_label}\n",
+                                state, im.lang_hint
+                            )))
+                            .await;
+
+                        let exec_cmd = wrap_exec_with_pwd(&command);
+                        let exec_result = exec::run_command(&exec_cmd, cwd_used.as_deref()).await;
+                        let (stdout, stderr, exit_code) = match exec_result {
+                            Ok(r) => (r.stdout, r.stderr, r.exit_code),
+                            Err(e) => (String::new(), e.to_string(), -1),
+                        };
+
+                        // Update cwd from marker output.
+                        let (stdout, pwd_after) = strip_pwd_marker(&stdout);
+                        let mut cwd_after_note: Option<String> = None;
+                        if let Some(p) = pwd_after {
+                            if let Some(ref root) = tool_root_abs {
+                                if is_within_root(&p, root) {
+                                    cur_cwd = Some(p);
+                                } else {
+                                    cwd_after_note =
+                                        Some(format!("NOTE: cwd_after was outside tool_root; ignored: {p}"));
+                                }
+                            } else {
+                                cur_cwd = Some(p);
+                            }
+                        }
+
+                        let escaped_tool_root = cwd_after_note.is_some();
+                        let cwd_after_label = cur_cwd
+                            .as_deref()
+                            .unwrap_or(cwd_used_label.as_str())
+                            .to_string();
+                        let cwd_line = if cwd_used_label == cwd_after_label {
+                            format!("cwd: {cwd_used_label}")
+                        } else {
+                            format!("cwd: {cwd_used_label}\ncwd_after: {cwd_after_label}")
+                        };
+
+                        state = AgentState::Verifying;
+                        let suspicious_reason = if exit_code == 0 {
+                            suspicious_success_reason(&stdout, &stderr)
+                        } else {
+                            None
+                        };
+                        let effective_exit_code =
+                            if exit_code == 0 && (suspicious_reason.is_some() || escaped_tool_root) {
+                                1
+                            } else {
+                                exit_code
+                            };
+
+                        let note = cwd_after_note.as_deref();
+                        let tool_output = if effective_exit_code == 0 {
+                            let base = build_ok_tool_output(&stdout);
+                            inject_cwd(&base, &cwd_line, note)
+                        } else {
+                            let mut out =
+                                build_failed_tool_output(&stdout, &stderr, effective_exit_code);
+                            if let Some(reason) = suspicious_reason {
+                                out = format!(
+                                    "NOTE: command returned exit_code=0 but was treated as failure.\nreason: {reason}\n\n{out}"
+                                );
+                            }
+                            if escaped_tool_root && exit_code == 0 {
+                                out = format!(
+                                    "NOTE: command escaped tool_root and was treated as failure.\n\
+This is blocked to prevent nested-repo / accidental repo-root modifications.\n\n{out}"
+                                );
+                            }
+                            inject_cwd(&out, &cwd_line, note)
+                        };
+
+                        let result_label = if effective_exit_code == 0 {
+                            format!("[RESULT][{:?}] exit=0\n", state)
+                        } else {
+                            format!("[RESULT][{:?}] exit={effective_exit_code} !\n", state)
+                        };
+                        let _ = tx.send(StreamToken::Delta(result_label)).await;
+
+                        // NOTE: do not fabricate tool_call_id. Feed the result back as user text.
+                        messages.push(json!({
+                            "role": "user",
+                            "content": format!(
+                                "[implied_exec]\nlang_hint: {}\ncommand:\n{}\n\n{}",
+                                im.lang_hint, command, tool_output
+                            ),
+                        }));
+
+                        if effective_exit_code != 0 {
+                            state = AgentState::Recovery;
+                        } else {
+                            state = AgentState::Planning;
+                        }
+
+                        pending_system_hint = if escaped_tool_root {
+                            Some(
+                                "SANDBOX BREACH: Your command ended outside tool_root.\n\
+Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` stays under tool_root."
+                                    .to_string(),
+                            )
+                        } else {
+                            mem.on_tool_result(&command, &stdout, &stderr, effective_exit_code)
+                        };
+
+                        if effective_exit_code != 0 {
+                            break;
+                        }
+                    }
+
+                    continue;
+                }
+            }
+
             // Common failure mode: model "explains what to do" but never calls exec,
             // even though the user asked to actually perform local actions.
-            if goal_wants_actions && !forced_tool_once && iter + 1 < MAX_ITERS {
+            if goal_wants_actions && !forced_tool_once && iter + 1 < max_iters {
                 forced_tool_once = true;
                 state = AgentState::Recovery;
                 let note = "\
@@ -1138,9 +1397,9 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
         };
 
         // Safety: stop if we've hit the iteration cap.
-        if iter + 1 == MAX_ITERS {
+        if iter + 1 == max_iters {
             let _ = tx.send(StreamToken::Delta(
-                format!("\n[agent] iteration cap ({MAX_ITERS}) reached.\n")
+                format!("\n[agent] iteration cap ({max_iters}) reached.\n")
             )).await;
         }
     }

@@ -147,6 +147,7 @@ pub struct App {
     pub observer_cfg: RunConfig,
     pub chat_cfg: RunConfig,
     pub tool_root: Option<String>,
+    pub coder_max_iters: Option<usize>,
     pub quit: bool,
 
     /// 100ms tick counter — drives the streaming spinner animation.
@@ -188,6 +189,7 @@ impl App {
         tool_root: Option<String>,
         auto_observe: bool,
         lang: String,
+        coder_max_iters: Option<usize>,
     ) -> Self {
         let l = lang.trim().to_ascii_lowercase();
         let lang = if l == "en" || l == "fr" { l } else { "ja".to_string() };
@@ -204,6 +206,7 @@ impl App {
             observer_cfg,
             chat_cfg,
             tool_root,
+            coder_max_iters,
             quit: false,
             tick_count: 0,
             coder_iter: 0,
