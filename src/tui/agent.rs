@@ -250,6 +250,68 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
     format!("{truncated}\n[…truncated — {total_lines} lines total, first {max_chars} chars shown]")
 }
 
+/// Tail-biased truncation: errors appear at the END of compiler output, not the beginning.
+/// E.g. `cargo build` prints 100+ "Compiling …" lines before the actual error.
+/// Showing the last `max_chars` puts the real error in view.
+fn truncate_output_tail(s: &str, max_chars: usize) -> String {
+    let s = s.trim_end();
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        return s.to_string();
+    }
+    let skip = char_count - max_chars;
+    let tail: String = s.chars().skip(skip).collect();
+    let total_lines = s.lines().count();
+    let shown_lines = tail.lines().count();
+    let hidden = total_lines.saturating_sub(shown_lines);
+    format!("[…{hidden} earlier lines omitted — showing last {max_chars} chars]\n{tail}")
+}
+
+/// Extract a compact digest of error lines from command output.
+/// Helps the model see ALL errors even when stdout is very long.
+/// Returns None when no clear error lines are found.
+fn extract_error_digest(stdout: &str, stderr: &str) -> Option<String> {
+    let patterns: &[&str] = &[
+        "error[e",          // Rust: error[E0XXX]
+        "error: aborting",  // Rust: summary line
+        " --> ",            // Rust: file:line pointer
+        "syntaxerror:",     // Python / JS
+        "typeerror:",
+        "nameerror:",
+        "attributeerror:",
+        "valueerror:",
+        "runtimeerror:",
+        "importerror:",
+        "modulenotfounderror:",
+        "referenceerror:",  // JS
+        "traceback (most recent call last)",
+        "error: ",          // generic (space avoids false positives)
+        "fatal: ",
+        "fatal error:",
+    ];
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for src in [stderr, stdout] {
+        for line in src.lines() {
+            let t = line.trim();
+            if t.is_empty() { continue; }
+            let low = t.to_ascii_lowercase();
+            if patterns.iter().any(|p| low.contains(p)) {
+                if seen.insert(t.to_string()) {
+                    lines.push(t.to_string());
+                    if lines.len() >= 20 { break; }
+                }
+            }
+        }
+        if lines.len() >= 20 { break; }
+    }
+
+    if lines.is_empty() { return None; }
+    Some(format!("[ERROR DIGEST — {} line(s)]\n{}", lines.len(), lines.join("\n")))
+}
+
 /// Returns true if a tool result can safely be pruned (= it was a success).
 /// Failures are never pruned because they are critical context for recovery.
 fn is_prunable_tool_result(content: &str) -> bool {
@@ -413,10 +475,19 @@ fn build_failed_tool_output(stdout: &str, stderr: &str, exit_code: i32) -> Strin
          3. Fix it with a single corrected command.\n\
          Do NOT continue the original plan until the fix succeeds.\n"
     );
-    let stdout_t = truncate_output(stdout, MAX_STDOUT_CHARS);
+
+    // Error digest first: compact list of all error lines so the model sees
+    // ALL errors even when stdout is long (e.g. cargo build with many "Compiling" lines).
+    if let Some(digest) = extract_error_digest(stdout, stderr) {
+        out.push_str(&format!("\n{digest}\n"));
+    }
+
+    // Tail-biased: errors appear at the END of compiler output, not the beginning.
+    // Showing the last N chars ensures the real errors are in view.
+    let stdout_t = truncate_output_tail(stdout, MAX_STDOUT_CHARS);
     let stderr_t = truncate_output(stderr, MAX_STDERR_CHARS);
     if !stdout_t.is_empty() {
-        out.push_str(&format!("\nstdout:\n{stdout_t}\n"));
+        out.push_str(&format!("\nstdout (tail):\n{stdout_t}\n"));
     }
     if !stderr_t.is_empty() {
         out.push_str(&format!("\nstderr:\n{stderr_t}\n"));
@@ -1020,6 +1091,7 @@ pub async fn run_agentic(
     max_iters: usize,
     tx: mpsc::Sender<StreamToken>,
     project_context: Option<String>,
+    agents_md: Option<String>,
 ) -> Result<()> {
     let client = reqwest::Client::new();
     let tools = json!([
@@ -1075,8 +1147,24 @@ NEVER create a git repo inside another git repo. If you see 'embedded git reposi
             messages.insert(pos, json!({"role":"system","content": ctx_text}));
         }
     }
+    // AGENTS.md / .obstral.md — project-specific rules injected right after project context.
+    // These take precedence over generic instructions and can override coding conventions.
+    if let Some(agents_text) = agents_md {
+        if !agents_text.is_empty() {
+            let pos = messages.len().min(3);
+            messages.insert(pos, json!({
+                "role": "system",
+                "content": format!("[Project Instructions — .obstral.md / AGENTS.md]\n{agents_text}")
+            }));
+        }
+    }
 
     let mut cur_cwd: Option<String> = tool_root_abs.clone();
+
+    // Session-scoped file read cache.
+    // Key: canonical path string.  Invalidated on write_file / patch_file success.
+    let mut file_cache: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     let max_iters = max_iters.max(1).min(64);
     for iter in 0..max_iters {
@@ -1357,17 +1445,63 @@ After it succeeds, verify and continue.";
             let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
 
             let base = tool_root_abs.as_deref();
+
+            // Cache key: canonical absolute path string.
+            let cache_key = crate::file_tools::resolve_safe_path(&path, base)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("{}|{}", path, base.unwrap_or("")));
+
             let (result, is_error) = match tc.name.as_str() {
-                "read_file" => crate::file_tools::tool_read_file(&path, base),
+                "read_file" => {
+                    // ── Gap 6: serve from cache if file hasn't changed ──────
+                    if let Some(cached) = file_cache.get(&cache_key) {
+                        let header = cached.lines().next().unwrap_or(&path).to_string();
+                        let _ = tx.send(StreamToken::Delta(
+                            format!("[CACHE_HIT] {header}\n")
+                        )).await;
+                        (format!("{} [⚡ cached — unchanged since last read]\n{cached}", header), false)
+                    } else {
+                        let (content, err) = crate::file_tools::tool_read_file(&path, base);
+                        if !err {
+                            file_cache.insert(cache_key.clone(), content.clone());
+                        }
+                        (content, err)
+                    }
+                }
                 "write_file" => {
                     let content = args["content"].as_str().unwrap_or("").to_string();
-                    crate::file_tools::tool_write_file(&path, &content, base)
+                    let r = crate::file_tools::tool_write_file(&path, &content, base);
+                    if !r.1 { file_cache.remove(&cache_key); } // invalidate
+                    r
                 }
                 _ => {
-                    // patch_file
+                    // ── patch_file ─────────────────────────────────────────
                     let search = args["search"].as_str().unwrap_or("").to_string();
                     let replace = args["replace"].as_str().unwrap_or("").to_string();
-                    crate::file_tools::tool_patch_file(&path, &search, &replace, base)
+                    let (mut patch_result, patch_err) =
+                        crate::file_tools::tool_patch_file(&path, &search, &replace, base);
+
+                    if !patch_err {
+                        file_cache.remove(&cache_key); // invalidate stale cache
+
+                        // ── Gap 7: auto-verify patch was applied correctly ──
+                        if let Ok(abs) = crate::file_tools::resolve_safe_path(&path, base) {
+                            if let Ok(new_content) = std::fs::read_to_string(&abs) {
+                                if replace.is_empty() || new_content.contains(&replace) {
+                                    patch_result.push_str("\n✓ auto-verify: patch confirmed in file");
+                                } else {
+                                    patch_result.push_str(
+                                        "\n✗ auto-verify FAILED: replacement text not found — \
+                                         file may be in unexpected state; call read_file to inspect"
+                                    );
+                                }
+                                // Seed cache with the freshly written content.
+                                file_cache.insert(cache_key.clone(), new_content);
+                            }
+                        }
+                    }
+                    (patch_result, patch_err)
                 }
             };
 

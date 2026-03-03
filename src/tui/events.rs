@@ -694,24 +694,26 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
     messages.push(ChatMessage { role: "user".to_string(), content: text });
 
     // Scan project context once per session (guarded by stack_label being None).
-    let project_context: Option<String> = if app.project_stack_label.is_none() {
-        if let Some(ref root) = tool_root {
-            if let Some(ctx) = crate::project::ProjectContext::scan(root).await {
-                app.project_stack_label = Some(ctx.stack_label());
-                Some(ctx.to_context_text())
+    let (project_context, agents_md): (Option<String>, Option<String>) =
+        if app.project_stack_label.is_none() {
+            if let Some(ref root) = tool_root {
+                if let Some(ctx) = crate::project::ProjectContext::scan(root).await {
+                    app.project_stack_label = Some(ctx.stack_label());
+                    let agents = ctx.agents_md.clone();
+                    (Some(ctx.to_context_text()), agents)
+                } else {
+                    (None, None)
+                }
             } else {
-                None
+                (None, None)
             }
         } else {
-            None
-        }
-    } else {
-        None
-    };
+            (None, None)
+        };
 
     let tx = tx.clone();
     let handle = tokio::spawn(async move {
-        if let Err(e) = agent::run_agentic(messages, &cfg, tool_root.as_deref(), max_iters, tx.clone(), project_context).await {
+        if let Err(e) = agent::run_agentic(messages, &cfg, tool_root.as_deref(), max_iters, tx.clone(), project_context, agents_md).await {
             let _ = tx.send(StreamToken::Error(format!("{e:#}"))).await;
         }
     });

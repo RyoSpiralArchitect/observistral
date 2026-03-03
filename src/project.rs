@@ -46,6 +46,8 @@ pub struct ProjectContext {
     pub tree: Vec<(String, usize)>, // (dir_name, file_count)
     pub key_files: Vec<String>,
     pub readme_excerpt: Option<String>,
+    /// Content of .obstral.md / AGENTS.md / CLAUDE.md — project-specific instructions.
+    pub agents_md: Option<String>,
 }
 
 // ── Main scan function ─────────────────────────────────────────────────────────
@@ -80,6 +82,9 @@ impl ProjectContext {
         let (git_branch, git_modified, git_untracked, git_recent) =
             scan_git(&root).await;
 
+        // Project-specific instruction file (.obstral.md > AGENTS.md > CLAUDE.md).
+        let agents_md = try_read_agents_file(&root);
+
         Some(ProjectContext {
             root,
             stack,
@@ -90,6 +95,7 @@ impl ProjectContext {
             tree,
             key_files,
             readme_excerpt,
+            agents_md,
         })
     }
 
@@ -361,4 +367,25 @@ fn read_readme_excerpt(root: &str) -> Option<String> {
     }
 
     Some(useful.join("\n"))
+}
+
+/// Read the first project instruction file found in `root`.
+/// Priority: .obstral.md > AGENTS.md > CLAUDE.md
+/// Truncated to 200 lines to keep token cost bounded.
+fn try_read_agents_file(root: &str) -> Option<String> {
+    for name in &[".obstral.md", "AGENTS.md", "CLAUDE.md"] {
+        let path = Path::new(root).join(name);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let trimmed = content.trim();
+            if trimmed.is_empty() { continue; }
+            // Cap at 200 lines to avoid blowing the context window.
+            let capped: String = trimmed
+                .lines()
+                .take(200)
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Some(capped);
+        }
+    }
+    None
 }

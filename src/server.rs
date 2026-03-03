@@ -629,18 +629,30 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
 
     let base_url = req.base_url.trim_end_matches('/').to_string();
 
-    // Project context injection for web UI path.
+    // Project context + AGENTS.md injection for web UI path.
     let injected_messages = {
         let mut msgs = req.messages.clone();
         if let Some(ref root) = req.tool_root {
             let root = root.trim();
             if !root.is_empty() {
                 if let Some(ctx) = crate::project::ProjectContext::scan(root).await {
+                    // 1. Project context (stack, git, tree).
                     let txt = ctx.to_context_text();
                     if !txt.is_empty() {
                         let pos = msgs.iter().position(|m| m["role"] == "system")
                             .map(|i| i + 1).unwrap_or(0);
                         msgs.insert(pos, serde_json::json!({"role":"system","content": txt}));
+                    }
+                    // 2. AGENTS.md / .obstral.md — project-specific rules.
+                    if let Some(agents_text) = ctx.agents_md {
+                        if !agents_text.is_empty() {
+                            let pos = msgs.iter().position(|m| m["role"] == "system")
+                                .map(|i| i + 2).unwrap_or(1);
+                            msgs.insert(pos.min(msgs.len()), serde_json::json!({
+                                "role": "system",
+                                "content": format!("[Project Instructions — .obstral.md / AGENTS.md]\n{agents_text}")
+                            }));
+                        }
                     }
                 }
             }
