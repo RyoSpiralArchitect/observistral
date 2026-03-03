@@ -1607,6 +1607,64 @@ async fn api_chat_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -
 
     write_sse_header(stream, 200, "OK").await?;
 
+    // Observer streaming has two problems in practice:
+    // 1) Some models ignore the requested language when streaming, and we cannot "rewrite" mid-stream.
+    // 2) We want the server-side loop suppression + language enforcement logic in ChatBot.
+    //
+    // Solution: for Observer mode, run the non-stream ChatBot (with enforcement) and "fake stream"
+    // the final text as deltas. This keeps the UI experience consistent while staying reliable.
+    if matches!(cfg.mode, Mode::Observer) {
+        let provider = providers::build_provider(state.client.clone(), &cfg);
+        let bot = ChatBot::new(provider);
+        let cot_str = cot.as_deref().unwrap_or("brief");
+
+        let resp = match bot
+            .run(
+                &history.user_input,
+                &history.messages,
+                &cfg.mode,
+                &cfg.persona,
+                lang.as_deref(),
+                cot_str,
+                cfg.temperature,
+                cfg.max_tokens,
+                diff.as_deref(),
+                None,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                let msg = anyhow!(err).to_string();
+                let data = serde_json::to_string(&ApiError { error: msg })?;
+                write_sse_event(stream, "error", &data).await?;
+                write_sse_event(stream, "done", "{}").await?;
+                return Ok(());
+            }
+        };
+
+        let mut chunk = String::new();
+        let mut n = 0usize;
+        const CHUNK_CHARS: usize = 28;
+        for ch in resp.content.chars() {
+            chunk.push(ch);
+            n += 1;
+            if n >= CHUNK_CHARS {
+                let data = serde_json::to_string(&serde_json::json!({ "delta": chunk }))?;
+                write_sse_event(stream, "delta", &data).await?;
+                chunk = String::new();
+                n = 0;
+            }
+        }
+        if !chunk.is_empty() {
+            let data = serde_json::to_string(&serde_json::json!({ "delta": chunk }))?;
+            write_sse_event(stream, "delta", &data).await?;
+        }
+
+        write_sse_event(stream, "done", "{}").await?;
+        return Ok(());
+    }
+
     let persona_def = personas::resolve_persona(&cfg.persona)?;
     let cot_str = cot.as_deref().unwrap_or("brief");
     let cot_instr = crate::modes::cot_instruction(cot_str, &cfg.mode);
