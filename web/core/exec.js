@@ -20,22 +20,41 @@
     const lines = raw.split("\n");
     const promptRe = /^\s*(\$\s+|PS(?: [^>]+)?>\s+|>\s+)/;
     const hasPrompt = lines.some((l) => promptRe.test(l));
+
+    const cutToolNoise = (s) => {
+      let x = String(s || "");
+      const xl = x.toLowerCase();
+      const toks = [
+        "assistant to=",
+        "to=multi_tool_use.",
+        "to=functions.",
+        "to=web.run",
+        "recipient_name",
+        "parameters:",
+      ];
+      let cut = x.length;
+      for (const t of toks) {
+        const idx = xl.indexOf(t);
+        if (idx !== -1) cut = Math.min(cut, idx);
+      }
+      if (cut !== x.length) x = x.slice(0, cut).trimEnd();
+      // If a tool-call trace leaked into the line, it often leaves stray brackets/braces at the end.
+      if (x.indexOf("{") === -1) x = x.replace(/[}\]]+$/g, "").trimEnd();
+      return x.trim();
+    };
+
     const out = [];
     for (const l0 of lines) {
       const l = String(l0 || "");
       if (hasPrompt) {
         if (!promptRe.test(l)) continue; // drop output lines
-        let x = l.replace(promptRe, "").trim();
-        // Common model glitch: trailing brace.
-        if (x.endsWith("}") && x.indexOf("{") === -1) x = x.slice(0, -1).trimEnd();
+        let x = cutToolNoise(l.replace(promptRe, "").trim());
         if (!x || x === "$") continue;
         out.push(x);
       } else {
         // No explicit prompts found: some models paste command+output without `$`/`PS>`.
         // Trim leading whitespace to make output-line filters robust.
-        let x = l.replace(/^\s*\$\s+/, "").trim();
-        // Common model glitch: trailing brace.
-        if (x.endsWith("}") && x.indexOf("{") === -1) x = x.slice(0, -1).trimEnd();
+        let x = cutToolNoise(l.replace(/^\s*\$\s+/, "").trim());
         if (!x || x === "$") continue;
 
         // Heuristic: drop obvious command output lines when the model accidentally pastes them
@@ -248,4 +267,3 @@
     normalizeExecScript,
   };
 })();
-

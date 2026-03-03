@@ -55,6 +55,31 @@ fn sanitize_shellish_command(cmd: &str) -> String {
             }
         }
 
+        // Some models leak tool-call syntax into code fences (e.g. "assistant to=...").
+        // Strip anything after the first known marker to keep the command runnable.
+        let lower = ln.to_ascii_lowercase();
+        let noise_tokens = [
+            "assistant to=",
+            "to=multi_tool_use.",
+            "to=functions.",
+            "to=web.run",
+            "recipient_name",
+            "parameters:",
+        ];
+        let mut cut_at: Option<usize> = None;
+        for tok in &noise_tokens {
+            if let Some(idx) = lower.find(tok) {
+                cut_at = Some(cut_at.map_or(idx, |c| c.min(idx)));
+            }
+        }
+        if let Some(idx) = cut_at {
+            ln.truncate(idx);
+            ln = ln.trim_end().to_string();
+        }
+
+        if ln.trim().is_empty() {
+            continue;
+        }
         out.push(ln);
     }
 
@@ -68,10 +93,27 @@ fn sanitize_shellish_command(cmd: &str) -> String {
         }
     }
 
-    // Strip trailing unmatched "}" (common artifact).
-    while s.ends_with('}') && s.matches('{').count() < s.matches('}').count() {
-        s.pop();
-        s = s.trim_end().to_string();
+    // Strip trailing unmatched "}" / "]" (common artifacts).
+    // Models sometimes emit "}}]}" or similar when mixing tool syntax into a shell line.
+    loop {
+        let t = s.trim_end();
+        if t.is_empty() {
+            s = t.to_string();
+            break;
+        }
+
+        let mut changed = false;
+        if t.ends_with('}') && t.matches('{').count() < t.matches('}').count() {
+            s = t[..t.len() - 1].trim_end().to_string();
+            changed = true;
+        } else if t.ends_with(']') && t.matches('[').count() < t.matches(']').count() {
+            s = t[..t.len() - 1].trim_end().to_string();
+            changed = true;
+        }
+
+        if !changed {
+            break;
+        }
     }
 
     s
@@ -593,6 +635,13 @@ mod tests {
         assert!(s.contains("mkdir -p foo"));
         assert!(s.contains("cd foo"));
         assert!(s.contains("touch a.txt"));
+    }
+
+    #[test]
+    fn sanitize_strips_leaked_tool_noise() {
+        let s = "New-Item -ItemType Directory -Force -Path 'src/'}}]} assistant to=multi_tool_use.parallel 0";
+        let cleaned = sanitize_shellish_command(s);
+        assert_eq!(cleaned, "New-Item -ItemType Directory -Force -Path 'src/'");
     }
 
     #[test]

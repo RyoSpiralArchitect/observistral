@@ -146,9 +146,16 @@ fn truncate_model(name: &str, max: usize) -> String {
 // ── Body: two-pane split ──────────────────────────────────────────────────────
 
 fn render_body(frame: &mut Frame, area: Rect, app: &App) {
+    // Give the focused side more space; long Observer critiques are otherwise painful to read.
+    let (left_pct, right_pct) = if app.focus == Focus::Right {
+        (40u16, 60u16)
+    } else {
+        (55u16, 45u16)
+    };
+
     let horiz = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Percentage(left_pct), Constraint::Percentage(right_pct)])
         .split(area);
 
     render_message_pane(frame, horiz[0], app, PaneView::Coder, app.focus == Focus::Coder);
