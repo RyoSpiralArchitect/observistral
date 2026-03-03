@@ -1052,6 +1052,7 @@ After it succeeds, verify and continue.";
                 cur_cwd = Some(p);
             }
         }
+        let escaped_tool_root = cwd_after_note.is_some();
         let cwd_after_label = cur_cwd
             .as_deref()
             .unwrap_or(cwd_used_label.as_str())
@@ -1081,7 +1082,7 @@ After it succeeds, verify and continue.";
         } else {
             None
         };
-        let effective_exit_code = if exit_code == 0 && suspicious_reason.is_some() {
+        let effective_exit_code = if exit_code == 0 && (suspicious_reason.is_some() || escaped_tool_root) {
             1
         } else {
             exit_code
@@ -1095,6 +1096,12 @@ After it succeeds, verify and continue.";
             if let Some(reason) = suspicious_reason {
                 out = format!(
                     "NOTE: command returned exit_code=0 but was treated as failure.\nreason: {reason}\n\n{out}"
+                );
+            }
+            if escaped_tool_root && exit_code == 0 {
+                out = format!(
+                    "NOTE: command escaped tool_root and was treated as failure.\n\
+This is blocked to prevent nested-repo / accidental repo-root modifications.\n\n{out}"
                 );
             }
             inject_cwd(&out, &cwd_line, note.as_deref())
@@ -1120,7 +1127,15 @@ After it succeeds, verify and continue.";
         } else {
             state = AgentState::Planning;
         }
-        pending_system_hint = mem.on_tool_result(&command, &stdout, &stderr, effective_exit_code);
+        pending_system_hint = if escaped_tool_root {
+            Some(
+                "SANDBOX BREACH: Your command ended outside tool_root.\n\
+Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` stays under tool_root."
+                    .to_string(),
+            )
+        } else {
+            mem.on_tool_result(&command, &stdout, &stderr, effective_exit_code)
+        };
 
         // Safety: stop if we've hit the iteration cap.
         if iter + 1 == MAX_ITERS {

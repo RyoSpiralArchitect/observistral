@@ -168,6 +168,36 @@ fn swap_max_tokens_to_max_completion_tokens(payload: &mut serde_json::Value) {
     }
 }
 
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
+fn retry_after_duration(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let v = headers.get("retry-after")?;
+    let s = v.to_str().ok()?.trim();
+    let secs: u64 = s.parse().ok()?;
+    Some(Duration::from_secs(secs.min(15)))
+}
+
+fn backoff_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    let pow = attempt.min(5) as u32;
+    let factor = 1u64.checked_shl(pow).unwrap_or(u64::MAX);
+    let base_ms = 500u64.saturating_mul(factor);
+    let mut d = Duration::from_millis(base_ms.min(6000));
+    if let Some(ra) = retry_after {
+        if ra > d {
+            d = ra;
+        }
+    }
+    d
+}
+
+fn is_retryable_send_error(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect()
+}
+
 fn prompt_from_chat_messages(messages: &[serde_json::Value]) -> String {
     let mut out = String::new();
 
@@ -384,6 +414,9 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
     if let Some(tools) = &req.tools {
         if !tools.is_empty() {
             payload["tools"] = json!(tools);
+            // Prefer forcing tool calls for agentic execution; if a provider rejects this,
+            // we will retry once without tool_choice.
+            payload["tool_choice"] = json!("required");
         }
     }
 
@@ -599,87 +632,102 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
     if let Some(tools) = &req.tools {
         if !tools.is_empty() {
             payload["tools"] = json!(tools);
+            payload["tool_choice"] = json!("required");
         }
     }
 
     let timeout = Duration::from_secs(req.timeout_seconds.unwrap_or(120));
     let mut last_err: Option<String> = None;
     let mut want_completions = false;
-    let payload_cur = payload.clone();
     let mut resp: Option<reqwest::Response> = None;
 
+    const MAX_CONNECT_RETRIES: usize = 3;
+
     for url in openai_compat_chat_urls(&base_url) {
-        let mut http_req = state.client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .timeout(timeout)
-            .json(&payload_cur);
+        let mut payload_try = payload.clone();
+        let mut attempt: usize = 0;
 
-        if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
-            http_req = http_req.bearer_auth(key);
-        }
-
-        let r = match http_req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                #[derive(Serialize)]
-                struct E { error: String }
-                return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
-            }
-        };
-
-        let status = r.status();
-        if status.is_success() {
-            resp = Some(r);
-            break;
-        }
-
-        let body_text = r.text().await.unwrap_or_default();
-
-        if should_swap_to_max_completion_tokens(status, &body_text) && payload_cur.get("max_tokens").is_some() {
-            let mut payload2 = payload_cur.clone();
-            swap_max_tokens_to_max_completion_tokens(&mut payload2);
-            let mut http_req2 = state.client
+        loop {
+            let mut http_req = state.client
                 .post(&url)
                 .header("Content-Type", "application/json")
                 .timeout(timeout)
-                .json(&payload2);
+                .json(&payload_try);
+
             if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
-                http_req2 = http_req2.bearer_auth(key);
+                http_req = http_req.bearer_auth(key);
             }
-            let r2 = match http_req2.send().await {
+
+            let r = match http_req.send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    if attempt < MAX_CONNECT_RETRIES && is_retryable_send_error(&e) {
+                        last_err = Some(e.to_string());
+                        let d = backoff_delay(attempt, None);
+                        attempt = attempt.saturating_add(1);
+                        tokio::time::sleep(d).await;
+                        continue;
+                    }
                     #[derive(Serialize)]
                     struct E { error: String }
                     return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
                 }
             };
-            let status2 = r2.status();
-            if status2.is_success() {
-                resp = Some(r2);
+
+            let status = r.status();
+            if status.is_success() {
+                resp = Some(r);
                 break;
             }
-            let body2 = r2.text().await.unwrap_or_default();
-            last_err = Some(format!("API error (HTTP {status2}): {body2}"));
-            continue;
+
+            let ra = retry_after_duration(r.headers());
+            let body_text = r.text().await.unwrap_or_default();
+
+            if should_swap_to_max_completion_tokens(status, &body_text) && payload_try.get("max_tokens").is_some() {
+                swap_max_tokens_to_max_completion_tokens(&mut payload_try);
+                continue;
+            }
+
+            // Some providers reject tool_choice. Retry once without it.
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && body_text.to_ascii_lowercase().contains("tool_choice")
+                && (body_text.to_ascii_lowercase().contains("unsupported")
+                    || body_text.to_ascii_lowercase().contains("unknown"))
+            {
+                if let Some(obj) = payload_try.as_object_mut() {
+                    obj.remove("tool_choice");
+                }
+                continue;
+            }
+
+            if should_use_v1_completions(status, &body_text) {
+                want_completions = true;
+                last_err = Some(format!("API error (HTTP {status}): {body_text}"));
+                break;
+            }
+
+            if status == reqwest::StatusCode::NOT_FOUND {
+                last_err = Some(format!("API error (HTTP {status}): {body_text}"));
+                break;
+            }
+
+            if attempt < MAX_CONNECT_RETRIES && is_retryable_status(status) {
+                last_err = Some(format!("API error (HTTP {status}): {body_text}"));
+                let d = backoff_delay(attempt, ra);
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(d).await;
+                continue;
+            }
+
+            #[derive(Serialize)]
+            struct E { error: String }
+            return write_json(stream, 502, "Bad Gateway",
+                &E { error: format!("API error (HTTP {status}): {body_text}") }).await;
         }
 
-        if should_use_v1_completions(status, &body_text) {
-            want_completions = true;
-            last_err = Some(format!("API error (HTTP {status}): {body_text}"));
+        if resp.is_some() || want_completions {
             break;
         }
-
-        if status == reqwest::StatusCode::NOT_FOUND {
-            last_err = Some(format!("API error (HTTP {status}): {body_text}"));
-            continue;
-        }
-
-        #[derive(Serialize)]
-        struct E { error: String }
-        return write_json(stream, 502, "Bad Gateway",
-            &E { error: format!("API error (HTTP {status}): {body_text}") }).await;
     }
 
     if resp.is_none() && want_completions {

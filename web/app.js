@@ -2197,6 +2197,16 @@
         setWorkdir(safeRel);
       };
 
+      const sandboxBreachReason = (pwdAfter) => {
+        // Detect if a command ended outside tool_root. This is a common cause of nested-git disasters.
+        const p0 = String(pwdAfter || "").trim();
+        if (!p0 || !threadRootNorm) return "";
+        const p = normalizePathSep(p0).replace(/\/+$/g, "");
+        const idx = p.toLowerCase().lastIndexOf(threadRootNorm.toLowerCase());
+        if (idx === -1) return `cwd_after escaped tool_root: ${p0}`;
+        return "";
+      };
+
       // UI-side loop breaker: if the model repeats the exact same failing command,
       // block it and force a different strategy.
       const cmdStats = new Map(); // key -> { attempts, fails, lastErr }
@@ -2345,10 +2355,11 @@
         "<think>",
         "goal: <≤12 words: what must succeed right now>",
         "risk: <≤12 words: most likely failure mode>",
+        "doubt: <≤12 words: one reason this could be wrong>",
         "next: <≤12 words: exact command or step>",
         "verify: <≤12 words: how to confirm this step succeeded>",
         "</think>",
-        "This 4-line check (~40 tokens) prevents wrong-direction errors that cost 300+ tokens to recover.",
+        "This 5-line check (~50 tokens) prevents wrong-direction errors that cost 300+ tokens to recover.",
         "",
         "[Error Protocol]",
         "If exit_code ≠ 0: STOP immediately.",
@@ -2567,16 +2578,22 @@
                 const execCmd = wrapExecWithPwd(commandToRun);
                 const execRes = await postJson("/api/exec", { command: execCmd, cwd: cwdUsed }, ac.signal);
                 const parsed = stripPwdMarker(execRes.stdout);
+                const breach = sandboxBreachReason(parsed.pwd);
                 maybeUpdateWorkdirFromPwd(parsed.pwd);
                 const stdout = truncTool(parsed.stdout, TRUNC_STDOUT);
                 const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
                 const exitCode = execRes.exit_code;
                 const looksHardError = (t) => /(^|\n)\s*(fatal:|error:|exception|traceback)\b/i.test(String(t || ""));
-                const failed = exitCode !== 0 || looksHardError(stderr);
+                const failed = exitCode !== 0 || looksHardError(stderr) || !!breach;
                 noteCmd(k, failed, cmdSig(stderr, stdout));
                 const hintGit = failed ? gitRepoHint(stderr) : "";
                 const hintGov = failed ? deriveGovernorHint(stderr, stdout) : "";
-                const hint = [hintGit, hintGov].filter(Boolean).join("\n\n");
+                const hintSandbox = breach ? [
+                  "SANDBOX BREACH: command ended outside tool_root.",
+                  breach,
+                  "Fix: re-run under tool_root; avoid `cd ..` / absolute paths. Verify `pwd` stays under tool_root.",
+                ].join("\n") : "";
+                const hint = [hintGit, hintGov, hintSandbox].filter(Boolean).join("\n\n");
 
                 const cwdUsedLabel = cwdUsed ? String(cwdUsed) : "(workspace root)";
                 const cwdAfter = cwdNow();
@@ -2587,7 +2604,8 @@
 
                 if (failed) {
                   governor.consecutiveFailures++;
-                  const sig = cmdSig(stderr, stdout);
+                  const sig0 = cmdSig(stderr, stdout);
+                  const sig = sig0 || (breach ? String(breach).slice(0, 180) : "");
                   if (sig && sig === governor.lastErrSig) governor.sameErrRepeats++;
                   else { governor.lastErrSig = sig; governor.sameErrRepeats = 1; }
                   const outHash = fnv1a64(String(stderr || "") + "\n" + String(stdout || ""));
@@ -2596,13 +2614,17 @@
 
                   // Escalate: if we're stuck, inject a hint to force a strategy change.
                   if (governor.sameErrRepeats >= 2 || governor.sameOutRepeats >= 2 || governor.consecutiveFailures >= 3) {
-                    governor.pendingHint = [
+                    const stuck = [
                       "You are stuck in a failure loop.",
                       governor.lastErrSig ? ("last_error_signature: " + governor.lastErrSig) : "",
                       "STOP repeating the same approach. Change strategy.",
                       hintGov || hintGit || "",
                       "First verify cwd/tool_root, then pick a different command.",
                     ].filter(Boolean).join("\n");
+                    governor.pendingHint = breach ? (hintSandbox + "\n\n" + stuck) : stuck;
+                  } else if (breach) {
+                    // Sandbox breaches are always critical: force a correction immediately.
+                    governor.pendingHint = hintSandbox;
                   }
                 } else {
                   governor.consecutiveFailures = 0;
@@ -2734,6 +2756,7 @@
                 const execCmd = wrapExecWithPwd(probeCmd);
                 const execRes = await postJson("/api/exec", { command: execCmd, cwd: cwdUsed }, ac.signal);
                 const parsed = stripPwdMarker(execRes.stdout);
+                const breach = sandboxBreachReason(parsed.pwd);
                 maybeUpdateWorkdirFromPwd(parsed.pwd);
                 const stdout = String(parsed.stdout || "").trim();
 
@@ -2752,6 +2775,19 @@
 
                 display += (stdout ? ("\n" + truncTool(stdout, TRUNC_STDOUT)) : "\n(stdout empty)") + "\n```";
                 flush();
+
+                if (breach) {
+                  messages.push({
+                    role: "user",
+                    content: [
+                      "[sandbox_breach]",
+                      "A command ended outside tool_root. This is blocked to prevent repo-root modification accidents.",
+                      breach,
+                      "Fix: re-run under tool_root; avoid `cd ..` / absolute paths. Verify `pwd` stays under tool_root.",
+                    ].join("\n"),
+                  });
+                  continue;
+                }
 
                 if (missing.length) {
                   messages.push({
@@ -2816,16 +2852,22 @@
               const execCmd = wrapExecWithPwd(commandToRun);
               const execRes = await postJson("/api/exec", { command: execCmd, cwd: cwdUsed }, ac.signal);
               const parsed = stripPwdMarker(execRes.stdout);
+              const breach = sandboxBreachReason(parsed.pwd);
               maybeUpdateWorkdirFromPwd(parsed.pwd);
               const stdout = truncTool(parsed.stdout, TRUNC_STDOUT);
               const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
               const exitCode = execRes.exit_code;
               const looksHardError = (t) => /(^|\n)\s*(fatal:|error:|exception|traceback)\b/i.test(String(t || ""));
-              const failed = exitCode !== 0 || looksHardError(stderr);
+              const failed = exitCode !== 0 || looksHardError(stderr) || !!breach;
               noteCmd(k, failed, cmdSig(stderr, stdout));
               const hintGit = failed ? gitRepoHint(stderr) : "";
               const hintGov = failed ? deriveGovernorHint(stderr, stdout) : "";
-              const hint = [hintGit, hintGov].filter(Boolean).join("\n\n");
+              const hintSandbox = breach ? [
+                "SANDBOX BREACH: command ended outside tool_root.",
+                breach,
+                "Fix: re-run under tool_root; avoid `cd ..` / absolute paths. Verify `pwd` stays under tool_root.",
+              ].join("\n") : "";
+              const hint = [hintGit, hintGov, hintSandbox].filter(Boolean).join("\n\n");
 
               const cwdUsedLabel = cwdUsed ? String(cwdUsed) : "(workspace root)";
               const cwdAfter = cwdNow();
@@ -2836,7 +2878,8 @@
 
               if (failed) {
                 governor.consecutiveFailures++;
-                const sig = cmdSig(stderr, stdout);
+                const sig0 = cmdSig(stderr, stdout);
+                const sig = sig0 || (breach ? String(breach).slice(0, 180) : "");
                 if (sig && sig === governor.lastErrSig) governor.sameErrRepeats++;
                 else { governor.lastErrSig = sig; governor.sameErrRepeats = 1; }
                 const outHash = fnv1a64(String(stderr || "") + "\n" + String(stdout || ""));
@@ -2844,13 +2887,16 @@
                 else { governor.lastOutHash = outHash; governor.sameOutRepeats = 1; }
 
                 if (governor.sameErrRepeats >= 2 || governor.sameOutRepeats >= 2 || governor.consecutiveFailures >= 3) {
-                  governor.pendingHint = [
+                  const stuck = [
                     "You are stuck in a failure loop.",
                     governor.lastErrSig ? ("last_error_signature: " + governor.lastErrSig) : "",
                     "STOP repeating the same approach. Change strategy.",
                     hintGov || hintGit || "",
                     "First verify cwd/tool_root, then pick a different command.",
                   ].filter(Boolean).join("\n");
+                  governor.pendingHint = breach ? (hintSandbox + "\n\n" + stuck) : stuck;
+                } else if (breach) {
+                  governor.pendingHint = hintSandbox;
                 }
               } else {
                 governor.consecutiveFailures = 0;

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde_json::json;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -45,6 +45,47 @@ fn should_use_v1_completions(status: reqwest::StatusCode, body: &str) -> bool {
         return true;
     }
     false
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
+fn retry_after_duration(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    // Best-effort: support only integer seconds (common for 429).
+    let v = headers.get("retry-after")?;
+    let s = v.to_str().ok()?.trim();
+    let secs: u64 = s.parse().ok()?;
+    Some(Duration::from_secs(secs.min(15)))
+}
+
+fn backoff_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    // attempt: 0..N (0 = first retry)
+    let pow = attempt.min(5) as u32;
+    // Keep this robust even if the cap changes in the future.
+    let factor = 1u64.checked_shl(pow).unwrap_or(u64::MAX);
+    let base_ms = 500u64.saturating_mul(factor);
+    let mut d = Duration::from_millis(base_ms.min(6000));
+    if let Some(ra) = retry_after {
+        if ra > d {
+            d = ra;
+        }
+    }
+    d
+}
+
+fn is_retryable_send_error(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect()
+}
+
+fn swap_max_tokens_to_max_completion_tokens(payload: &mut serde_json::Value) {
+    if let Some(obj) = payload.as_object_mut() {
+        if let Some(mt) = obj.remove("max_tokens") {
+            obj.insert("max_completion_tokens".to_string(), mt);
+        }
+    }
 }
 
 fn prompt_from_json_messages(messages: &[serde_json::Value]) -> String {
@@ -143,78 +184,99 @@ pub async fn stream_openai_compat_json(
 
     let mut resp: Option<reqwest::Response> = None;
 
+    const MAX_CONNECT_RETRIES: usize = 3;
+
     for url in stream_chat_urls_for_base_url(&cfg.base_url) {
-        let mut req = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(cfg.timeout_seconds))
-            .json(&payload);
-        if let Some(key) = &cfg.api_key {
-            req = req.bearer_auth(key);
-        }
+        let connect_ctx = format!(
+            "failed to connect to {url}\n\
+             If behind a proxy, set: $env:HTTPS_PROXY=\"http://host:port\""
+        );
 
-        let r = req.send().await.with_context(|| {
-            format!(
-                "failed to connect to {url}\n\
-                 If behind a proxy, set: $env:HTTPS_PROXY=\"http://host:port\""
-            )
-        })?;
-
-        let status = r.status();
-        if status.is_success() {
-            resp = Some(r);
-            break;
-        }
-
-        let body = r.text().await.unwrap_or_default();
-
-        // Some models reject `max_tokens` and require `max_completion_tokens`.
-        if status == reqwest::StatusCode::BAD_REQUEST
-            && body.contains("max_completion_tokens")
-            && body.contains("max_tokens")
-            && payload.get("max_tokens").is_some()
-        {
-            let mut payload2 = payload.clone();
-            if let Some(mt) = payload2.get("max_tokens").cloned() {
-                if let Some(obj) = payload2.as_object_mut() {
-                    obj.remove("max_tokens");
-                    obj.insert("max_completion_tokens".to_string(), mt);
-                }
-            }
-
-            let mut req2 = client
+        let mut payload_try = payload.clone();
+        let mut attempt: usize = 0;
+        loop {
+            let mut req = client
                 .post(&url)
                 .header("Content-Type", "application/json")
                 .timeout(Duration::from_secs(cfg.timeout_seconds))
-                .json(&payload2);
+                .json(&payload_try);
             if let Some(key) = &cfg.api_key {
-                req2 = req2.bearer_auth(key);
+                req = req.bearer_auth(key);
             }
 
-            let r2 = req2.send().await.context("request failed")?;
-            let status2 = r2.status();
-            if status2.is_success() {
-                resp = Some(r2);
+            let r = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let retryable = is_retryable_send_error(&e);
+                    let err = anyhow!(e).context(connect_ctx.clone());
+                    if attempt < MAX_CONNECT_RETRIES && retryable {
+                        last_err = Some(err);
+                        let d = backoff_delay(attempt, None);
+                        attempt = attempt.saturating_add(1);
+                        tokio::time::sleep(d).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+
+            let status = r.status();
+            if status.is_success() {
+                resp = Some(r);
                 break;
             }
-            let body2 = r2.text().await.unwrap_or_default();
-            last_err = Some(anyhow!("{label} API error (HTTP {status2})\n{body2}"));
-            continue;
+
+            let ra = retry_after_duration(r.headers());
+            let body = r.text().await.unwrap_or_default();
+
+            // Some models reject `max_tokens` and require `max_completion_tokens`.
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && body.contains("max_completion_tokens")
+                && body.contains("max_tokens")
+                && payload_try.get("max_tokens").is_some()
+            {
+                swap_max_tokens_to_max_completion_tokens(&mut payload_try);
+                // Retry immediately with adjusted payload (do not count as backoff attempt).
+                continue;
+            }
+
+            // Some providers don't support tool_choice. Retry once without it.
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && body.to_ascii_lowercase().contains("tool_choice")
+                && (body.to_ascii_lowercase().contains("unsupported")
+                    || body.to_ascii_lowercase().contains("unknown"))
+            {
+                if let Some(obj) = payload_try.as_object_mut() {
+                    obj.remove("tool_choice");
+                }
+                continue;
+            }
+
+            if should_use_v1_completions(status, &body) {
+                want_completions = true;
+                last_err = Some(anyhow!("{label} API error (HTTP {status})\n{body}"));
+                break;
+            }
+
+            // Endpoint mismatch (e.g. Codestral uses /chat/completion). Try next candidate.
+            if status == reqwest::StatusCode::NOT_FOUND {
+                last_err = Some(anyhow!("{label} API error (HTTP {status})\n{body}"));
+                break;
+            }
+
+            if attempt < MAX_CONNECT_RETRIES && is_retryable_status(status) {
+                let d = backoff_delay(attempt, ra);
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(d).await;
+                continue;
+            }
+
+            return Err(anyhow!("{label} API error (HTTP {status})\n{body}"));
         }
 
-        if should_use_v1_completions(status, &body) {
-            want_completions = true;
-            last_err = Some(anyhow!("{label} API error (HTTP {status})\n{body}"));
+        if resp.is_some() || want_completions {
             break;
         }
-
-        // Endpoint mismatch (e.g. Codestral uses /chat/completion). Try next candidate.
-        if status == reqwest::StatusCode::NOT_FOUND {
-            last_err = Some(anyhow!("{label} API error (HTTP {status})\n{body}"));
-            continue;
-        }
-
-        return Err(anyhow!("{label} API error (HTTP {status})\n{body}"));
     }
 
     let mut resp = if let Some(r) = resp {
@@ -231,52 +293,55 @@ pub async fn stream_openai_compat_json(
         });
 
         // No tools on completions endpoint.
-        let mut req = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(cfg.timeout_seconds))
-            .json(&comp_payload);
-        if let Some(key) = &cfg.api_key {
-            req = req.bearer_auth(key);
-        }
+        let mut attempt: usize = 0;
+        loop {
+            let mut req = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .timeout(Duration::from_secs(cfg.timeout_seconds))
+                .json(&comp_payload);
+            if let Some(key) = &cfg.api_key {
+                req = req.bearer_auth(key);
+            }
 
-        let r = req.send().await.context("request failed")?;
-        let status = r.status();
-        if status.is_success() {
-            r
-        } else {
+            let r = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt < MAX_CONNECT_RETRIES && is_retryable_send_error(&e) {
+                        let d = backoff_delay(attempt, None);
+                        attempt = attempt.saturating_add(1);
+                        tokio::time::sleep(d).await;
+                        continue;
+                    }
+                    return Err(anyhow!(e).context("request failed"));
+                }
+            };
+
+            let status = r.status();
+            if status.is_success() {
+                break r;
+            }
+
+            let ra = retry_after_duration(r.headers());
             let body = r.text().await.unwrap_or_default();
-            // Retry once using max_completion_tokens if hinted.
+
             if status == reqwest::StatusCode::BAD_REQUEST
                 && body.contains("max_completion_tokens")
                 && body.contains("max_tokens")
                 && comp_payload.get("max_tokens").is_some()
             {
-                if let Some(mt) = comp_payload.get("max_tokens").cloned() {
-                    if let Some(obj) = comp_payload.as_object_mut() {
-                        obj.remove("max_tokens");
-                        obj.insert("max_completion_tokens".to_string(), mt);
-                    }
-                }
-                let mut req2 = client
-                    .post(&url)
-                    .header("Content-Type", "application/json")
-                    .timeout(Duration::from_secs(cfg.timeout_seconds))
-                    .json(&comp_payload);
-                if let Some(key) = &cfg.api_key {
-                    req2 = req2.bearer_auth(key);
-                }
-                let r2 = req2.send().await.context("request failed")?;
-                let status2 = r2.status();
-                if status2.is_success() {
-                    r2
-                } else {
-                    let body2 = r2.text().await.unwrap_or_default();
-                    return Err(anyhow!("{label} API error (HTTP {status2})\n{body2}"));
-                }
-            } else {
-                return Err(anyhow!("{label} API error (HTTP {status})\n{body}"));
+                swap_max_tokens_to_max_completion_tokens(&mut comp_payload);
+                continue;
             }
+
+            if attempt < MAX_CONNECT_RETRIES && is_retryable_status(status) {
+                let d = backoff_delay(attempt, ra);
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(d).await;
+                continue;
+            }
+
+            return Err(anyhow!("{label} API error (HTTP {status})\n{body}"));
         }
     } else {
         return Err(last_err.unwrap_or_else(|| anyhow!("{label} request failed")));
@@ -422,23 +487,49 @@ pub async fn stream_anthropic(
         "stream": true,
     });
 
-    let resp = client
-        .post(&url)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", crate::providers::anthropic::ANTHROPIC_VERSION)
-        .header("Accept", "text/event-stream")
-        .header("Content-Type", "application/json")
-        .timeout(Duration::from_secs(cfg.timeout_seconds))
-        .json(&payload)
-        .send()
-        .await
-        .context("request failed")?;
+    const MAX_CONNECT_RETRIES: usize = 3;
+    let mut attempt: usize = 0;
+    let resp = loop {
+        let r = client
+            .post(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", crate::providers::anthropic::ANTHROPIC_VERSION)
+            .header("Accept", "text/event-stream")
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(cfg.timeout_seconds))
+            .json(&payload)
+            .send()
+            .await;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt < MAX_CONNECT_RETRIES && is_retryable_send_error(&e) {
+                    let d = backoff_delay(attempt, None);
+                    attempt = attempt.saturating_add(1);
+                    tokio::time::sleep(d).await;
+                    continue;
+                }
+                return Err(anyhow!(e).context("request failed"));
+            }
+        };
+
+        let status = r.status();
+        if status.is_success() {
+            break r;
+        }
+
+        let ra = retry_after_duration(r.headers());
+        let body = r.text().await.unwrap_or_default();
+        if attempt < MAX_CONNECT_RETRIES && is_retryable_status(status) {
+            let d = backoff_delay(attempt, ra);
+            attempt = attempt.saturating_add(1);
+            tokio::time::sleep(d).await;
+            continue;
+        }
+
         return Err(anyhow!("Anthropic API error (HTTP {status})\n{body}"));
-    }
+    };
 
     let mut resp = resp;
     let mut buf: Vec<u8> = Vec::new();
