@@ -1128,7 +1128,7 @@
       else cfg.observerIntensity = DEFAULT_CONFIG.observerIntensity;
       {
         const ol0 = String(cfg.observerLang || "").trim().toLowerCase();
-        if (ol0 === "ui" || ol0 === "ja" || ol0 === "en" || ol0 === "fr") cfg.observerLang = ol0;
+        if (ol0 === "ui" || ol0 === "auto" || ol0 === "ja" || ol0 === "en" || ol0 === "fr") cfg.observerLang = ol0;
         else cfg.observerLang = DEFAULT_CONFIG.observerLang;
       }
       if (typeof cfg.includeCoderContext !== "boolean") cfg.includeCoderContext = !!DEFAULT_CONFIG.includeCoderContext;
@@ -3548,8 +3548,40 @@
         loopInfo && loopInfo.depth > 0
           ? `ui_loop_detected: depth=${loopInfo.depth} sim=${Math.round((loopInfo.score || 0) * 100)}%`
           : "";
+      const inferLangFromText = (s) => {
+        const x = String(s || "");
+        const jp = (x.match(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g) || []).length;
+        if (jp >= 1) return "ja";
+        const acc = (x.match(/[\u00C0-\u017F]/g) || []).length;
+        const fr = (x.match(/\b(le|la|les|des|du|de|pour|avec|sans|est|sont|pas|mais|donc|sur|dans|vous|tu|je|nous|votre)\b/gi) || []).length;
+        if (acc > 0 || fr >= 2) return "fr";
+        return "en";
+      };
       const outLang = (() => {
         const ol0 = String(config.observerLang || "ui").trim().toLowerCase();
+        if (ol0 === "auto") {
+          const sample = (() => {
+            try {
+              const pickLastUser = (pane) => {
+                const msgs = pane ? paneMessages(pane) : (activeThread && activeThread.messages) || [];
+                if (!msgs || !msgs.length) return "";
+                for (let i = msgs.length - 1; i >= 0; i--) {
+                  const m = msgs[i];
+                  if (!m || m.role !== "user") continue;
+                  const t = String(m.content || "").trim();
+                  if (t) return t;
+                }
+                return "";
+              };
+              return pickLastUser("coder") || pickLastUser("chat") || pickLastUser("");
+            } catch (_) {
+              return "";
+            }
+          })();
+          const sampleTrim = String(sample || "").trim();
+          if (!sampleTrim) return String(lang || "ja").trim().toLowerCase();
+          return inferLangFromText(sampleTrim);
+        }
         if (ol0 === "ja" || ol0 === "en" || ol0 === "fr") return ol0;
         return String(lang || "ja").trim().toLowerCase();
       })();
@@ -4591,6 +4623,7 @@
                     onChange: (ev) => setConfig({ ...config, observerLang: ev.target.value }),
                   },
                   e("option", { value: "ui" }, "UI"),
+                  e("option", { value: "auto" }, "Auto"),
                   e("option", { value: "ja" }, "JA"),
                   e("option", { value: "en" }, "EN"),
                   e("option", { value: "fr" }, "FR"),
