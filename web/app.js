@@ -2256,10 +2256,74 @@
       // block it and force a different strategy.
       const cmdStats = new Map(); // key -> { attempts, fails, lastErr }
       const cmdKey = (cmd) => String(cmd || "").toLowerCase().replace(/\s+/g, " ").trim();
-      const cmdSig = (stderr, stdout) => {
+
+      // Failure signatures (noise-resistant): collapse digits, lowercase, collapse whitespace.
+      // This improves loop detection vs messages that differ only by line numbers / timestamps.
+      const normalizeForSig = (s) => {
+        const t = String(s || "").trim();
+        if (!t) return "";
+        let out = "";
+        for (let i = 0; i < t.length && out.length < 160; i++) {
+          const ch = t[i];
+          const code = ch.charCodeAt(0);
+          if (code >= 48 && code <= 57) out += "#";
+          else out += ch.toLowerCase();
+        }
+        return out.replace(/\s+/g, " ").trim();
+      };
+
+      const commandSig = (command) => {
+        const raw = String(command || "").replace(/\r\n/g, "\n");
+        const first = raw.split("\n").find((l) => String(l || "").trim()) || "";
+        return normalizeForSig(first.split(/\s+/).join(" "));
+      };
+
+      const pickInterestingErrorLine = (stdout, stderr) => {
+        const keywords = [
+          "error",
+          "fatal",
+          "exception",
+          "traceback",
+          "parsererror",
+          "unexpected token",
+          "not recognized",
+          "commandnotfoundexception",
+          "missing expression",
+          "unable to",
+          "could not",
+          "access is denied",
+          "permission denied",
+        ];
+
+        const scan = (src) => {
+          const raw = String(src || "").replace(/\r\n/g, "\n");
+          for (const ln of raw.split("\n")) {
+            const t = String(ln || "").trim();
+            if (!t) continue;
+            const low = t.toLowerCase();
+            if (keywords.some((k) => low.includes(k))) {
+              return normalizeForSig(t);
+            }
+          }
+          return "";
+        };
+
+        return scan(stderr) || scan(stdout) || "";
+      };
+
+      const errorSignature = (command, stdout, stderr, exitCode) => {
+        const cmd = commandSig(command);
+        const err = pickInterestingErrorLine(stdout, stderr);
+        const out = `exit=${exitCode}|cmd=${cmd}|err=${err}`;
+        return out.length > 220 ? out.slice(0, 220) : out;
+      };
+
+      const errorLineSig = (stdout, stderr) => {
+        const p = pickInterestingErrorLine(stdout, stderr);
+        if (p) return p;
         const s = String(stderr || "") || String(stdout || "");
-        const first = (s.split("\n")[0] || "").trim();
-        return first.slice(0, 180);
+        const first = (s.replace(/\r\n/g, "\n").split("\n")[0] || "").trim();
+        return normalizeForSig(first).slice(0, 180);
       };
       const blockedByRepeatFailure = (k) => {
         const st = cmdStats.get(k);
@@ -2664,7 +2728,7 @@
                 const exitCode = execRes.exit_code;
                 const looksHardError = (t) => /(^|\n)\s*(fatal:|error:|exception|traceback)\b/i.test(String(t || ""));
                 const failed = exitCode !== 0 || looksHardError(stderr) || !!breach;
-                noteCmd(k, failed, cmdSig(stderr, stdout));
+                noteCmd(k, failed, errorLineSig(stdout, stderr));
                 const hintGit = failed ? gitRepoHint(stderr) : "";
                 const hintGov = failed ? deriveGovernorHint(stderr, stdout) : "";
                 const hintSandbox = breach ? [
@@ -2683,7 +2747,7 @@
 
                 if (failed) {
                   governor.consecutiveFailures++;
-                  const sig0 = cmdSig(stderr, stdout);
+                  const sig0 = errorSignature(commandToRun, stdout, stderr, exitCode);
                   const sig = sig0 || (breach ? String(breach).slice(0, 180) : "");
                   if (sig && sig === governor.lastErrSig) governor.sameErrRepeats++;
                   else { governor.lastErrSig = sig; governor.sameErrRepeats = 1; }
@@ -2721,7 +2785,7 @@
                 if (stderr) display += "\nstderr: " + stderr;
                 display += "\n```\nexit: " + exitCode;
               } catch (execErr) {
-                noteCmd(k, true, cmdSig(execErr.message || "", ""));
+                noteCmd(k, true, normalizeForSig(execErr.message || ""));
                 toolResult = `error: ${execErr.message}`;
                 display += "\nerror: " + execErr.message + "\n```";
               }
@@ -2968,7 +3032,7 @@
               const exitCode = execRes.exit_code;
               const looksHardError = (t) => /(^|\n)\s*(fatal:|error:|exception|traceback)\b/i.test(String(t || ""));
               const failed = exitCode !== 0 || looksHardError(stderr) || !!breach;
-              noteCmd(k, failed, cmdSig(stderr, stdout));
+              noteCmd(k, failed, errorLineSig(stdout, stderr));
               const hintGit = failed ? gitRepoHint(stderr) : "";
               const hintGov = failed ? deriveGovernorHint(stderr, stdout) : "";
               const hintSandbox = breach ? [
@@ -2987,7 +3051,7 @@
 
               if (failed) {
                 governor.consecutiveFailures++;
-                const sig0 = cmdSig(stderr, stdout);
+                const sig0 = errorSignature(commandToRun, stdout, stderr, exitCode);
                 const sig = sig0 || (breach ? String(breach).slice(0, 180) : "");
                 if (sig && sig === governor.lastErrSig) governor.sameErrRepeats++;
                 else { governor.lastErrSig = sig; governor.sameErrRepeats = 1; }
@@ -3035,7 +3099,7 @@
                 ].join("\n"),
               });
             } catch (execErr) {
-              noteCmd(k, true, cmdSig(execErr.message || "", ""));
+              noteCmd(k, true, normalizeForSig(execErr.message || ""));
               resultText = `error: ${execErr.message}`;
               display += "\nerror: " + execErr.message + "\n```";
               flush();
