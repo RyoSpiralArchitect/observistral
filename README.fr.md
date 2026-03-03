@@ -116,7 +116,7 @@ Par defaut: `.tmp/<thread-id>` pour isoler chaque thread et eviter les depots gi
 ### Approbations
 
 - **Edit approval**: `write_file` est mis en file d'attente (pending edits) et applique apres approbation.
-- **Command approval**: `exec` peut etre gate de la meme maniere (optionnel).
+- **Command approval**: `exec` est mis en file d'attente (pending commands) et approuve/rejete (le Coder reprend apres approbation).
 
 ## Providers
 

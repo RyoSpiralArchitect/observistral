@@ -83,7 +83,7 @@ Default: `.tmp/<thread-id>` so each thread is isolated and you avoid nested-git 
 ### Approvals
 
 - **Edit approval**: model requests `write_file` get queued as pending edits; you approve/reject.
-- **Command approval**: model requests `exec` can be gated the same way (optional).
+- **Command approval**: model requests `exec` get queued as pending commands; you approve/reject (Coder resumes after approval).
 
 ## Providers
 

@@ -54,6 +54,7 @@
       findInThread: "Find in thread…",
       noMatches: "No matches",
       pendingEdits: "Pending edits",
+      pendingCommands: "Pending commands",
       approve: "Approve",
       reject: "Reject",
       send: "Send",
@@ -223,6 +224,7 @@
       editApproval: "編集承認",
       commandApproval: "コマンド承認",
       pendingEdits: "保留中の編集",
+      pendingCommands: "保留中のコマンド",
       approve: "承認",
       reject: "却下",
     },
@@ -257,6 +259,7 @@
       findInThread: "Rechercher dans le fil…",
       noMatches: "Aucun résultat",
       pendingEdits: "Éditions en attente",
+      pendingCommands: "Commandes en attente",
       approve: "Approuver",
       reject: "Rejeter",
       send: "Envoyer",
@@ -1171,6 +1174,7 @@
     const [modelsErr, setModelsErr] = useState("");
     const [modelsTarget, setModelsTarget] = useState("chat");
     const [pendingEdits, setPendingEdits] = useState([]);
+    const [pendingCommands, setPendingCommands] = useState([]);
     const [pendingBusy, setPendingBusy] = useState(false);
     const [metaBusy, setMetaBusy] = useState(false);
     const [observerSubTab, setObserverSubTab] = useState("analysis"); // "analysis" | "chat"
@@ -1424,7 +1428,11 @@
     useEffect(() => {
       refreshStatus();
       refreshPendingEdits();
-      const t = setInterval(() => refreshPendingEdits(), 3000);
+      refreshPendingCommands();
+      const t = setInterval(() => {
+        refreshPendingEdits();
+        refreshPendingCommands();
+      }, 3000);
       return () => clearInterval(t);
     }, []);
 
@@ -1494,6 +1502,13 @@
         .catch(() => {});
     };
 
+    const refreshPendingCommands = () => {
+      fetch("/api/pending_commands")
+        .then((r) => r.json())
+        .then((j) => setPendingCommands(j && Array.isArray(j.pending) ? j.pending : []))
+        .catch(() => {});
+    };
+
     const resolvePendingEdit = async (id, approve) => {
       const eid = String(id || "").trim();
       if (!eid || pendingBusy) return;
@@ -1520,6 +1535,34 @@
       } finally {
         setPendingBusy(false);
         refreshPendingEdits();
+      }
+    };
+
+    const resolvePendingCommand = async (id, approve) => {
+      const cid = String(id || "").trim();
+      if (!cid || pendingBusy) return;
+      setPendingBusy(true);
+      try {
+        const resp = await postJson(approve ? "/api/approve_command" : "/api/reject_command", { id: cid });
+        if (approve && resp && resp.item && !sendingCoder) {
+          const it = resp.item;
+          const command = String(it.command || "").trim();
+          const cwd = it.cwd != null ? String(it.cwd || "").trim() : "";
+          const result = it.result != null ? JSON.stringify(it.result, null, 2) : "";
+          const preview = result && result.length > 1800 ? (result.slice(0, 1800) + "\n...truncated...") : result;
+          const msg = [
+            "[OBSTRAL] Pending command approved. Continue without redoing the approved step.",
+            `id: ${cid}`,
+            command ? `command: ${command}` : "",
+            cwd ? `cwd: ${cwd}` : "",
+            preview ? ("result:\n" + preview) : "",
+          ].filter(Boolean).join("\n");
+          sendCoder(msg);
+        }
+      } catch (_) {
+      } finally {
+        setPendingBusy(false);
+        refreshPendingCommands();
       }
     };
 
@@ -2579,12 +2622,35 @@
                   messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
                   continue;
                 }
-                if (config.requireCommandApproval && !window.confirm("Run command?\n\n" + commandToRun)) {
-                  toolResult = "error: command rejected by user";
-                  display += "\n(rejected)\n```\nexit: -1";
-                  flush();
-                  messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
-                  continue;
+                if (config.requireCommandApproval) {
+                  const canQueue = !!(status && status.features && status.features.pending_commands);
+                  if (canQueue) {
+                    try {
+                      const cwdUsed = cwdNow();
+                      const q = await postJson("/api/queue_command", { command: commandToRun, cwd: cwdUsed }, ac.signal);
+                      const aid = String((q && q.approval_id) || "");
+                      refreshPendingCommands();
+                      toolResult = aid
+                        ? `Awaiting approval via /api/approve_command\napproval_id: ${aid}`
+                        : "Awaiting approval via /api/approve_command";
+                      display += aid
+                        ? `\n(queued for approval: ${aid})\n\`\`\`\nexit: -1`
+                        : "\n(queued)\n```\nexit: -1";
+                      flush();
+                      messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                      awaitingApproval = true;
+                      break;
+                    } catch (_) {
+                      // Fall through to confirm() for older servers / transient failures.
+                    }
+                  }
+                  if (!window.confirm("Run command?\n\n" + commandToRun)) {
+                    toolResult = "error: command rejected by user";
+                    display += "\n(rejected)\n```\nexit: -1";
+                    flush();
+                    messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                    continue;
+                  }
                 }
 
                 const cwdUsed = cwdNow();
@@ -2853,12 +2919,42 @@
                 messages.push({ role: "user", content: `[exec blocked]\nreason: ${danger}\ncommand:\n${commandToRun}` });
                 break;
               }
-              if (config.requireCommandApproval && !window.confirm("Run command?\n\n" + commandToRun)) {
-                resultText = "error: command rejected by user";
-                display += "\n(rejected)\n```\nexit: -1";
-                flush();
-                messages.push({ role: "user", content: `[exec rejected]\ncommand:\n${commandToRun}` });
-                break;
+              if (config.requireCommandApproval) {
+                const canQueue = !!(status && status.features && status.features.pending_commands);
+                if (canQueue) {
+                  try {
+                    const cwdUsed = cwdNow();
+                    const q = await postJson("/api/queue_command", { command: commandToRun, cwd: cwdUsed }, ac.signal);
+                    const aid = String((q && q.approval_id) || "");
+                    refreshPendingCommands();
+                    resultText = aid
+                      ? `Awaiting approval via /api/approve_command\napproval_id: ${aid}`
+                      : "Awaiting approval via /api/approve_command";
+                    display += aid
+                      ? `\n(queued for approval: ${aid})\n\`\`\`\nexit: -1`
+                      : "\n(queued)\n```\nexit: -1";
+                    flush();
+                    messages.push({
+                      role: "user",
+                      content: [
+                        "[exec awaiting approval]",
+                        aid ? ("approval_id: " + aid) : "",
+                        "command:\n" + commandToRun,
+                      ].filter(Boolean).join("\n"),
+                    });
+                    awaitingApproval = true;
+                    break;
+                  } catch (_) {
+                    // Fall through to confirm() for older servers / transient failures.
+                  }
+                }
+                if (!window.confirm("Run command?\n\n" + commandToRun)) {
+                  resultText = "error: command rejected by user";
+                  display += "\n(rejected)\n```\nexit: -1";
+                  flush();
+                  messages.push({ role: "user", content: `[exec rejected]\ncommand:\n${commandToRun}` });
+                  break;
+                }
               }
 
               const cwdUsed = cwdNow();
@@ -2949,6 +3045,7 @@
           }
           // In longrun autonomy mode, continue the agent loop so non-tool-calling models can still
           // iterate (command -> result -> next command) without user nudges.
+          if (awaitingApproval) break;
           if (longrun) continue;
           break; // implied exec done — in non-longrun mode, stop to avoid notification spam
         }
@@ -4790,6 +4887,73 @@
                                 "pre",
                                 { style: { marginTop: 6, maxHeight: 100, overflow: "auto" } },
                                 String(it.diff || it.preview)
+                              )
+                            : null
+                        )
+                      )
+                    )
+                  : e("div", { className: "hint" }, "none")
+              ),
+              e(
+                "div",
+                { className: "field", style: { marginTop: "10px" } },
+                e("label", null, tr(lang, "pendingCommands")),
+                pendingCommands && pendingCommands.length
+                  ? e(
+                      "div",
+                      { style: { display: "flex", flexDirection: "column", gap: 8, maxHeight: 160, overflow: "auto" } },
+                      pendingCommands.map((it) =>
+                        e(
+                          "div",
+                          {
+                            key: String(it.id || Math.random()),
+                            style: {
+                              border: "1px solid rgba(255,255,255,0.15)",
+                              borderRadius: 8,
+                              padding: "8px 10px",
+                              background: "rgba(255,255,255,0.03)",
+                            },
+                          },
+                          e(
+                            "div",
+                            { style: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" } },
+                            e("code", null, String(it.id || "")),
+                            e("span", { className: "pill" }, String(it.status || "")),
+                            it.cwd
+                              ? e("span", { style: { color: "var(--faint)", fontSize: 12 } }, String(it.cwd || ""))
+                              : null,
+                            String(it.status || "") === "pending"
+                              ? e(
+                                  "div",
+                                  { style: { marginLeft: "auto", display: "flex", gap: 6 } },
+                                  e(
+                                    "button",
+                                    {
+                                      className: "btn btn-primary",
+                                      type: "button",
+                                      disabled: pendingBusy,
+                                      onClick: () => resolvePendingCommand(it.id, true),
+                                    },
+                                    tr(lang, "approve")
+                                  ),
+                                  e(
+                                    "button",
+                                    {
+                                      className: "btn btn-warn",
+                                      type: "button",
+                                      disabled: pendingBusy,
+                                      onClick: () => resolvePendingCommand(it.id, false),
+                                    },
+                                    tr(lang, "reject")
+                                  )
+                                )
+                              : null
+                          ),
+                          (it.preview || it.command)
+                            ? e(
+                                "pre",
+                                { style: { marginTop: 6, maxHeight: 100, overflow: "auto" } },
+                                String(it.preview || it.command || "")
                               )
                             : null
                         )

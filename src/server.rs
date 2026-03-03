@@ -254,6 +254,7 @@ struct AppState {
     client: reqwest::Client,
     defaults: PartialConfig,
     pending_edits: crate::pending_edits::PendingEditStore,
+    pending_commands: crate::pending_commands::PendingCommandStore,
     workspace_root: PathBuf,
 }
 
@@ -271,6 +272,7 @@ pub async fn run(args: ServeArgs, defaults: PartialConfig) -> Result<()> {
         client: reqwest::Client::new(),
         defaults,
         pending_edits: crate::pending_edits::PendingEditStore::new(),
+        pending_commands: crate::pending_commands::PendingCommandStore::new(),
         workspace_root,
     };
 
@@ -361,6 +363,10 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/queue_edit") => api_queue_edit(&mut stream, state, &req.body).await,
         ("POST", "/api/approve_edit") => api_approve_edit(&mut stream, state, &req.body).await,
         ("POST", "/api/reject_edit") => api_reject_edit(&mut stream, state, &req.body).await,
+        ("GET", "/api/pending_commands") => api_pending_commands(&mut stream, state).await,
+        ("POST", "/api/queue_command") => api_queue_command(&mut stream, state, &req.body).await,
+        ("POST", "/api/approve_command") => api_approve_command(&mut stream, state, &req.body).await,
+        ("POST", "/api/reject_command") => api_reject_command(&mut stream, state, &req.body).await,
         ("GET", "/api/meta_prompts") => api_meta_prompts_get(&mut stream, state).await,
         ("POST", "/api/meta_prompts") => api_meta_prompts_post(&mut stream, state, &req.body).await,
         ("POST", "/api/write_file") => api_write_file(&mut stream, state, &req.body).await,
@@ -962,6 +968,106 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     write_json(stream, 200, "OK", &out).await
 }
 
+async fn api_pending_commands(stream: &mut TcpStream, state: AppState) -> Result<()> {
+    #[derive(Serialize)]
+    struct Res {
+        pending: Vec<crate::pending_commands::PendingCommandView>,
+    }
+    let pending = state.pending_commands.list().await;
+    write_json(stream, 200, "OK", &Res { pending }).await
+}
+
+async fn api_queue_command(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        command: String,
+        cwd: Option<String>,
+    }
+    #[derive(Serialize)]
+    struct Res {
+        ok: bool,
+        approval_id: String,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+
+    let id = match state.pending_commands.queue(&req.command, req.cwd).await {
+        Ok(id) => id,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+
+    write_json(stream, 200, "OK", &Res { ok: true, approval_id: id }).await
+}
+
+async fn api_approve_command(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        id: String,
+    }
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+    let id = req.id.trim();
+    if id.is_empty() {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: "id is required".into() }).await;
+    }
+
+    let item = match state.pending_commands.approve(id).await {
+        Ok(it) => it,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+    write_json(
+        stream,
+        200,
+        "OK",
+        &crate::pending_commands::PendingCommandResolveResponse { ok: true, item },
+    )
+    .await
+}
+
+async fn api_reject_command(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        id: String,
+    }
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+    let id = req.id.trim();
+    if id.is_empty() {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: "id is required".into() }).await;
+    }
+
+    let item = match state.pending_commands.reject(id).await {
+        Ok(it) => it,
+        Err(e) => {
+            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+        }
+    };
+    write_json(
+        stream,
+        200,
+        "OK",
+        &crate::pending_commands::PendingCommandResolveResponse { ok: true, item },
+    )
+    .await
+}
+
 async fn api_pending_edits(stream: &mut TcpStream, state: AppState) -> Result<()> {
     #[derive(Serialize)]
     struct Res {
@@ -1313,6 +1419,7 @@ async fn api_status(stream: &mut TcpStream, state: AppState) -> Result<()> {
         features: ApiFeatures {
             exec: true,
             pending_edits: true,
+            pending_commands: true,
             chat_tools: true,
             meta_prompts: true,
             open_file: true,
@@ -1767,6 +1874,7 @@ struct ApiStatusResponse {
 struct ApiFeatures {
     exec: bool,
     pending_edits: bool,
+    pending_commands: bool,
     chat_tools: bool,
     meta_prompts: bool,
     open_file: bool,
