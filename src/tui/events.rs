@@ -614,6 +614,24 @@ fn handle_task_plan_error(e: String, app: &mut App) {
     app.chat.push_tool(format!("(task router error) {e}"));
 }
 
+/// Extract `@path` tokens from a message (unique, ordered).
+/// Accepts patterns like @src/main.rs, @README.md, @dir/sub/file.txt.
+fn parse_at_refs(text: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for word in text.split_whitespace() {
+        if !word.starts_with('@') { continue; }
+        let path = word.trim_start_matches('@');
+        // Strip common trailing punctuation.
+        let path = path.trim_end_matches(|c: char| matches!(c, ',' | ')' | ']' | ';' | ':' | '.'));
+        if path.is_empty() { continue; }
+        if seen.insert(path.to_string()) {
+            refs.push(path.to_string());
+        }
+    }
+    refs
+}
+
 async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, text: String) {
     let text = text.trim().to_string();
     if text.is_empty() || app.coder.streaming {
@@ -633,16 +651,34 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
     app.coder.scroll = 0;         // pin to bottom for new output
     app.ignore_coder_tokens = false;
 
+    // Resolve tool_root early (needed for @ref file reads below).
+    let tool_root = app.tool_root.clone().or_else(|| {
+        std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())
+    });
+
+    // Expand @file references: read files and collect system messages to inject.
+    let at_refs = parse_at_refs(&text);
+    let mut at_ref_messages: Vec<ChatMessage> = Vec::new();
     app.coder.push_user(text.clone());
+    for ref_path in &at_refs {
+        let (content, is_err) = crate::file_tools::tool_read_file(ref_path, tool_root.as_deref());
+        if is_err {
+            app.coder.push_tool(format!("📎 @{ref_path}: not found"));
+        } else {
+            // Header line is "[path] (N lines, B bytes)" — use it as the notification.
+            let header = content.lines().next().unwrap_or(ref_path.as_str()).to_string();
+            app.coder.push_tool(format!("📎 injected: {header}"));
+            at_ref_messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: format!("[@{ref_path}]\n{content}"),
+            });
+        }
+    }
     app.coder.streaming = true;
     app.coder.messages.push(Message::new_streaming(Role::Assistant));
 
     let history = app.coder.chat_history();
     let cfg = app.coder_cfg.clone();
-    // Default tool_root to the current working directory so the model knows where to create files.
-    let tool_root = app.tool_root.clone().or_else(|| {
-        std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())
-    });
     let max_iters = app.coder_max_iters.unwrap_or(agent::DEFAULT_MAX_ITERS);
 
     let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
@@ -653,11 +689,29 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
     for m in history.iter().take(hist_len.saturating_sub(1)) {
         messages.push(m.clone());
     }
+    // Inject @file system messages immediately before the user turn.
+    messages.extend(at_ref_messages);
     messages.push(ChatMessage { role: "user".to_string(), content: text });
+
+    // Scan project context once per session (guarded by stack_label being None).
+    let project_context: Option<String> = if app.project_stack_label.is_none() {
+        if let Some(ref root) = tool_root {
+            if let Some(ctx) = crate::project::ProjectContext::scan(root).await {
+                app.project_stack_label = Some(ctx.stack_label());
+                Some(ctx.to_context_text())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let tx = tx.clone();
     let handle = tokio::spawn(async move {
-        if let Err(e) = agent::run_agentic(messages, &cfg, tool_root.as_deref(), max_iters, tx.clone()).await {
+        if let Err(e) = agent::run_agentic(messages, &cfg, tool_root.as_deref(), max_iters, tx.clone(), project_context).await {
             let _ = tx.send(StreamToken::Error(format!("{e:#}"))).await;
         }
     });

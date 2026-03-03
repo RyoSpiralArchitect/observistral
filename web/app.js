@@ -1211,6 +1211,9 @@
     const [proposalModalText, setProposalModalText] = useState("");
     const [readerModal, setReaderModal] = useState(null);
     const [planningTasks, setPlanningTasks] = useState(false);
+    const [projectScan, setProjectScan] = useState(null);
+    const [projectScanLoading, setProjectScanLoading] = useState(false);
+    const projectScanRootRef = useRef("");
 
     const [threadState, setThreadState] = useState(() => {
       let threads = safeJsonParse(localStorage.getItem(LS.threads) || "null", null);
@@ -1533,6 +1536,18 @@
         ensureDir(wd);
       }
     }, [status && status.features && status.features.exec, config.toolRoot, activeThread && activeThread.id, activeThread && activeThread.workdir]);
+
+    useEffect(() => {
+      const root = String(config.toolRoot || "").trim();
+      if (!root || root === projectScanRootRef.current) return;
+      projectScanRootRef.current = root;
+      setProjectScanLoading(true);
+      fetch(`/api/project/scan?root=${encodeURIComponent(root)}`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => setProjectScan(d && d.root ? d : null))
+        .catch(() => setProjectScan(null))
+        .finally(() => setProjectScanLoading(false));
+    }, [config.toolRoot]);
 
     const refreshStatus = () => {
       fetch("/api/status")
@@ -4206,6 +4221,20 @@
       };
       const coderMsgsView = filterMsgs(coderMsgs, coderFind);
       const observerMsgsView = filterMsgs(observerMsgs, observerFind);
+
+      // @file reference chips — parse @path tokens from coderInput for visual feedback.
+      const atRefChips = React.useMemo(() => {
+        const chips = [];
+        const seen = new Set();
+        for (const word of String(coderInput || "").split(/\s+/)) {
+          if (!word.startsWith("@")) continue;
+          let path = word.replace(/^@/, "").replace(/[,);:\].]+$/, "");
+          if (!path || seen.has(path)) continue;
+          seen.add(path);
+          chips.push(path);
+        }
+        return chips;
+      }, [coderInput]);
       const threadTasks = (activeThread && Array.isArray(activeThread.tasks)) ? activeThread.tasks : [];
       const sortedTasks = [...threadTasks].sort((a, b) => {
         const sa = String(a && a.status ? a.status : "new");
@@ -4936,7 +4965,17 @@
                   value: String(config.toolRoot || ""),
                   onChange: (ev) => setConfig({ ...config, toolRoot: ev.target.value }),
                   placeholder: "(optional) subdir (e.g. myrepo)",
-                })
+                }),
+                (projectScanLoading || (projectScan && projectScan.stack_label))
+                  ? e("div", { style: { marginTop: "4px", fontSize: "0.78rem",
+                                         color: "var(--accent,#2dd4bf)", fontFamily: "monospace" } },
+                      projectScanLoading
+                        ? "⟳ scanning…"
+                        : e("span", null,
+                            e("span", { style: { opacity: 0.6 } }, (config.toolRoot || "") + "  ●  "),
+                            projectScan.stack_label)
+                    )
+                  : null
               ),
               e(
                 "div",
@@ -5384,6 +5423,30 @@
                   }
                 },
               }),
+              atRefChips.length > 0
+                ? e(
+                    "div",
+                    { style: { display: "flex", flexWrap: "wrap", gap: "4px", padding: "4px 0" } },
+                    ...atRefChips.map((path) =>
+                      e(
+                        "span",
+                        {
+                          key: path,
+                          style: {
+                            background: "rgba(45,212,191,0.12)",
+                            color: "var(--accent,#2dd4bf)",
+                            border: "1px solid rgba(45,212,191,0.3)",
+                            borderRadius: "4px",
+                            padding: "1px 7px",
+                            fontSize: "0.76rem",
+                            fontFamily: "var(--mono)",
+                          },
+                        },
+                        "📎 @" + path
+                      )
+                    )
+                  )
+                : null,
               e(
                 "div",
                 { style: { display: "flex", gap: 8, alignItems: "center" } },

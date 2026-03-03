@@ -55,7 +55,7 @@ const WIN_SYSTEM_ADDON: &str = "\n\n[Windows execution rules]\n\
 /// Benefit: avoids wrong-direction mistakes that cost 300-500 tokens to correct.
 /// The <plan> block runs once; <think> runs before every tool call.
 const SCRATCHPAD_ADDON: &str = "\n\n\
-[Planning Protocol — emit ONCE before your very first exec call]\n\
+[Planning Protocol — emit ONCE before your very first tool call]\n\
 <plan>\n\
 goal: <one sentence: what the finished task looks like when done>\n\
 steps: 1) ... 2) ... 3) ... (3-7 concrete, ordered steps)\n\
@@ -63,7 +63,7 @@ risks: <the 2 most likely failure modes for this specific task>\n\
 assumptions: <what you are taking as given>\n\
 </plan>\n\
 \n\
-[Reasoning Protocol — emit before EVERY exec call]\n\
+[Reasoning Protocol — emit before EVERY tool call]\n\
 <think>\n\
 goal:   <≤12 words: what must succeed right now>\n\
 risk:   <≤12 words: most likely failure mode>\n\
@@ -109,26 +109,107 @@ pub fn exec_tool_def() -> serde_json::Value {
     })
 }
 
+pub fn read_file_tool_def() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the full content of a file. Use before editing to see the exact current text. \
+                            Path is relative to tool_root (or absolute within tool_root). \
+                            Large files are truncated automatically.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to tool_root."
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    })
+}
+
+pub fn write_file_tool_def() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Atomically create or overwrite a file with the given content. \
+                            Creates parent directories automatically. \
+                            More reliable than exec+echo for file creation (handles encoding, special chars, newlines). \
+                            Path is relative to tool_root.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to tool_root."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Complete file content to write."
+                    }
+                },
+                "required": ["path", "content"]
+            }
+        }
+    })
+}
+
+pub fn patch_file_tool_def() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "patch_file",
+            "description": "Edit a file by replacing an exact text snippet. \
+                            The search string MUST appear exactly once in the file. \
+                            Call read_file first to see the exact current text if unsure. \
+                            For whole-file rewrites use write_file instead. \
+                            Path is relative to tool_root.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to tool_root."
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Exact text to find (must match character-for-character, including whitespace and newlines)."
+                    },
+                    "replace": {
+                        "type": "string",
+                        "description": "Text to substitute in place of the search string."
+                    }
+                },
+                "required": ["path", "search", "replace"]
+            }
+        }
+    })
+}
+
 // ── System prompt builders ────────────────────────────────────────────────────
 
 /// Fixed base for the TUI Coder pane — always an agentic executor, not a chat bot.
 const CODER_BASE_SYSTEM: &str = "\
-You are an autonomous coding agent with an exec tool that runs shell commands.\n\
+You are an autonomous coding agent with 4 tools:\n\
+  exec(command, cwd?)              — run shell commands (build, test, git, installs)\n\
+  read_file(path)                  — read a file's exact content\n\
+  write_file(path, content)        — create or overwrite a file reliably\n\
+  patch_file(path, search, replace)— replace an exact snippet in a file\n\
 \n\
-RULE: You MUST call exec on every single turn. Never respond with text only.\n\
-If you need to create a file — call exec. If you need to run code — call exec.\n\
-If you are done — call exec to verify the result, then say done.\n\
+RULE: You MUST call a tool on every single turn. Never respond with text only.\n\
 \n\
-File creation (Windows PowerShell):\n\
-  New-Item -ItemType Directory -Path 'src' -Force\n\
-  @('print(\"hello\")') | Set-Content -Path 'main.py' -Encoding UTF8\n\
+Choose the right tool:\n\
+  Create/overwrite file → write_file  (more reliable than exec+echo; handles encoding)\n\
+  Edit part of a file  → read_file first, then patch_file (no quoting issues)\n\
+  Run programs/tests   → exec\n\
+  Git / installs       → exec\n\
+  Check a file exists  → exec or read_file\n\
 \n\
-File creation (Unix sh):\n\
-  mkdir -p src && cat > main.py << 'EOF'\n\
-  print(\"hello\")\n\
-  EOF\n\
-\n\
-After every file write: verify with Get-Content or cat.\n\
+After patch_file/write_file: if correctness matters, call read_file to verify.\n\
 After every build/test: confirm exit_code == 0 before proceeding.\n\
 \n\
 When ALL steps from your <plan> are verified complete:\n\
@@ -169,6 +250,19 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
     format!("{truncated}\n[…truncated — {total_lines} lines total, first {max_chars} chars shown]")
 }
 
+/// Returns true if a tool result can safely be pruned (= it was a success).
+/// Failures are never pruned because they are critical context for recovery.
+fn is_prunable_tool_result(content: &str) -> bool {
+    let c = content.trim_start();
+    // exec success
+    c.starts_with("OK (exit_code: 0)")
+        // write_file / patch_file success
+        || c.starts_with("OK: wrote '")
+        || c.starts_with("OK: patched '")
+        // read_file success — header starts with "[path] (N lines"
+        || (c.starts_with('[') && c.contains("] (") && c.contains(" lines,"))
+}
+
 /// Collapse tool result messages older than KEEP_RECENT_TOOL_TURNS to a
 /// one-line summary.  Each collapsed result saves ~200-2000 tokens.
 /// Only the content field is modified; tool_call_id stays intact.
@@ -188,8 +282,8 @@ fn prune_old_tool_results(messages: &mut Vec<serde_json::Value>) {
     for &idx in tool_indices.iter().take(prune_count) {
         if let Some(content) = messages[idx]["content"].as_str() {
             // Never prune failures: they are the most important context for recovery.
-            // We only prune successful tool outputs we generated ("OK (exit_code: 0) ...").
-            if !content.trim_start().starts_with("OK (exit_code: 0)") {
+            // Prune successful exec outputs and file tool outputs.
+            if !is_prunable_tool_result(content) {
                 continue;
             }
             let line_count = content.lines().count();
@@ -925,9 +1019,15 @@ pub async fn run_agentic(
     tool_root: Option<&str>,
     max_iters: usize,
     tx: mpsc::Sender<StreamToken>,
+    project_context: Option<String>,
 ) -> Result<()> {
     let client = reqwest::Client::new();
-    let tools = json!([exec_tool_def()]);
+    let tools = json!([
+        exec_tool_def(),
+        read_file_tool_def(),
+        write_file_tool_def(),
+        patch_file_tool_def(),
+    ]);
     let mut state = AgentState::Planning;
     let mut mem = FailureMemory::default();
     let mut pending_system_hint: Option<String> = None;
@@ -968,6 +1068,14 @@ NEVER create a git repo inside another git repo. If you see 'embedded git reposi
             messages.insert(0, json!({"role":"system","content": note}));
         }
     }
+    // Project context — inject once at position 2 (after [Working directory] note).
+    if let Some(ctx_text) = project_context {
+        if !ctx_text.is_empty() {
+            let pos = messages.len().min(2);
+            messages.insert(pos, json!({"role":"system","content": ctx_text}));
+        }
+    }
+
     let mut cur_cwd: Option<String> = tool_root_abs.clone();
 
     let max_iters = max_iters.max(1).min(64);
@@ -1214,9 +1322,9 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
                 let note = "\
 [Tool enforcement]\n\
 The user asked you to ACT on the local machine (create files/run commands).\n\
-You have an `exec` tool. You MUST call it now.\n\
+You have exec, read_file, write_file, and patch_file tools. You MUST call one now.\n\
 Do NOT give instructions. Do NOT say you cannot run commands.\n\
-Start with ONE minimal command that moves toward the goal.\n\
+Start with ONE minimal action that moves toward the goal (write_file, exec, or read_file).\n\
 After it succeeds, verify and continue.";
                 let _ = tx
                     .send(StreamToken::Delta("\n[governor] tool_call missing; forcing exec\n".to_string()))
@@ -1234,6 +1342,69 @@ After it succeeds, verify and continue.";
 
         // ── Execute the tool ───────────────────────────────────────────────
         let tc = tool_call.unwrap();
+
+        // ── File tools: read_file / write_file / patch_file ────────────────
+        if matches!(tc.name.as_str(), "read_file" | "write_file" | "patch_file") {
+            let args: serde_json::Value = serde_json::from_str(&tc.arguments)
+                .unwrap_or(json!({}));
+            let path = args["path"].as_str().unwrap_or("").to_string();
+
+            // Emit annotation (visible in TUI).
+            let tool_upper = tc.name.to_ascii_uppercase();
+            let _ = tx.send(StreamToken::Delta(
+                format!("\n\n[{tool_upper}] {path}\n")
+            )).await;
+            let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
+
+            let base = tool_root_abs.as_deref();
+            let (result, is_error) = match tc.name.as_str() {
+                "read_file" => crate::file_tools::tool_read_file(&path, base),
+                "write_file" => {
+                    let content = args["content"].as_str().unwrap_or("").to_string();
+                    crate::file_tools::tool_write_file(&path, &content, base)
+                }
+                _ => {
+                    // patch_file
+                    let search = args["search"].as_str().unwrap_or("").to_string();
+                    let replace = args["replace"].as_str().unwrap_or("").to_string();
+                    crate::file_tools::tool_patch_file(&path, &search, &replace, base)
+                }
+            };
+
+            // Emit result label.
+            let first_line = result.lines().next().unwrap_or("").to_string();
+            if is_error {
+                let _ = tx.send(StreamToken::Delta(
+                    format!("[RESULT_FILE_ERR] {first_line}\n")
+                )).await;
+                state = AgentState::Recovery;
+                pending_system_hint = Some(format!(
+                    "File tool error: {first_line}\n\
+                     Read the error message carefully and fix the issue before proceeding."
+                ));
+            } else {
+                let _ = tx.send(StreamToken::Delta(
+                    format!("[RESULT_FILE] {first_line}\n")
+                )).await;
+                state = AgentState::Planning;
+                pending_system_hint = None;
+            }
+
+            // Append tool result to conversation.
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            }));
+
+            if iter + 1 == max_iters {
+                let _ = tx.send(StreamToken::Delta(
+                    format!("\n[agent] iteration cap ({max_iters}) reached.\n")
+                )).await;
+            }
+            continue; // skip exec block below
+        }
+
         if tc.name != "exec" {
             return Err(anyhow!("unknown tool: {}", tc.name));
         }

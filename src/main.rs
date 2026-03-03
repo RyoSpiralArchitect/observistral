@@ -12,6 +12,8 @@ mod server;
 mod streaming;
 mod tui;
 mod types;
+mod file_tools;
+mod project;
 mod providers;
 
 use anyhow::{Context, Result};

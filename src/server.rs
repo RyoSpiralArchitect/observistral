@@ -370,6 +370,8 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("GET", "/api/meta_prompts") => api_meta_prompts_get(&mut stream, state).await,
         ("POST", "/api/meta_prompts") => api_meta_prompts_post(&mut stream, state, &req.body).await,
         ("POST", "/api/write_file") => api_write_file(&mut stream, state, &req.body).await,
+        ("GET", p) if p.starts_with("/api/project/scan") =>
+            api_project_scan(&mut stream, p).await,
         _ => {
             write_text(
                 &mut stream,
@@ -613,6 +615,7 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
         temperature: Option<f64>,
         max_tokens: Option<u32>,
         timeout_seconds: Option<u64>,
+        tool_root: Option<String>,
     }
 
     let req: Req = match serde_json::from_slice(body) {
@@ -625,11 +628,62 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
     };
 
     let base_url = req.base_url.trim_end_matches('/').to_string();
-    let messages_for_prompt = req.messages.clone();
+
+    // Project context injection for web UI path.
+    let injected_messages = {
+        let mut msgs = req.messages.clone();
+        if let Some(ref root) = req.tool_root {
+            let root = root.trim();
+            if !root.is_empty() {
+                if let Some(ctx) = crate::project::ProjectContext::scan(root).await {
+                    let txt = ctx.to_context_text();
+                    if !txt.is_empty() {
+                        let pos = msgs.iter().position(|m| m["role"] == "system")
+                            .map(|i| i + 1).unwrap_or(0);
+                        msgs.insert(pos, serde_json::json!({"role":"system","content": txt}));
+                    }
+                }
+            }
+        }
+        msgs
+    };
+
+    // Expand @file references found in the last user message.
+    let injected_messages = {
+        let mut msgs = injected_messages;
+        if let Some(ref root) = req.tool_root {
+            let root_str = root.trim();
+            if !root_str.is_empty() {
+                if let Some(last_user_pos) = msgs.iter().rposition(|m| m["role"] == "user") {
+                    let user_text = msgs[last_user_pos]["content"].as_str().unwrap_or("").to_string();
+                    let at_refs = parse_at_refs_str(&user_text);
+                    if !at_refs.is_empty() {
+                        let mut inject_msgs: Vec<serde_json::Value> = Vec::new();
+                        for ref_path in &at_refs {
+                            let (content, is_err) =
+                                crate::file_tools::tool_read_file(ref_path, Some(root_str));
+                            if !is_err {
+                                inject_msgs.push(serde_json::json!({
+                                    "role": "system",
+                                    "content": format!("[@{ref_path}]\n{content}")
+                                }));
+                            }
+                        }
+                        for (i, msg) in inject_msgs.into_iter().enumerate() {
+                            msgs.insert(last_user_pos + i, msg);
+                        }
+                    }
+                }
+            }
+        }
+        msgs
+    };
+
+    let messages_for_prompt = injected_messages.clone();
 
     let mut payload = json!({
         "model": req.model,
-        "messages": req.messages,
+        "messages": injected_messages,
         "temperature": req.temperature.unwrap_or(0.7),
         "max_tokens": req.max_tokens.unwrap_or(4096),
         "stream": true,
@@ -2498,6 +2552,84 @@ fn take_next_sse_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     let frame = buf[..pos].to_vec();
     buf.drain(..pos + sep_len);
     Some(frame)
+}
+
+/// Extract `@path` tokens from a message string (unique, ordered).
+fn parse_at_refs_str(text: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for word in text.split_whitespace() {
+        if !word.starts_with('@') { continue; }
+        let path = word.trim_start_matches('@');
+        let path = path.trim_end_matches(|c: char| matches!(c, ',' | ')' | ']' | ';' | ':' | '.'));
+        if path.is_empty() { continue; }
+        if seen.insert(path.to_string()) {
+            refs.push(path.to_string());
+        }
+    }
+    refs
+}
+
+fn extract_query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
+    let q_start = path.find('?')?;
+    let query = &path[q_start + 1..];
+    for pair in query.split('&') {
+        if let Some(eq) = pair.find('=') {
+            let k = &pair[..eq];
+            let v = &pair[eq + 1..];
+            if k == key {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn url_decode(s: &str) -> String {
+    let s = s.replace('+', " ");
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+async fn api_project_scan(stream: &mut TcpStream, path: &str) -> Result<()> {
+    let raw_root = match extract_query_param(path, "root") {
+        Some(r) => r,
+        None => {
+            return write_text(stream, 400, "Bad Request",
+                "text/plain; charset=utf-8", "missing ?root= parameter\n").await;
+        }
+    };
+
+    let root = url_decode(raw_root);
+
+    // Path traversal guard.
+    if root.contains("..") {
+        return write_text(stream, 400, "Bad Request",
+            "text/plain; charset=utf-8", "invalid path: '..' not allowed\n").await;
+    }
+
+    let result = match crate::project::ProjectContext::scan(&root).await {
+        Some(ctx) => ctx.to_scan_result(),
+        None => crate::project::ProjectScanResult::default(),
+    };
+
+    write_json(stream, 200, "OK", &result).await
 }
 
 async fn write_json<T: Serialize>(

@@ -23,11 +23,43 @@ OBSTRAL resout ca en faisant tourner Coder et Observer dans des **contextes enti
 
 | Role | Ce qu'il fait | Ce qu'il ne fait jamais |
 |---|---|---|
-| **Coder** | Agit — fichiers, commandes shell, boucle agentique (12 etapes max) | Relire ou remettre en question son propre travail |
+| **Coder** | Agit — fichiers, commandes shell, boucle agentique (12 etapes max), 4 outils integres | Relire ou remettre en question son propre travail |
 | **Observer** | Critique — score chaque proposition, escalade ce que vous ignorez | Toucher au code. Il lit seulement. |
 | **Chat** | Reflechit avec vous — conception, canard en plastique, compromis | Interrompre la boucle d'execution |
 
 Roles distincts. Modeles distincts si vous le souhaitez. Contextes toujours distincts.
+
+---
+
+## Ce qu'OBSTRAL sait avant que vous parliez
+
+Quand vous definissez `tool_root`, OBSTRAL analyse automatiquement le projet :
+
+```
+[Project Context — auto-detected]
+stack: Rust, React (no bundler)
+git:   branch=main  modified=2  untracked=1
+recent: "fix(observe): require all 4 blocks" · "feat(agent): error classifier"
+tree:
+  src/          12 files  (Rust source)
+  web/           4 files  (JS/CSS)
+  scripts/       8 files  (PowerShell)
+key:  Cargo.toml · web/app.js · README.md
+```
+
+Ce contexte est injecte dans le message systeme du Coder **avant votre premier prompt**. Quand vous commencez a taper, le Coder connait deja le stack, la branche courante, les fichiers modifies et l'arborescence.
+
+Dans le TUI, un badge s'affiche en temps reel dans l'entete : `▸ Rust · React · git:main`
+Dans l'UI Web, le label du stack apparait sous le champ toolRoot dans les parametres.
+
+**Detection du stack** — OBSTRAL cherche les fichiers manifestes :
+- `Cargo.toml` → Rust
+- `package.json` → Node / React / TypeScript (inspecte les deps)
+- `pyproject.toml` / `requirements.txt` → Python
+- `go.mod` → Go
+- `pom.xml` → Java
+
+L'analyse s'execute une fois par session, prend moins de 200 ms et ignore silencieusement ce qu'elle ne peut pas lire.
 
 ---
 
@@ -64,21 +96,64 @@ Quand une commande echoue, OBSTRAL ne donne pas au modele un brut `exit_code: 1`
 | `NETWORK` | Verifiez le service et les variables proxy. |
 | `LOGIC` | Relisez la logique. Ne relancez pas juste pour relancer. |
 
+### Le Coder dispose de quatre outils
+
+Le Coder n'est pas limite aux commandes shell. Il dispose de quatre outils dedies :
+
+| Outil | Quand l'utiliser |
+|---|---|
+| `exec(command, cwd?)` | Build, tests, git, installation de packages — tout ce qui est shell |
+| `read_file(path)` | Lire le contenu exact d'un fichier sans problemes de guillemets shell |
+| `write_file(path, content)` | Creer ou ecraser un fichier de maniere atomique (repertoires parents auto-crees) |
+| `patch_file(path, search, replace)` | Remplacer un extrait exact — echoue bruyamment en cas d'ambiguite |
+
+`write_file` et `patch_file` utilisent un schema fichier temporaire → renommage, donc un crash en cours d'ecriture ne laisse jamais de fichier corrompu.
+
+`patch_file` exige que la chaine de recherche apparaisse **exactement une fois**. Zero occurrence → apercu du fichier pour auto-correction. Plusieurs occurrences → compte exact retourne en erreur. L'ambiguite est une erreur, pas une supposition.
+
+**Marqueurs visuels dans le TUI** pour identifier l'outil utilise d'un coup d'oeil :
+- `📄 READ` (bleu-vert) — fichier lu
+- `✎ WRITE` (bleu) — fichier cree ou ecrase
+- `⟳ PATCH` (magenta) — extrait remplace
+- `✓` (vert) / `✗` (rouge) — succes / erreur
+
 ### Le Coder se remet en question
 
-Avant chaque commande, le Coder remplit un bloc de 5 lignes :
+Avant chaque appel d'outil, le Coder remplit un bloc de 5 lignes :
 
 ```
 <think>
 goal:   ce qui doit reussir maintenant
 risk:   le mode d'echec le plus probable
 doubt:  une raison pour laquelle cette approche pourrait etre fausse   ← le champ inhabituel
-next:   commande exacte
+next:   commande ou operation exacte
 verify: comment confirmer que ca a fonctionne
 </think>
 ```
 
 Le champ `doubt:` force le modele a formuler un doute avant d'agir. ~50 tokens. Ca empeche le mode d'echec ou le modele est confiant et faux.
+
+### References @fichier : sautez le tour de lecture
+
+Tapez `@chemin` n'importe ou dans votre message pour injecter le contenu du fichier comme contexte avant que votre prompt atteigne le Coder :
+
+```
+@src/main.rs que fait run_chat ?
+@Cargo.toml @package.json montre-moi les versions de dependances cote a cote
+corrige le bug dans @src/server.rs ligne 400
+```
+
+Le TUI affiche une notification pour chaque fichier injecte :
+```
+📎 injected: [src/main.rs] (276 lines, 8192 bytes)
+```
+
+L'UI Web affiche des chips dans le compositeur pendant la saisie :
+```
+📎 @src/main.rs   📎 @Cargo.toml
+```
+
+Le Coder voit le contenu du fichier immediatement — pas de tour `read_file` supplementaire. Avec un budget de 12 iterations, economiser un tour de lecture peut faire la difference entre succes et timeout.
 
 ### Phase gating : taire le bon bruit
 
@@ -102,7 +177,7 @@ Aux iterations 3, 6 et 9, le Coder s'arrete pour une auto-evaluation :
 ```
 1. DONE: quelles etapes du plan sont verifiees completes (exit_code=0) ?
 2. REMAINING: qu'est-ce qui reste ?
-3. ON_TRACK: oui/non — si non, reevalu le plan avant la prochaine commande.
+3. ON_TRACK: oui/non — si non, reevalue le plan avant la prochaine operation.
 ```
 
 C'est la difference entre un agent qui tourne en rond et un qui sait quand il est perdu.
@@ -185,9 +260,15 @@ python .\scripts\serve_lite.py
 
 ### tool_root
 
-Chaque action de l'agent s'execute dans un repertoire scratch. Par defaut : `.tmp/<thread-id>`.
+Chaque action de l'agent s'execute dans un repertoire de travail. Par defaut : `.tmp/<thread-id>`.
 
-Ca empeche les depots git imbriques, les fichiers egares a la racine du projet, et le mode d'echec classique "pourquoi ca a tourne dans le mauvais repertoire ?". Chaque thread est completement isole.
+Pour travailler sur votre projet reel, definissez `tool_root` sur le chemin du projet :
+- **TUI** : option `--tool-root .`, ou commande slash `/root <chemin>` en cours de session
+- **UI Web** : Parametres → champ toolRoot
+
+Quand `tool_root` est defini, OBSTRAL l'analyse a la premiere utilisation pour construire le bloc de contexte projet (stack, git, arborescence). Les envois suivants dans la meme session sautent l'analyse.
+
+La traversee de chemins est bloquee : les chemins avec des composantes `..` sont rejetes a chaque frontiere d'outil (jamais silencieusement).
 
 ### Approbations
 
@@ -214,11 +295,25 @@ Cinq chips au-dessus du compositeur Chat — changez a tout moment, independant 
 | 😏 Cynique (cynical) | Va droit a la verite qui derange |
 | 🦆 Canard (duck) | Ne repond jamais — pose juste « Pourquoi ? » |
 
+### Commandes slash (TUI)
+
+| Commande | Effet |
+|---|---|
+| `/model <nom>` | Changer de modele en cours de session |
+| `/persona <cle>` | Changer le persona du Coder |
+| `/temp <0.0–1.0>` | Ajuster la temperature |
+| `/root <chemin>` | Modifier le tool_root pour les envois suivants |
+| `/lang ja\|en\|fr` | Changer la langue de l'UI et des prompts |
+| `/find <requete>` | Filtrer les messages dans le panneau courant |
+| `/help` | Afficher toutes les commandes |
+
 ---
 
 ## Securite
 
 `127.0.0.1` uniquement par defaut. L'execution shell est reelle — gardez les approbations activees.
+
+Les chemins des outils fichiers sont valides par rapport a `tool_root` a chaque appel : les chemins absolus hors `tool_root` et tout composant `..` sont rejetes en erreur (jamais silencieusement).
 
 Si vous l'exposez sur un reseau, ajoutez une authentification et durcissez l'execution d'outils.
 

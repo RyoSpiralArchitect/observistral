@@ -147,6 +147,8 @@ pub struct App {
     pub observer_cfg: RunConfig,
     pub chat_cfg: RunConfig,
     pub tool_root: Option<String>,
+    /// Stack label detected at first Coder send (e.g. "Rust · React · git:main").
+    pub project_stack_label: Option<String>,
     pub coder_max_iters: Option<usize>,
     pub quit: bool,
 
@@ -206,6 +208,7 @@ impl App {
             observer_cfg,
             chat_cfg,
             tool_root,
+            project_stack_label: None,
             coder_max_iters,
             quit: false,
             tick_count: 0,

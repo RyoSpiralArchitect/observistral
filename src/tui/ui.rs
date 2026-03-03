@@ -121,6 +121,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             format!("  LANG: {}", app.lang.to_ascii_uppercase()),
             Style::default().fg(MUTED),
         ),
+        Span::styled(
+            app.project_stack_label
+                .as_deref()
+                .map(|l| format!("  ▸ {l}"))
+                .unwrap_or_default(),
+            Style::default().fg(ACCENT),
+        ),
     ]);
 
     let row2 = Line::from(Span::styled(
@@ -938,6 +945,66 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
                     Style::default().fg(WARN).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(cmd.to_string(), Style::default().fg(TEXT_BODY)),
+            ]));
+            continue;
+        }
+        if trimmed.starts_with("[READ_FILE]") {
+            in_diff = false;
+            let path = trimmed.trim_start_matches("[READ_FILE]").trim();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  📄 READ  ",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(path.to_string(), Style::default().fg(TEXT_BODY)),
+            ]));
+            continue;
+        }
+        if trimmed.starts_with("[WRITE_FILE]") {
+            in_diff = false;
+            let path = trimmed.trim_start_matches("[WRITE_FILE]").trim();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  ✎ WRITE ",
+                    Style::default().fg(CODER_BLUE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(path.to_string(), Style::default().fg(TEXT_BODY)),
+            ]));
+            continue;
+        }
+        if trimmed.starts_with("[PATCH_FILE]") {
+            in_diff = false;
+            let path = trimmed.trim_start_matches("[PATCH_FILE]").trim();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  ⟳ PATCH ",
+                    Style::default().fg(OBS_MAG).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(path.to_string(), Style::default().fg(TEXT_BODY)),
+            ]));
+            continue;
+        }
+        if trimmed.starts_with("[RESULT_FILE]") {
+            in_diff = false;
+            let rest = trimmed.trim_start_matches("[RESULT_FILE]").trim();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  ✓ ",
+                    Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(rest.to_string(), Style::default().fg(SUCCESS)),
+            ]));
+            continue;
+        }
+        if trimmed.starts_with("[RESULT_FILE_ERR]") {
+            in_diff = false;
+            let rest = trimmed.trim_start_matches("[RESULT_FILE_ERR]").trim();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  ✗ ",
+                    Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(rest.to_string(), Style::default().fg(DANGER)),
             ]));
             continue;
         }

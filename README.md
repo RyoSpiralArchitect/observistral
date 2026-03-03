@@ -23,11 +23,43 @@ OBSTRAL fixes this by running Coder and Observer in **completely separate contex
 
 | Role | What it does | What it never does |
 |---|---|---|
-| **Coder** | Acts — files, shell commands, agentic loop (up to 12 steps) | Review or second-guess its own work |
+| **Coder** | Acts — files, shell commands, agentic loop (up to 12 steps), 4 built-in tools | Review or second-guess its own work |
 | **Observer** | Critiques — scores every proposal, escalates what you ignore | Touch any code. It only reads. |
 | **Chat** | Thinks with you — design, rubber duck, tradeoffs | Interrupt the execution loop |
 
 Different roles. Different models if you want. Different contexts always.
+
+---
+
+## What OBSTRAL Knows Before You Say Anything
+
+When you set `tool_root`, OBSTRAL automatically scans the project:
+
+```
+[Project Context — auto-detected]
+stack: Rust, React (no bundler)
+git:   branch=main  modified=2  untracked=1
+recent: "fix(observe): require all 4 blocks" · "feat(agent): error classifier"
+tree:
+  src/          12 files  (Rust source)
+  web/           4 files  (JS/CSS)
+  scripts/       8 files  (PowerShell)
+key:  Cargo.toml · web/app.js · README.md
+```
+
+This context is injected into the Coder's system message **before your first prompt**. The Coder already knows the stack, current branch, modified files, and directory layout when you start typing.
+
+In the TUI header you'll see a live badge: `▸ Rust · React · git:main`
+In the Web UI, the stack label appears below the toolRoot field in Settings.
+
+**Stack detection** — OBSTRAL looks for manifest files:
+- `Cargo.toml` → Rust
+- `package.json` → Node / React / TypeScript (inspects deps)
+- `pyproject.toml` / `requirements.txt` → Python
+- `go.mod` → Go
+- `pom.xml` → Java
+
+The scan runs once per session, takes under 200 ms, and silently skips anything it can't read.
 
 ---
 
@@ -64,21 +96,64 @@ When a command fails, OBSTRAL doesn't hand the model a raw `exit_code: 1` and ho
 | `NETWORK` | Check service status and proxy vars. |
 | `LOGIC` | Re-read the logic. Don't just re-run. |
 
+### The Coder Has Four Tools
+
+The Coder isn't limited to shell commands. It has four purpose-built tools:
+
+| Tool | When to use it |
+|---|---|
+| `exec(command, cwd?)` | Build, test, git, install packages — anything shell-based |
+| `read_file(path)` | Read exact file content without shell quoting issues |
+| `write_file(path, content)` | Atomically create or overwrite a file (parent dirs auto-created) |
+| `patch_file(path, search, replace)` | Replace an exact snippet — fails loudly on ambiguity |
+
+`write_file` and `patch_file` use a temp-file → rename pattern, so a crash mid-write never leaves corrupt output.
+
+`patch_file` requires the search string to appear **exactly once**. If it appears zero times, you get a preview of the file so the model can self-correct. If it appears more than once, you get the count. Ambiguity is an error, not a guess.
+
+**Visual markers in the TUI** show which tool fired at a glance:
+- `📄 READ` (teal) — file was read
+- `✎ WRITE` (blue) — file was created or overwritten
+- `⟳ PATCH` (magenta) — exact snippet replaced
+- `✓` (green) / `✗` (red) — result OK or error
+
 ### The Coder Doubts Itself
 
-Before every command, the Coder fills out a 5-line scratchpad:
+Before every tool call, the Coder fills out a 5-line scratchpad:
 
 ```
 <think>
 goal:   what must succeed right now
 risk:   most likely failure mode
 doubt:  one reason this approach could be wrong   ← the unusual field
-next:   exact command
+next:   exact command or operation
 verify: how to confirm it worked
 </think>
 ```
 
 The `doubt:` field forces the model to surface one self-criticism before acting. ~50 tokens. It prevents the failure mode where the model is confidently wrong.
+
+### @file References: Skip the Read Turn
+
+Type `@path` anywhere in your message to inject that file's content as context before your prompt reaches the Coder:
+
+```
+@src/main.rs what does run_chat do?
+@Cargo.toml @package.json show me the dependency versions side by side
+fix the bug in @src/server.rs line 400
+```
+
+The TUI shows a notification for each injected file:
+```
+📎 injected: [src/main.rs] (276 lines, 8192 bytes)
+```
+
+The Web UI shows chips in the composer as you type:
+```
+📎 @src/main.rs   📎 @Cargo.toml
+```
+
+The Coder sees the file content immediately — no extra `read_file` round-trip needed. On a tight 12-iteration budget, skipping one read turn can be the difference between success and timeout.
 
 ### Phase Gating: Silence the Right Noise
 
@@ -185,9 +260,15 @@ python .\scripts\serve_lite.py
 
 ### tool_root
 
-Every agent action runs inside a scratch directory. Default: `.tmp/<thread-id>`.
+Every agent action runs inside a working directory. Default: `.tmp/<thread-id>`.
 
-This prevents nested git repositories, stray files in your project root, and the "why did it run in the wrong directory?" failure mode. Each thread is fully isolated.
+To work on your actual project, set `tool_root` to your project path:
+- **TUI**: `--tool-root .` flag, or `/root <path>` slash command at runtime
+- **Web UI**: Settings → toolRoot field
+
+When `tool_root` is set, OBSTRAL scans it on first use to build the project context block (stack, git, tree). Subsequent sends in the same session skip the scan.
+
+Path traversal is blocked: paths with `..` components are rejected at every tool boundary.
 
 ### Approvals
 
@@ -214,11 +295,25 @@ Five chips above the Chat composer — switch anytime, independent of Coder/Obse
 | 😏 Cynical | Points straight to the uncomfortable truth |
 | 🦆 Duck | Never answers — just asks "Why?" to unblock your thinking |
 
+### /slash Commands (TUI)
+
+| Command | Effect |
+|---|---|
+| `/model <name>` | Switch model mid-session |
+| `/persona <key>` | Switch Coder persona |
+| `/temp <0.0–1.0>` | Adjust temperature |
+| `/root <path>` | Change tool_root for subsequent sends |
+| `/lang ja\|en\|fr` | Switch UI + prompt language |
+| `/find <query>` | Filter messages in the current pane |
+| `/help` | Show all commands |
+
 ---
 
 ## Security
 
 `127.0.0.1` only by default. Shell execution is real — keep approvals enabled.
+
+File tool paths are validated against `tool_root` at every call: absolute paths outside `tool_root` and any `..` component are rejected with an error (never silently).
 
 If you expose to a network, add authentication and harden tool execution.
 
