@@ -2947,7 +2947,10 @@
               break;
             }
           }
-          break; // implied exec done — don't loop back; prevents "complete" notification spam
+          // In longrun autonomy mode, continue the agent loop so non-tool-calling models can still
+          // iterate (command -> result -> next command) without user nudges.
+          if (longrun) continue;
+          break; // implied exec done — in non-longrun mode, stop to avoid notification spam
         }
       }
 
