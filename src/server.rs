@@ -374,6 +374,8 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/patch_file") => api_patch_file(&mut stream, state, &req.body).await,
         ("POST", "/api/search_files") => api_search_files_endpoint(&mut stream, state, &req.body).await,
         ("POST", "/api/glob_files") => api_glob_files(&mut stream, state, &req.body).await,
+        ("POST", "/api/apply_diff") => api_apply_diff(&mut stream, state, &req.body).await,
+        ("POST", "/api/rollback") => api_rollback(&mut stream, state, &req.body).await,
         ("GET", p) if p.starts_with("/api/project/scan") =>
             api_project_scan(&mut stream, p).await,
         _ => {
@@ -1489,6 +1491,56 @@ async fn api_glob_files(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
         return write_json(stream, 400, "Bad Request", &ApiError { error: output }).await;
     }
     write_json(stream, 200, "OK", &Res { ok: true, output }).await
+}
+
+async fn api_apply_diff(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req { path: String, diff: String }
+    #[derive(Serialize)]
+    struct Res { ok: bool, message: String }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
+    };
+    let base = state.workspace_root.to_string_lossy().into_owned();
+    let (msg, is_err) = crate::file_tools::tool_apply_diff(&req.path, &req.diff, Some(&base));
+    if is_err {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: msg }).await;
+    }
+    write_json(stream, 200, "OK", &Res { ok: true, message: msg }).await
+}
+
+async fn api_rollback(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req { checkpoint: String }
+    #[derive(Serialize)]
+    struct Res { ok: bool, message: String }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
+    };
+    let checkpoint = req.checkpoint.trim();
+    // Safety: only allow hex strings (git hashes).
+    if checkpoint.is_empty() || !checkpoint.chars().all(|c| c.is_ascii_hexdigit()) {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: "invalid checkpoint hash".into() }).await;
+    }
+    let root = state.workspace_root.to_string_lossy().into_owned();
+    let out = std::process::Command::new("git")
+        .args(["-C", &root, "reset", "--hard", checkpoint])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let short = &checkpoint[..checkpoint.len().min(8)];
+            write_json(stream, 200, "OK", &Res { ok: true, message: format!("rolled back to {short}") }).await
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            write_json(stream, 400, "Bad Request", &ApiError { error: stderr }).await
+        }
+        Err(e) => write_json(stream, 500, "Internal Server Error", &ApiError { error: e.to_string() }).await,
+    }
 }
 
 async fn api_open(stream: &mut TcpStream, body: &[u8]) -> Result<()> {

@@ -149,6 +149,10 @@ pub struct App {
     pub tool_root: Option<String>,
     /// Stack label detected at first Coder send (e.g. "Rust · React · git:main").
     pub project_stack_label: Option<String>,
+    /// Git commit hash created at the start of the last Coder session (for /rollback).
+    pub last_git_checkpoint: Option<String>,
+    /// Auto-detected or configured test command from project scan.
+    pub project_test_cmd: Option<String>,
     pub coder_max_iters: Option<usize>,
     pub quit: bool,
 
@@ -209,6 +213,8 @@ impl App {
             chat_cfg,
             tool_root,
             project_stack_label: None,
+            last_git_checkpoint: None,
+            project_test_cmd: None,
             coder_max_iters,
             quit: false,
             tick_count: 0,

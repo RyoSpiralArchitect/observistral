@@ -223,6 +223,35 @@ pub fn search_files_tool_def() -> serde_json::Value {
     })
 }
 
+pub fn apply_diff_tool_def() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "apply_diff",
+            "description": "Apply a unified diff to a file. More reliable than patch_file for \
+                            complex edits that span many lines or have multiple hunks. \
+                            Use standard @@ unified diff format. Each hunk is matched by \
+                            content (context + remove lines), so exact line numbers are not required. \
+                            Multiple hunks per call are supported. \
+                            ALWAYS include 2-3 context lines around changes for reliable matching.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to tool_root."
+                    },
+                    "diff": {
+                        "type": "string",
+                        "description": "Unified diff string with @@ hunks. Example:\n@@ -10,5 +10,6 @@\n context\n-old line\n+new line\n context"
+                    }
+                },
+                "required": ["path", "diff"]
+            }
+        }
+    })
+}
+
 pub fn glob_tool_def() -> serde_json::Value {
     json!({
         "type": "function",
@@ -256,26 +285,34 @@ pub fn glob_tool_def() -> serde_json::Value {
 
 /// Fixed base for the TUI Coder pane — always an agentic executor, not a chat bot.
 const CODER_BASE_SYSTEM: &str = "\
-You are an autonomous coding agent with 6 tools:\n\
+You are an autonomous coding agent with 7 tools:\n\
   exec(command, cwd?)                       — run shell commands (build, test, git, installs)\n\
   read_file(path)                           — read a file's exact content\n\
   write_file(path, content)                 — create or overwrite a file reliably\n\
   patch_file(path, search, replace)         — replace an exact snippet in a file\n\
+  apply_diff(path, diff)                    — apply a unified @@ diff (multiple hunks)\n\
   search_files(pattern, dir?, ci?)          — find text across files (like grep -rn)\n\
   glob(pattern, dir?)                       — find files by name pattern (like find -name)\n\
 \n\
 RULE: You MUST call a tool on every single turn. Never respond with text only.\n\
 \n\
 Choose the right tool:\n\
-  List files by pattern → glob           (NOT exec+ls/find; OS-agnostic, token-efficient)\n\
-  Find text in files    → search_files   (NOT exec+grep; safer, token-efficient)\n\
-  Create/overwrite file → write_file     (handles encoding; more reliable than exec+echo)\n\
-  Edit part of a file   → read_file first, then patch_file  (no quoting issues)\n\
-  Run programs/tests    → exec\n\
-  Git / installs        → exec\n\
+  List files by pattern  → glob           (NOT exec+ls/find; OS-agnostic, token-efficient)\n\
+  Find text in files     → search_files   (NOT exec+grep; safer, token-efficient)\n\
+  Create/overwrite file  → write_file     (handles encoding; more reliable than exec+echo)\n\
+  Small targeted edit    → read_file → patch_file  (simple single-snippet replacement)\n\
+  Complex multi-hunk edit→ read_file → apply_diff  (multiple changes, spans many lines)\n\
+  Run programs/tests     → exec\n\
+  Git / installs         → exec\n\
 \n\
-After patch_file: diff preview is shown automatically — verify it looks correct.\n\
-After write_file: review the result with read_file if uncertain.\n\
+apply_diff format (include 2-3 context lines for reliable matching):\n\
+  @@ -10,4 +10,5 @@\n\
+   context line\n\
+  -old line to remove\n\
+  +new line to add\n\
+   context line\n\
+\n\
+After every file edit: tests run automatically if configured — check the result.\n\
 After every build/test: confirm exit_code == 0 before proceeding.\n\
 \n\
 When ALL steps from your <plan> are verified complete:\n\
@@ -1146,6 +1183,83 @@ Action: print diagnostics and change strategy; do not repeat the same command."
     }
 }
 
+// ── Git helpers ───────────────────────────────────────────────────────────────
+
+/// Create a git checkpoint commit in `root` (if it is a git repo).
+/// Returns the HEAD hash after the commit, or None if not a git repo / git unavailable.
+async fn git_create_checkpoint(root: &str) -> Option<String> {
+    // Only proceed if this is a git repo.
+    let head = run_git_cmd(root, &["rev-parse", "HEAD"]).await;
+    if head.is_none() {
+        return None;
+    }
+
+    // Stage all current changes (untracked included).
+    let _ = run_git_cmd(root, &["add", "-A"]).await;
+
+    // Commit with --allow-empty so we always get a clean ref even if nothing changed.
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let msg = format!("obstral: pre-session checkpoint {epoch}");
+    let _ = run_git_cmd(root, &["commit", "--allow-empty", "-m", &msg]).await;
+
+    // Return the new HEAD hash.
+    run_git_cmd(root, &["rev-parse", "HEAD"]).await
+}
+
+/// Run `git -C root <args>` with a 5-second timeout. Returns trimmed stdout or None.
+async fn run_git_cmd(root: &str, args: &[&str]) -> Option<String> {
+    let fut = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+        .await.ok()?.ok()?;
+    if !out.status.success() { return None; }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Run the project's test command after a file edit. Returns a formatted result string.
+/// Capped at 120 seconds; stdout/stderr truncated to MAX_STDOUT_CHARS.
+async fn run_test_cmd(cmd: &str, cwd: &str) -> String {
+    let fut = tokio::process::Command::new(if cfg!(target_os = "windows") { "powershell" } else { "sh" })
+        .args(if cfg!(target_os = "windows") {
+            vec!["-Command", cmd]
+        } else {
+            vec!["-c", cmd]
+        })
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(120), fut).await {
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let combined = format!("{}{}", stdout, stderr);
+            let exit = out.status.code().unwrap_or(-1);
+            (combined, exit)
+        }
+        Ok(Err(e)) => (format!("error running test: {e}"), -1),
+        Err(_) => ("test timed out after 120s".to_string(), -1),
+    };
+
+    let (combined, exit) = result;
+    let truncated = truncate_output_tail(&combined, 1200);
+
+    if exit == 0 {
+        format!("\n\n[auto-test] ✓ PASSED (exit 0)\n{truncated}")
+    } else {
+        format!("\n\n[auto-test] ✗ FAILED (exit {exit})\n{truncated}\nFix the test failure before proceeding.")
+    }
+}
+
 // ── Agentic loop ──────────────────────────────────────────────────────────────
 
 /// Run the agentic loop.  Sends StreamToken events to `tx` for the TUI to display.
@@ -1158,6 +1272,8 @@ pub async fn run_agentic(
     tx: mpsc::Sender<StreamToken>,
     project_context: Option<String>,
     agents_md: Option<String>,
+    // Command to run after every successful file edit (e.g. "cargo test 2>&1").
+    test_cmd: Option<String>,
 ) -> Result<()> {
     let client = reqwest::Client::new();
     let tools = json!([
@@ -1165,6 +1281,7 @@ pub async fn run_agentic(
         read_file_tool_def(),
         write_file_tool_def(),
         patch_file_tool_def(),
+        apply_diff_tool_def(),
         search_files_tool_def(),
         glob_tool_def(),
     ]);
@@ -1197,6 +1314,17 @@ pub async fn run_agentic(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .and_then(absolutize_path);
+    // D — git checkpoint: snapshot HEAD so the user can /rollback if the session goes wrong.
+    if let Some(ref root) = tool_root_abs {
+        if let Some(hash) = git_create_checkpoint(root).await {
+            let short = hash[..hash.len().min(8)].to_string();
+            let _ = tx.send(StreamToken::Checkpoint(hash)).await;
+            let _ = tx.send(StreamToken::Delta(
+                format!("[git checkpoint] {short} saved — use /rollback to restore\n\n")
+            )).await;
+        }
+    }
+
     if let Some(ref root) = tool_root_abs {
         let _ = std::fs::create_dir_all(root);
         let note = format!(
@@ -1312,6 +1440,7 @@ NEVER create a git repo inside another git repo. If you see 'embedded git reposi
                     let _ = tx.send(StreamToken::Error(e.clone())).await;
                     return Err(anyhow!("stream error: {e}"));
                 }
+                StreamToken::Checkpoint(_) => {} // not emitted by inner stream
             }
         }
 
@@ -1513,6 +1642,74 @@ After it succeeds, verify and continue.";
         // ── Execute the tool ───────────────────────────────────────────────
         let tc = tool_call.unwrap();
 
+        // ── apply_diff tool ───────────────────────────────────────────────
+        if tc.name.as_str() == "apply_diff" {
+            let args: serde_json::Value = serde_json::from_str(&tc.arguments)
+                .unwrap_or(json!({}));
+            let path = args["path"].as_str().unwrap_or("").to_string();
+            let diff = args["diff"].as_str().unwrap_or("").to_string();
+
+            let _ = tx.send(StreamToken::Delta(
+                format!("\n\n[APPLY_DIFF] {path}\n")
+            )).await;
+            let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
+
+            let base = tool_root_abs.as_deref();
+
+            // B — capture old content for diff anchoring
+            let old_for_cache = base.and_then(|b| {
+                crate::file_tools::resolve_safe_path(&path, Some(b))
+                    .ok()
+                    .and_then(|abs| std::fs::read_to_string(&abs).ok())
+            });
+
+            let (mut result, is_error) =
+                crate::file_tools::tool_apply_diff(&path, &diff, base);
+
+            // Invalidate file cache on success + auto-test
+            if !is_error {
+                let cache_key = crate::file_tools::resolve_safe_path(&path, base)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                file_cache.remove(&cache_key);
+                // Seed cache with new content
+                if let Ok(abs) = crate::file_tools::resolve_safe_path(&path, base) {
+                    if let Ok(new_content) = std::fs::read_to_string(&abs) {
+                        file_cache.insert(cache_key, new_content);
+                    }
+                }
+                // A — auto-run tests
+                if let Some(ref cmd) = test_cmd {
+                    if let Some(ref root) = tool_root_abs {
+                        let test_out = run_test_cmd(cmd, root).await;
+                        result.push_str(&test_out);
+                    }
+                }
+            }
+
+            let first_line = result.lines().next().unwrap_or("").to_string();
+            if is_error {
+                let _ = tx.send(StreamToken::Delta(format!("[RESULT_FILE_ERR] {first_line}\n"))).await;
+                state = AgentState::Recovery;
+                file_tool_consec_failures += 1;
+                pending_system_hint = Some(format!("apply_diff error: {first_line}"));
+            } else {
+                let _ = tx.send(StreamToken::Delta(format!("[RESULT_FILE] {first_line}\n"))).await;
+                state = AgentState::Planning;
+                file_tool_consec_failures = 0;
+                pending_system_hint = None;
+            }
+
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            }));
+            let _ = old_for_cache; // used above
+            continue;
+        }
+
         // ── glob tool ─────────────────────────────────────────────────────
         if tc.name.as_str() == "glob" {
             let args: serde_json::Value = serde_json::from_str(&tc.arguments)
@@ -1631,9 +1828,17 @@ After it succeeds, verify and continue.";
                 }
                 "write_file" => {
                     let content = args["content"].as_str().unwrap_or("").to_string();
-                    let r = crate::file_tools::tool_write_file(&path, &content, base);
-                    if !r.1 { file_cache.remove(&cache_key); } // invalidate
-                    r
+                    let (mut r_text, r_err) = crate::file_tools::tool_write_file(&path, &content, base);
+                    if !r_err {
+                        file_cache.remove(&cache_key);
+                        // A — auto-test after write
+                        if let Some(ref cmd) = test_cmd {
+                            if let Some(ref root) = tool_root_abs {
+                                r_text.push_str(&run_test_cmd(cmd, root).await);
+                            }
+                        }
+                    }
+                    (r_text, r_err)
                 }
                 _ => {
                     // ── patch_file ─────────────────────────────────────────
@@ -1674,6 +1879,12 @@ After it succeeds, verify and continue.";
                                 }
                                 // Seed cache with the freshly written content.
                                 file_cache.insert(cache_key.clone(), new_content);
+                            }
+                        }
+                        // A — auto-test after successful patch
+                        if let Some(ref cmd) = test_cmd {
+                            if let Some(ref root) = tool_root_abs {
+                                patch_result.push_str(&run_test_cmd(cmd, root).await);
                             }
                         }
                     }

@@ -162,6 +162,32 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                 push!(format!("find: {q}"));
             }
         }
+        "/rollback" => {
+            match (&app.last_git_checkpoint, &app.tool_root) {
+                (Some(hash), Some(root)) => {
+                    let hash = hash.clone();
+                    let root = root.clone();
+                    let short = &hash[..hash.len().min(8)];
+                    // Run git reset --hard synchronously (blocking is fine here — TUI is paused on input).
+                    match std::process::Command::new("git")
+                        .args(["-C", &root, "reset", "--hard", &hash])
+                        .output()
+                    {
+                        Ok(out) if out.status.success() => {
+                            push!(format!("✓ rolled back to checkpoint {short}"));
+                            app.last_git_checkpoint = None;
+                        }
+                        Ok(out) => {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            push!(format!("✗ rollback failed: {}", stderr.trim()));
+                        }
+                        Err(e) => push!(format!("✗ rollback error: {e}")),
+                    }
+                }
+                (None, _) => push!("no checkpoint available (run Coder first)".to_string()),
+                (_, None) => push!("no tool_root set — use /root <path> first".to_string()),
+            }
+        }
         "/help" | "/?" => {
             push!(
                 "/model <name>       set model\n\
@@ -170,6 +196,7 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
 /lang <ja|en|fr>    set language\n\
 /root <path>        set tool_root\n\
 /find <text>        filter history\n\
+/rollback           restore git checkpoint from session start\n\
 Ctrl+R              cycle right tab\n"
                     .to_string()
             );
@@ -531,6 +558,9 @@ fn handle_coder_token(token: StreamToken, app: &mut App) {
             app.coder.push_tool(format!("ERROR: {e}"));
             app.coder.finish_stream();
         }
+        StreamToken::Checkpoint(hash) => {
+            app.last_git_checkpoint = Some(hash);
+        }
     }
 }
 
@@ -540,7 +570,7 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
         StreamToken::Delta(s) => {
             app.observer.push_delta(&s);
         }
-        StreamToken::ToolCall(_) => {}
+        StreamToken::ToolCall(_) | StreamToken::Checkpoint(_) => {}
         StreamToken::Done => {
             app.observer.finish_stream();
             // Detect repeated Observer replies and schedule a one-shot diff-only retry.
@@ -582,7 +612,7 @@ fn handle_chat_token(token: StreamToken, app: &mut App) {
         StreamToken::Delta(s) => {
             app.chat.push_delta(&s);
         }
-        StreamToken::ToolCall(_) => {}
+        StreamToken::ToolCall(_) | StreamToken::Checkpoint(_) => {}
         StreamToken::Done => {
             app.chat.finish_stream();
         }
@@ -699,6 +729,9 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
             if let Some(ref root) = tool_root {
                 if let Some(ctx) = crate::project::ProjectContext::scan(root).await {
                     app.project_stack_label = Some(ctx.stack_label());
+                    if app.project_test_cmd.is_none() {
+                        app.project_test_cmd = ctx.test_cmd.clone();
+                    }
                     let agents = ctx.agents_md.clone();
                     (Some(ctx.to_context_text()), agents)
                 } else {
@@ -710,10 +743,11 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
         } else {
             (None, None)
         };
+    let test_cmd = app.project_test_cmd.clone();
 
     let tx = tx.clone();
     let handle = tokio::spawn(async move {
-        if let Err(e) = agent::run_agentic(messages, &cfg, tool_root.as_deref(), max_iters, tx.clone(), project_context, agents_md).await {
+        if let Err(e) = agent::run_agentic(messages, &cfg, tool_root.as_deref(), max_iters, tx.clone(), project_context, agents_md, test_cmd).await {
             let _ = tx.send(StreamToken::Error(format!("{e:#}"))).await;
         }
     });

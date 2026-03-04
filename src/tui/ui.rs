@@ -1008,6 +1008,40 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
             ]));
             continue;
         }
+        if trimmed.starts_with("[APPLY_DIFF]") {
+            in_diff = false;
+            let path = trimmed.trim_start_matches("[APPLY_DIFF]").trim();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  ⟁ DIFF ",
+                    Style::default().fg(OBS_MAG).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(path.to_string(), Style::default().fg(TEXT_BODY)),
+            ]));
+            continue;
+        }
+        if trimmed.starts_with("[auto-test]") {
+            in_diff = false;
+            let rest = trimmed.trim_start_matches("[auto-test]").trim();
+            let (icon, col) = if rest.starts_with('✓') { ("  ✓ TEST ", SUCCESS) } else { ("  ✗ TEST ", DANGER) };
+            lines.push(Line::from(vec![
+                Span::styled(icon, Style::default().fg(col).add_modifier(Modifier::BOLD)),
+                Span::styled(rest.to_string(), Style::default().fg(col)),
+            ]));
+            continue;
+        }
+        if trimmed.starts_with("[git checkpoint]") {
+            in_diff = false;
+            let rest = trimmed.trim_start_matches("[git checkpoint]").trim();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  ◎ CHKPT ",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(rest.to_string(), Style::default().fg(ACCENT)),
+            ]));
+            continue;
+        }
         if trimmed.starts_with("[GLOB]") {
             in_diff = false;
             let pat = trimmed.trim_start_matches("[GLOB]").trim();

@@ -48,6 +48,8 @@ pub struct ProjectContext {
     pub readme_excerpt: Option<String>,
     /// Content of .obstral.md / AGENTS.md / CLAUDE.md — project-specific instructions.
     pub agents_md: Option<String>,
+    /// Auto-detected or .obstral.md-configured test command.
+    pub test_cmd: Option<String>,
 }
 
 // ── Main scan function ─────────────────────────────────────────────────────────
@@ -85,6 +87,9 @@ impl ProjectContext {
         // Project-specific instruction file (.obstral.md > AGENTS.md > CLAUDE.md).
         let agents_md = try_read_agents_file(&root);
 
+        // Test command: from .obstral.md `test_cmd:` line, then auto-detect from stack.
+        let test_cmd = detect_test_cmd(&root, agents_md.as_deref());
+
         Some(ProjectContext {
             root,
             stack,
@@ -96,6 +101,7 @@ impl ProjectContext {
             key_files,
             readme_excerpt,
             agents_md,
+            test_cmd,
         })
     }
 
@@ -367,6 +373,48 @@ fn read_readme_excerpt(root: &str) -> Option<String> {
     }
 
     Some(useful.join("\n"))
+}
+
+/// Detect the test command for this project.
+/// Priority: `test_cmd:` line in .obstral.md > auto-detect from stack markers.
+fn detect_test_cmd(root: &str, agents_md: Option<&str>) -> Option<String> {
+    // 1. Explicit override in .obstral.md: `test_cmd: cargo test --workspace`
+    if let Some(content) = agents_md {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("test_cmd:") {
+                let cmd = rest.trim().to_string();
+                if !cmd.is_empty() {
+                    return Some(cmd);
+                }
+            }
+        }
+    }
+
+    // 2. Auto-detect from stack.
+    let p = Path::new(root);
+    if p.join("Cargo.toml").is_file() {
+        return Some("cargo test 2>&1".to_string());
+    }
+    if p.join("package.json").is_file() {
+        // Check for a "test" script in package.json
+        if let Ok(src) = std::fs::read_to_string(p.join("package.json")) {
+            if src.contains("\"test\"") {
+                let mgr = if p.join("pnpm-lock.yaml").is_file() { "pnpm" }
+                          else if p.join("yarn.lock").is_file() { "yarn" }
+                          else { "npm" };
+                return Some(format!("{mgr} test --passWithNoTests 2>&1"));
+            }
+        }
+    }
+    if p.join("pyproject.toml").is_file() || p.join("pytest.ini").is_file() || p.join("setup.cfg").is_file() {
+        return Some("pytest -q 2>&1".to_string());
+    }
+    if p.join("go.mod").is_file() {
+        return Some("go test ./... 2>&1".to_string());
+    }
+
+    None
 }
 
 /// Read the first project instruction file found in `root`.

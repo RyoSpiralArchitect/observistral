@@ -12,6 +12,8 @@ pub enum StreamToken {
     ToolCall(ToolCallData),
     Done,
     Error(String),
+    /// Git checkpoint hash created at session start (for rollback).
+    Checkpoint(String),
 }
 
 #[derive(Debug, Clone)]

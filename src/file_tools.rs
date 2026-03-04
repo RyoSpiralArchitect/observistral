@@ -379,6 +379,153 @@ pub fn tool_search_files(
     (out, false)
 }
 
+// ── apply_diff ────────────────────────────────────────────────────────────────
+
+/// One line in a diff hunk.
+enum DiffLine {
+    Context(String),
+    Remove(String),
+    Add(String),
+}
+
+struct DiffHunk {
+    lines: Vec<DiffLine>,
+}
+
+/// Parse standard unified diff into hunks.
+/// Skips `--- a/…` / `+++ b/…` header lines automatically.
+fn parse_diff_hunks(diff: &str) -> Vec<DiffHunk> {
+    let mut hunks: Vec<DiffHunk> = Vec::new();
+    let mut current: Option<DiffHunk> = None;
+
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            if let Some(h) = current.take() {
+                hunks.push(h);
+            }
+            current = Some(DiffHunk { lines: Vec::new() });
+        } else if let Some(ref mut hunk) = current {
+            if line.starts_with("---") || line.starts_with("+++") {
+                // Skip file header lines that may appear inside diff output.
+                continue;
+            } else if let Some(rest) = line.strip_prefix('-') {
+                hunk.lines.push(DiffLine::Remove(rest.to_string()));
+            } else if let Some(rest) = line.strip_prefix('+') {
+                hunk.lines.push(DiffLine::Add(rest.to_string()));
+            } else {
+                // Context line — may start with a space or be empty.
+                let ctx = if line.starts_with(' ') { &line[1..] } else { line };
+                hunk.lines.push(DiffLine::Context(ctx.to_string()));
+            }
+        }
+    }
+    if let Some(h) = current {
+        hunks.push(h);
+    }
+    hunks
+}
+
+/// Apply a unified diff to a file.  Each `@@` hunk is matched by content
+/// (context + remove lines) and replaced with context + add lines.
+/// Multiple hunks per file are supported; applied in order.
+pub fn tool_apply_diff(path: &str, diff: &str, base: Option<&str>) -> (String, bool) {
+    if diff.trim().is_empty() {
+        return ("ERROR: diff cannot be empty".to_string(), true);
+    }
+
+    let abs_path = match resolve_safe_path(path, base) {
+        Ok(p) => p,
+        Err(e) => return (format!("ERROR: {e}"), true),
+    };
+
+    let content = match std::fs::read_to_string(&abs_path) {
+        Ok(c) => c,
+        Err(e) => return (format!("ERROR reading '{path}': {e}"), true),
+    };
+
+    let hunks = parse_diff_hunks(diff);
+    if hunks.is_empty() {
+        return ("ERROR: no valid @@ hunks found in diff — make sure to include @@ markers".to_string(), true);
+    }
+
+    let mut new_content = content.clone();
+    let mut applied = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, hunk) in hunks.iter().enumerate() {
+        // Build the "old block" (context + remove lines) and "new block" (context + add lines).
+        let old_lines: Vec<&str> = hunk.lines.iter()
+            .filter_map(|l| match l {
+                DiffLine::Context(s) | DiffLine::Remove(s) => Some(s.as_str()),
+                DiffLine::Add(_) => None,
+            })
+            .collect();
+        let new_lines: Vec<&str> = hunk.lines.iter()
+            .filter_map(|l| match l {
+                DiffLine::Context(s) | DiffLine::Add(s) => Some(s.as_str()),
+                DiffLine::Remove(_) => None,
+            })
+            .collect();
+
+        if old_lines.is_empty() {
+            errors.push(format!("hunk {}: no context/remove lines", i + 1));
+            continue;
+        }
+
+        let old_block = old_lines.join("\n");
+        let new_block = new_lines.join("\n");
+
+        let count = new_content.matches(&old_block).count();
+        if count == 0 {
+            let preview: String = old_lines.iter().take(3).cloned().collect::<Vec<_>>().join("\\n");
+            errors.push(format!("hunk {}: old block not found (starts: {:?})", i + 1, preview));
+        } else if count > 1 {
+            errors.push(format!("hunk {}: old block not unique ({count} matches) — add more context lines", i + 1));
+        } else {
+            new_content = new_content.replacen(&old_block, &new_block, 1);
+            applied += 1;
+        }
+    }
+
+    if applied == 0 {
+        let preview: String = content.lines().take(6).collect::<Vec<_>>().join("\n");
+        return (
+            format!(
+                "ERROR: no hunks applied ({}). File starts with:\n{preview}\n\nTip: call read_file to inspect exact content.",
+                errors.join("; ")
+            ),
+            true,
+        );
+    }
+
+    // Atomic write.
+    let mut tmp_os = abs_path.as_os_str().to_owned();
+    tmp_os.push(".__obstral_tmp");
+    let tmp_path = PathBuf::from(tmp_os);
+
+    if let Err(e) = std::fs::write(&tmp_path, &new_content) {
+        return (format!("ERROR writing temp file: {e}"), true);
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &abs_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return (format!("ERROR finalizing diff to '{path}': {e}"), true);
+    }
+
+    let warn = if errors.is_empty() {
+        String::new()
+    } else {
+        format!("\n⚠ {}/{} hunks skipped: {}", errors.len(), hunks.len(), errors.join("; "))
+    };
+
+    (
+        format!(
+            "OK: applied {applied}/{} hunk(s) to '{path}'{warn}",
+            hunks.len()
+        ),
+        false,
+    )
+}
+
 // ── glob_files ────────────────────────────────────────────────────────────────
 
 const MAX_GLOB_RESULTS: usize = 200;
