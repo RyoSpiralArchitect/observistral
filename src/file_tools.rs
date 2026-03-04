@@ -379,6 +379,166 @@ pub fn tool_search_files(
     (out, false)
 }
 
+// ── glob_files ────────────────────────────────────────────────────────────────
+
+const MAX_GLOB_RESULTS: usize = 200;
+
+/// Minimal glob matcher (no regex crate required).
+///
+/// Supports:  `*`  → any chars except `/`
+///            `**` → any chars including `/`
+///            `?`  → single char except `/`
+///            literal chars
+fn glob_match(pattern: &str, path: &str) -> bool {
+    glob_inner(pattern.as_bytes(), path.as_bytes())
+}
+
+fn glob_inner(pat: &[u8], s: &[u8]) -> bool {
+    if pat.is_empty() {
+        return s.is_empty();
+    }
+    // `**` — matches any sequence including path separators.
+    if pat.starts_with(b"**") {
+        let rest = if pat.get(2) == Some(&b'/') { &pat[3..] } else { &pat[2..] };
+        if rest.is_empty() {
+            return true;
+        }
+        for i in 0..=s.len() {
+            if glob_inner(rest, &s[i..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    // `*` — matches any chars except `/`.
+    if pat[0] == b'*' {
+        if s.is_empty() || s[0] == b'/' {
+            return glob_inner(&pat[1..], s);
+        }
+        return glob_inner(&pat[1..], s) || glob_inner(pat, &s[1..]);
+    }
+    // `?` — single non-separator char.
+    if pat[0] == b'?' {
+        return !s.is_empty() && s[0] != b'/' && glob_inner(&pat[1..], &s[1..]);
+    }
+    // Literal.
+    !s.is_empty() && pat[0] == s[0] && glob_inner(&pat[1..], &s[1..])
+}
+
+/// Walk `search_root` and return paths (relative, forward-slash) that match `pattern`.
+pub fn tool_glob_files(pattern: &str, dir: &str, base: Option<&str>) -> (String, bool) {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return ("ERROR: glob pattern cannot be empty".to_string(), true);
+    }
+
+    let search_root = if dir.trim().is_empty() {
+        base.map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    } else {
+        match resolve_safe_path(dir, base) {
+            Ok(p) => p,
+            Err(e) => return (format!("ERROR: {e}"), true),
+        }
+    };
+
+    if !search_root.is_dir() {
+        return (format!("ERROR: '{}' is not a directory", search_root.display()), true);
+    }
+
+    let mut results: Vec<String> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![search_root.clone()];
+    let mut truncated = false;
+
+    'outer: while let Some(dir_path) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir_path) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                if !skip_dir(&name) {
+                    subdirs.push(path);
+                }
+            } else {
+                let rel = path
+                    .strip_prefix(&search_root)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| path.display().to_string());
+                if glob_match(pattern, &rel) {
+                    results.push(rel);
+                    if results.len() >= MAX_GLOB_RESULTS {
+                        truncated = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        stack.extend(subdirs);
+    }
+
+    if results.is_empty() {
+        return (format!("[glob] No files matching '{}' in '{}'", pattern, search_root.display()), false);
+    }
+
+    results.sort();
+    let cap_note = if truncated {
+        format!(" (first {MAX_GLOB_RESULTS} shown)")
+    } else {
+        String::new()
+    };
+    let header = format!("[glob: '{}' — {} file(s){}]\n", pattern, results.len(), cap_note);
+    (format!("{}{}", header, results.join("\n")), false)
+}
+
+// ── make_patch_diff ───────────────────────────────────────────────────────────
+
+/// Generate a compact context diff showing what patch_file changed.
+/// Returns an empty string if the search text can't be located in content.
+pub fn make_patch_diff(content: &str, search: &str, replace: &str) -> String {
+    let byte_pos = match content.find(search) {
+        Some(p) => p,
+        None => return String::new(),
+    };
+
+    const CTX: usize = 3;
+    let lines_before: Vec<&str> = content[..byte_pos].lines().collect();
+    let after_offset = byte_pos + search.len();
+    let lines_after: Vec<&str> = content[after_offset..].lines().take(CTX).collect();
+
+    let ctx_start = lines_before.len().saturating_sub(CTX);
+    let line_no = lines_before.len() + 1; // 1-based line number of change
+
+    let mut out = format!("[diff @line {}]\n", line_no);
+    for line in &lines_before[ctx_start..] {
+        out.push_str(&format!("  {line}\n"));
+    }
+    let remove_empty = search.trim_end_matches('\n').is_empty();
+    if !remove_empty {
+        for line in search.lines() {
+            out.push_str(&format!("- {line}\n"));
+        }
+    }
+    let add_empty = replace.trim_end_matches('\n').is_empty();
+    if !add_empty {
+        for line in replace.lines() {
+            out.push_str(&format!("+ {line}\n"));
+        }
+    }
+    for line in &lines_after {
+        out.push_str(&format!("  {line}\n"));
+    }
+    out.trim_end().to_string()
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

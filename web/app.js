@@ -2713,6 +2713,22 @@
         },
       };
 
+      const globTool = {
+        type: "function",
+        function: {
+          name: "glob",
+          description: "Find files by name/path pattern. Supports * (single dir), ** (any depth), ? (single char). Examples: '**/*.rs', 'src/*.ts'. Returns sorted relative paths. Prefer over exec+find/ls.",
+          parameters: {
+            type: "object",
+            properties: {
+              pattern: { type: "string", description: "Glob pattern, e.g. '**/*.py' or 'src/*.ts'" },
+              dir: { type: "string", description: "Subdirectory to search in (default: tool_root)" },
+            },
+            required: ["pattern"],
+          },
+        },
+      };
+
       const messages = [
         { role: "system", content: SYSTEM_BASE_TEXT },
         ...history,
@@ -2822,7 +2838,7 @@
           if (display) display += "\n\n";
            streamResult = await streamChatTools({
              messages,
-            tools: [execTool, writeFileTool, readFileTool, patchFileTool, searchFilesTool],
+            tools: [execTool, writeFileTool, readFileTool, patchFileTool, searchFilesTool, globTool],
              model: String(reqCfg.codeModel || reqCfg.model || ""),
              base_url: String(reqCfg.baseUrl || ""),
              api_key: resolvedKey || undefined,
@@ -3109,6 +3125,25 @@
                 toolResult = res && res.output ? res.output : `[search_files] No matches for '${pattern}'`;
               } catch (e2) {
                 toolResult = `ERROR searching '${pattern}': ${prettyErr(e2)}`;
+              }
+              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              flush();
+              continue;
+            }
+
+            if (toolName === "glob") {
+              let args;
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+              const pattern = String(args.pattern || "").trim();
+              const dir = String(args.dir || "");
+              display += (display ? "\n\n" : "") + `❖ glob: ${pattern}`;
+              flush();
+              let toolResult;
+              try {
+                const res = await postJson("/api/glob_files", { pattern, dir }, ac.signal);
+                toolResult = res && res.output ? res.output : `[glob] No files matching '${pattern}'`;
+              } catch (e2) {
+                toolResult = `ERROR glob '${pattern}': ${prettyErr(e2)}`;
               }
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               flush();

@@ -1008,6 +1008,30 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
             ]));
             continue;
         }
+        if trimmed.starts_with("[GLOB]") {
+            in_diff = false;
+            let pat = trimmed.trim_start_matches("[GLOB]").trim();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  ❖ GLOB ",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(pat.to_string(), Style::default().fg(TEXT_BODY)),
+            ]));
+            continue;
+        }
+        if trimmed.starts_with("[RESULT_GLOB]") {
+            in_diff = false;
+            let rest = trimmed.trim_start_matches("[RESULT_GLOB]").trim();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  ✓ ",
+                    Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(rest.to_string(), Style::default().fg(SUCCESS)),
+            ]));
+            continue;
+        }
         if trimmed.starts_with("[CACHE_HIT]") {
             in_diff = false;
             let rest = trimmed.trim_start_matches("[CACHE_HIT]").trim();

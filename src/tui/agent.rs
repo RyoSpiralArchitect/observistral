@@ -223,28 +223,59 @@ pub fn search_files_tool_def() -> serde_json::Value {
     })
 }
 
+pub fn glob_tool_def() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Find files by name/path pattern (like find -name). \
+                            Supports * (single component), ** (any depth), ? (single char). \
+                            Examples: '**/*.rs', 'src/*.ts', 'test_*'. \
+                            Returns relative paths sorted alphabetically. \
+                            PREFER this over exec+find/ls — OS-agnostic and token-efficient.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern, e.g. '**/*.rs' or 'src/*.ts'"
+                    },
+                    "dir": {
+                        "type": "string",
+                        "description": "Subdirectory to search in (relative to tool_root). \
+                                        Omit to search all of tool_root."
+                    }
+                },
+                "required": ["pattern"]
+            }
+        }
+    })
+}
+
 // ── System prompt builders ────────────────────────────────────────────────────
 
 /// Fixed base for the TUI Coder pane — always an agentic executor, not a chat bot.
 const CODER_BASE_SYSTEM: &str = "\
-You are an autonomous coding agent with 5 tools:\n\
+You are an autonomous coding agent with 6 tools:\n\
   exec(command, cwd?)                       — run shell commands (build, test, git, installs)\n\
   read_file(path)                           — read a file's exact content\n\
   write_file(path, content)                 — create or overwrite a file reliably\n\
   patch_file(path, search, replace)         — replace an exact snippet in a file\n\
   search_files(pattern, dir?, ci?)          — find text across files (like grep -rn)\n\
+  glob(pattern, dir?)                       — find files by name pattern (like find -name)\n\
 \n\
 RULE: You MUST call a tool on every single turn. Never respond with text only.\n\
 \n\
 Choose the right tool:\n\
-  Find text in files   → search_files  (NOT exec+grep; safer, token-efficient)\n\
-  Create/overwrite file→ write_file    (handles encoding; more reliable than exec+echo)\n\
-  Edit part of a file  → read_file first, then patch_file  (no quoting issues)\n\
-  Run programs/tests   → exec\n\
-  Git / installs       → exec\n\
-  Check a file exists  → exec or read_file\n\
+  List files by pattern → glob           (NOT exec+ls/find; OS-agnostic, token-efficient)\n\
+  Find text in files    → search_files   (NOT exec+grep; safer, token-efficient)\n\
+  Create/overwrite file → write_file     (handles encoding; more reliable than exec+echo)\n\
+  Edit part of a file   → read_file first, then patch_file  (no quoting issues)\n\
+  Run programs/tests    → exec\n\
+  Git / installs        → exec\n\
 \n\
-After patch_file/write_file: patch_file auto-verifies; for write_file review the result.\n\
+After patch_file: diff preview is shown automatically — verify it looks correct.\n\
+After write_file: review the result with read_file if uncertain.\n\
 After every build/test: confirm exit_code == 0 before proceeding.\n\
 \n\
 When ALL steps from your <plan> are verified complete:\n\
@@ -1135,11 +1166,16 @@ pub async fn run_agentic(
         write_file_tool_def(),
         patch_file_tool_def(),
         search_files_tool_def(),
+        glob_tool_def(),
     ]);
     let mut state = AgentState::Planning;
     let mut mem = FailureMemory::default();
     let mut pending_system_hint: Option<String> = None;
     let mut forced_tool_once = false;
+    // C — token budget guardian
+    let mut budget_warned = false;
+    // D — consecutive file-tool failure escalation
+    let mut file_tool_consec_failures: usize = 0;
 
     let root_user_text = messages_in
         .iter()
@@ -1206,6 +1242,16 @@ NEVER create a git repo inside another git repo. If you see 'embedded git reposi
     for iter in 0..max_iters {
         // ── Prune old tool results before sending to save context tokens ───
         prune_old_tool_results(&mut messages);
+
+        // C — Token budget guardian: warn once when context grows large.
+        if !budget_warned && messages.len() > 28 && pending_system_hint.is_none() {
+            budget_warned = true;
+            pending_system_hint = Some(format!(
+                "[Token Budget] Context has {} messages. Be concise: prefer tool calls \
+                 over long explanations. Summarise intermediate results in 1-2 lines.",
+                messages.len()
+            ));
+        }
 
         // ── Progress checkpoint every 3 iterations ────────────────────────
         // Asks the model to self-evaluate goal distance before the next command.
@@ -1467,6 +1513,44 @@ After it succeeds, verify and continue.";
         // ── Execute the tool ───────────────────────────────────────────────
         let tc = tool_call.unwrap();
 
+        // ── glob tool ─────────────────────────────────────────────────────
+        if tc.name.as_str() == "glob" {
+            let args: serde_json::Value = serde_json::from_str(&tc.arguments)
+                .unwrap_or(json!({}));
+            let pattern = args["pattern"].as_str().unwrap_or("").to_string();
+            let dir = args["dir"].as_str().unwrap_or("").to_string();
+
+            let _ = tx.send(StreamToken::Delta(
+                format!("\n\n[GLOB] {pattern}\n")
+            )).await;
+            let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
+
+            let base = tool_root_abs.as_deref();
+            let (result, is_error) =
+                crate::file_tools::tool_glob_files(&pattern, &dir, base);
+
+            let first_line = result.lines().next().unwrap_or("").to_string();
+            if is_error {
+                let _ = tx.send(StreamToken::Delta(
+                    format!("[RESULT_FILE_ERR] {first_line}\n")
+                )).await;
+                state = AgentState::Recovery;
+            } else {
+                let _ = tx.send(StreamToken::Delta(
+                    format!("[RESULT_GLOB] {first_line}\n")
+                )).await;
+                state = AgentState::Planning;
+                pending_system_hint = None;
+            }
+
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            }));
+            continue;
+        }
+
         // ── search_files tool ─────────────────────────────────────────────
         if tc.name.as_str() == "search_files" {
             let args: serde_json::Value = serde_json::from_str(&tc.arguments)
@@ -1555,13 +1639,29 @@ After it succeeds, verify and continue.";
                     // ── patch_file ─────────────────────────────────────────
                     let search = args["search"].as_str().unwrap_or("").to_string();
                     let replace = args["replace"].as_str().unwrap_or("").to_string();
+
+                    // B — capture old content for diff preview before patching.
+                    let old_content_for_diff = file_cache.get(&cache_key).cloned().or_else(|| {
+                        crate::file_tools::resolve_safe_path(&path, base)
+                            .ok()
+                            .and_then(|abs| std::fs::read_to_string(&abs).ok())
+                    });
+
                     let (mut patch_result, patch_err) =
                         crate::file_tools::tool_patch_file(&path, &search, &replace, base);
 
                     if !patch_err {
                         file_cache.remove(&cache_key); // invalidate stale cache
 
-                        // ── Gap 7: auto-verify patch was applied correctly ──
+                        // B — append diff preview (shows exactly what changed).
+                        if let Some(ref old) = old_content_for_diff {
+                            let diff = crate::file_tools::make_patch_diff(old, &search, &replace);
+                            if !diff.is_empty() {
+                                patch_result.push_str(&format!("\n{diff}"));
+                            }
+                        }
+
+                        // Gap 7: auto-verify patch was applied correctly.
                         if let Ok(abs) = crate::file_tools::resolve_safe_path(&path, base) {
                             if let Ok(new_content) = std::fs::read_to_string(&abs) {
                                 if replace.is_empty() || new_content.contains(&replace) {
@@ -1581,6 +1681,13 @@ After it succeeds, verify and continue.";
                 }
             };
 
+            // D — track consecutive file-tool failures for escalation.
+            if is_error {
+                file_tool_consec_failures += 1;
+            } else {
+                file_tool_consec_failures = 0;
+            }
+
             // Emit result label.
             let first_line = result.lines().next().unwrap_or("").to_string();
             if is_error {
@@ -1588,10 +1695,21 @@ After it succeeds, verify and continue.";
                     format!("[RESULT_FILE_ERR] {first_line}\n")
                 )).await;
                 state = AgentState::Recovery;
-                pending_system_hint = Some(format!(
-                    "File tool error: {first_line}\n\
-                     Read the error message carefully and fix the issue before proceeding."
-                ));
+                // D — escalate after 3 consecutive file-tool failures.
+                let hint = if file_tool_consec_failures >= 3 {
+                    format!(
+                        "CRITICAL: {file_tool_consec_failures} consecutive file-tool errors.\n\
+                         You MUST abandon the current approach. Do NOT retry the same operation.\n\
+                         Instead: call read_file to inspect the actual file state, then choose \
+                         a completely different strategy (e.g. write_file instead of patch_file)."
+                    )
+                } else {
+                    format!(
+                        "File tool error: {first_line}\n\
+                         Read the error message carefully and fix the issue before proceeding."
+                    )
+                };
+                pending_system_hint = Some(hint);
             } else {
                 let _ = tx.send(StreamToken::Delta(
                     format!("[RESULT_FILE] {first_line}\n")

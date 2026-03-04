@@ -373,6 +373,7 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/read_file") => api_read_file(&mut stream, state, &req.body).await,
         ("POST", "/api/patch_file") => api_patch_file(&mut stream, state, &req.body).await,
         ("POST", "/api/search_files") => api_search_files_endpoint(&mut stream, state, &req.body).await,
+        ("POST", "/api/glob_files") => api_glob_files(&mut stream, state, &req.body).await,
         ("GET", p) if p.starts_with("/api/project/scan") =>
             api_project_scan(&mut stream, p).await,
         _ => {
@@ -1462,6 +1463,28 @@ async fn api_search_files_endpoint(stream: &mut TcpStream, state: AppState, body
     let base = state.workspace_root.to_string_lossy().into_owned();
     let (output, is_err) =
         crate::file_tools::tool_search_files(&req.pattern, &req.dir, req.case_insensitive, Some(&base));
+    if is_err {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: output }).await;
+    }
+    write_json(stream, 200, "OK", &Res { ok: true, output }).await
+}
+
+async fn api_glob_files(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        pattern: String,
+        #[serde(default)]
+        dir: String,
+    }
+    #[derive(Serialize)]
+    struct Res { ok: bool, output: String }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
+    };
+    let base = state.workspace_root.to_string_lossy().into_owned();
+    let (output, is_err) = crate::file_tools::tool_glob_files(&req.pattern, &req.dir, Some(&base));
     if is_err {
         return write_json(stream, 400, "Bad Request", &ApiError { error: output }).await;
     }
