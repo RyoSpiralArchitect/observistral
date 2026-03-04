@@ -96,9 +96,9 @@ When a command fails, OBSTRAL doesn't hand the model a raw `exit_code: 1` and ho
 | `NETWORK` | Check service status and proxy vars. |
 | `LOGIC` | Re-read the logic. Don't just re-run. |
 
-### The Coder Has Four Tools
+### The Coder Has Five Tools
 
-The Coder isn't limited to shell commands. It has four purpose-built tools:
+The Coder isn't limited to shell commands. It has five purpose-built tools:
 
 | Tool | When to use it |
 |---|---|
@@ -106,8 +106,9 @@ The Coder isn't limited to shell commands. It has four purpose-built tools:
 | `read_file(path)` | Read exact file content without shell quoting issues |
 | `write_file(path, content)` | Atomically create or overwrite a file (parent dirs auto-created) |
 | `patch_file(path, search, replace)` | Replace an exact snippet — fails loudly on ambiguity |
+| `apply_diff(path, diff)` | Apply a unified `@@` diff (multiple hunks) — best for larger edits when `patch_file` is too small |
 
-`write_file` and `patch_file` use a temp-file → rename pattern, so a crash mid-write never leaves corrupt output.
+`write_file`, `patch_file`, and `apply_diff` use a temp-file → rename pattern, so a crash mid-write never leaves corrupt output.
 
 `patch_file` requires the search string to appear **exactly once**. If it appears zero times, you get a preview of the file so the model can self-correct. If it appears more than once, you get the count. Ambiguity is an error, not a guess.
 

@@ -23,7 +23,7 @@ OBSTRAL resout ca en faisant tourner Coder et Observer dans des **contextes enti
 
 | Role | Ce qu'il fait | Ce qu'il ne fait jamais |
 |---|---|---|
-| **Coder** | Agit — fichiers, commandes shell, boucle agentique (12 etapes max), 4 outils integres | Relire ou remettre en question son propre travail |
+| **Coder** | Agit — fichiers, commandes shell, boucle agentique (12 etapes max), 5 outils integres | Relire ou remettre en question son propre travail |
 | **Observer** | Critique — score chaque proposition, escalade ce que vous ignorez | Toucher au code. Il lit seulement. |
 | **Chat** | Reflechit avec vous — conception, canard en plastique, compromis | Interrompre la boucle d'execution |
 
@@ -96,9 +96,9 @@ Quand une commande echoue, OBSTRAL ne donne pas au modele un brut `exit_code: 1`
 | `NETWORK` | Verifiez le service et les variables proxy. |
 | `LOGIC` | Relisez la logique. Ne relancez pas juste pour relancer. |
 
-### Le Coder dispose de quatre outils
+### Le Coder dispose de cinq outils
 
-Le Coder n'est pas limite aux commandes shell. Il dispose de quatre outils dedies :
+Le Coder n'est pas limite aux commandes shell. Il dispose de cinq outils dedies :
 
 | Outil | Quand l'utiliser |
 |---|---|
@@ -106,8 +106,9 @@ Le Coder n'est pas limite aux commandes shell. Il dispose de quatre outils dedie
 | `read_file(path)` | Lire le contenu exact d'un fichier sans problemes de guillemets shell |
 | `write_file(path, content)` | Creer ou ecraser un fichier de maniere atomique (repertoires parents auto-crees) |
 | `patch_file(path, search, replace)` | Remplacer un extrait exact — echoue bruyamment en cas d'ambiguite |
+| `apply_diff(path, diff)` | Appliquer un diff unifie `@@` (plusieurs hunks) — ideal quand `patch_file` est trop petit |
 
-`write_file` et `patch_file` utilisent un schema fichier temporaire → renommage, donc un crash en cours d'ecriture ne laisse jamais de fichier corrompu.
+`write_file`, `patch_file` et `apply_diff` utilisent un schema fichier temporaire → renommage, donc un crash en cours d'ecriture ne laisse jamais de fichier corrompu.
 
 `patch_file` exige que la chaine de recherche apparaisse **exactement une fois**. Zero occurrence → apercu du fichier pour auto-correction. Plusieurs occurrences → compte exact retourne en erreur. L'ambiguite est une erreur, pas une supposition.
 
