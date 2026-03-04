@@ -2569,7 +2569,8 @@
         `Working directory (tool_root): ${cwdLabelNow()}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "0. NEVER create a git repo inside another git repo. If you see 'embedded git repository' warnings, STOP and relocate to a clean directory under tool_root.",
-        "1. ALWAYS use tools to act: use `write_file` to create/edit files, and `exec` to run commands. NEVER just show code.",
+        "1. ALWAYS use tools to act. Available tools: exec, write_file, read_file, patch_file, search_files. NEVER just show code.",
+        "   Use read_file to inspect files before editing. Use patch_file for targeted edits. Use search_files to find code across files.",
         "   Fallback (if tool calls are not supported): output ONE ```powershell``` code block containing ONLY commands (no `$ ` or `PS>` prompts).",
         "2. Use PowerShell syntax ONLY (cmd.exe is NOT used):",
         "   - Create directory tree: New-Item -ItemType Directory -Force -Path 'a/b/c'",
@@ -2586,7 +2587,8 @@
         `Working directory (tool_root): ${cwdLabelNow()}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "0. NEVER create a git repo inside another git repo. If you see 'embedded git repository' warnings, STOP and relocate to a clean directory under tool_root.",
-        "1. ALWAYS use tools to act: use `write_file` to create/edit files, and `exec` to run commands. NEVER just show code.",
+        "1. ALWAYS use tools to act. Available tools: exec, write_file, read_file, patch_file, search_files. NEVER just show code.",
+        "   Use read_file to inspect files before editing. Use patch_file for targeted edits. Use search_files to find code across files.",
         "   Fallback (if tool calls are not supported): output ONE ```bash``` code block containing ONLY commands (no `$ ` prompts).",
         "2. Use Unix shell commands:",
         "   - Create directory: mkdir -p path/to/dir",
@@ -2658,6 +2660,55 @@
               content: { type: "string", description: "Full file content (UTF-8 text)" },
             },
             required: ["path", "content"],
+          },
+        },
+      };
+
+      const readFileTool = {
+        type: "function",
+        function: {
+          name: "read_file",
+          description: "Read the content of a file under tool_root. Use before editing to see the exact current text. Large files are truncated automatically.",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "Relative file path under tool_root" },
+            },
+            required: ["path"],
+          },
+        },
+      };
+
+      const patchFileTool = {
+        type: "function",
+        function: {
+          name: "patch_file",
+          description: "Edit a file by replacing an exact text snippet. The search string must appear exactly once. Call read_file first to see the exact current text. For whole-file rewrites use write_file.",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "Relative file path under tool_root" },
+              search: { type: "string", description: "Exact text to find (must be unique in the file)" },
+              replace: { type: "string", description: "Text to replace it with" },
+            },
+            required: ["path", "search", "replace"],
+          },
+        },
+      };
+
+      const searchFilesTool = {
+        type: "function",
+        function: {
+          name: "search_files",
+          description: "Search file contents for a literal text pattern (like grep -rn). Returns matching lines with file path and line number. Use to find where a function/symbol is defined or used.",
+          parameters: {
+            type: "object",
+            properties: {
+              pattern: { type: "string", description: "Literal text to search for" },
+              dir: { type: "string", description: "Subdirectory to search in (default: tool_root)" },
+              case_insensitive: { type: "boolean", description: "Case-insensitive search (default: false)" },
+            },
+            required: ["pattern"],
           },
         },
       };
@@ -2771,7 +2822,7 @@
           if (display) display += "\n\n";
            streamResult = await streamChatTools({
              messages,
-            tools: [execTool, writeFileTool],
+            tools: [execTool, writeFileTool, readFileTool, patchFileTool, searchFilesTool],
              model: String(reqCfg.codeModel || reqCfg.model || ""),
              base_url: String(reqCfg.baseUrl || ""),
              api_key: resolvedKey || undefined,
@@ -3003,6 +3054,64 @@
               }
               flush();
               if (awaitingApproval) break;
+              continue;
+            }
+
+            if (toolName === "read_file") {
+              let args;
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+              const path0 = String(args.path || "").trim();
+              display += (display ? "\n\n" : "") + `📄 read_file: ${path0}`;
+              flush();
+              let toolResult;
+              try {
+                const res = await postJson("/api/read_file", { path: path0 }, ac.signal);
+                toolResult = res && res.content ? res.content : `ERROR: empty response`;
+              } catch (e2) {
+                toolResult = `ERROR reading '${path0}': ${prettyErr(e2)}`;
+              }
+              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              flush();
+              continue;
+            }
+
+            if (toolName === "patch_file") {
+              let args;
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+              const path0 = String(args.path || "").trim();
+              const search = String(args.search || "");
+              const replace = String(args.replace || "");
+              display += (display ? "\n\n" : "") + `✎ patch_file: ${path0}`;
+              flush();
+              let toolResult;
+              try {
+                const res = await postJson("/api/patch_file", { path: path0, search, replace }, ac.signal);
+                toolResult = res && res.message ? res.message : "OK: patched";
+              } catch (e2) {
+                toolResult = `ERROR patching '${path0}': ${prettyErr(e2)}`;
+              }
+              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              flush();
+              continue;
+            }
+
+            if (toolName === "search_files") {
+              let args;
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+              const pattern = String(args.pattern || "").trim();
+              const dir = String(args.dir || "");
+              const ci = !!args.case_insensitive;
+              display += (display ? "\n\n" : "") + `🔍 search_files: ${pattern}`;
+              flush();
+              let toolResult;
+              try {
+                const res = await postJson("/api/search_files", { pattern, dir, case_insensitive: ci }, ac.signal);
+                toolResult = res && res.output ? res.output : `[search_files] No matches for '${pattern}'`;
+              } catch (e2) {
+                toolResult = `ERROR searching '${pattern}': ${prettyErr(e2)}`;
+              }
+              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              flush();
               continue;
             }
 

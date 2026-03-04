@@ -370,6 +370,9 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("GET", "/api/meta_prompts") => api_meta_prompts_get(&mut stream, state).await,
         ("POST", "/api/meta_prompts") => api_meta_prompts_post(&mut stream, state, &req.body).await,
         ("POST", "/api/write_file") => api_write_file(&mut stream, state, &req.body).await,
+        ("POST", "/api/read_file") => api_read_file(&mut stream, state, &req.body).await,
+        ("POST", "/api/patch_file") => api_patch_file(&mut stream, state, &req.body).await,
+        ("POST", "/api/search_files") => api_search_files_endpoint(&mut stream, state, &req.body).await,
         ("GET", p) if p.starts_with("/api/project/scan") =>
             api_project_scan(&mut stream, p).await,
         _ => {
@@ -1400,6 +1403,69 @@ async fn api_write_file(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
         },
     )
     .await
+}
+
+async fn api_read_file(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req { path: String }
+    #[derive(Serialize)]
+    struct Res { ok: bool, content: String, lines: usize, bytes: usize }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
+    };
+    let base = state.workspace_root.to_string_lossy().into_owned();
+    let (text, is_err) = crate::file_tools::tool_read_file(&req.path, Some(&base));
+    if is_err {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: text }).await;
+    }
+    let lines = text.lines().count();
+    let bytes = text.len();
+    write_json(stream, 200, "OK", &Res { ok: true, content: text, lines, bytes }).await
+}
+
+async fn api_patch_file(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req { path: String, search: String, replace: String }
+    #[derive(Serialize)]
+    struct Res { ok: bool, message: String }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
+    };
+    let base = state.workspace_root.to_string_lossy().into_owned();
+    let (msg, is_err) = crate::file_tools::tool_patch_file(&req.path, &req.search, &req.replace, Some(&base));
+    if is_err {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: msg }).await;
+    }
+    write_json(stream, 200, "OK", &Res { ok: true, message: msg }).await
+}
+
+async fn api_search_files_endpoint(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        pattern: String,
+        #[serde(default)]
+        dir: String,
+        #[serde(default)]
+        case_insensitive: bool,
+    }
+    #[derive(Serialize)]
+    struct Res { ok: bool, output: String }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
+    };
+    let base = state.workspace_root.to_string_lossy().into_owned();
+    let (output, is_err) =
+        crate::file_tools::tool_search_files(&req.pattern, &req.dir, req.case_insensitive, Some(&base));
+    if is_err {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: output }).await;
+    }
+    write_json(stream, 200, "OK", &Res { ok: true, output }).await
 }
 
 async fn api_open(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
