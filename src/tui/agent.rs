@@ -190,26 +190,61 @@ pub fn patch_file_tool_def() -> serde_json::Value {
     })
 }
 
+pub fn search_files_tool_def() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": "Search file contents for a literal text pattern (like grep -rn). \
+                            Returns matching lines as 'file:line: content'. \
+                            PREFER this over exec+grep — it is faster, safer, and token-efficient. \
+                            Use to find function definitions, TODO items, error strings, or any \
+                            pattern across the codebase. Dir is relative to tool_root.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Literal text to search for (not a regex)."
+                    },
+                    "dir": {
+                        "type": "string",
+                        "description": "Subdirectory to search in (relative to tool_root). \
+                                        Omit or leave empty to search all files under tool_root."
+                    },
+                    "case_insensitive": {
+                        "type": "boolean",
+                        "description": "If true, search ignores case. Default: false."
+                    }
+                },
+                "required": ["pattern"]
+            }
+        }
+    })
+}
+
 // ── System prompt builders ────────────────────────────────────────────────────
 
 /// Fixed base for the TUI Coder pane — always an agentic executor, not a chat bot.
 const CODER_BASE_SYSTEM: &str = "\
-You are an autonomous coding agent with 4 tools:\n\
-  exec(command, cwd?)              — run shell commands (build, test, git, installs)\n\
-  read_file(path)                  — read a file's exact content\n\
-  write_file(path, content)        — create or overwrite a file reliably\n\
-  patch_file(path, search, replace)— replace an exact snippet in a file\n\
+You are an autonomous coding agent with 5 tools:\n\
+  exec(command, cwd?)                       — run shell commands (build, test, git, installs)\n\
+  read_file(path)                           — read a file's exact content\n\
+  write_file(path, content)                 — create or overwrite a file reliably\n\
+  patch_file(path, search, replace)         — replace an exact snippet in a file\n\
+  search_files(pattern, dir?, ci?)          — find text across files (like grep -rn)\n\
 \n\
 RULE: You MUST call a tool on every single turn. Never respond with text only.\n\
 \n\
 Choose the right tool:\n\
-  Create/overwrite file → write_file  (more reliable than exec+echo; handles encoding)\n\
-  Edit part of a file  → read_file first, then patch_file (no quoting issues)\n\
+  Find text in files   → search_files  (NOT exec+grep; safer, token-efficient)\n\
+  Create/overwrite file→ write_file    (handles encoding; more reliable than exec+echo)\n\
+  Edit part of a file  → read_file first, then patch_file  (no quoting issues)\n\
   Run programs/tests   → exec\n\
   Git / installs       → exec\n\
   Check a file exists  → exec or read_file\n\
 \n\
-After patch_file/write_file: if correctness matters, call read_file to verify.\n\
+After patch_file/write_file: patch_file auto-verifies; for write_file review the result.\n\
 After every build/test: confirm exit_code == 0 before proceeding.\n\
 \n\
 When ALL steps from your <plan> are verified complete:\n\
@@ -1099,6 +1134,7 @@ pub async fn run_agentic(
         read_file_tool_def(),
         write_file_tool_def(),
         patch_file_tool_def(),
+        search_files_tool_def(),
     ]);
     let mut state = AgentState::Planning;
     let mut mem = FailureMemory::default();
@@ -1430,6 +1466,46 @@ After it succeeds, verify and continue.";
 
         // ── Execute the tool ───────────────────────────────────────────────
         let tc = tool_call.unwrap();
+
+        // ── search_files tool ─────────────────────────────────────────────
+        if tc.name.as_str() == "search_files" {
+            let args: serde_json::Value = serde_json::from_str(&tc.arguments)
+                .unwrap_or(json!({}));
+            let pattern = args["pattern"].as_str().unwrap_or("").to_string();
+            let dir = args["dir"].as_str().unwrap_or("").to_string();
+            let ci = args["case_insensitive"].as_bool().unwrap_or(false);
+
+            let _ = tx.send(StreamToken::Delta(
+                format!("\n\n[SEARCH_FILES] {pattern}\n")
+            )).await;
+            let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
+
+            let base = tool_root_abs.as_deref();
+            let (result, is_error) =
+                crate::file_tools::tool_search_files(&pattern, &dir, ci, base);
+
+            let first_line = result.lines().next().unwrap_or("").to_string();
+            if is_error {
+                let _ = tx.send(StreamToken::Delta(
+                    format!("[RESULT_FILE_ERR] {first_line}\n")
+                )).await;
+                state = AgentState::Recovery;
+            } else {
+                let _ = tx.send(StreamToken::Delta(
+                    format!("[RESULT_SEARCH] {first_line}\n")
+                )).await;
+                state = AgentState::Planning;
+                pending_system_hint = None;
+            }
+
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            }));
+
+            continue;
+        }
 
         // ── File tools: read_file / write_file / patch_file ────────────────
         if matches!(tc.name.as_str(), "read_file" | "write_file" | "patch_file") {

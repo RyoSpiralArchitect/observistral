@@ -211,6 +211,174 @@ pub fn tool_patch_file(
     )
 }
 
+// ── search_files ──────────────────────────────────────────────────────────────
+
+const MAX_SEARCH_RESULTS: usize = 50;
+const MAX_SEARCH_OUT_CHARS: usize = 6000;
+const MAX_LINE_DISPLAY: usize = 200;
+
+/// True for directory names that should never be searched.
+fn skip_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "target" | "node_modules" | ".git" | "__pycache__" | "dist" | "build"
+            | ".next" | ".nuxt" | "vendor" | ".venv" | "venv" | ".tox"
+            | "coverage" | ".cache" | ".idea" | ".vscode" | "out" | ".svn"
+    )
+}
+
+/// True for file extensions that are clearly binary — skip to avoid UTF-8 errors.
+fn skip_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "exe" | "dll" | "so" | "dylib" | "bin" | "o" | "a" | "obj" | "wasm"
+            | "zip" | "tar" | "gz" | "bz2" | "7z" | "rar" | "xz" | "zst"
+            | "jpg" | "jpeg" | "png" | "gif" | "bmp" | "ico" | "webp" | "avif"
+            | "mp3" | "mp4" | "wav" | "avi" | "mov" | "mkv" | "flac" | "ogg"
+            | "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx"
+            | "db" | "sqlite" | "sqlite3" | "parquet" | "arrow"
+            | "lock" // Cargo.lock / package-lock.json can be enormous
+    )
+}
+
+/// Recursive file search (literal, no regex dependency).
+/// Returns "relative/path:line_no: content" for each matching line.
+pub fn tool_search_files(
+    pattern: &str,
+    dir: &str,
+    case_insensitive: bool,
+    base: Option<&str>,
+) -> (String, bool) {
+    if pattern.is_empty() {
+        return ("ERROR: search pattern cannot be empty".to_string(), true);
+    }
+
+    // Resolve search root.
+    let search_root = if dir.trim().is_empty() {
+        base.map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    } else {
+        match resolve_safe_path(dir, base) {
+            Ok(p) => p,
+            Err(e) => return (format!("ERROR: {e}"), true),
+        }
+    };
+
+    if !search_root.is_dir() {
+        return (
+            format!("ERROR: '{}' is not a directory", search_root.display()),
+            true,
+        );
+    }
+
+    let needle = if case_insensitive {
+        pattern.to_ascii_lowercase()
+    } else {
+        pattern.to_string()
+    };
+
+    let mut results: Vec<String> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![search_root.clone()];
+    let mut truncated = false;
+
+    'outer: while let Some(dir_path) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir_path) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        let mut files: Vec<PathBuf> = Vec::new();
+
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if name.starts_with('.') && name != ".obstral.md" {
+                continue; // skip hidden
+            }
+            if path.is_dir() {
+                if !skip_dir(name) {
+                    subdirs.push(path);
+                }
+            } else {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if !skip_extension(&ext) {
+                    files.push(path);
+                }
+            }
+        }
+
+        for file_path in &files {
+            let content = match std::fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let rel = file_path
+                .strip_prefix(&search_root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| file_path.display().to_string());
+
+            for (ln, line) in content.lines().enumerate() {
+                let cmp = if case_insensitive {
+                    line.to_ascii_lowercase()
+                } else {
+                    line.to_string()
+                };
+                if cmp.contains(&needle) {
+                    let display: String =
+                        line.trim_end().chars().take(MAX_LINE_DISPLAY).collect();
+                    results.push(format!("{}:{}: {}", rel, ln + 1, display));
+                    if results.len() >= MAX_SEARCH_RESULTS {
+                        truncated = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        stack.extend(subdirs);
+    }
+
+    if results.is_empty() {
+        return (
+            format!(
+                "[search_files] No matches for '{}' in '{}'",
+                pattern,
+                search_root.display()
+            ),
+            false,
+        );
+    }
+
+    let count = results.len();
+    let cap_note = if truncated {
+        format!(" (first {MAX_SEARCH_RESULTS} shown — more may exist)")
+    } else {
+        String::new()
+    };
+    let header = format!(
+        "[search_files: '{}' — {} match(es){}]\n",
+        pattern, count, cap_note
+    );
+    let body = results.join("\n");
+
+    let out = if body.chars().count() > MAX_SEARCH_OUT_CHARS {
+        let trunc: String = body.chars().take(MAX_SEARCH_OUT_CHARS).collect();
+        format!("{header}{trunc}\n[…output truncated]")
+    } else {
+        format!("{header}{body}")
+    };
+
+    (out, false)
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

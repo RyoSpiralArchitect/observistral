@@ -2222,6 +2222,15 @@
         return t.slice(0, max) + `\n[…truncated — ${lines} lines total, first ${max} chars shown]`;
       };
 
+      const isPrunableToolSuccess = (content) => {
+        const s = String(content || "").trimStart();
+        if (s.startsWith("OK (exit_code: 0)")) return true;           // exec success
+        if (/^OK: (wrote|patched) '/.test(s)) return true;            // write_file / patch_file
+        if (/^\[.+\] \(\d+ lines?,/.test(s)) return true;             // read_file header
+        if (s.startsWith("[search_files:")) return true;               // search_files header
+        return false;
+      };
+
       const pruneToolMessages = (msgs) => {
         const toolIdxs = msgs.reduce((acc, m, i) => m.role === "tool" ? [...acc, i] : acc, []);
         if (toolIdxs.length <= KEEP_TOOL_TURNS) return;
@@ -2229,7 +2238,7 @@
         for (const idx of toPrune) {
           const content = String(msgs[idx].content || "");
           // Never prune failures: they are the most important recovery context.
-          if (!content.trimStart().startsWith("OK (exit_code: 0)")) continue;
+          if (!isPrunableToolSuccess(content)) continue;
           const lines = content.split("\n");
           if (lines.length > 2) {
             msgs[idx] = { ...msgs[idx], content: lines[0] + ` [pruned ${lines.length}L]` };
