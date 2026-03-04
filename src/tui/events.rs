@@ -162,6 +162,99 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                 push!(format!("find: {q}"));
             }
         }
+        "/autofix" => {
+            app.auto_fix_mode = !app.auto_fix_mode;
+            push!(format!(
+                "auto-fix mode: {} — Observer reviews will {} be forwarded to Coder",
+                if app.auto_fix_mode { "ON" } else { "OFF" },
+                if app.auto_fix_mode { "automatically" } else { "NOT" }
+            ));
+        }
+        "/diff" => {
+            let root = app.tool_root.as_ref().cloned().unwrap_or_else(|| ".".to_string());
+            let base = app.last_git_checkpoint.as_deref().unwrap_or("HEAD~1");
+            let stat = std::process::Command::new("git")
+                .args(["-C", &root, "diff", base, "--stat"])
+                .output();
+            let diff = std::process::Command::new("git")
+                .args(["-C", &root, "diff", base, "--name-status"])
+                .output();
+            match (stat, diff) {
+                (Ok(s), Ok(d)) => {
+                    let stat_text = String::from_utf8_lossy(&s.stdout);
+                    let diff_text = String::from_utf8_lossy(&d.stdout);
+                    if stat_text.trim().is_empty() {
+                        push!("no changes since session start".to_string());
+                    } else {
+                        push!(format!(
+                            "[Session diff from checkpoint]\n{}\n\nFiles changed:\n{}",
+                            stat_text.trim(),
+                            diff_text.trim()
+                        ));
+                    }
+                }
+                _ => push!("git diff failed — is tool_root a git repo?".to_string()),
+            }
+        }
+        "/init" => {
+            let root = app.tool_root.as_ref().cloned().unwrap_or_else(|| ".".to_string());
+            let obstral_path = std::path::Path::new(&root).join(".obstral.md");
+            if obstral_path.exists() {
+                push!(format!(".obstral.md already exists at {}", obstral_path.display()));
+            } else {
+                // Detect stack and test_cmd synchronously.
+                let has_cargo = std::path::Path::new(&root).join("Cargo.toml").exists();
+                let has_pkg   = std::path::Path::new(&root).join("package.json").exists();
+                let has_py    = std::path::Path::new(&root).join("pyproject.toml").exists()
+                             || std::path::Path::new(&root).join("requirements.txt").exists();
+                let has_go    = std::path::Path::new(&root).join("go.mod").exists();
+                let stack = [
+                    if has_cargo { Some("Rust") } else { None },
+                    if has_pkg   { Some("Node/React") } else { None },
+                    if has_py    { Some("Python") } else { None },
+                    if has_go    { Some("Go") } else { None },
+                ].iter().flatten().cloned().collect::<Vec<_>>().join(", ");
+                let test_cmd = if has_cargo { "cargo test 2>&1" }
+                               else if has_pkg { "npm test --passWithNoTests 2>&1" }
+                               else if has_py  { "pytest -q 2>&1" }
+                               else if has_go  { "go test ./... 2>&1" }
+                               else { "# add your test command here" };
+                let stack_line = if stack.is_empty() { "# auto-detected: unknown".to_string() }
+                                 else { stack.clone() };
+                let content = format!(
+"# .obstral.md — Project Instructions for OBSTRAL Coder
+#
+# This file is automatically injected into the Coder's system prompt.
+# Edit it to set project rules, test commands, and coding conventions.
+
+## Stack
+{stack_line}
+
+## Test Command
+test_cmd: {test_cmd}
+
+## Development Rules
+- Always run tests after modifying source files
+- Use patch_file or apply_diff for targeted edits (safer than exec+sed)
+- Keep git commits small and focused
+- Check for compilation errors before marking a task done
+
+## Forbidden Commands
+# List commands that should never be run automatically:
+# - git push --force
+# - rm -rf /
+# - DROP TABLE
+
+## Notes
+# Add any project-specific context, architecture notes, or constraints here.
+"
+                );
+                match std::fs::write(&obstral_path, &content) {
+                    Ok(_) => push!(format!("✓ created .obstral.md at {} — edit it to customize", obstral_path.display())),
+                    Err(e) => push!(format!("✗ failed to create .obstral.md: {e}")),
+                }
+            }
+        }
         "/rollback" => {
             match (&app.last_git_checkpoint, &app.tool_root) {
                 (Some(hash), Some(root)) => {
@@ -196,6 +289,9 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
 /lang <ja|en|fr>    set language\n\
 /root <path>        set tool_root\n\
 /find <text>        filter history\n\
+/autofix            toggle Observer→Coder auto-fix pipeline\n\
+/diff               show session diff from git checkpoint\n\
+/init               generate .obstral.md template\n\
 /rollback           restore git checkpoint from session start\n\
 Ctrl+R              cycle right tab\n"
                     .to_string()
@@ -278,7 +374,14 @@ pub async fn run_event_loop(
             AppEvent::Tick => {
                 app.tick_count = app.tick_count.wrapping_add(1);
                 maybe_auto_observe(app, &observer_tx).await;
+                maybe_observer_lang_retry(app, &observer_tx).await;
                 maybe_observer_loop_retry(app, &observer_tx).await;
+                // A — consume pending auto-fix (set by handle_observer_token on Done).
+                if let Some(fix_text) = app.pending_auto_fix.take() {
+                    if !app.coder.streaming {
+                        send_coder_with_text(app, &coder_tx, fix_text).await;
+                    }
+                }
             }
         }
 
@@ -573,6 +676,47 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
         StreamToken::ToolCall(_) | StreamToken::Checkpoint(_) => {}
         StreamToken::Done => {
             app.observer.finish_stream();
+            // A — auto-fix pipeline: queue the review text for Coder on next Tick.
+            if app.auto_fix_mode && !app.coder.streaming {
+                if let Some(review) = app.observer.messages.iter()
+                    .filter(|m| matches!(m.role, crate::tui::app::Role::Assistant) && m.complete)
+                    .last()
+                    .map(|m| m.content.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    app.pending_auto_fix = Some(format!(
+                        "[Auto-fix requested]\nThe Observer has reviewed the code and identified the following issues. Fix ALL of them:\n\n{review}"
+                    ));
+                }
+            }
+
+            // Language enforcement (Observer): if the model ignored the requested language (ja/fr),
+            // schedule a one-shot rewrite retry. Streaming responses can't be rewritten mid-stream,
+            // so we do it after Done and overwrite the last assistant message on the next Tick.
+            let expected = app.lang.as_str();
+            if expected != "en" && app.observer_lang_retry_budget > 0 {
+                if let Some(last) = app
+                    .observer
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(m.role, Role::Assistant) && m.complete && !m.content.trim().is_empty())
+                    .last()
+                {
+                    if crate::lang_detect::needs_language_rewrite(expected, &last.content) {
+                        app.observer_lang_retry_budget =
+                            app.observer_lang_retry_budget.saturating_sub(1);
+                        app.observer_lang_pending = Some(expected.to_string());
+                        let note = match expected {
+                            "fr" => "(lang fix) Observer a répondu dans la mauvaise langue — réécriture en français…",
+                            "ja" => "(lang fix) Observerが指定言語で返していないため、書き直します…",
+                            _ => "(lang fix) Observer language mismatch — rewriting…",
+                        };
+                        app.observer.push_tool(note.to_string());
+                        // Skip loop detection on the pre-rewrite text.
+                        return;
+                    }
+                }
+            }
             // Detect repeated Observer replies and schedule a one-shot diff-only retry.
             // This prevents the common "template critique loop" when nothing new happened.
             if app.observer_loop_retry_budget > 0 {
@@ -798,6 +942,9 @@ async fn send_observer_message(
     // Each new Observer send gets a single anti-loop retry budget.
     app.observer_loop_retry_budget = 1;
     app.observer_loop_pending = None;
+    // Each new Observer send gets a single language rewrite budget.
+    app.observer_lang_retry_budget = 1;
+    app.observer_lang_pending = None;
     app.observer.push_user(text.clone());
     app.observer.streaming = true;
     app.observer.messages.push(Message::new_streaming(Role::Assistant));
@@ -1115,6 +1262,93 @@ async fn maybe_auto_observe(app: &mut App, observer_tx: &mpsc::Sender<StreamToke
         };
         send_observer_message(app, observer_tx, Some(prompt)).await;
     }
+}
+
+async fn maybe_observer_lang_retry(app: &mut App, observer_tx: &mpsc::Sender<StreamToken>) {
+    let Some(expected) = app.observer_lang_pending.take() else { return; };
+    if app.observer.streaming { return; }
+
+    // Best-effort: abort the previous task handle (it should already be complete).
+    if let Some(handle) = app.observer_task.take() { handle.abort(); }
+
+    let idx_opt = app.observer.messages.iter().rposition(|m| {
+        matches!(m.role, Role::Assistant) && m.complete && !m.content.trim().is_empty()
+    });
+    let Some(idx) = idx_opt else { return; };
+    let original = app.observer.messages.get(idx).map(|m| m.content.clone()).unwrap_or_default();
+    if original.trim().is_empty() { return; }
+
+    // Overwrite the last assistant message if it's the tail; otherwise append a new streaming assistant.
+    if idx + 1 == app.observer.messages.len() {
+        if let Some(m) = app.observer.messages.get_mut(idx) {
+            m.content.clear();
+            m.complete = false;
+        }
+    } else {
+        app.observer.messages.push(Message::new_streaming(Role::Assistant));
+    }
+
+    app.observer.scroll = 0;
+    app.ignore_observer_tokens = false;
+    app.observer.streaming = true;
+
+    let system_fix = if expected.eq_ignore_ascii_case("fr") {
+        "You are a strict translator.\n\
+Rewrite the provided text into French ONLY.\n\
+Do not add new content.\n\
+Output ONLY the rewritten text.\n\
+Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+    } else {
+        // Default: Japanese.
+        "You are a strict translator.\n\
+Rewrite the provided text into Japanese ONLY.\n\
+Do not add new content.\n\
+Output ONLY the rewritten text.\n\
+Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
+    };
+    let user_fix = format!("TEXT:\n```text\n{}\n```", original.trim_end());
+
+    let cfg = app.observer_cfg.clone();
+    let messages = vec![
+        ChatMessage { role: "system".to_string(), content: system_fix.to_string() },
+        ChatMessage { role: "user".to_string(), content: user_fix },
+    ];
+
+    let tx = observer_tx.clone();
+    let handle = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let provider = crate::providers::build_provider(client, &cfg);
+        let req = crate::types::ChatRequest {
+            messages,
+            temperature: Some(0.0),
+            max_tokens: Some(cfg.max_tokens.min(1024)),
+            metadata: None,
+        };
+        match provider.chat(&req).await {
+            Ok(resp) => {
+                let mut chunk = String::new();
+                let mut n = 0usize;
+                const CHUNK_CHARS: usize = 28;
+                for ch in resp.content.chars() {
+                    chunk.push(ch);
+                    n += 1;
+                    if n >= CHUNK_CHARS {
+                        let _ = tx.send(StreamToken::Delta(chunk.clone())).await;
+                        chunk.clear();
+                        n = 0;
+                    }
+                }
+                if !chunk.is_empty() {
+                    let _ = tx.send(StreamToken::Delta(chunk)).await;
+                }
+                let _ = tx.send(StreamToken::Done).await;
+            }
+            Err(e) => {
+                let _ = tx.send(StreamToken::Error(e.to_string())).await;
+            }
+        }
+    });
+    app.observer_task = Some(handle);
 }
 
 async fn maybe_observer_loop_retry(app: &mut App, observer_tx: &mpsc::Sender<StreamToken>) {

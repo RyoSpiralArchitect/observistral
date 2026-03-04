@@ -153,6 +153,10 @@ pub struct App {
     pub last_git_checkpoint: Option<String>,
     /// Auto-detected or configured test command from project scan.
     pub project_test_cmd: Option<String>,
+    /// When true, Observer review is automatically forwarded to Coder for fixing.
+    pub auto_fix_mode: bool,
+    /// Pending auto-fix text: set by handle_observer_token, consumed on next Tick.
+    pub pending_auto_fix: Option<String>,
     pub coder_max_iters: Option<usize>,
     pub quit: bool,
 
@@ -180,6 +184,12 @@ pub struct App {
     /// When set, the next Tick will re-run the Observer with a diff-only instruction
     /// and overwrite the last assistant message (value = similarity 0..1).
     pub observer_loop_pending: Option<f64>,
+
+    /// One-shot language rewrite retry budget for the Observer pane.
+    /// If the Observer ignores the requested language (ja/fr), we rewrite once.
+    pub observer_lang_retry_budget: u8,
+    /// When set, the next Tick will rewrite the last assistant message into this language.
+    pub observer_lang_pending: Option<String>,
 
     /// Background task planning state (Chat -> TaskRouter -> Tasks tab).
     pub planning_tasks: bool,
@@ -215,6 +225,8 @@ impl App {
             project_stack_label: None,
             last_git_checkpoint: None,
             project_test_cmd: None,
+            auto_fix_mode: false,
+            pending_auto_fix: None,
             coder_max_iters,
             quit: false,
             tick_count: 0,
@@ -227,6 +239,8 @@ impl App {
             ignore_chat_tokens: false,
             observer_loop_retry_budget: 0,
             observer_loop_pending: None,
+            observer_lang_retry_budget: 0,
+            observer_lang_pending: None,
             planning_tasks: false,
             tasks: Vec::new(),
             tasks_cursor: 0,

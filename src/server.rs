@@ -1513,7 +1513,13 @@ async fn api_apply_diff(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
 
 async fn api_rollback(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
     #[derive(Deserialize)]
-    struct Req { checkpoint: String }
+    struct Req {
+        #[serde(default)]
+        checkpoint: String,
+        // Back-compat: older UI versions used `{hash: "..."}`
+        #[serde(default)]
+        hash: String,
+    }
     #[derive(Serialize)]
     struct Res { ok: bool, message: String }
 
@@ -1521,7 +1527,12 @@ async fn api_rollback(stream: &mut TcpStream, state: AppState, body: &[u8]) -> R
         Ok(r) => r,
         Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
     };
-    let checkpoint = req.checkpoint.trim();
+    let checkpoint_in = if req.checkpoint.trim().is_empty() {
+        req.hash
+    } else {
+        req.checkpoint
+    };
+    let checkpoint = checkpoint_in.trim();
     // Safety: only allow hex strings (git hashes).
     if checkpoint.is_empty() || !checkpoint.chars().all(|c| c.is_ascii_hexdigit()) {
         return write_json(stream, 400, "Bad Request", &ApiError { error: "invalid checkpoint hash".into() }).await;

@@ -1,4 +1,4 @@
-(() => {
+﻿(() => {
   "use strict";
 
   const root = document.getElementById("app-root");
@@ -1214,6 +1214,7 @@
     const [projectScan, setProjectScan] = useState(null);
     const [projectScanLoading, setProjectScanLoading] = useState(false);
     const projectScanRootRef = useRef("");
+    const [gitCheckpoint, setGitCheckpoint] = useState(null);
 
     const [threadState, setThreadState] = useState(() => {
       let threads = safeJsonParse(localStorage.getItem(LS.threads) || "null", null);
@@ -1295,7 +1296,8 @@
         const v = Number(localStorage.getItem(LS.splitPct));
         if (Number.isFinite(v) && v >= 20 && v <= 80) return v;
       } catch (_) {}
-      return 55;
+      // Default: bias toward readable Observer critiques (users can resize + it persists).
+      return 40;
     });
     const arenaRef = useRef(null);
     const isDraggingRef = useRef(false);
@@ -2729,6 +2731,22 @@
         },
       };
 
+      const applyDiffTool = {
+        type: "function",
+        function: {
+          name: "apply_diff",
+          description: "Apply a unified diff to a file. More reliable than patch_file for complex multi-hunk edits. Use @@ unified diff format with 2-3 context lines. Multiple hunks per call are supported.",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "File path relative to tool_root" },
+              diff: { type: "string", description: "Unified diff string with @@ hunks" },
+            },
+            required: ["path", "diff"],
+          },
+        },
+      };
+
       const messages = [
         { role: "system", content: SYSTEM_BASE_TEXT },
         ...history,
@@ -2809,6 +2827,7 @@
         return out;
       };
 
+      let checkpointCaptured = false;
       for (let iter = 0; iter < MAX_ITERS; iter++) {
         if (ac.signal.aborted) break;
         pruneToolMessages(messages);
@@ -2838,7 +2857,7 @@
           if (display) display += "\n\n";
            streamResult = await streamChatTools({
              messages,
-            tools: [execTool, writeFileTool, readFileTool, patchFileTool, searchFilesTool, globTool],
+            tools: [execTool, writeFileTool, readFileTool, patchFileTool, applyDiffTool, searchFilesTool, globTool],
              model: String(reqCfg.codeModel || reqCfg.model || ""),
              base_url: String(reqCfg.baseUrl || ""),
              api_key: resolvedKey || undefined,
@@ -2848,6 +2867,10 @@
           }, ac.signal, (delta) => {
             display += delta;
             flush();
+            if (!checkpointCaptured) {
+              const cpMatch = display.match(/\[git checkpoint\]\s+([0-9a-f]{6,})/);
+              if (cpMatch) { checkpointCaptured = true; setGitCheckpoint(cpMatch[1]); }
+            }
           });
         } catch (err) {
           if (ac.signal.aborted) break;
@@ -3125,6 +3148,25 @@
                 toolResult = res && res.output ? res.output : `[search_files] No matches for '${pattern}'`;
               } catch (e2) {
                 toolResult = `ERROR searching '${pattern}': ${prettyErr(e2)}`;
+              }
+              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              flush();
+              continue;
+            }
+
+            if (toolName === "apply_diff") {
+              let args;
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+              const path0 = String(args.path || "").trim();
+              const diff = String(args.diff || "");
+              display += (display ? "\n\n" : "") + `⟁ apply_diff: ${path0}`;
+              flush();
+              let toolResult;
+              try {
+                const res = await postJson("/api/apply_diff", { path: path0, diff }, ac.signal);
+                toolResult = res && res.message ? res.message : "OK: diff applied";
+              } catch (e2) {
+                toolResult = `ERROR applying diff to '${path0}': ${prettyErr(e2)}`;
               }
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               flush();
@@ -5520,7 +5562,42 @@
                   type: "button",
                   title: tr(lang, "focusCoder"),
                   onClick: () => setSplitPct(70),
-                }, "◀")
+                }, "◀"),
+                gitCheckpoint
+                  ? e("button", {
+                      className: "btn btn-warn",
+                      type: "button",
+                      title: `Rollback to git checkpoint ${gitCheckpoint}`,
+                      style: { fontSize: 11, padding: "3px 8px" },
+                      disabled: sendingCoder,
+                      onClick: async () => {
+                        if (!confirm(`Reset all files to checkpoint ${gitCheckpoint}? (git reset --hard)`)) return;
+                        try {
+                          const r = await fetch("/api/rollback", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ checkpoint: gitCheckpoint }),
+                          });
+                          const j = await r.json().catch(() => ({}));
+                          const ok = !!(j && j.ok);
+                          const msgText = ok
+                            ? String(j.message || `rolled back to ${String(gitCheckpoint || "").slice(0, 8)}`)
+                            : String(j.error || `HTTP ${r.status}`);
+                          const content = ok ? `[rollback] ✅ ${msgText}` : `[rollback] ❌ ${msgText}`;
+                          const msg = { id: uid(), pane: "coder", role: "assistant", content, ts: Date.now() };
+                          setThreadState((s) => ({
+                            ...s,
+                            threads: s.threads.map((t) =>
+                              t.id === activeThread.id ? { ...t, messages: [...(t.messages || []), msg] } : t
+                            ),
+                          }));
+                          if (j.ok) setGitCheckpoint(null);
+                        } catch (err) {
+                          alert("Rollback failed: " + err.message);
+                        }
+                      },
+                    }, `⟳ ${gitCheckpoint}`)
+                  : null
               )
             ),
             e(
