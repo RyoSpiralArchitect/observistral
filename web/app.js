@@ -15,7 +15,8 @@
     config: "obstral.config.v1",
     threads: "obstral.threads.v1",
     active: "obstral.active.v1",
-    splitPct: "obstral.splitPct.v1",
+    // Bump version to reset the default split for readability (Observer critiques are the product).
+    splitPct: "obstral.splitPct.v2",
   };
 
   // ── i18n strings (en / ja / fr) ──────────────────────────────────────────────
@@ -2441,6 +2442,13 @@
         const first = (s.replace(/\r\n/g, "\n").split("\n")[0] || "").trim();
         return normalizeForSig(first).slice(0, 180);
       };
+      const suspiciousSuccessReason = (stdout, stderr) => {
+        // PowerShell can exit 0 even when it printed errors (non-terminating error records).
+        // Treat strong error markers as failure to avoid "false success" drift.
+        const line = pickInterestingErrorLine(stdout, stderr);
+        if (!line) return "";
+        return `exit_code was 0, but output contained error markers (e.g. \`${line}\`)`;
+      };
       const blockedByRepeatFailure = (k) => {
         const st = cmdStats.get(k);
         if (!st) return "";
@@ -2969,8 +2977,8 @@
                 const stdout = truncTool(parsed.stdout, TRUNC_STDOUT);
                 const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
                 const exitCode = execRes.exit_code;
-                const looksHardError = (t) => /(^|\n)\s*(fatal:|error:|exception|traceback)\b/i.test(String(t || ""));
-                const failed = exitCode !== 0 || looksHardError(stderr) || !!breach;
+                const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdout, stderr) : "";
+                const failed = exitCode !== 0 || !!suspicious || !!breach;
                 noteCmd(k, failed, errorLineSig(stdout, stderr));
                 const hintGit = failed ? gitRepoHint(stderr) : "";
                 const hintGov = failed ? deriveGovernorHint(stderr, stdout) : "";
@@ -2979,7 +2987,7 @@
                   breach,
                   "Fix: re-run under tool_root; avoid `cd ..` / absolute paths. Verify `pwd` stays under tool_root.",
                 ].join("\n") : "";
-                const hint = [hintGit, hintGov, hintSandbox].filter(Boolean).join("\n\n");
+                const hint = [hintGit, hintGov, hintSandbox, suspicious ? ("SUSPICIOUS_SUCCESS: " + suspicious) : ""].filter(Boolean).join("\n\n");
 
                 const cwdUsedLabel = cwdUsed ? String(cwdUsed) : "(workspace root)";
                 const cwdAfter = cwdNow();
@@ -3369,8 +3377,8 @@
               const stdout = truncTool(parsed.stdout, TRUNC_STDOUT);
               const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
               const exitCode = execRes.exit_code;
-              const looksHardError = (t) => /(^|\n)\s*(fatal:|error:|exception|traceback)\b/i.test(String(t || ""));
-              const failed = exitCode !== 0 || looksHardError(stderr) || !!breach;
+              const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdout, stderr) : "";
+              const failed = exitCode !== 0 || !!suspicious || !!breach;
               noteCmd(k, failed, errorLineSig(stdout, stderr));
               const hintGit = failed ? gitRepoHint(stderr) : "";
               const hintGov = failed ? deriveGovernorHint(stderr, stdout) : "";
@@ -3379,7 +3387,7 @@
                 breach,
                 "Fix: re-run under tool_root; avoid `cd ..` / absolute paths. Verify `pwd` stays under tool_root.",
               ].join("\n") : "";
-              const hint = [hintGit, hintGov, hintSandbox].filter(Boolean).join("\n\n");
+              const hint = [hintGit, hintGov, hintSandbox, suspicious ? ("SUSPICIOUS_SUCCESS: " + suspicious) : ""].filter(Boolean).join("\n\n");
 
               const cwdUsedLabel = cwdUsed ? String(cwdUsed) : "(workspace root)";
               const cwdAfter = cwdNow();
@@ -3427,6 +3435,9 @@
               display += "\n```\nexit: " + exitCode;
               flush();
 
+              const nextInstr = failed
+                ? "⚠ The command failed. Diagnose the error above and output a FIX command as ONE code block. Do NOT continue to the next step until this succeeds."
+                : "Continue by outputting the NEXT command(s) as ONE code block (or use exec tool calls if supported).";
               messages.push({
                 role: "user",
                 content: [
@@ -3434,7 +3445,7 @@
                   "command:",
                   commandToRun,
                   resultText,
-                  "Continue by outputting the NEXT command(s) as ONE code block (or use exec tool calls if supported).",
+                  nextInstr,
                 ].join("\n"),
               });
             } catch (execErr) {
@@ -3831,33 +3842,45 @@
         if (acc > 0 || fr >= 2) return "fr";
         return "en";
       };
+      const pickLastUserSample = () => {
+        try {
+          const pickLastUser = (pane) => {
+            const msgs = pane ? paneMessages(pane) : (activeThread && activeThread.messages) || [];
+            if (!msgs || !msgs.length) return "";
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              const m = msgs[i];
+              if (!m || m.role !== "user") continue;
+              const t = String(m.content || "").trim();
+              if (t) return t;
+            }
+            return "";
+          };
+          return pickLastUser("coder") || pickLastUser("chat") || pickLastUser("");
+        } catch (_) {
+          return "";
+        }
+      };
       const outLang = (() => {
         const ol0 = String(config.observerLang || "ui").trim().toLowerCase();
         if (ol0 === "auto") {
-          const sample = (() => {
-            try {
-              const pickLastUser = (pane) => {
-                const msgs = pane ? paneMessages(pane) : (activeThread && activeThread.messages) || [];
-                if (!msgs || !msgs.length) return "";
-                for (let i = msgs.length - 1; i >= 0; i--) {
-                  const m = msgs[i];
-                  if (!m || m.role !== "user") continue;
-                  const t = String(m.content || "").trim();
-                  if (t) return t;
-                }
-                return "";
-              };
-              return pickLastUser("coder") || pickLastUser("chat") || pickLastUser("");
-            } catch (_) {
-              return "";
-            }
-          })();
+          const sample = pickLastUserSample();
           const sampleTrim = String(sample || "").trim();
           if (!sampleTrim) return String(lang || "ja").trim().toLowerCase();
           return inferLangFromText(sampleTrim);
         }
         if (ol0 === "ja" || ol0 === "en" || ol0 === "fr") return ol0;
-        return String(lang || "ja").trim().toLowerCase();
+
+        // ol0 === "ui" (or unknown): follow UI language, but if the UI is English/French and the user is
+        // clearly typing in another language, prefer the user's language to avoid "Observer stuck in English".
+        const uiLang = String(lang || "ja").trim().toLowerCase();
+        if (uiLang === "en" || uiLang === "fr") {
+          const sample = String(pickLastUserSample() || "").trim();
+          if (sample) {
+            const inferred = inferLangFromText(sample);
+            if (inferred && inferred !== uiLang) return inferred;
+          }
+        }
+        return uiLang;
       })();
       const proposalKeysLine = "Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).";
       const langLine = outLang === "fr"
@@ -5724,7 +5747,7 @@
             title: tr(lang, "splitHint"),
             onMouseDown: onSplitDragStart,
             onTouchStart: onSplitDragStart,
-            onDoubleClick: () => setSplitPct(55),
+            onDoubleClick: () => setSplitPct(40),
           }),
 
           // Observer pane
