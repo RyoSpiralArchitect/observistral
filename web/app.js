@@ -2536,10 +2536,16 @@
 
       const governor = {
         consecutiveFailures: 0,
+
+        lastCmdSig: "",
+        sameCmdRepeats: 0,
+
         lastErrSig: "",
         sameErrRepeats: 0,
+
         lastOutHash: 0n,
         sameOutRepeats: 0,
+
         pendingHint: "",
       };
 
@@ -3018,6 +3024,11 @@
 
                 if (failed) {
                   governor.consecutiveFailures++;
+
+                  const cmdSigNow = commandSig(commandToRun);
+                  if (cmdSigNow && cmdSigNow === governor.lastCmdSig) governor.sameCmdRepeats++;
+                  else { governor.lastCmdSig = cmdSigNow; governor.sameCmdRepeats = 1; }
+
                   const sig0 = errorSignature(commandToRun, stdout, stderr, exitCode);
                   const sig = sig0 || (breach ? String(breach).slice(0, 180) : "");
                   if (sig && sig === governor.lastErrSig) governor.sameErrRepeats++;
@@ -3026,12 +3037,18 @@
                   if (outHash === governor.lastOutHash) governor.sameOutRepeats++;
                   else { governor.lastOutHash = outHash; governor.sameOutRepeats = 1; }
 
-                  // Escalate: if we're stuck, inject a hint to force a strategy change.
-                  if (governor.sameErrRepeats >= 2 || governor.sameOutRepeats >= 2 || governor.consecutiveFailures >= 3) {
+                  // Emit hints only when crossing key thresholds to avoid spamming context.
+                  let stuckReason = "";
+                  if (governor.sameErrRepeats === 2) stuckReason = "The SAME error happened twice.";
+                  else if (governor.sameCmdRepeats === 3) stuckReason = "You ran the SAME command 3 times.";
+                  else if (governor.consecutiveFailures === 3) stuckReason = "3 consecutive failures.";
+                  else if (governor.sameOutRepeats === 2 && governor.sameCmdRepeats >= 2) stuckReason = "Stuck detected: repeated identical output.";
+
+                  if (stuckReason) {
                     const stuck = [
-                      "You are stuck in a failure loop.",
+                      stuckReason,
                       governor.lastErrSig ? ("last_error_signature: " + governor.lastErrSig) : "",
-                      "STOP repeating the same approach. Change strategy.",
+                      "Action: stop repeating. Run diagnostics (pwd, ls, git status), then change strategy.",
                       hintGov || hintGit || "",
                       "First verify cwd/tool_root, then pick a different command.",
                     ].filter(Boolean).join("\n");
@@ -3042,6 +3059,8 @@
                   }
                 } else {
                   governor.consecutiveFailures = 0;
+                  governor.lastCmdSig = "";
+                  governor.sameCmdRepeats = 0;
                   governor.lastErrSig = "";
                   governor.sameErrRepeats = 0;
                   governor.lastOutHash = 0n;
@@ -3418,6 +3437,11 @@
 
               if (failed) {
                 governor.consecutiveFailures++;
+
+                const cmdSigNow = commandSig(commandToRun);
+                if (cmdSigNow && cmdSigNow === governor.lastCmdSig) governor.sameCmdRepeats++;
+                else { governor.lastCmdSig = cmdSigNow; governor.sameCmdRepeats = 1; }
+
                 const sig0 = errorSignature(commandToRun, stdout, stderr, exitCode);
                 const sig = sig0 || (breach ? String(breach).slice(0, 180) : "");
                 if (sig && sig === governor.lastErrSig) governor.sameErrRepeats++;
@@ -3426,11 +3450,18 @@
                 if (outHash === governor.lastOutHash) governor.sameOutRepeats++;
                 else { governor.lastOutHash = outHash; governor.sameOutRepeats = 1; }
 
-                if (governor.sameErrRepeats >= 2 || governor.sameOutRepeats >= 2 || governor.consecutiveFailures >= 3) {
+                // Emit hints only when crossing key thresholds to avoid spamming context.
+                let stuckReason = "";
+                if (governor.sameErrRepeats === 2) stuckReason = "The SAME error happened twice.";
+                else if (governor.sameCmdRepeats === 3) stuckReason = "You ran the SAME command 3 times.";
+                else if (governor.consecutiveFailures === 3) stuckReason = "3 consecutive failures.";
+                else if (governor.sameOutRepeats === 2 && governor.sameCmdRepeats >= 2) stuckReason = "Stuck detected: repeated identical output.";
+
+                if (stuckReason) {
                   const stuck = [
-                    "You are stuck in a failure loop.",
+                    stuckReason,
                     governor.lastErrSig ? ("last_error_signature: " + governor.lastErrSig) : "",
-                    "STOP repeating the same approach. Change strategy.",
+                    "Action: stop repeating. Run diagnostics (pwd, ls, git status), then change strategy.",
                     hintGov || hintGit || "",
                     "First verify cwd/tool_root, then pick a different command.",
                   ].filter(Boolean).join("\n");
@@ -3440,6 +3471,8 @@
                 }
               } else {
                 governor.consecutiveFailures = 0;
+                governor.lastCmdSig = "";
+                governor.sameCmdRepeats = 0;
                 governor.lastErrSig = "";
                 governor.sameErrRepeats = 0;
                 governor.lastOutHash = 0n;
