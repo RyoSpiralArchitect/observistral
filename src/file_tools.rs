@@ -11,6 +11,34 @@ use std::path::{Component, Path, PathBuf};
 
 // ── Path safety ───────────────────────────────────────────────────────────────
 
+fn normalize_component(s: String) -> String {
+    if cfg!(target_os = "windows") {
+        s.to_ascii_lowercase()
+    } else {
+        s
+    }
+}
+
+fn components_vec(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|c| match c {
+            Component::CurDir => None,
+            Component::Prefix(pre) => Some(normalize_component(
+                pre.as_os_str().to_string_lossy().into_owned(),
+            )),
+            Component::RootDir => Some("/".to_string()),
+            Component::Normal(os) => Some(normalize_component(os.to_string_lossy().into_owned())),
+            Component::ParentDir => Some("..".to_string()),
+        })
+        .collect()
+}
+
+fn is_within_root(p: &Path, root: &Path) -> bool {
+    let p_vec = components_vec(p);
+    let root_vec = components_vec(root);
+    !root_vec.is_empty() && p_vec.starts_with(&root_vec)
+}
+
 /// Resolve a file path safely within `base` (tool_root).
 ///
 /// - Relative paths: joined with base; `..` components are rejected.
@@ -24,11 +52,13 @@ pub fn resolve_safe_path(rel: &str, base: Option<&str>) -> Result<PathBuf> {
     let p = Path::new(rel);
 
     if p.is_absolute() {
+        // Absolute paths must still be traversal-free (e.g. "/root/../escape").
+        if p.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(anyhow!("path traversal ('..') not allowed: {}", rel));
+        }
         if let Some(root) = base {
-            let canon_p = p.to_string_lossy().replace('\\', "/");
-            let canon_r = Path::new(root).to_string_lossy().replace('\\', "/");
-            let canon_r = canon_r.trim_end_matches('/');
-            if !canon_p.starts_with(canon_r) {
+            let root_p = Path::new(root);
+            if !is_within_root(p, root_p) {
                 return Err(anyhow!(
                     "absolute path '{}' is outside tool_root '{}'", rel, root
                 ));
@@ -37,10 +67,16 @@ pub fn resolve_safe_path(rel: &str, base: Option<&str>) -> Result<PathBuf> {
         return Ok(p.to_path_buf());
     }
 
-    // Relative: reject any `..` component.
+    // Relative: accept only normal path components (no absolute-ish prefixes, no "..").
     for comp in p.components() {
-        if matches!(comp, Component::ParentDir) {
-            return Err(anyhow!("path traversal ('..') not allowed: {}", rel));
+        match comp {
+            Component::CurDir | Component::Normal(_) => {}
+            Component::ParentDir => {
+                return Err(anyhow!("path traversal ('..') not allowed: {}", rel));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!("absolute path not allowed: {}", rel));
+            }
         }
     }
 
@@ -702,6 +738,23 @@ mod tests {
     fn safe_path_relative_ok() {
         let p = resolve_safe_path("src/main.rs", Some("/tmp/root")).unwrap();
         assert!(p.to_string_lossy().contains("src"));
+    }
+
+    #[test]
+    fn safe_path_rejects_absolute_prefix_trick() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let outside = format!("{root}2");
+        assert!(resolve_safe_path(&outside, Some(&root)).is_err());
+    }
+
+    #[test]
+    fn safe_path_rejects_absolute_with_dotdot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_p = dir.path();
+        let root = root_p.to_string_lossy().into_owned();
+        let traversal = root_p.join("..").join("x");
+        assert!(resolve_safe_path(&traversal.to_string_lossy(), Some(&root)).is_err());
     }
 
     #[test]

@@ -301,12 +301,37 @@ struct HttpRequest {
 /// Returns true only for origins that are the local server itself.
 /// Rejects cross-site requests from arbitrary web pages.
 fn is_localhost_origin(origin: &str) -> bool {
-    let o = origin.trim().to_ascii_lowercase();
-    o.starts_with("http://127.0.0.1")
-        || o.starts_with("http://localhost")
-        || o.starts_with("http://[::1]")
-        || o.starts_with("https://127.0.0.1")
-        || o.starts_with("https://localhost")
+    let o = origin.trim();
+    if o.is_empty() {
+        return false;
+    }
+
+    // IMPORTANT: do not use string prefix matching here.
+    // "https://localhost.evil.com" must NOT be treated as a localhost origin.
+    let u = match reqwest::Url::parse(o) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+
+    match u.scheme() {
+        "http" | "https" => {}
+        _ => return false,
+    }
+
+    let Some(host) = u.host_str() else {
+        return false;
+    };
+
+    if host == "localhost" || host == "127.0.0.1" {
+        return true;
+    }
+
+    // IPv6 loopback. Some parsers return "::1", others include brackets.
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()> {
@@ -388,6 +413,25 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_localhost_origin;
+
+    #[test]
+    fn localhost_origin_parsing_is_strict() {
+        assert!(is_localhost_origin("http://127.0.0.1:18080"));
+        assert!(is_localhost_origin("http://localhost:18080"));
+        assert!(is_localhost_origin("https://localhost:18080"));
+        assert!(is_localhost_origin("http://[::1]:18080"));
+        assert!(is_localhost_origin("https://[::1]:18080"));
+
+        assert!(!is_localhost_origin("https://localhost.evil.com"));
+        assert!(!is_localhost_origin("http://127.0.0.1.evil.com"));
+        assert!(!is_localhost_origin("null"));
+        assert!(!is_localhost_origin(""));
     }
 }
 
@@ -1013,6 +1057,17 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     }
 
     if let Some(cwd) = req.cwd.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Err(err) = crate::exec::validate_cwd(cwd) {
+            #[derive(Serialize)]
+            struct E { error: String }
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &E { error: format!("invalid cwd: {err}") },
+            )
+            .await;
+        }
         let cwd_path = Path::new(cwd);
         if let Err(err) = std::fs::create_dir_all(cwd_path) {
             #[derive(Serialize)]

@@ -4,6 +4,8 @@ mod exec;
 mod lang_detect;
 mod loop_detect;
 mod modes;
+mod approvals;
+mod agent_session;
 mod pending_commands;
 mod pending_edits;
 mod personas;
@@ -17,8 +19,10 @@ mod project;
 mod providers;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde_json::json;
 use std::path::PathBuf;
+use tokio::sync::mpsc;
 
 use crate::chatbot::ChatBot;
 use crate::config::{PartialConfig, ProviderKind};
@@ -54,6 +58,15 @@ enum Command {
         prompt: String,
     },
 
+    /// Headless coding agent (agentic loop with tools; like TUI Coder but CLI-only)
+    Agent(AgentArgs),
+
+    /// Review `git diff` with Observer (or diff批評) and print critique
+    Review(ReviewArgs),
+
+    /// Generate `.obstral.md` template in tool_root (project instructions + test_cmd)
+    Init(InitArgs),
+
     /// Interactive REPL
     Repl,
 
@@ -77,67 +90,144 @@ enum ListWhat {
     Personas,
 }
 
+#[derive(Args, Debug, Clone)]
+struct AgentArgs {
+    /// Prompt text. If omitted, pass `--stdin` to read the prompt from stdin.
+    prompt: Option<String>,
+
+    /// Working directory for file/exec tools (defaults to current directory)
+    #[arg(long)]
+    tool_root: Option<String>,
+
+    /// UI / response language hint (ja/en/fr)
+    #[arg(long, default_value = "ja")]
+    lang: String,
+
+    /// Max tool-call iterations (default: 12, max: 64)
+    #[arg(long)]
+    max_iters: Option<usize>,
+
+    /// Auto-approve all commands and edits (no prompts)
+    #[arg(long)]
+    yes: bool,
+
+    /// Disable approval prompts for `exec` tool calls (and implied commands)
+    #[arg(long)]
+    no_command_approval: bool,
+
+    /// Disable approval prompts for file edits (write_file/patch_file/apply_diff)
+    #[arg(long)]
+    no_edit_approval: bool,
+
+    /// Save and resume an agent session from this JSON file.
+    /// If the file exists, OBSTRAL loads it and continues the conversation.
+    #[arg(long)]
+    session: Option<PathBuf>,
+
+    /// Start a new session even if `--session` already exists.
+    #[arg(long)]
+    new_session: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ReviewArgs {
+    /// Optional guidance for the review (e.g. "focus on security and tests")
+    prompt: Option<String>,
+
+    /// Git repository directory to review (defaults to current directory)
+    #[arg(long)]
+    tool_root: Option<String>,
+
+    /// Review only staged changes (`git diff --staged`)
+    #[arg(long)]
+    staged: bool,
+
+    /// Review only unstaged changes (`git diff`)
+    #[arg(long)]
+    unstaged: bool,
+
+    /// Base revision for a combined diff (`git diff <base>`). Cannot be combined with --staged/--unstaged.
+    /// Useful with the agent's printed checkpoint hash.
+    #[arg(long)]
+    base: Option<String>,
+
+    /// Maximum diff characters to include in the prompt (default: 24000)
+    #[arg(long)]
+    max_diff_chars: Option<usize>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct InitArgs {
+    /// Directory to write `.obstral.md` into (defaults to current directory)
+    #[arg(long)]
+    tool_root: Option<String>,
+
+    /// Overwrite `.obstral.md` if it already exists
+    #[arg(long)]
+    force: bool,
+}
+
 #[derive(Parser, Clone, Debug)]
 struct CommonArgs {
     /// Apply VIBE preset defaults (provider=mistral, model=codestral-latest, mode=VIBE)
-    #[arg(long)]
+    #[arg(long, global = true)]
     vibe: bool,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, global = true)]
     provider: Option<ProviderKind>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     model: Option<String>,
 
     /// Model for chat-like modes (実況/壁打ち). Defaults to --model when omitted.
-    #[arg(long)]
+    #[arg(long, global = true)]
     chat_model: Option<String>,
 
     /// Model for coding-like modes (VIBE/diff批評/ログ解析). Defaults to --model when omitted.
-    #[arg(long)]
+    #[arg(long, global = true)]
     code_model: Option<String>,
 
     /// API key (prefer env vars to avoid shell history)
-    #[arg(long)]
+    #[arg(long, global = true)]
     api_key: Option<String>,
 
     /// Provider base URL (OpenAI-compatible: .../v1, Anthropic: .../v1)
-    #[arg(long)]
+    #[arg(long, global = true)]
     base_url: Option<String>,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, global = true)]
     mode: Option<modes::Mode>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     persona: Option<String>,
 
-    #[arg(long, default_value_t = 0.4)]
+    #[arg(long, default_value_t = 0.4, global = true)]
     temperature: f64,
 
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = 1024, global = true)]
     max_tokens: u32,
 
-    #[arg(long, default_value_t = 120)]
+    #[arg(long, default_value_t = 120, global = true)]
     timeout_seconds: u64,
 
     /// Read a diff/patch file and inject it into the prompt (for diff批評)
-    #[arg(long)]
+    #[arg(long, global = true)]
     diff_file: Option<PathBuf>,
 
     /// Path to a log file (for ログ解析 mode). Defaults to stdin when omitted.
-    #[arg(long)]
+    #[arg(long, global = true)]
     log_file: Option<PathBuf>,
 
     /// HF: device (auto|cpu|cuda)
-    #[arg(long)]
+    #[arg(long, global = true)]
     device: Option<String>,
 
     /// HF: local_files_only
-    #[arg(long)]
+    #[arg(long, global = true)]
     hf_local_only: bool,
 
     /// Read stdin and append it to the prompt
-    #[arg(long)]
+    #[arg(long, global = true)]
     stdin: bool,
 }
 
@@ -168,6 +258,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Chat { prompt }) => run_chat(prompt, cli.common).await,
+        Some(Command::Agent(args)) => run_agent(args, cli.common).await,
+        Some(Command::Review(args)) => run_review(args, cli.common).await,
+        Some(Command::Init(args)) => run_init(args, cli.common).await,
         Some(Command::Repl) => repl::run(cli.common.to_partial_config()).await,
         Some(Command::Serve(args)) => server::run(args, cli.common.to_partial_config()).await,
         Some(Command::Tui(args)) => tui::run(args, cli.common.to_partial_config()).await,
@@ -264,6 +357,699 @@ async fn run_chat(prompt: String, common: CommonArgs) -> Result<()> {
         .await?;
 
     println!("{}", resp.content);
+    Ok(())
+}
+
+fn truncate_middle(s: &str, max_chars: usize) -> String {
+    let s = s.trim_end();
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        return s.to_string();
+    }
+    let head_len = max_chars / 2;
+    let tail_len = max_chars.saturating_sub(head_len);
+    let head: String = s.chars().take(head_len).collect();
+    let tail: String = s.chars().skip(char_count.saturating_sub(tail_len)).collect();
+    let total_lines = s.lines().count();
+    format!(
+        "{head}\n...[truncated — {total_lines} lines total, {char_count} chars total]...\n{tail}"
+    )
+}
+
+fn git_cmd_output(root: &str, args: &[&str]) -> Result<(String, String, i32)> {
+    let out = std::process::Command::new("git")
+        .args(["-C", root])
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git: git -C {root} {}", args.join(" ")))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let exit = out.status.code().unwrap_or(-1);
+    Ok((stdout, stderr, exit))
+}
+
+async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
+    let tool_root = args.tool_root.clone().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    let tool_root = tool_root
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+
+    if args.base.is_some() && (args.staged || args.unstaged) {
+        anyhow::bail!("--base cannot be combined with --staged/--unstaged");
+    }
+    if args.staged && args.unstaged {
+        anyhow::bail!("--staged and --unstaged are mutually exclusive (omit both for combined review)");
+    }
+
+    // Read optional prompt guidance from stdin.
+    let mut guidance = args.prompt.unwrap_or_default();
+    if common.stdin {
+        let stdin_text = read_stdin_to_string().context("failed to read stdin")?;
+        if !stdin_text.trim().is_empty() {
+            if guidance.trim().is_empty() {
+                guidance = stdin_text;
+            } else {
+                guidance = format!("{guidance}\n\n[stdin]\n{stdin_text}");
+            }
+        }
+    }
+    if guidance.trim().is_empty() {
+        guidance = "Review this git diff and critique it ruthlessly and concretely.".to_string();
+    }
+
+    // Auto-scan project context (stack/git/tree + .obstral.md/AGENTS.md) for better reviews.
+    let (project_context, agents_md) = if let Some(ctx) = crate::project::ProjectContext::scan(&tool_root).await {
+        (Some(ctx.to_context_text()), ctx.agents_md)
+    } else {
+        (None, None)
+    };
+
+    // Git status and diff payload.
+    let (status_out, status_err, status_exit) =
+        git_cmd_output(&tool_root, &["status", "--porcelain=v1"])?;
+    if status_exit != 0 {
+        anyhow::bail!(
+            "git status failed (exit {status_exit}).\n{status_err}"
+        );
+    }
+
+    let base = args.base.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
+    let max_chars = args.max_diff_chars.unwrap_or(24_000).max(2_000).min(200_000);
+
+    // Build diff + stat.
+    let (diff_label, stat_args, diff_args): (&str, Vec<&str>, Vec<&str>) = if args.staged {
+        ("staged", vec!["diff", "--no-color", "--stat", "--staged"], vec!["diff", "--no-color", "--staged"])
+    } else if args.unstaged {
+        ("unstaged", vec!["diff", "--no-color", "--stat"], vec!["diff", "--no-color"])
+    } else if let Some(b) = base {
+        ("combined", vec!["diff", "--no-color", "--stat", b], vec!["diff", "--no-color", b])
+    } else {
+        // Prefer a combined diff vs HEAD when it exists; otherwise fall back to staged+unstaged sections.
+        let (_h_out, _h_err, h_exit) =
+            git_cmd_output(&tool_root, &["rev-parse", "--verify", "HEAD"])?;
+        if h_exit == 0 {
+            ("combined", vec!["diff", "--no-color", "--stat", "HEAD"], vec!["diff", "--no-color", "HEAD"])
+        } else {
+            ("mixed", vec![], vec![])
+        }
+    };
+
+    let mut git_context = String::new();
+    git_context.push_str(&format!("[repo]\nroot: {tool_root}\n"));
+    if let Some(b) = base {
+        git_context.push_str(&format!("base: {b}\n"));
+    }
+    git_context.push_str("\n[git status --porcelain=v1]\n");
+    git_context.push_str(status_out.trim_end());
+    if !status_out.trim().is_empty() {
+        git_context.push('\n');
+    }
+
+    let mut diff_payload = git_context.clone();
+    let mut diff_patch = String::new();
+
+    if diff_label == "mixed" {
+        // Empty repo / no HEAD: show staged + unstaged separately.
+        let (stat_s, err_s, exit_s) =
+            git_cmd_output(&tool_root, &["diff", "--no-color", "--stat", "--staged"])?;
+        if exit_s == 0 && !stat_s.trim().is_empty() {
+            diff_payload.push_str("\n[git diff --staged --stat]\n");
+            diff_payload.push_str(stat_s.trim_end());
+            diff_payload.push('\n');
+
+            git_context.push_str("\n[git diff --staged --stat]\n");
+            git_context.push_str(stat_s.trim_end());
+            git_context.push('\n');
+        } else if exit_s != 0 && !err_s.trim().is_empty() {
+            diff_payload.push_str("\n[git diff --staged --stat ERROR]\n");
+            diff_payload.push_str(err_s.trim_end());
+            diff_payload.push('\n');
+        }
+
+        let (diff_s, err_sd, exit_sd) =
+            git_cmd_output(&tool_root, &["diff", "--no-color", "--staged"])?;
+        if exit_sd == 0 && !diff_s.trim().is_empty() {
+            diff_payload.push_str("\n[git diff --staged]\n");
+            let t = truncate_middle(&diff_s, max_chars);
+            diff_payload.push_str(&t);
+            diff_payload.push('\n');
+
+            diff_patch.push_str("[git diff --staged]\n");
+            diff_patch.push_str(&t);
+            diff_patch.push('\n');
+        } else if exit_sd != 0 && !err_sd.trim().is_empty() {
+            diff_payload.push_str("\n[git diff --staged ERROR]\n");
+            diff_payload.push_str(err_sd.trim_end());
+            diff_payload.push('\n');
+        }
+
+        let (stat_u, err_u, exit_u) =
+            git_cmd_output(&tool_root, &["diff", "--no-color", "--stat"])?;
+        if exit_u == 0 && !stat_u.trim().is_empty() {
+            diff_payload.push_str("\n[git diff --stat]\n");
+            diff_payload.push_str(stat_u.trim_end());
+            diff_payload.push('\n');
+
+            git_context.push_str("\n[git diff --stat]\n");
+            git_context.push_str(stat_u.trim_end());
+            git_context.push('\n');
+        } else if exit_u != 0 && !err_u.trim().is_empty() {
+            diff_payload.push_str("\n[git diff --stat ERROR]\n");
+            diff_payload.push_str(err_u.trim_end());
+            diff_payload.push('\n');
+        }
+
+        let (diff_u, err_ud, exit_ud) = git_cmd_output(&tool_root, &["diff", "--no-color"])?;
+        if exit_ud == 0 && !diff_u.trim().is_empty() {
+            diff_payload.push_str("\n[git diff]\n");
+            let t = truncate_middle(&diff_u, max_chars);
+            diff_payload.push_str(&t);
+            diff_payload.push('\n');
+
+            diff_patch.push_str("[git diff]\n");
+            diff_patch.push_str(&t);
+            diff_patch.push('\n');
+        } else if exit_ud != 0 && !err_ud.trim().is_empty() {
+            diff_payload.push_str("\n[git diff ERROR]\n");
+            diff_payload.push_str(err_ud.trim_end());
+            diff_payload.push('\n');
+        }
+    } else {
+        let (stat, stat_err, stat_exit) = git_cmd_output(&tool_root, &stat_args)?;
+        if stat_exit == 0 && !stat.trim().is_empty() {
+            diff_payload.push_str(&format!("\n[git diff --stat] ({diff_label})\n"));
+            diff_payload.push_str(stat.trim_end());
+            diff_payload.push('\n');
+
+            git_context.push_str(&format!("\n[git diff --stat] ({diff_label})\n"));
+            git_context.push_str(stat.trim_end());
+            git_context.push('\n');
+        } else if stat_exit != 0 && !stat_err.trim().is_empty() {
+            diff_payload.push_str("\n[git diff --stat ERROR]\n");
+            diff_payload.push_str(stat_err.trim_end());
+            diff_payload.push('\n');
+        }
+
+        let (diff, diff_err, diff_exit) = git_cmd_output(&tool_root, &diff_args)?;
+        if diff_exit == 0 && !diff.trim().is_empty() {
+            diff_payload.push_str(&format!("\n[git diff] ({diff_label})\n"));
+            let t = truncate_middle(&diff, max_chars);
+            diff_payload.push_str(&t);
+            diff_payload.push('\n');
+
+            diff_patch.push_str(&t);
+            diff_patch.push('\n');
+        } else if diff_exit != 0 {
+            anyhow::bail!("git diff failed (exit {diff_exit}).\n{diff_err}");
+        }
+    }
+
+    // Resolve config. Default review mode to Observer unless the user explicitly set one.
+    let mut partial = common.to_partial_config();
+    if partial.mode.is_none() {
+        partial.mode = Some(crate::modes::Mode::Observer);
+    }
+    let cfg = partial.resolve()?;
+
+    let client = reqwest::Client::new();
+    let provider = providers::build_provider(client, &cfg);
+    let bot = ChatBot::new(provider);
+
+    // For diff批評 mode, pass diff via diff_text so compose_user_text wraps it in ```diff```.
+    // For Observer mode, include the diff in the user input (diff_text injection is ignored there).
+    let user_input = if matches!(cfg.mode, crate::modes::Mode::DiffReview) {
+        let mut s = String::new();
+        if let Some(ctx) = project_context.as_deref() {
+            if !ctx.trim().is_empty() {
+                s.push_str(ctx.trim_end());
+                s.push_str("\n\n");
+            }
+        }
+        if let Some(a) = agents_md.as_deref() {
+            if !a.trim().is_empty() {
+                s.push_str("[Project Instructions]\n");
+                s.push_str(a.trim_end());
+                s.push_str("\n\n");
+            }
+        }
+        if !git_context.trim().is_empty() {
+            s.push_str("[git context]\n");
+            s.push_str(git_context.trim_end());
+            s.push_str("\n\n");
+        }
+        s.push_str(&guidance);
+        s
+    } else {
+        let mut s = String::new();
+        if let Some(ctx) = project_context.as_deref() {
+            if !ctx.trim().is_empty() {
+                s.push_str(ctx.trim_end());
+                s.push_str("\n\n");
+            }
+        }
+        if let Some(a) = agents_md.as_deref() {
+            if !a.trim().is_empty() {
+                s.push_str("[Project Instructions]\n");
+                s.push_str(a.trim_end());
+                s.push_str("\n\n");
+            }
+        }
+        s.push_str(&guidance);
+        s.push_str("\n\n[git diff payload]\n");
+        s.push_str(diff_payload.trim_end());
+        s
+    };
+
+    let resp = bot
+        .run(
+            &user_input,
+            &[],
+            &cfg.mode,
+            &cfg.persona,
+            None,
+            "brief",
+            cfg.temperature,
+            cfg.max_tokens,
+            if matches!(cfg.mode, crate::modes::Mode::DiffReview) {
+                Some(diff_patch.as_str())
+            } else {
+                None
+            },
+            None,
+        )
+        .await?;
+
+    println!("{}", resp.content);
+    Ok(())
+}
+
+fn parse_at_refs(text: &str) -> Vec<String> {
+    let mut refs: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for word in text.split_whitespace() {
+        if !word.starts_with('@') {
+            continue;
+        }
+        let path = word.trim_start_matches('@');
+        let path = path.trim_end_matches(|c: char| matches!(c, ',' | ')' | ']' | ';' | ':' | '.'));
+        if path.is_empty() {
+            continue;
+        }
+        if seen.insert(path.to_string()) {
+            refs.push(path.to_string());
+        }
+    }
+    refs
+}
+
+fn normalize_path_for_compare(s: &str) -> String {
+    let mut out = s.trim().replace('\\', "/");
+    while out.ends_with('/') && out.len() > 1 {
+        out.pop();
+    }
+    if cfg!(target_os = "windows") {
+        out = out.to_ascii_lowercase();
+    }
+    out
+}
+
+fn normalize_tool_root(tool_root: Option<String>) -> Option<String> {
+    let raw = tool_root?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let pb = std::path::PathBuf::from(raw);
+    let abs = if pb.is_absolute() {
+        pb
+    } else {
+        std::env::current_dir().ok()?.join(pb)
+    };
+
+    // Ensure the directory exists so canonicalize can remove `..` components.
+    let _ = std::fs::create_dir_all(&abs);
+    let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
+
+    Some(abs.to_string_lossy().into_owned())
+}
+
+async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
+    let AgentArgs {
+        prompt,
+        tool_root: tool_root_arg,
+        lang,
+        max_iters,
+        yes,
+        no_command_approval,
+        no_edit_approval,
+        session: session_path,
+        new_session,
+    } = args;
+
+    let mut loaded_session: Option<crate::agent_session::AgentSession> = None;
+    let mut start_messages_json: Option<Vec<serde_json::Value>> = None;
+    let mut start_checkpoint: Option<String> = None;
+    let mut start_cwd: Option<String> = None;
+    let mut create_checkpoint = true;
+    let mut resuming = false;
+
+    if let Some(ref sp) = session_path {
+        if sp.exists() && !new_session {
+            let mut sess = crate::agent_session::AgentSession::load(sp)?;
+            start_checkpoint = sess.checkpoint.clone();
+            start_cwd = sess.cur_cwd.clone();
+            create_checkpoint = sess.checkpoint.is_none();
+            start_messages_json = Some(std::mem::take(&mut sess.messages));
+            loaded_session = Some(sess);
+            resuming = true;
+        }
+    }
+
+    let saved_tool_root = loaded_session.as_ref().and_then(|s| s.tool_root.clone());
+    let saved_tool_root_norm = normalize_tool_root(saved_tool_root.clone());
+
+    let tool_root = normalize_tool_root(
+        tool_root_arg
+            .clone()
+            .or_else(|| saved_tool_root.clone())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        }),
+    );
+
+    if resuming && tool_root_arg.is_some() {
+        if let (Some(ref chosen), Some(ref saved)) = (tool_root.as_ref(), saved_tool_root_norm.as_ref()) {
+            if normalize_path_for_compare(chosen) != normalize_path_for_compare(saved) {
+                eprintln!(
+                    "WARN: --tool-root ({}) differs from saved session tool_root ({}). Continuing with --tool-root.",
+                    chosen,
+                    saved
+                );
+            }
+        }
+    }
+
+    // Build the user prompt text.
+    fn default_continue_prompt(lang: &str) -> String {
+        let l = lang.trim().to_ascii_lowercase();
+        if l == "fr" {
+            "Continue depuis l’état précédent. Reprends la tâche et vérifie avec des commandes/tests.".to_string()
+        } else if l == "en" {
+            "Continue from the previous state. Resume the task and verify with commands/tests.".to_string()
+        } else {
+            "前回の状態から続けて。作業を再開して、コマンド/テストで検証して。".to_string()
+        }
+    }
+    let mut used_stdin_as_prompt = false;
+    let mut user_input = match (prompt, common.stdin) {
+        (Some(p), _) => p,
+        (None, true) => {
+            used_stdin_as_prompt = true;
+            read_stdin_to_string().context("failed to read stdin")?
+        }
+        (None, false) if resuming => default_continue_prompt(&lang),
+        (None, false) => anyhow::bail!("missing prompt. Provide a prompt argument or pass --stdin."),
+    };
+
+    // If --stdin and a prompt was provided, append stdin as extra context (like `run_chat`).
+    if common.stdin && !used_stdin_as_prompt && !user_input.trim().is_empty() {
+        let stdin_text = read_stdin_to_string().context("failed to read stdin")?;
+        if !stdin_text.trim().is_empty() {
+            user_input = format!("{user_input}\n\n[stdin]\n{stdin_text}");
+        }
+    }
+
+    // Expand @file references into injected system messages.
+    let at_refs = parse_at_refs(&user_input);
+    let mut at_ref_messages_json: Vec<serde_json::Value> = Vec::new();
+    for ref_path in &at_refs {
+        let (content, is_err) = crate::file_tools::tool_read_file(ref_path, tool_root.as_deref());
+        if is_err {
+            eprintln!("[@{ref_path}] not found");
+        } else {
+            let header = content
+                .lines()
+                .next()
+                .unwrap_or(ref_path.as_str())
+                .to_string();
+            eprintln!("📎 injected: {header}");
+            at_ref_messages_json.push(json!({
+                "role": "system",
+                "content": format!("[@{ref_path}]\n{content}"),
+            }));
+        }
+    }
+
+    // Resolve config. For the headless coding agent, default to a code-like mode
+    // so `--code-model` is selected when users set different models per mode.
+    let mut partial = common.to_partial_config();
+    if !partial.vibe && partial.mode.is_none() {
+        partial.mode = Some(crate::modes::Mode::Vibe);
+    }
+    let cfg = partial.resolve()?;
+
+    // Build initial message list (OpenAI-compatible JSON).
+    let mut messages_json: Vec<serde_json::Value> = if let Some(m) = start_messages_json.take() {
+        m
+    } else {
+        // New session: build system prompt (same as TUI Coder).
+        let persona_prompt = personas::resolve_persona(&cfg.persona)
+            .map(|p| p.prompt)
+            .unwrap_or("");
+        let lang_instruction = crate::modes::language_instruction(Some(&lang), &cfg.mode);
+        let system = crate::tui::agent::coder_system(persona_prompt, lang_instruction);
+        vec![json!({"role":"system","content": system})]
+    };
+    messages_json.extend(at_ref_messages_json);
+    messages_json.push(json!({"role":"user","content": user_input}));
+
+    // Scan project context (stack/git/tree + .obstral.md/AGENTS.md + test_cmd).
+    let (project_context, agents_md, test_cmd) = if let Some(ref root) = tool_root {
+        if let Some(ctx) = project::ProjectContext::scan(root).await {
+            (Some(ctx.to_context_text()), ctx.agents_md, ctx.test_cmd)
+        } else {
+            (None, None, None)
+        }
+    } else {
+        (None, None, None)
+    };
+
+    // Stream tokens to stdout.
+    let max_iters = max_iters
+        .unwrap_or(crate::tui::agent::DEFAULT_MAX_ITERS)
+        .max(1)
+        .min(64);
+    let approver = crate::approvals::CliApprover::new(
+        !no_command_approval,
+        !no_edit_approval,
+        yes,
+    );
+    let (tx, mut rx) = mpsc::channel::<streaming::StreamToken>(128);
+
+    let start_state = crate::tui::agent::AgenticStartState {
+        messages: messages_json,
+        checkpoint: start_checkpoint.clone(),
+        cur_cwd: start_cwd.clone(),
+        create_checkpoint,
+    };
+
+    let tool_root_for_task = tool_root.clone();
+    let cfg_for_task = cfg.clone();
+    let handle = tokio::spawn(async move {
+        crate::tui::agent::run_agentic_json(
+            start_state,
+            &cfg_for_task,
+            tool_root_for_task.as_deref(),
+            max_iters,
+            tx,
+            project_context,
+            agents_md,
+            test_cmd,
+            &approver,
+        )
+        .await
+    });
+
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let mut saw_error = false;
+    let mut checkpoint: Option<String> = start_checkpoint.clone();
+
+    while let Some(token) = rx.recv().await {
+        match token {
+            streaming::StreamToken::Delta(s) => {
+                stdout.write_all(s.as_bytes()).ok();
+                stdout.flush().ok();
+            }
+            streaming::StreamToken::ToolCall(_) => {}
+            streaming::StreamToken::Checkpoint(hash) => {
+                checkpoint = Some(hash);
+            }
+            streaming::StreamToken::Done => break,
+            streaming::StreamToken::Error(e) => {
+                saw_error = true;
+                eprintln!("ERROR: {e}");
+            }
+        }
+    }
+
+    let mut end_state: Option<crate::tui::agent::AgenticEndState> = None;
+    let join_result = match handle.await {
+        Err(e) => Err(anyhow::anyhow!("agent task panicked: {e}")),
+        Ok(Ok(s)) => {
+            end_state = Some(s);
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+    };
+    let result = match (join_result, saw_error) {
+        (Ok(()), false) => Ok(()),
+        (Ok(()), true) => Err(anyhow::anyhow!("agent finished with errors")),
+        (Err(e), _) => Err(e),
+    };
+
+    // Save session file (if requested).
+    if let (Some(ref sp), Some(state)) = (session_path.as_ref(), end_state.as_ref()) {
+        let mut sess = loaded_session.unwrap_or_else(|| {
+            crate::agent_session::AgentSession::new(
+                tool_root.clone(),
+                None,
+                None,
+                Vec::new(),
+            )
+        });
+        sess.tool_root = tool_root.clone();
+        sess.checkpoint = checkpoint.clone().or_else(|| state.checkpoint.clone());
+        sess.cur_cwd = state.cur_cwd.clone();
+        sess.messages = state.messages.clone();
+        sess.touch();
+        crate::agent_session::AgentSession::save_atomic(sp, &sess)?;
+    }
+
+    // CLI nicety: show a compact git diff summary from the auto-created checkpoint.
+    if result.is_ok() {
+        let checkpoint_final = checkpoint
+            .as_deref()
+            .map(|s| s.to_string())
+            .or_else(|| end_state.as_ref().and_then(|s| s.checkpoint.clone()));
+        if let (Some(ref root), Some(ref hash)) = (tool_root, checkpoint_final.as_deref()) {
+            let stat = std::process::Command::new("git")
+                .args(["-C", root, "diff", hash, "--stat"])
+                .output();
+            let names = std::process::Command::new("git")
+                .args(["-C", root, "diff", hash, "--name-status"])
+                .output();
+            if let (Ok(s), Ok(n)) = (stat, names) {
+                if s.status.success() && n.status.success() {
+                    let s_txt = String::from_utf8_lossy(&s.stdout).trim().to_string();
+                    let n_txt = String::from_utf8_lossy(&n.stdout).trim().to_string();
+                    if !s_txt.is_empty() || !n_txt.is_empty() {
+                        println!("\n\n[git diff from checkpoint]\n{}\n\nFiles:\n{}",
+                            if s_txt.is_empty() { "(no changes)".to_string() } else { s_txt },
+                            if n_txt.is_empty() { "(no files)".to_string() } else { n_txt },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+async fn run_init(args: InitArgs, _common: CommonArgs) -> Result<()> {
+    let root = args.tool_root.clone().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    let root = root.unwrap_or_else(|| ".".to_string());
+    let root_p = std::path::Path::new(&root);
+    let obstral_path = root_p.join(".obstral.md");
+
+    if obstral_path.exists() && !args.force {
+        anyhow::bail!(
+            ".obstral.md already exists at {} (use --force to overwrite)",
+            obstral_path.display()
+        );
+    }
+
+    // Detect stack and test_cmd synchronously (same logic as TUI /init).
+    let has_cargo = root_p.join("Cargo.toml").exists();
+    let has_pkg = root_p.join("package.json").exists();
+    let has_py = root_p.join("pyproject.toml").exists() || root_p.join("requirements.txt").exists();
+    let has_go = root_p.join("go.mod").exists();
+    let stack = [
+        if has_cargo { Some("Rust") } else { None },
+        if has_pkg { Some("Node/React") } else { None },
+        if has_py { Some("Python") } else { None },
+        if has_go { Some("Go") } else { None },
+    ]
+    .iter()
+    .flatten()
+    .cloned()
+    .collect::<Vec<_>>()
+    .join(", ");
+    let test_cmd = if has_cargo {
+        "cargo test 2>&1"
+    } else if has_pkg {
+        "npm test --passWithNoTests 2>&1"
+    } else if has_py {
+        "pytest -q 2>&1"
+    } else if has_go {
+        "go test ./... 2>&1"
+    } else {
+        "# add your test command here"
+    };
+    let stack_line = if stack.is_empty() {
+        "# auto-detected: unknown".to_string()
+    } else {
+        stack.clone()
+    };
+    let content = format!(
+"# .obstral.md — Project Instructions for OBSTRAL Coder
+#
+# This file is automatically injected into the Coder's system prompt.
+# Edit it to set project rules, test commands, and coding conventions.
+
+## Stack
+{stack_line}
+
+## Test Command
+test_cmd: {test_cmd}
+
+## Development Rules
+- Always run tests after modifying source files
+- Use patch_file or apply_diff for targeted edits (safer than exec+sed)
+- Keep git commits small and focused
+- Check for compilation errors before marking a task done
+
+## Forbidden Commands
+# List commands that should never be run automatically:
+# - git push --force
+# - rm -rf /
+# - DROP TABLE
+
+## Notes
+# Add any project-specific context, architecture notes, or constraints here.
+");
+
+    std::fs::create_dir_all(root_p)
+        .with_context(|| format!("failed to create tool_root: {}", root_p.display()))?;
+    std::fs::write(&obstral_path, content.as_bytes())
+        .with_context(|| format!("failed to write {}", obstral_path.display()))?;
+
+    println!("✓ wrote {}", obstral_path.display());
     Ok(())
 }
 

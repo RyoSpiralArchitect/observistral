@@ -168,6 +168,24 @@ impl PendingCommandStore {
         };
 
         if let Some(cwd) = cwd.as_deref().filter(|s| !s.trim().is_empty()) {
+            if let Err(err) = crate::exec::validate_cwd(cwd) {
+                let res = serde_json::json!({
+                    "ok": false,
+                    "error": format!("invalid cwd: {err}"),
+                });
+                let mut items = self.items.lock().await;
+                if let Some(it) = items.iter_mut().find(|x| x.id == id) {
+                    it.result = Some(res);
+                    return Ok(PendingCommandResolvedItem {
+                        id: it.id.clone(),
+                        status: it.status.clone(),
+                        command: it.command.clone(),
+                        cwd: it.cwd.clone(),
+                        result: it.result.clone(),
+                    });
+                }
+                return Err(anyhow!("pending command disappeared: {id}"));
+            }
             if let Err(err) = std::fs::create_dir_all(std::path::Path::new(cwd)) {
                 let res = serde_json::json!({
                     "ok": false,

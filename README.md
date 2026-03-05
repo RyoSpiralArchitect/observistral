@@ -249,6 +249,29 @@ Every field is intentional. `quote` pins the exact offending line to the card. `
 .\scripts\run-tui.ps1
 ```
 
+**Headless Coder (CLI)**
+```powershell
+# (optional) generate .obstral.md template (stack + test_cmd)
+obstral init --tool-root .
+
+# run the coding agent in your project
+obstral agent "fix the failing test" --tool-root . --vibe
+
+# persist and resume a session
+obstral agent "fix the failing test" --tool-root . --vibe --session .tmp/obstral_session.json
+# resume later (omit prompt -> auto "continue")
+obstral agent --tool-root . --vibe --session .tmp/obstral_session.json
+
+# auto-approve tool actions (no prompts)
+obstral agent "fix the failing test" --tool-root . --vibe --yes
+
+# review your current git diff with Observer
+obstral review --tool-root .
+
+# review changes since a checkpoint (hash printed by `obstral agent`)
+obstral review --tool-root . --base <checkpoint_hash>
+ ```
+
 **Python Lite (WDAC / no Rust binary)**
 ```powershell
 python .\scripts\serve_lite.py
@@ -266,17 +289,26 @@ Every agent action runs inside a working directory. Default: `.tmp/<thread-id>`.
 To work on your actual project, set `tool_root` to your project path:
 - **TUI**: `--tool-root .` flag, or `/root <path>` slash command at runtime
 - **Web UI**: Settings → toolRoot field
+- **CLI**: `obstral agent "<prompt>" --tool-root .`
 
 When `tool_root` is set, OBSTRAL scans it on first use to build the project context block (stack, git, tree). Subsequent sends in the same session skip the scan.
 
 Path traversal is blocked: paths with `..` components are rejected at every tool boundary.
 
+### Sessions (CLI)
+
+`obstral agent` can save and resume the full conversation (including tool calls) with `--session <path>`.
+
+- Resume without a prompt: run `obstral agent --tool-root . --session <path>` again
+- Start fresh: add `--new-session` (overwrites the file)
+
+Session JSON may contain code and tool outputs — treat it as sensitive.
+
 ### Approvals
 
-- **Edit approval**: `write_file` calls queue as pending edits. You approve or reject each one.
-- **Command approval**: `exec` calls can be gated the same way (optional). The Coder pauses and resumes after your decision.
-
-Neither mode requires you to stop working — they queue silently.
+- **Web UI**: edits/commands can queue as pending items. Approve/reject from the browser.
+- **CLI (`obstral agent`)**: prompts before running `exec` and applying file edits (`write_file` / `patch_file` / `apply_diff`). Use `--yes` to auto-approve.
+- **TUI**: currently auto-approves tool actions.
 
 ### Providers
 

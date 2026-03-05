@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use anyhow::anyhow;
+use std::path::{Component, Path};
 use std::process::Stdio;
 use tokio::process::Command;
 
@@ -19,6 +21,42 @@ pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+}
+
+/// Validate `cwd` passed into `run_command`.
+///
+/// We keep this conservative:
+/// - Reject any path that contains `..` components (even if absolute).
+/// - Reject "absolute-ish" Windows prefixes when the path is not absolute (e.g. `C:foo`).
+pub fn validate_cwd(cwd: &str) -> Result<()> {
+    let s = cwd.trim();
+    if s.is_empty() {
+        return Ok(());
+    }
+    if s.contains('\0') {
+        return Err(anyhow!("cwd contains NUL byte"));
+    }
+
+    let p = Path::new(s);
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(anyhow!("cwd traversal ('..') not allowed: {s}"));
+    }
+
+    // On Windows, "C:foo" is NOT absolute but has a Prefix component.
+    // Treat this as unsafe because it's ambiguous and can escape expected roots.
+    if !p.is_absolute() {
+        for c in p.components() {
+            match c {
+                Component::CurDir | Component::Normal(_) => {}
+                Component::ParentDir => unreachable!("handled above"),
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(anyhow!("cwd must be a normal relative path: {s}"));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Best-effort cleanup for LLM-produced shell transcripts.
@@ -634,6 +672,7 @@ pub async fn run_command(command: &str, cwd: Option<&str>) -> Result<ExecResult>
     scrub_poison_proxy_env(&mut cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(cwd) = cwd.filter(|s| !s.trim().is_empty()) {
+        validate_cwd(cwd).context("invalid cwd")?;
         cmd.current_dir(cwd);
     }
 
@@ -778,6 +817,32 @@ mod tests {
     #[test]
     fn ps_single_quote_escapes() {
         assert_eq!(ps_single_quote("a'b"), "'a''b'");
+    }
+
+    #[test]
+    fn validate_cwd_allows_normal_paths() {
+        validate_cwd("").unwrap();
+        validate_cwd("subdir").unwrap();
+        validate_cwd("a/b").unwrap();
+    }
+
+    #[test]
+    fn validate_cwd_rejects_dotdot() {
+        assert!(validate_cwd("../x").is_err());
+        assert!(validate_cwd("a/../b").is_err());
+    }
+
+    #[test]
+    fn validate_cwd_rejects_absolute_with_dotdot() {
+        let p = std::env::temp_dir().join("..").join("x");
+        let s = p.to_string_lossy().into_owned();
+        assert!(validate_cwd(&s).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn validate_cwd_rejects_drive_relative_prefix() {
+        assert!(validate_cwd("C:foo").is_err());
     }
 
     #[cfg(target_os = "windows")]

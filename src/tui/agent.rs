@@ -23,8 +23,24 @@ use tokio::sync::mpsc;
 
 use crate::config::RunConfig;
 use crate::exec;
+use crate::approvals::{ApprovalOutcome, ApprovalRequest, Approver};
 use crate::streaming::{StreamToken, ToolCallData, stream_openai_compat_json};
 use crate::types::ChatMessage;
+
+#[derive(Debug, Clone)]
+pub struct AgenticStartState {
+    pub messages: Vec<serde_json::Value>,
+    pub checkpoint: Option<String>,
+    pub cur_cwd: Option<String>,
+    pub create_checkpoint: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgenticEndState {
+    pub messages: Vec<serde_json::Value>,
+    pub checkpoint: Option<String>,
+    pub cur_cwd: Option<String>,
+}
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -368,6 +384,37 @@ fn truncate_output_tail(s: &str, max_chars: usize) -> String {
     let shown_lines = tail.lines().count();
     let hidden = total_lines.saturating_sub(shown_lines);
     format!("[…{hidden} earlier lines omitted — showing last {max_chars} chars]\n{tail}")
+}
+
+/// Line- and char-bounded preview truncation (used for approval prompts).
+fn truncate_preview(s: &str, max_chars: usize, max_lines: usize) -> String {
+    let mut out = String::new();
+    let mut lines = 0usize;
+    for line in s.lines() {
+        if lines >= max_lines {
+            out.push_str("\n...truncated...\n");
+            break;
+        }
+        if out.len() + line.len() + 1 > max_chars {
+            out.push_str("\n...truncated...\n");
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+        lines += 1;
+    }
+    out.trim_end().to_string()
+}
+
+fn simple_before_after(old: &str, new: &str) -> String {
+    if old == new {
+        return "(no changes)".to_string();
+    }
+    let old_p = truncate_preview(old, 1400, 60);
+    let new_p = truncate_preview(new, 1400, 60);
+    format!("--- before ---\n{old_p}\n\n--- after ---\n{new_p}\n")
+        .trim_end()
+        .to_string()
 }
 
 /// Extract a compact digest of error lines from command output.
@@ -1274,7 +1321,44 @@ pub async fn run_agentic(
     agents_md: Option<String>,
     // Command to run after every successful file edit (e.g. "cargo test 2>&1").
     test_cmd: Option<String>,
-) -> Result<()> {
+    approver: &dyn Approver,
+) -> Result<AgenticEndState> {
+    let messages_json: Vec<serde_json::Value> = messages_in
+        .iter()
+        .map(|m| json!({"role": m.role, "content": m.content}))
+        .collect();
+    let start = AgenticStartState {
+        messages: messages_json,
+        checkpoint: None,
+        cur_cwd: None,
+        create_checkpoint: true,
+    };
+    run_agentic_json(
+        start,
+        cfg,
+        tool_root,
+        max_iters,
+        tx,
+        project_context,
+        agents_md,
+        test_cmd,
+        approver,
+    )
+    .await
+}
+
+pub async fn run_agentic_json(
+    start: AgenticStartState,
+    cfg: &RunConfig,
+    tool_root: Option<&str>,
+    max_iters: usize,
+    tx: mpsc::Sender<StreamToken>,
+    project_context: Option<String>,
+    agents_md: Option<String>,
+    // Command to run after every successful file edit (e.g. "cargo test 2>&1").
+    test_cmd: Option<String>,
+    approver: &dyn Approver,
+) -> Result<AgenticEndState> {
     let client = reqwest::Client::new();
     let tools = json!([
         exec_tool_def(),
@@ -1294,19 +1378,18 @@ pub async fn run_agentic(
     // D — consecutive file-tool failure escalation
     let mut file_tool_consec_failures: usize = 0;
 
-    let root_user_text = messages_in
+    let root_user_text = start
+        .messages
         .iter()
         .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
+        .find(|m| m["role"].as_str() == Some("user"))
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or("")
+        .to_string();
     let goal_wants_actions = wants_local_actions(&root_user_text);
 
     // Keep messages as serde_json::Value throughout to preserve tool_call_id.
-    let mut messages: Vec<serde_json::Value> = messages_in
-        .iter()
-        .map(|m| json!({"role": m.role, "content": m.content}))
-        .collect();
+    let mut messages: Vec<serde_json::Value> = start.messages;
 
     // Resolve tool_root once (absolute path) and track cwd across tool calls.
     // This prevents the classic "cd didn't persist, so git add ran in the wrong repo" failure.
@@ -1314,14 +1397,32 @@ pub async fn run_agentic(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .and_then(absolutize_path);
+
+    fn has_system_prefix(messages: &[serde_json::Value], prefix: &str) -> bool {
+        messages.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("system")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.trim_start().starts_with(prefix))
+                    .unwrap_or(false)
+        })
+    }
+
+    let mut checkpoint = start.checkpoint.clone();
     // D — git checkpoint: snapshot HEAD so the user can /rollback if the session goes wrong.
     if let Some(ref root) = tool_root_abs {
-        if let Some(hash) = git_create_checkpoint(root).await {
-            let short = hash[..hash.len().min(8)].to_string();
-            let _ = tx.send(StreamToken::Checkpoint(hash)).await;
-            let _ = tx.send(StreamToken::Delta(
-                format!("[git checkpoint] {short} saved — use /rollback to restore\n\n")
-            )).await;
+        if checkpoint.is_none() && start.create_checkpoint {
+            if let Some(hash) = git_create_checkpoint(root).await {
+                checkpoint = Some(hash.clone());
+                let short = hash[..hash.len().min(8)].to_string();
+                let _ = tx.send(StreamToken::Checkpoint(hash)).await;
+                let _ = tx.send(StreamToken::Delta(
+                    format!("[git checkpoint] {short} saved — use /rollback to restore\n\n")
+                )).await;
+            }
+        } else if let Some(ref hash) = checkpoint {
+            // Resume: re-emit checkpoint token for UI/CLI consumers.
+            let _ = tx.send(StreamToken::Checkpoint(hash.clone())).await;
         }
     }
 
@@ -1331,35 +1432,46 @@ pub async fn run_agentic(
             "[Working directory]\n\
 Working directory (tool_root): {root}\n\
 IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the tool reports cwd.\n\
-Always operate under tool_root. Create new repos under tool_root (fresh directory).\n\
-NEVER create a git repo inside another git repo. If you see 'embedded git repository', STOP and relocate."
+ Always operate under tool_root. Create new repos under tool_root (fresh directory).\n\
+ NEVER create a git repo inside another git repo. If you see 'embedded git repository', STOP and relocate."
         );
-        if messages.first().and_then(|m| m["role"].as_str()) == Some("system") {
-            messages.insert(1, json!({"role":"system","content": note}));
-        } else {
-            messages.insert(0, json!({"role":"system","content": note}));
+        if !has_system_prefix(&messages, "[Working directory]") {
+            if messages.first().and_then(|m| m["role"].as_str()) == Some("system") {
+                messages.insert(1, json!({"role":"system","content": note}));
+            } else {
+                messages.insert(0, json!({"role":"system","content": note}));
+            }
         }
     }
     // Project context — inject once at position 2 (after [Working directory] note).
     if let Some(ctx_text) = project_context {
         if !ctx_text.is_empty() {
-            let pos = messages.len().min(2);
-            messages.insert(pos, json!({"role":"system","content": ctx_text}));
+            if !has_system_prefix(&messages, "[Project Context") {
+                let pos = messages.len().min(2);
+                messages.insert(pos, json!({"role":"system","content": ctx_text}));
+            }
         }
     }
     // AGENTS.md / .obstral.md — project-specific rules injected right after project context.
     // These take precedence over generic instructions and can override coding conventions.
     if let Some(agents_text) = agents_md {
         if !agents_text.is_empty() {
-            let pos = messages.len().min(3);
-            messages.insert(pos, json!({
-                "role": "system",
-                "content": format!("[Project Instructions — .obstral.md / AGENTS.md]\n{agents_text}")
-            }));
+            if !has_system_prefix(&messages, "[Project Instructions — .obstral.md / AGENTS.md]") {
+                let pos = messages.len().min(3);
+                messages.insert(pos, json!({
+                    "role": "system",
+                    "content": format!("[Project Instructions — .obstral.md / AGENTS.md]\n{agents_text}")
+                }));
+            }
         }
     }
 
-    let mut cur_cwd: Option<String> = tool_root_abs.clone();
+    let mut cur_cwd: Option<String> = start.cur_cwd.clone().or_else(|| tool_root_abs.clone());
+    if let (Some(ref root), Some(ref cwd)) = (tool_root_abs.as_ref(), cur_cwd.as_ref()) {
+        if !is_within_root(cwd, root) {
+            cur_cwd = tool_root_abs.clone();
+        }
+    }
 
     // Session-scoped file read cache.
     // Key: canonical path string.  Invalidated on write_file / patch_file success.
@@ -1425,6 +1537,7 @@ NEVER create a git repo inside another git repo. If you see 'embedded git reposi
 
         let mut assistant_text = String::new();
         let mut tool_call: Option<ToolCallData> = None;
+        let mut stream_error: Option<String> = None;
 
         while let Some(token) = token_rx.recv().await {
             match token {
@@ -1438,21 +1551,39 @@ NEVER create a git repo inside another git repo. If you see 'embedded git reposi
                 StreamToken::Done => break,
                 StreamToken::Error(e) => {
                     let _ = tx.send(StreamToken::Error(e.clone())).await;
-                    return Err(anyhow!("stream error: {e}"));
+                    stream_error = Some(e);
+                    break;
                 }
                 StreamToken::Checkpoint(_) => {} // not emitted by inner stream
             }
         }
 
         match stream_task.await {
-            Err(join_err) => return Err(anyhow!("stream task panicked: {join_err}")),
+            Err(join_err) => {
+                let msg = format!("stream task panicked: {join_err}");
+                if stream_error.is_none() {
+                    let _ = tx.send(StreamToken::Error(msg.clone())).await;
+                }
+                stream_error = Some(msg);
+            }
             Ok(Err(e)) => {
                 // Stream failed (network error, bad status, etc.) — surface it.
                 let msg = format!("{e:#}");
-                let _ = tx.send(StreamToken::Error(msg.clone())).await;
-                return Err(anyhow!("{msg}"));
+                if stream_error.is_none() {
+                    let _ = tx.send(StreamToken::Error(msg.clone())).await;
+                }
+                stream_error = Some(msg);
             }
             Ok(Ok(())) => {}
+        }
+
+        if stream_error.is_some() {
+            let _ = tx
+                .send(StreamToken::Delta(
+                    "\n[agent] aborted due to stream error; session can be resumed.\n".to_string(),
+                ))
+                .await;
+            break;
         }
 
         // ── Append assistant turn ──────────────────────────────────────────
@@ -1503,6 +1634,38 @@ NEVER create a git repo inside another git repo. If you see 'embedded git reposi
                                 state, im.lang_hint
                             )))
                             .await;
+
+                        let approval = approver
+                            .approve(ApprovalRequest::Command {
+                                command: command.clone(),
+                                cwd: cwd_used.clone(),
+                            })
+                            .await?;
+                        if approval == ApprovalOutcome::Rejected {
+                            state = AgentState::Recovery;
+                            let _ = tx
+                                .send(StreamToken::Delta(
+                                    "[RESULT][Recovery] REJECTED by user\n".to_string(),
+                                ))
+                                .await;
+
+                            let cwd_line = format!("cwd: {cwd_used_label}");
+                            let tool_output =
+                                format!("REJECTED BY USER\n{cwd_line}\ncommand:\n{command}");
+                            // NOTE: do not fabricate tool_call_id. Feed the rejection back as user text.
+                            messages.push(json!({
+                                "role": "user",
+                                "content": format!(
+                                    "[implied_exec]\nlang_hint: {}\ncommand:\n{}\n\n{}",
+                                    im.lang_hint, command, tool_output
+                                ),
+                            }));
+                            pending_system_hint = Some(
+                                "The user rejected the command. Choose a safer alternative or explain why it is necessary before retrying."
+                                    .to_string(),
+                            );
+                            break;
+                        }
 
                         let exec_cmd = wrap_exec_with_pwd(&command);
                         let exec_result = exec::run_command(&exec_cmd, cwd_used.as_deref()).await;
@@ -1655,6 +1818,7 @@ After it succeeds, verify and continue.";
             let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
 
             let base = tool_root_abs.as_deref();
+            let mut rejected_by_user = false;
 
             // B — capture old content for diff anchoring
             let old_for_cache = base.and_then(|b| {
@@ -1663,8 +1827,25 @@ After it succeeds, verify and continue.";
                     .and_then(|abs| std::fs::read_to_string(&abs).ok())
             });
 
-            let (mut result, is_error) =
-                crate::file_tools::tool_apply_diff(&path, &diff, base);
+            let preview = truncate_preview(&diff, 2800, 140);
+            let approval = approver
+                .approve(ApprovalRequest::Edit {
+                    action: "apply_diff".to_string(),
+                    path: path.clone(),
+                    preview,
+                })
+                .await?;
+            let (mut result, is_error) = if approval == ApprovalOutcome::Approved {
+                crate::file_tools::tool_apply_diff(&path, &diff, base)
+            } else {
+                rejected_by_user = true;
+                (
+                    format!(
+                        "REJECTED BY USER\naction: apply_diff\npath: {path}\n(no changes applied)"
+                    ),
+                    true,
+                )
+            };
 
             // Invalidate file cache on success + auto-test
             if !is_error {
@@ -1692,8 +1873,15 @@ After it succeeds, verify and continue.";
             if is_error {
                 let _ = tx.send(StreamToken::Delta(format!("[RESULT_FILE_ERR] {first_line}\n"))).await;
                 state = AgentState::Recovery;
-                file_tool_consec_failures += 1;
-                pending_system_hint = Some(format!("apply_diff error: {first_line}"));
+                if !rejected_by_user {
+                    file_tool_consec_failures += 1;
+                    pending_system_hint = Some(format!("apply_diff error: {first_line}"));
+                } else {
+                    pending_system_hint = Some(
+                        "The user rejected the edit. Choose a safer alternative or ask again with a smaller change."
+                            .to_string(),
+                    );
+                }
             } else {
                 let _ = tx.send(StreamToken::Delta(format!("[RESULT_FILE] {first_line}\n"))).await;
                 state = AgentState::Planning;
@@ -1808,6 +1996,7 @@ After it succeeds, verify and continue.";
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| format!("{}|{}", path, base.unwrap_or("")));
+            let mut rejected_by_user = false;
 
             let (result, is_error) = match tc.name.as_str() {
                 "read_file" => {
@@ -1828,17 +2017,43 @@ After it succeeds, verify and continue.";
                 }
                 "write_file" => {
                     let content = args["content"].as_str().unwrap_or("").to_string();
-                    let (mut r_text, r_err) = crate::file_tools::tool_write_file(&path, &content, base);
-                    if !r_err {
-                        file_cache.remove(&cache_key);
-                        // A — auto-test after write
-                        if let Some(ref cmd) = test_cmd {
-                            if let Some(ref root) = tool_root_abs {
-                                r_text.push_str(&run_test_cmd(cmd, root).await);
+
+                    // Approval: show a compact before/after preview.
+                    let old = file_cache.get(&cache_key).cloned().or_else(|| {
+                        crate::file_tools::resolve_safe_path(&path, base)
+                            .ok()
+                            .and_then(|abs| std::fs::read_to_string(&abs).ok())
+                    }).unwrap_or_default();
+                    let preview = simple_before_after(&old, &content);
+                    let approval = approver
+                        .approve(ApprovalRequest::Edit {
+                            action: "write_file".to_string(),
+                            path: path.clone(),
+                            preview,
+                        })
+                        .await?;
+                    if approval == ApprovalOutcome::Rejected {
+                        rejected_by_user = true;
+                        (
+                            format!(
+                                "REJECTED BY USER\naction: write_file\npath: {path}\n(no changes applied)"
+                            ),
+                            true,
+                        )
+                    } else {
+                        let (mut r_text, r_err) =
+                            crate::file_tools::tool_write_file(&path, &content, base);
+                        if !r_err {
+                            file_cache.remove(&cache_key);
+                            // A — auto-test after write
+                            if let Some(ref cmd) = test_cmd {
+                                if let Some(ref root) = tool_root_abs {
+                                    r_text.push_str(&run_test_cmd(cmd, root).await);
+                                }
                             }
                         }
+                        (r_text, r_err)
                     }
-                    (r_text, r_err)
                 }
                 _ => {
                     // ── patch_file ─────────────────────────────────────────
@@ -1852,49 +2067,83 @@ After it succeeds, verify and continue.";
                             .and_then(|abs| std::fs::read_to_string(&abs).ok())
                     });
 
-                    let (mut patch_result, patch_err) =
-                        crate::file_tools::tool_patch_file(&path, &search, &replace, base);
-
-                    if !patch_err {
-                        file_cache.remove(&cache_key); // invalidate stale cache
-
-                        // B — append diff preview (shows exactly what changed).
-                        if let Some(ref old) = old_content_for_diff {
-                            let diff = crate::file_tools::make_patch_diff(old, &search, &replace);
-                            if !diff.is_empty() {
-                                patch_result.push_str(&format!("\n{diff}"));
-                            }
-                        }
-
-                        // Gap 7: auto-verify patch was applied correctly.
-                        if let Ok(abs) = crate::file_tools::resolve_safe_path(&path, base) {
-                            if let Ok(new_content) = std::fs::read_to_string(&abs) {
-                                if replace.is_empty() || new_content.contains(&replace) {
-                                    patch_result.push_str("\n✓ auto-verify: patch confirmed in file");
-                                } else {
-                                    patch_result.push_str(
-                                        "\n✗ auto-verify FAILED: replacement text not found — \
-                                         file may be in unexpected state; call read_file to inspect"
-                                    );
-                                }
-                                // Seed cache with the freshly written content.
-                                file_cache.insert(cache_key.clone(), new_content);
-                            }
-                        }
-                        // A — auto-test after successful patch
-                        if let Some(ref cmd) = test_cmd {
-                            if let Some(ref root) = tool_root_abs {
-                                patch_result.push_str(&run_test_cmd(cmd, root).await);
-                            }
-                        }
+                    // Approval: show the computed patch diff (or search/replace when diff can't be made).
+                    let mut preview = old_content_for_diff
+                        .as_deref()
+                        .map(|old| crate::file_tools::make_patch_diff(old, &search, &replace))
+                        .unwrap_or_default();
+                    if preview.trim().is_empty() {
+                        let s = truncate_preview(&search, 700, 28);
+                        let r = truncate_preview(&replace, 700, 28);
+                        preview = format!(
+                            "(no context diff available)\n--- search ---\n{s}\n\n--- replace ---\n{r}\n"
+                        );
                     }
-                    (patch_result, patch_err)
+                    let approval = approver
+                        .approve(ApprovalRequest::Edit {
+                            action: "patch_file".to_string(),
+                            path: path.clone(),
+                            preview,
+                        })
+                        .await?;
+                    if approval == ApprovalOutcome::Rejected {
+                        rejected_by_user = true;
+                        (
+                            format!(
+                                "REJECTED BY USER\naction: patch_file\npath: {path}\n(no changes applied)"
+                            ),
+                            true,
+                        )
+                    } else {
+                        let (mut patch_result, patch_err) =
+                            crate::file_tools::tool_patch_file(&path, &search, &replace, base);
+
+                        if !patch_err {
+                            file_cache.remove(&cache_key); // invalidate stale cache
+
+                            // B — append diff preview (shows exactly what changed).
+                            if let Some(ref old) = old_content_for_diff {
+                                let diff =
+                                    crate::file_tools::make_patch_diff(old, &search, &replace);
+                                if !diff.is_empty() {
+                                    patch_result.push_str(&format!("\n{diff}"));
+                                }
+                            }
+
+                            // Gap 7: auto-verify patch was applied correctly.
+                            if let Ok(abs) = crate::file_tools::resolve_safe_path(&path, base) {
+                                if let Ok(new_content) = std::fs::read_to_string(&abs) {
+                                    if replace.is_empty() || new_content.contains(&replace) {
+                                        patch_result.push_str(
+                                            "\n✓ auto-verify: patch confirmed in file",
+                                        );
+                                    } else {
+                                        patch_result.push_str(
+                                            "\n✗ auto-verify FAILED: replacement text not found — \
+                                             file may be in unexpected state; call read_file to inspect",
+                                        );
+                                    }
+                                    // Seed cache with the freshly written content.
+                                    file_cache.insert(cache_key.clone(), new_content);
+                                }
+                            }
+                            // A — auto-test after successful patch
+                            if let Some(ref cmd) = test_cmd {
+                                if let Some(ref root) = tool_root_abs {
+                                    patch_result.push_str(&run_test_cmd(cmd, root).await);
+                                }
+                            }
+                        }
+                        (patch_result, patch_err)
+                    }
                 }
             };
 
             // D — track consecutive file-tool failures for escalation.
             if is_error {
-                file_tool_consec_failures += 1;
+                if !rejected_by_user {
+                    file_tool_consec_failures += 1;
+                }
             } else {
                 file_tool_consec_failures = 0;
             }
@@ -1907,7 +2156,10 @@ After it succeeds, verify and continue.";
                 )).await;
                 state = AgentState::Recovery;
                 // D — escalate after 3 consecutive file-tool failures.
-                let hint = if file_tool_consec_failures >= 3 {
+                let hint = if rejected_by_user {
+                    "The user rejected the edit. Choose a safer alternative or ask again with a smaller change."
+                        .to_string()
+                } else if file_tool_consec_failures >= 3 {
                     format!(
                         "CRITICAL: {file_tool_consec_failures} consecutive file-tool errors.\n\
                          You MUST abandon the current approach. Do NOT retry the same operation.\n\
@@ -1996,6 +2248,40 @@ After it succeeds, verify and continue.";
                 state
             )))
             .await;
+
+        let approval = approver
+            .approve(ApprovalRequest::Command {
+                command: command.clone(),
+                cwd: cwd_used.clone(),
+            })
+            .await?;
+        if approval == ApprovalOutcome::Rejected {
+            state = AgentState::Recovery;
+            let _ = tx
+                .send(StreamToken::Delta(
+                    "[RESULT][Recovery] REJECTED by user\n".to_string(),
+                ))
+                .await;
+            let cwd_line = format!("cwd: {cwd_used_label}");
+            let tool_output = format!("REJECTED BY USER\n{cwd_line}\ncommand:\n{command}");
+
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": tool_output,
+            }));
+            pending_system_hint = Some(
+                "The user rejected the command. Choose a safer alternative or explain why it is necessary before retrying."
+                    .to_string(),
+            );
+
+            if iter + 1 == max_iters {
+                let _ = tx.send(StreamToken::Delta(
+                    format!("\n[agent] iteration cap ({max_iters}) reached.\n")
+                )).await;
+            }
+            continue;
+        }
 
         let exec_cmd = wrap_exec_with_pwd(&command);
         let exec_result = exec::run_command(&exec_cmd, cwd_used.as_deref()).await;
@@ -2115,5 +2401,9 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
     }
 
     let _ = tx.send(StreamToken::Done).await;
-    Ok(())
+    Ok(AgenticEndState {
+        messages,
+        checkpoint,
+        cur_cwd,
+    })
 }

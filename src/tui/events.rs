@@ -891,7 +891,20 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
 
     let tx = tx.clone();
     let handle = tokio::spawn(async move {
-        if let Err(e) = agent::run_agentic(messages, &cfg, tool_root.as_deref(), max_iters, tx.clone(), project_context, agents_md, test_cmd).await {
+        let approver = crate::approvals::AutoApprover;
+        if let Err(e) = agent::run_agentic(
+            messages,
+            &cfg,
+            tool_root.as_deref(),
+            max_iters,
+            tx.clone(),
+            project_context,
+            agents_md,
+            test_cmd,
+            &approver,
+        )
+        .await
+        {
             let _ = tx.send(StreamToken::Error(format!("{e:#}"))).await;
         }
     });
