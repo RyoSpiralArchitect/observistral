@@ -19,6 +19,16 @@ OBSTRAL resout ca en faisant tourner Coder et Observer dans des **contextes enti
 
 ---
 
+## Pourquoi OBSTRAL existe
+
+La plupart des outils LLM optimisent la conversation.
+OBSTRAL optimise des boucles d'execution controlees : roles separes, garde-fous d'approbation, et critique cumulative au lieu de repartir de zero a chaque tour.
+
+Ce n'est pas un client de chat.
+C'est un moteur de controle du processus de developpement.
+
+---
+
 ## Trois roles. Trois contextes. Zero conflit.
 
 | Role | Ce qu'il fait | Ce qu'il ne fait jamais |

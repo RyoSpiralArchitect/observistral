@@ -927,6 +927,78 @@ async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
     send_coder_with_text(app, tx, text).await;
 }
 
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let s = s.trim_end();
+    let mut it = s.chars();
+    let head: String = it.by_ref().take(max_chars).collect();
+    if it.next().is_some() {
+        format!("{head}…[truncated]")
+    } else {
+        head
+    }
+}
+
+fn build_recent_tool_outputs(messages: &[Message]) -> String {
+    const MAX_TOOL_MSGS: usize = 6;
+    const MAX_TOOL_CHARS: usize = 1_200;
+
+    fn is_failure_like(output: &str) -> bool {
+        let o = output.trim_start();
+        o.contains("FAILED (exit_code:")
+            || o.contains("REJECTED BY USER")
+            || o.contains("[auto-test] ✗ FAILED")
+    }
+
+    let tool_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m.role, Role::Tool) && m.complete)
+        .map(|(i, _)| i)
+        .collect();
+
+    if tool_indices.is_empty() {
+        return String::new();
+    }
+
+    let mut selected: Vec<usize> = Vec::new();
+    // Prefer recent failures (including auto-test failures), then fill with recency context.
+    for &idx in tool_indices.iter().rev() {
+        if selected.len() >= MAX_TOOL_MSGS {
+            break;
+        }
+        if is_failure_like(&messages[idx].content) {
+            selected.push(idx);
+        }
+    }
+    for &idx in tool_indices.iter().rev() {
+        if selected.len() >= MAX_TOOL_MSGS {
+            break;
+        }
+        if !selected.contains(&idx) {
+            selected.push(idx);
+        }
+    }
+    selected.sort_unstable();
+
+    let count = selected.len();
+    let snippet = selected
+        .into_iter()
+        .enumerate()
+        .map(|(i, idx)| {
+            format!(
+                "[tool {}]: {}",
+                i + 1,
+                truncate_chars(&messages[idx].content, MAX_TOOL_CHARS)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "\n\n[Recent tool outputs — last {count}]\n{snippet}"
+    )
+}
+
 async fn send_observer_message(
     app: &mut App,
     tx: &mpsc::Sender<StreamToken>,
@@ -991,7 +1063,7 @@ async fn send_observer_message(
                     m.role,
                     m.content.chars().take(800).collect::<String>()
                 )
-            })
+             })
             .collect::<Vec<_>>()
             .join("\n");
         format!("\n\n[Recent Coder activity — last 10 turns]\n{snippet}")
@@ -999,7 +1071,11 @@ async fn send_observer_message(
         String::new()
     };
 
-    let system_base = format!("{obs_system}{coder_context}").trim_end().to_string();
+    let tool_context = build_recent_tool_outputs(&app.coder.messages);
+
+    let system_base = format!("{obs_system}{coder_context}{tool_context}")
+        .trim_end()
+        .to_string();
     // Exclude the last entry in history (current user message, already pushed to pane)
     // to avoid sending a duplicate user message, matching the pattern in send_coder_message.
     let hist_len = history.len();
@@ -1544,7 +1620,10 @@ async fn maybe_observer_loop_retry(app: &mut App, observer_tx: &mpsc::Sender<Str
         String::new()
     };
 
-    let system = format!("{obs_system}{coder_context}").trim_end().to_string();
+    let tool_context = build_recent_tool_outputs(&app.coder.messages);
+    let system = format!("{obs_system}{coder_context}{tool_context}")
+        .trim_end()
+        .to_string();
     let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
     for m in &history { messages.push(m.clone()); }
 

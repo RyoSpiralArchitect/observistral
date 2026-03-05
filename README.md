@@ -19,6 +19,16 @@ OBSTRAL fixes this by running Coder and Observer in **completely separate contex
 
 ---
 
+## Why OBSTRAL Exists
+
+Most LLM tools optimize for conversation.
+OBSTRAL optimizes for controlled execution loops: separate roles, approval gates, and critique that accumulates instead of resetting every turn.
+
+This is not a chat client.
+It's a development control engine.
+
+---
+
 ## Three Roles. Three Contexts. Zero Conflicts.
 
 | Role | What it does | What it never does |

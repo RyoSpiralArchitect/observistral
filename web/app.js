@@ -550,7 +550,8 @@
     observerMode: "Observer",
     observerPersona: "novelist",
     observerIntensity: "critical",
-    observerLang: "ui",
+    // Default to auto so Observer follows the conversation language even if the UI is in English.
+    observerLang: "auto",
     includeCoderContext: true,
     temperature: "0.7",
     maxTokens: "1024",
@@ -1920,7 +1921,11 @@
         (!m.streaming && m.role === "assistant" && pane === "observer")
           ? stripObserverMeta(raw)
           : raw;
-      const isLong = !m.streaming && (s.length > 2600 || (s.match(/\n/g) || []).length > 40);
+      // Observer critiques are often long; collapsing them makes the pane hard to read.
+      // Use a higher threshold so only extreme walls of text collapse by default.
+      const longCharLimit = pane === "observer" ? 5600 : 2600;
+      const longLineLimit = pane === "observer" ? 90 : 40;
+      const isLong = !m.streaming && (s.length > longCharLimit || (s.match(/\n/g) || []).length > longLineLimit);
       const isExpanded = expandedMsgs.has(m.id);
       const isCollapsed = isLong && !isExpanded;
       const choices = (!m.streaming && m.role === "assistant" && m.pane !== "observer") ? extractChoices(s) : [];

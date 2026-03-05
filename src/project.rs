@@ -128,6 +128,14 @@ impl ProjectContext {
             out.push_str(&format!("stack: {}\n", self.stack.join(", ")));
         }
 
+        // Test command (auto-detected or configured in .obstral.md)
+        if let Some(ref cmd) = self.test_cmd {
+            let cmd = cmd.trim();
+            if !cmd.is_empty() {
+                out.push_str(&format!("test_cmd: {cmd}\n"));
+            }
+        }
+
         // Git
         let git_line = match &self.git_branch {
             Some(branch) => format!(
