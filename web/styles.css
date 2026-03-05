@@ -476,6 +476,35 @@ body.looping .bubble.assistant {
   word-break: break-word;
 }
 
+/* --- Lightweight Markdown layout (parseMarkdown) --- */
+.md-h {
+  font-weight: 800;
+  line-height: 1.25;
+  margin: 12px 0 6px;
+}
+.md-h1 { font-size: 18px; }
+.md-h2 { font-size: 16px; }
+.md-h3 { font-size: 15px; opacity: 0.96; }
+
+.md-li {
+  display: flex;
+  gap: 8px;
+  margin: 2px 0 4px;
+}
+.md-li-mark {
+  width: 2.4em;
+  text-align: right;
+  padding-top: 1px;
+  flex-shrink: 0;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.md-li-text { min-width: 0; }
+
+.md-line { margin-bottom: 4px; }
+.md-blank { height: 10px; }
+
 .content.content-collapsed {
   position: relative;
   max-height: 340px;
@@ -539,8 +568,8 @@ body.looping .bubble.assistant {
   margin: 0;
   padding: 10px;
   font-family: var(--mono);
-  font-size: 13px;
-  line-height: 1.55;
+  font-size: 14px;
+  line-height: 1.6;
   tab-size: 2;
   color: rgba(255, 255, 255, 0.86);
   overflow-x: auto;

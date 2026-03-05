@@ -919,8 +919,8 @@
     const lines = text.split("\n");
     const out = [];
     let i = 0, k = 0;
-    while (i < lines.length) {
-      const line = lines[i];
+      while (i < lines.length) {
+        const line = lines[i];
       if (line.startsWith("```")) {
         const rawLang = line.slice(3).trim();
         // Detect optional filepath appended to lang: e.g. "python src/main.py"
@@ -975,8 +975,8 @@
       }
       const hm = line.match(/^(#{1,3})\s+(.+)/);
       if (hm) {
-        const sz = hm[1].length === 1 ? "15px" : hm[1].length === 2 ? "14px" : "13px";
-        out.push(e("div", { key: k++, style: { fontWeight: 700, fontSize: sz, margin: "10px 0 4px" } }, hm[2]));
+        const lvl = hm[1].length;
+        out.push(e("div", { key: k++, className: "md-h md-h" + String(lvl) }, hm[2]));
         i++; continue;
       }
       if (/^---+$/.test(line.trim())) {
@@ -985,17 +985,18 @@
       }
       const lm = line.match(/^(\s*[-*]|\s*\d+\.)\s+(.+)/);
       if (lm) {
-        out.push(e("div", { key: k++, style: { display: "flex", gap: 6, marginBottom: 2 } },
-          e("span", { style: { color: "var(--faint)", flexShrink: 0 } }, "·"),
-          e("span", null, renderInlineMd(lm[2], k)),
+        const mark = /^\s*\d+\./.test(lm[1]) ? String(lm[1]).trim() : "•";
+        out.push(e("div", { key: k++, className: "md-li" },
+          e("span", { className: "md-li-mark" }, mark),
+          e("span", { className: "md-li-text" }, renderInlineMd(lm[2], k)),
         ));
         i++; continue;
       }
       if (line.trim() === "") {
-        out.push(e("div", { key: k++, style: { height: 6 } }));
+        out.push(e("div", { key: k++, className: "md-blank" }));
         i++; continue;
       }
-      out.push(e("div", { key: k++, style: { marginBottom: 2 } }, renderInlineMd(line, k)));
+      out.push(e("div", { key: k++, className: "md-line" }, renderInlineMd(line, k)));
       i++;
     }
     return out;
@@ -3915,8 +3916,15 @@
       };
       const outLang = (() => {
         const ol0 = String(config.observerLang || "ui").trim().toLowerCase();
+        const pickLangSample = () => {
+          // Prefer the Observer prompt itself. This fixes "Observer stuck in English" when the
+          // last coder/chat user message is mostly commands/logs.
+          const a = String(text || "").trim();
+          if (a) return a;
+          return pickLastUserSample();
+        };
         if (ol0 === "auto") {
-          const sample = pickLastUserSample();
+          const sample = pickLangSample();
           const sampleTrim = String(sample || "").trim();
           if (!sampleTrim) return String(lang || "ja").trim().toLowerCase();
           return inferLangFromText(sampleTrim);
@@ -3927,7 +3935,7 @@
         // clearly typing in another language, prefer the user's language to avoid "Observer stuck in English".
         const uiLang = String(lang || "ja").trim().toLowerCase();
         if (uiLang === "en" || uiLang === "fr") {
-          const sample = String(pickLastUserSample() || "").trim();
+          const sample = String(pickLangSample() || "").trim();
           if (sample) {
             const inferred = inferLangFromText(sample);
             if (inferred && inferred !== uiLang) return inferred;
