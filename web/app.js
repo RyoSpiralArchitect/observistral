@@ -2230,6 +2230,12 @@
         const lines = t.split("\n").length;
         return t.slice(0, max) + `\n[…truncated — ${lines} lines total, first ${max} chars shown]`;
       };
+      const truncToolTail = (s, max) => {
+        const t = String(s || "").trim();
+        if (t.length <= max) return t;
+        const lines = t.split("\n").length;
+        return `[…truncated — ${lines} lines total, last ${max} chars shown]\n` + t.slice(-max);
+      };
 
       const isPrunableToolSuccess = (content) => {
         const s = String(content || "").trimStart();
@@ -2388,6 +2394,125 @@
           else out += ch.toLowerCase();
         }
         return out.replace(/\s+/g, " ").trim();
+      };
+
+      // Coarse error classification (ported from Rust TUI) so the Coder can choose a better recovery strategy.
+      // This is intentionally heuristic: it trades a few false positives for better "what to do next" guidance.
+      const classifyErrorClass = (stderr, stdout) => {
+        const low = (String(stderr || "") + "\n" + String(stdout || "")).toLowerCase();
+        if (!low.trim()) return "unknown";
+
+        if (
+          low.includes("command not found") ||
+          low.includes("is not recognized as the name") ||
+          low.includes("is not recognized as an internal") ||
+          low.includes("permission denied") ||
+          low.includes("access is denied") ||
+          low.includes("access denied") ||
+          low.includes("commandnotfoundexception") ||
+          low.includes("win32 error 5")
+        ) return "environment";
+
+        if (
+          low.includes("syntax error") ||
+          low.includes("unexpected token") ||
+          low.includes("parse error") ||
+          low.includes("parsererror") ||
+          low.includes("invalid syntax") ||
+          low.includes("missing expression") ||
+          low.includes("unexpected end of")
+        ) return "syntax";
+
+        if (
+          low.includes("no such file") ||
+          low.includes("cannot find path") ||
+          low.includes("path not found") ||
+          (low.includes("does not exist") && !low.includes("package")) ||
+          low.includes("could not find a part of the path")
+        ) return "path";
+
+        if (
+          low.includes("modulenotfounderror") ||
+          low.includes("cannot find module") ||
+          low.includes("no module named") ||
+          low.includes("package not found") ||
+          low.includes("no such package") ||
+          (low.includes("could not find") && (low.includes("package") || low.includes("crate")))
+        ) return "dependency";
+
+        if (
+          low.includes("connection refused") ||
+          low.includes("timed out") ||
+          low.includes("network unreachable") ||
+          low.includes("could not connect") ||
+          low.includes("name resolution failed") ||
+          low.includes("failed to connect")
+        ) return "network";
+
+        if (
+          low.includes("assertion") ||
+          low.includes("test failed") ||
+          (low.includes("expected") && low.includes("actual"))
+        ) return "logic";
+
+        return "unknown";
+      };
+      const errorClassHint = (cls) => {
+        if (!cls || cls === "unknown") return "";
+        if (cls === "environment") return "⚠ ENVIRONMENT ERROR: a binary/permission is missing. Fix the environment first — do NOT modify source code.";
+        if (cls === "syntax") return "⚠ SYNTAX ERROR: fix the exact parser error line — do NOT change unrelated code.";
+        if (cls === "path") return "⚠ PATH ERROR: wrong cwd or missing file/dir. Verify `pwd` + `ls`, then correct the path.";
+        if (cls === "dependency") return "⚠ DEPENDENCY ERROR: install missing packages/crates, then retry. Do NOT refactor code to 'work around' missing deps.";
+        if (cls === "network") return "⚠ NETWORK ERROR: fix connectivity/auth/proxy first. Do NOT keep retrying the same request.";
+        if (cls === "logic") return "⚠ LOGIC/TEST ERROR: the program ran but behavior is wrong. Read the failure, reproduce, then implement the minimal fix + test.";
+        return "";
+      };
+
+      const extractErrorDigest = (stdout, stderr) => {
+        const keys = [
+          "error",
+          "fatal",
+          "exception",
+          "traceback",
+          "parsererror",
+          "unexpected token",
+          "not recognized",
+          "commandnotfoundexception",
+          "missing expression",
+          "unable to",
+          "could not",
+          "access is denied",
+          "permission denied",
+          "does not have a commit checked out",
+          "unable to index file",
+          "adding embedded git repository",
+          "unauthorized",
+          "invalid api key",
+          "too many requests",
+          "rate limit",
+          "unsupported parameter",
+          "not a chat model",
+        ];
+        const seen = new Set();
+        const out = [];
+        const scan = (src) => {
+          const lines = String(src || "").replace(/\r\n/g, "\n").split("\n");
+          for (const ln0 of lines) {
+            const t = String(ln0 || "").trim();
+            if (!t) continue;
+            const low = t.toLowerCase();
+            if (!keys.some((k) => low.includes(k))) continue;
+            const n = normalizeForSig(t).slice(0, 220);
+            if (!n || seen.has(n)) continue;
+            seen.add(n);
+            out.push(t.slice(0, 320));
+            if (out.length >= 8) break;
+          }
+        };
+        scan(stderr);
+        if (out.length < 8) scan(stdout);
+        if (!out.length) return "";
+        return "ERROR_DIGEST:\n- " + out.join("\n- ");
       };
 
       const commandSig = (command) => {
@@ -3001,20 +3126,26 @@
                 const parsed = stripPwdMarker(execRes.stdout);
                 const breach = sandboxBreachReason(parsed.pwd);
                 maybeUpdateWorkdirFromPwd(parsed.pwd);
-                const stdout = truncTool(parsed.stdout, TRUNC_STDOUT);
-                const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
+                const stdoutRaw = String(parsed.stdout || "");
+                const stderrRaw = String(execRes.stderr || "");
+                const stdout = truncToolTail(stdoutRaw, TRUNC_STDOUT);
+                const stderr = truncToolTail(stderrRaw, TRUNC_STDERR);
                 const exitCode = execRes.exit_code;
-                const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdout, stderr) : "";
+                const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdoutRaw, stderrRaw) : "";
                 const failed = exitCode !== 0 || !!suspicious || !!breach;
                 noteCmd(k, failed, errorLineSig(stdout, stderr));
-                const hintGit = failed ? gitRepoHint(stderr) : "";
-                const hintGov = failed ? deriveGovernorHint(stderr, stdout) : "";
+                const hintGit = failed ? gitRepoHint(stderrRaw) : "";
+                const hintGov = failed ? deriveGovernorHint(stderrRaw, stdoutRaw) : "";
+                const hintClass = failed ? errorClassHint(classifyErrorClass(stderrRaw, stdoutRaw)) : "";
+                const digest = failed ? extractErrorDigest(stdoutRaw, stderrRaw) : "";
                 const hintSandbox = breach ? [
                   "SANDBOX BREACH: command ended outside tool_root.",
                   breach,
                   "Fix: re-run under tool_root; avoid `cd ..` / absolute paths. Verify `pwd` stays under tool_root.",
                 ].join("\n") : "";
                 const hint = [hintGit, hintGov, hintSandbox, suspicious ? ("SUSPICIOUS_SUCCESS: " + suspicious) : ""].filter(Boolean).join("\n\n");
+                const prefix = [hintClass, digest].filter(Boolean).join("\n\n");
+                const prefixText = prefix ? (prefix + "\n\n") : "";
 
                 const cwdUsedLabel = cwdUsed ? String(cwdUsed) : "(workspace root)";
                 const cwdAfter = cwdNow();
@@ -3069,7 +3200,7 @@
                 }
 
                 toolResult = failed
-                  ? `FAILED (exit_code: ${exitCode}).\n${cwdLine}\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}\n⚠ The command failed. Diagnose the error above and call exec again with the fix. Do NOT continue to the next step until this succeeds.`
+                  ? `${prefixText}FAILED (exit_code: ${exitCode}).\n${cwdLine}\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}\n⚠ The command failed. Diagnose the error above and call exec again with the fix. Do NOT continue to the next step until this succeeds.`
                   : `OK (exit_code: 0)\n${cwdLine}\nstdout: ${stdout || "(empty)"}`;
 
                 if (stdout) display += "\n" + stdout;
@@ -3414,20 +3545,26 @@
               const parsed = stripPwdMarker(execRes.stdout);
               const breach = sandboxBreachReason(parsed.pwd);
               maybeUpdateWorkdirFromPwd(parsed.pwd);
-              const stdout = truncTool(parsed.stdout, TRUNC_STDOUT);
-              const stderr = truncTool(execRes.stderr, TRUNC_STDERR);
+              const stdoutRaw = String(parsed.stdout || "");
+              const stderrRaw = String(execRes.stderr || "");
+              const stdout = truncToolTail(stdoutRaw, TRUNC_STDOUT);
+              const stderr = truncToolTail(stderrRaw, TRUNC_STDERR);
               const exitCode = execRes.exit_code;
-              const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdout, stderr) : "";
+              const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdoutRaw, stderrRaw) : "";
               const failed = exitCode !== 0 || !!suspicious || !!breach;
               noteCmd(k, failed, errorLineSig(stdout, stderr));
-              const hintGit = failed ? gitRepoHint(stderr) : "";
-              const hintGov = failed ? deriveGovernorHint(stderr, stdout) : "";
+              const hintGit = failed ? gitRepoHint(stderrRaw) : "";
+              const hintGov = failed ? deriveGovernorHint(stderrRaw, stdoutRaw) : "";
+              const hintClass = failed ? errorClassHint(classifyErrorClass(stderrRaw, stdoutRaw)) : "";
+              const digest = failed ? extractErrorDigest(stdoutRaw, stderrRaw) : "";
               const hintSandbox = breach ? [
                 "SANDBOX BREACH: command ended outside tool_root.",
                 breach,
                 "Fix: re-run under tool_root; avoid `cd ..` / absolute paths. Verify `pwd` stays under tool_root.",
               ].join("\n") : "";
               const hint = [hintGit, hintGov, hintSandbox, suspicious ? ("SUSPICIOUS_SUCCESS: " + suspicious) : ""].filter(Boolean).join("\n\n");
+              const prefix = [hintClass, digest].filter(Boolean).join("\n\n");
+              const prefixText = prefix ? (prefix + "\n\n") : "";
 
               const cwdUsedLabel = cwdUsed ? String(cwdUsed) : "(workspace root)";
               const cwdAfter = cwdNow();
@@ -3481,7 +3618,7 @@
               }
 
               resultText = failed
-                ? `FAILED (exit_code: ${exitCode}).\n${cwdLine}\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}`
+                ? `${prefixText}FAILED (exit_code: ${exitCode}).\n${cwdLine}\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}`
                 : `OK (exit_code: 0)\n${cwdLine}\nstdout: ${stdout || "(empty)"}`;
 
               if (stdout) display += "\n" + stdout;
