@@ -309,6 +309,7 @@ Path traversal is blocked: paths with `..` components are rejected at every tool
 `obstral agent` can save and resume the full conversation (including tool calls) with `--session[=<path>]`.
 
 - Default path: `.tmp/obstral_session.json`
+- Autosaves during the run (after tool calls)
 - Resume without a prompt: run `obstral agent -C . --session` again
 - Start fresh: add `--new-session` (overwrites the file)
 

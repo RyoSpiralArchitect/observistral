@@ -19,6 +19,7 @@ use anyhow::{Result, anyhow};
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::config::RunConfig;
@@ -40,6 +41,25 @@ pub struct AgenticEndState {
     pub messages: Vec<serde_json::Value>,
     pub checkpoint: Option<String>,
     pub cur_cwd: Option<String>,
+}
+
+async fn autosave_best_effort(
+    autosaver: &Option<Arc<crate::agent_session::SessionAutoSaver>>,
+    tx: &mpsc::Sender<StreamToken>,
+    tool_root_abs: Option<&str>,
+    checkpoint: Option<&str>,
+    cur_cwd: Option<&str>,
+    messages: &[serde_json::Value],
+) {
+    let Some(ref saver) = autosaver else {
+        return;
+    };
+    let Some(warn) = saver.save_best_effort(tool_root_abs, checkpoint, cur_cwd, messages) else {
+        return;
+    };
+    let _ = tx
+        .send(StreamToken::Delta(format!("\n[autosave] WARN: {warn}\n")))
+        .await;
 }
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -1368,6 +1388,7 @@ pub async fn run_agentic(
         project_context,
         agents_md,
         test_cmd,
+        None,
         approver,
     )
     .await
@@ -1383,6 +1404,7 @@ pub async fn run_agentic_json(
     agents_md: Option<String>,
     // Command to run after every successful file edit (e.g. "cargo test 2>&1").
     test_cmd: Option<String>,
+    autosaver: Option<Arc<crate::agent_session::SessionAutoSaver>>,
     approver: &dyn Approver,
 ) -> Result<AgenticEndState> {
     let client = reqwest::Client::new();
@@ -1499,6 +1521,17 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
             cur_cwd = tool_root_abs.clone();
         }
     }
+
+    // Seed the session file early so long runs can resume even if interrupted.
+    autosave_best_effort(
+        &autosaver,
+        &tx,
+        tool_root_abs.as_deref(),
+        checkpoint.as_deref(),
+        cur_cwd.as_deref(),
+        &messages,
+    )
+    .await;
 
     // Session-scoped file read cache.
     // Key: canonical path string.  Invalidated on write_file / patch_file success.
@@ -1651,6 +1684,15 @@ This is the LAST model call for this run.\n\
             }));
         } else {
             messages.push(json!({"role": "assistant", "content": assistant_text}));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
 
             // Model didn't call tools. If the user asked for local actions, try implied scripts
             // (PowerShell/bash code fences) as a fallback so non-tool-calling models can still act.
@@ -1708,6 +1750,15 @@ This is the LAST model call for this run.\n\
                                     im.lang_hint, command, tool_output
                                 ),
                             }));
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
+                            .await;
                             pending_system_hint = Some(
                                 "The user rejected the command. Choose a safer alternative or explain why it is necessary before retrying."
                                     .to_string(),
@@ -1798,6 +1849,15 @@ This is blocked to prevent nested-repo / accidental repo-root modifications.\n\n
                                 im.lang_hint, command, tool_output
                             ),
                         }));
+                        autosave_best_effort(
+                            &autosaver,
+                            &tx,
+                            tool_root_abs.as_deref(),
+                            checkpoint.as_deref(),
+                            cur_cwd.as_deref(),
+                            &messages,
+                        )
+                        .await;
 
                         if effective_exit_code != 0 {
                             state = AgentState::Recovery;
@@ -1846,6 +1906,15 @@ Do NOT respond with text-only instructions."
                     .send(StreamToken::Delta("\n[governor] tool_call missing; forcing tool call\n".to_string()))
                     .await;
                 messages.push(json!({"role":"system","content": note}));
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
                 continue;
             }
 
@@ -1883,6 +1952,16 @@ Do NOT respond with text-only instructions."
                 "content": "OK: done"
             }));
             messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
 
             let _ = tx
                 .send(StreamToken::Delta(format!("\n\n{final_text}\n")))
@@ -1979,6 +2058,15 @@ Do NOT respond with text-only instructions."
                 "tool_call_id": tc.id,
                 "content": result,
             }));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
             let _ = old_for_cache; // used above
             continue;
         }
@@ -2018,6 +2106,15 @@ Do NOT respond with text-only instructions."
                 "tool_call_id": tc.id,
                 "content": result,
             }));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
             continue;
         }
 
@@ -2057,6 +2154,15 @@ Do NOT respond with text-only instructions."
                 "tool_call_id": tc.id,
                 "content": result,
             }));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
 
             continue;
         }
@@ -2272,6 +2378,15 @@ Do NOT respond with text-only instructions."
                 "tool_call_id": tc.id,
                 "content": result,
             }));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
 
             if iter + 1 == max_iters {
                 let _ = tx.send(StreamToken::Delta(
@@ -2355,6 +2470,15 @@ Do NOT respond with text-only instructions."
                 "tool_call_id": tc.id,
                 "content": tool_output,
             }));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
             pending_system_hint = Some(
                 "The user rejected the command. Choose a safer alternative or explain why it is necessary before retrying."
                     .to_string(),
@@ -2460,6 +2584,15 @@ This is blocked to prevent nested-repo / accidental repo-root modifications.\n\n
             "tool_call_id": tc.id,
             "content": tool_output,
         }));
+        autosave_best_effort(
+            &autosaver,
+            &tx,
+            tool_root_abs.as_deref(),
+            checkpoint.as_deref(),
+            cur_cwd.as_deref(),
+            &messages,
+        )
+        .await;
 
         // Update failure memory + possibly inject a system hint on repeated failures.
         if effective_exit_code != 0 {

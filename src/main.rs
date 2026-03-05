@@ -963,11 +963,25 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
 
     use std::io::Write;
     let mut stdout = std::io::stdout();
-    let mut have_state = false;
     let mut checkpoint: Option<String> = start_checkpoint.clone();
     let mut cur_cwd: Option<String> = start_cwd.clone();
     let mut create_checkpoint_round = create_checkpoint;
     let mut result: Result<()> = Ok(());
+
+    let autosaver = session_path.as_ref().map(|sp| {
+        std::sync::Arc::new(crate::agent_session::SessionAutoSaver::new(
+            sp.clone(),
+            loaded_session.as_ref(),
+        ))
+    });
+    if let Some(ref saver) = autosaver {
+        saver.save_or_error(
+            tool_root.as_deref(),
+            checkpoint.as_deref(),
+            cur_cwd.as_deref(),
+            &messages_json,
+        )?;
+    }
 
     let total_rounds = 1usize + autofix_rounds;
     for round in 0..total_rounds {
@@ -993,6 +1007,7 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         let project_context_for_task = project_context.clone();
         let agents_md_for_task = agents_md.clone();
         let test_cmd_for_task = test_cmd.clone();
+        let autosaver_for_task = autosaver.clone();
         let approver_for_task = approver.clone();
 
         let handle = tokio::spawn(async move {
@@ -1005,6 +1020,7 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
                 project_context_for_task,
                 agents_md_for_task,
                 test_cmd_for_task,
+                autosaver_for_task,
                 approver_for_task.as_ref(),
             )
             .await
@@ -1040,7 +1056,6 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
             }
         };
 
-        have_state = true;
         messages_json = end_state.messages;
         cur_cwd = end_state.cur_cwd;
         checkpoint = checkpoint.or(end_state.checkpoint);
@@ -1109,24 +1124,26 @@ For each proposal you address, verify with commands/tests. When finished, call d
 {review}"
         );
         messages_json.push(json!({"role":"user","content": next_prompt}));
+        if let Some(ref saver) = autosaver {
+            if let Some(warn) = saver.save_best_effort(
+                tool_root.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages_json,
+            ) {
+                eprintln!("[autosave] WARN: {warn}");
+            }
+        }
     }
 
     // Save session file (if requested).
-    if let (Some(ref sp), true) = (session_path.as_ref(), have_state) {
-        let mut sess = loaded_session.unwrap_or_else(|| {
-            crate::agent_session::AgentSession::new(
-                tool_root.clone(),
-                None,
-                None,
-                Vec::new(),
-            )
-        });
-        sess.tool_root = tool_root.clone();
-        sess.checkpoint = checkpoint.clone();
-        sess.cur_cwd = cur_cwd.clone();
-        sess.messages = messages_json.clone();
-        sess.touch();
-        crate::agent_session::AgentSession::save_atomic(sp, &sess)?;
+    if let Some(ref saver) = autosaver {
+        saver.save_or_error(
+            tool_root.as_deref(),
+            checkpoint.as_deref(),
+            cur_cwd.as_deref(),
+            &messages_json,
+        )?;
     }
 
     // CLI nicety: show a compact git diff summary from the auto-created checkpoint.
