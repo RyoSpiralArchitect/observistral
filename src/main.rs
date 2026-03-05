@@ -96,7 +96,7 @@ struct AgentArgs {
     prompt: Option<String>,
 
     /// Working directory for file/exec tools (defaults to current directory)
-    #[arg(long)]
+    #[arg(long, short = 'C', alias = "root")]
     tool_root: Option<String>,
 
     /// UI / response language hint (ja/en/fr)
@@ -108,8 +108,12 @@ struct AgentArgs {
     max_iters: Option<usize>,
 
     /// Auto-approve all commands and edits (no prompts)
-    #[arg(long)]
+    #[arg(long, short = 'y')]
     yes: bool,
+
+    /// Disable ALL approval prompts (commands + edits)
+    #[arg(long, alias = "no-approvals")]
+    no_approval: bool,
 
     /// Disable approval prompts for `exec` tool calls (and implied commands)
     #[arg(long)]
@@ -121,7 +125,7 @@ struct AgentArgs {
 
     /// Save and resume an agent session from this JSON file.
     /// If the file exists, OBSTRAL loads it and continues the conversation.
-    #[arg(long)]
+    #[arg(long, short = 's', num_args = 0..=1, default_missing_value = ".tmp/obstral_session.json")]
     session: Option<PathBuf>,
 
     /// Start a new session even if `--session` already exists.
@@ -130,12 +134,18 @@ struct AgentArgs {
 
     /// Auto-fix loop: after the agent finishes, run an Observer diff review and feed it back
     /// to the agent as a follow-up prompt.
-    #[arg(long)]
-    autofix: bool,
-
-    /// Maximum auto-fix rounds (default: 1, max: 8). Requires `--autofix`.
-    #[arg(long)]
-    autofix_rounds: Option<usize>,
+    /// Usage:
+    /// - `--autofix` (runs 1 round)
+    /// - `--autofix 3` (runs 3 rounds)
+    /// - `--autofix-rounds 3` (alias)
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        value_name = "ROUNDS",
+        alias = "autofix-rounds"
+    )]
+    autofix: Option<usize>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -144,7 +154,7 @@ struct ReviewArgs {
     prompt: Option<String>,
 
     /// Git repository directory to review (defaults to current directory)
-    #[arg(long)]
+    #[arg(long, short = 'C', alias = "root")]
     tool_root: Option<String>,
 
     /// Review only staged changes (`git diff --staged`)
@@ -168,7 +178,7 @@ struct ReviewArgs {
 #[derive(Args, Debug, Clone)]
 struct InitArgs {
     /// Directory to write `.obstral.md` into (defaults to current directory)
-    #[arg(long)]
+    #[arg(long, short = 'C', alias = "root")]
     tool_root: Option<String>,
 
     /// Overwrite `.obstral.md` if it already exists
@@ -780,17 +790,13 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         lang,
         max_iters,
         yes,
+        no_approval,
         no_command_approval,
         no_edit_approval,
         session: session_path,
         new_session,
         autofix,
-        autofix_rounds,
     } = args;
-
-    if autofix_rounds.is_some() && !autofix {
-        anyhow::bail!("--autofix-rounds requires --autofix");
-    }
 
     let mut loaded_session: Option<crate::agent_session::AgentSession> = None;
     let mut start_messages_json: Option<Vec<serde_json::Value>> = None;
@@ -829,7 +835,7 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         if let (Some(ref chosen), Some(ref saved)) = (tool_root.as_ref(), saved_tool_root_norm.as_ref()) {
             if normalize_path_for_compare(chosen) != normalize_path_for_compare(saved) {
                 eprintln!(
-                    "WARN: --tool-root ({}) differs from saved session tool_root ({}). Continuing with --tool-root.",
+                    "WARN: --root/--tool-root ({}) differs from saved session tool_root ({}). Continuing with provided tool root.",
                     chosen,
                     saved
                 );
@@ -937,10 +943,9 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         (None, None, None)
     };
 
-    let autofix_rounds = if autofix {
-        autofix_rounds.unwrap_or(1).max(1).min(8)
-    } else {
-        0usize
+    let autofix_rounds = match autofix {
+        Some(n) => n.max(1).min(8),
+        None => 0usize,
     };
 
     // Stream tokens to stdout.
@@ -948,9 +953,11 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         .unwrap_or(crate::tui::agent::DEFAULT_MAX_ITERS)
         .max(1)
         .min(64);
+    let command_approval = !no_command_approval && !no_approval;
+    let edit_approval = !no_edit_approval && !no_approval;
     let approver = std::sync::Arc::new(crate::approvals::CliApprover::new(
-        !no_command_approval,
-        !no_edit_approval,
+        command_approval,
+        edit_approval,
         yes,
     ));
 

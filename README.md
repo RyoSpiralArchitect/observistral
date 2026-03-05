@@ -252,28 +252,28 @@ Every field is intentional. `quote` pins the exact offending line to the card. `
 **Headless Coder (CLI)**
 ```powershell
 # (optional) generate .obstral.md template (stack + test_cmd)
-obstral init --tool-root .
+obstral init -C .
 
 # run the coding agent in your project
-obstral agent "fix the failing test" --tool-root . --vibe
+obstral agent "fix the failing test" -C . --vibe
 
-# persist and resume a session
-obstral agent "fix the failing test" --tool-root . --vibe --session .tmp/obstral_session.json
+# persist and resume a session (default: .tmp/obstral_session.json)
+obstral agent "fix the failing test" -C . --vibe --session
 # resume later (omit prompt -> auto "continue")
-obstral agent --tool-root . --vibe --session .tmp/obstral_session.json
+obstral agent -C . --vibe --session
 
 # auto-fix loop (Coder → Observer diff review → Coder)
-obstral agent "fix the failing test" --tool-root . --vibe --autofix
-obstral agent "fix the failing test" --tool-root . --vibe --autofix --autofix-rounds 3
+obstral agent "fix the failing test" -C . --vibe --autofix
+obstral agent "fix the failing test" -C . --vibe --autofix 3
 
 # auto-approve tool actions (no prompts)
-obstral agent "fix the failing test" --tool-root . --vibe --yes
+obstral agent "fix the failing test" -C . --vibe -y
 
 # review your current git diff with Observer
-obstral review --tool-root .
+obstral review -C .
 
 # review changes since a checkpoint (hash printed by `obstral agent`)
-obstral review --tool-root . --base <checkpoint_hash>
+obstral review -C . --base <checkpoint_hash>
  ```
 
 **Python Lite (WDAC / no Rust binary)**
@@ -288,12 +288,17 @@ python .\scripts\serve_lite.py
 
 ### tool_root
 
-Every agent action runs inside a working directory. Default: `.tmp/<thread-id>`.
+Every agent action runs inside a working directory.
+
+Defaults:
+- **Web UI**: `.tmp/<thread-id>` (isolated per thread)
+- **TUI**: `.tmp/tui_<epoch>` (isolated per session)
+- **CLI**: current directory
 
 To work on your actual project, set `tool_root` to your project path:
-- **TUI**: `--tool-root .` flag, or `/root <path>` slash command at runtime
+- **TUI**: `-C .` / `--tool-root .` flag, or `/root <path>` slash command at runtime
 - **Web UI**: Settings → toolRoot field
-- **CLI**: `obstral agent "<prompt>" --tool-root .`
+- **CLI**: `obstral agent "<prompt>" -C .`
 
 When `tool_root` is set, OBSTRAL scans it on first use to build the project context block (stack, git, tree). Subsequent sends in the same session skip the scan.
 
@@ -301,9 +306,10 @@ Path traversal is blocked: paths with `..` components are rejected at every tool
 
 ### Sessions (CLI)
 
-`obstral agent` can save and resume the full conversation (including tool calls) with `--session <path>`.
+`obstral agent` can save and resume the full conversation (including tool calls) with `--session[=<path>]`.
 
-- Resume without a prompt: run `obstral agent --tool-root . --session <path>` again
+- Default path: `.tmp/obstral_session.json`
+- Resume without a prompt: run `obstral agent -C . --session` again
 - Start fresh: add `--new-session` (overwrites the file)
 
 Session JSON may contain code and tool outputs — treat it as sensitive.
@@ -311,7 +317,7 @@ Session JSON may contain code and tool outputs — treat it as sensitive.
 ### Approvals
 
 - **Web UI**: edits/commands can queue as pending items. Approve/reject from the browser.
-- **CLI (`obstral agent`)**: prompts before running `exec` and applying file edits (`write_file` / `patch_file` / `apply_diff`). Use `--yes` to auto-approve.
+- **CLI (`obstral agent`)**: prompts before running `exec` and applying file edits (`write_file` / `patch_file` / `apply_diff`). Use `-y/--yes` or `--no-approvals` to skip prompts.
 - **TUI**: currently auto-approves tool actions.
 
 ### Providers

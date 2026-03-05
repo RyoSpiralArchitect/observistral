@@ -26,7 +26,7 @@ pub struct TuiArgs {
     pub lang: String,
 
     /// Working directory for exec tool calls.
-    #[arg(long)]
+    #[arg(long, short = 'C', alias = "root")]
     pub tool_root: Option<String>,
 
     /// Max iterations for the Coder agent loop (default: 12). Increase for long runs.

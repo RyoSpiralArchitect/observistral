@@ -261,10 +261,15 @@ python .\scripts\serve_lite.py
 
 ### tool_root
 
-Chaque action de l'agent s'execute dans un repertoire de travail. Par defaut : `.tmp/<thread-id>`.
+Chaque action de l'agent s'execute dans un repertoire de travail.
+
+Par defaut :
+- **UI Web** : `.tmp/<thread-id>` (isole par thread)
+- **TUI** : `.tmp/tui_<epoch>` (isole par session)
+- **CLI** : repertoire courant
 
 Pour travailler sur votre projet reel, definissez `tool_root` sur le chemin du projet :
-- **TUI** : option `--tool-root .`, ou commande slash `/root <chemin>` en cours de session
+- **TUI** : option `-C .` / `--tool-root .`, ou commande slash `/root <chemin>` en cours de session
 - **UI Web** : Parametres → champ toolRoot
 
 Quand `tool_root` est defini, OBSTRAL l'analyse a la premiere utilisation pour construire le bloc de contexte projet (stack, git, arborescence). Les envois suivants dans la meme session sautent l'analyse.
