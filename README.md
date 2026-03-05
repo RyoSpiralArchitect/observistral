@@ -262,6 +262,10 @@ obstral agent "fix the failing test" --tool-root . --vibe --session .tmp/obstral
 # resume later (omit prompt -> auto "continue")
 obstral agent --tool-root . --vibe --session .tmp/obstral_session.json
 
+# auto-fix loop (Coder → Observer diff review → Coder)
+obstral agent "fix the failing test" --tool-root . --vibe --autofix
+obstral agent "fix the failing test" --tool-root . --vibe --autofix --autofix-rounds 3
+
 # auto-approve tool actions (no prompts)
 obstral agent "fix the failing test" --tool-root . --vibe --yes
 

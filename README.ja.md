@@ -262,6 +262,10 @@ obstral agent "fix the failing test" --tool-root . --vibe --session .tmp/obstral
 # 後で再開（プロンプト省略 -> 自動で「続けて」）
 obstral agent --tool-root . --vibe --session .tmp/obstral_session.json
 
+# 自動修正ループ（Coder → Observer差分レビュー → Coder）
+obstral agent "fix the failing test" --tool-root . --vibe --autofix
+obstral agent "fix the failing test" --tool-root . --vibe --autofix --autofix-rounds 3
+
 # ツール実行を自動承認（プロンプトなし）
 obstral agent "fix the failing test" --tool-root . --vibe --yes
 

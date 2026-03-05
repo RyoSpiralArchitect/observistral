@@ -127,6 +127,15 @@ struct AgentArgs {
     /// Start a new session even if `--session` already exists.
     #[arg(long)]
     new_session: bool,
+
+    /// Auto-fix loop: after the agent finishes, run an Observer diff review and feed it back
+    /// to the agent as a follow-up prompt.
+    #[arg(long)]
+    autofix: bool,
+
+    /// Maximum auto-fix rounds (default: 1, max: 8). Requires `--autofix`.
+    #[arg(long)]
+    autofix_rounds: Option<usize>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -389,73 +398,79 @@ fn git_cmd_output(root: &str, args: &[&str]) -> Result<(String, String, i32)> {
     Ok((stdout, stderr, exit))
 }
 
-async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
-    let tool_root = args.tool_root.clone().or_else(|| {
-        std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
-    });
-    let tool_root = tool_root
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| ".".to_string());
-
-    if args.base.is_some() && (args.staged || args.unstaged) {
-        anyhow::bail!("--base cannot be combined with --staged/--unstaged");
-    }
-    if args.staged && args.unstaged {
-        anyhow::bail!("--staged and --unstaged are mutually exclusive (omit both for combined review)");
+fn git_change_signal_since_base(root: &str, base: &str) -> Result<bool> {
+    let (status_out, status_err, status_exit) =
+        git_cmd_output(root, &["status", "--porcelain=v1"])?;
+    if status_exit != 0 {
+        anyhow::bail!("git status failed (exit {status_exit}).\n{status_err}");
     }
 
-    // Read optional prompt guidance from stdin.
-    let mut guidance = args.prompt.unwrap_or_default();
-    if common.stdin {
-        let stdin_text = read_stdin_to_string().context("failed to read stdin")?;
-        if !stdin_text.trim().is_empty() {
-            if guidance.trim().is_empty() {
-                guidance = stdin_text;
-            } else {
-                guidance = format!("{guidance}\n\n[stdin]\n{stdin_text}");
-            }
-        }
-    }
-    if guidance.trim().is_empty() {
-        guidance = "Review this git diff and critique it ruthlessly and concretely.".to_string();
+    let (diff_out, diff_err, diff_exit) =
+        git_cmd_output(root, &["diff", "--no-color", "--name-only", base])?;
+    if diff_exit != 0 {
+        anyhow::bail!("git diff --name-only failed (exit {diff_exit}).\n{diff_err}");
     }
 
+    Ok(!(status_out.trim().is_empty() && diff_out.trim().is_empty()))
+}
+
+async fn review_git_diff(
+    tool_root: &str,
+    staged: bool,
+    unstaged: bool,
+    base: Option<&str>,
+    max_diff_chars: usize,
+    guidance: &str,
+    common: &CommonArgs,
+    lang: Option<&str>,
+) -> Result<String> {
     // Auto-scan project context (stack/git/tree + .obstral.md/AGENTS.md) for better reviews.
-    let (project_context, agents_md) = if let Some(ctx) = crate::project::ProjectContext::scan(&tool_root).await {
-        (Some(ctx.to_context_text()), ctx.agents_md)
-    } else {
-        (None, None)
-    };
+    let (project_context, agents_md) =
+        if let Some(ctx) = crate::project::ProjectContext::scan(tool_root).await {
+            (Some(ctx.to_context_text()), ctx.agents_md)
+        } else {
+            (None, None)
+        };
 
     // Git status and diff payload.
     let (status_out, status_err, status_exit) =
-        git_cmd_output(&tool_root, &["status", "--porcelain=v1"])?;
+        git_cmd_output(tool_root, &["status", "--porcelain=v1"])?;
     if status_exit != 0 {
-        anyhow::bail!(
-            "git status failed (exit {status_exit}).\n{status_err}"
-        );
+        anyhow::bail!("git status failed (exit {status_exit}).\n{status_err}");
     }
 
-    let base = args.base.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
-    let max_chars = args.max_diff_chars.unwrap_or(24_000).max(2_000).min(200_000);
+    let base = base.map(|s| s.trim()).filter(|s| !s.is_empty());
+    let max_chars = max_diff_chars.max(2_000).min(200_000);
 
     // Build diff + stat.
-    let (diff_label, stat_args, diff_args): (&str, Vec<&str>, Vec<&str>) = if args.staged {
-        ("staged", vec!["diff", "--no-color", "--stat", "--staged"], vec!["diff", "--no-color", "--staged"])
-    } else if args.unstaged {
-        ("unstaged", vec!["diff", "--no-color", "--stat"], vec!["diff", "--no-color"])
+    let (diff_label, stat_args, diff_args): (&str, Vec<&str>, Vec<&str>) = if staged {
+        (
+            "staged",
+            vec!["diff", "--no-color", "--stat", "--staged"],
+            vec!["diff", "--no-color", "--staged"],
+        )
+    } else if unstaged {
+        (
+            "unstaged",
+            vec!["diff", "--no-color", "--stat"],
+            vec!["diff", "--no-color"],
+        )
     } else if let Some(b) = base {
-        ("combined", vec!["diff", "--no-color", "--stat", b], vec!["diff", "--no-color", b])
+        (
+            "combined",
+            vec!["diff", "--no-color", "--stat", b],
+            vec!["diff", "--no-color", b],
+        )
     } else {
         // Prefer a combined diff vs HEAD when it exists; otherwise fall back to staged+unstaged sections.
         let (_h_out, _h_err, h_exit) =
-            git_cmd_output(&tool_root, &["rev-parse", "--verify", "HEAD"])?;
+            git_cmd_output(tool_root, &["rev-parse", "--verify", "HEAD"])?;
         if h_exit == 0 {
-            ("combined", vec!["diff", "--no-color", "--stat", "HEAD"], vec!["diff", "--no-color", "HEAD"])
+            (
+                "combined",
+                vec!["diff", "--no-color", "--stat", "HEAD"],
+                vec!["diff", "--no-color", "HEAD"],
+            )
         } else {
             ("mixed", vec![], vec![])
         }
@@ -478,7 +493,7 @@ async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
     if diff_label == "mixed" {
         // Empty repo / no HEAD: show staged + unstaged separately.
         let (stat_s, err_s, exit_s) =
-            git_cmd_output(&tool_root, &["diff", "--no-color", "--stat", "--staged"])?;
+            git_cmd_output(tool_root, &["diff", "--no-color", "--stat", "--staged"])?;
         if exit_s == 0 && !stat_s.trim().is_empty() {
             diff_payload.push_str("\n[git diff --staged --stat]\n");
             diff_payload.push_str(stat_s.trim_end());
@@ -494,7 +509,7 @@ async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
         }
 
         let (diff_s, err_sd, exit_sd) =
-            git_cmd_output(&tool_root, &["diff", "--no-color", "--staged"])?;
+            git_cmd_output(tool_root, &["diff", "--no-color", "--staged"])?;
         if exit_sd == 0 && !diff_s.trim().is_empty() {
             diff_payload.push_str("\n[git diff --staged]\n");
             let t = truncate_middle(&diff_s, max_chars);
@@ -511,7 +526,7 @@ async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
         }
 
         let (stat_u, err_u, exit_u) =
-            git_cmd_output(&tool_root, &["diff", "--no-color", "--stat"])?;
+            git_cmd_output(tool_root, &["diff", "--no-color", "--stat"])?;
         if exit_u == 0 && !stat_u.trim().is_empty() {
             diff_payload.push_str("\n[git diff --stat]\n");
             diff_payload.push_str(stat_u.trim_end());
@@ -526,7 +541,7 @@ async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
             diff_payload.push('\n');
         }
 
-        let (diff_u, err_ud, exit_ud) = git_cmd_output(&tool_root, &["diff", "--no-color"])?;
+        let (diff_u, err_ud, exit_ud) = git_cmd_output(tool_root, &["diff", "--no-color"])?;
         if exit_ud == 0 && !diff_u.trim().is_empty() {
             diff_payload.push_str("\n[git diff]\n");
             let t = truncate_middle(&diff_u, max_chars);
@@ -542,7 +557,7 @@ async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
             diff_payload.push('\n');
         }
     } else {
-        let (stat, stat_err, stat_exit) = git_cmd_output(&tool_root, &stat_args)?;
+        let (stat, stat_err, stat_exit) = git_cmd_output(tool_root, &stat_args)?;
         if stat_exit == 0 && !stat.trim().is_empty() {
             diff_payload.push_str(&format!("\n[git diff --stat] ({diff_label})\n"));
             diff_payload.push_str(stat.trim_end());
@@ -557,7 +572,7 @@ async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
             diff_payload.push('\n');
         }
 
-        let (diff, diff_err, diff_exit) = git_cmd_output(&tool_root, &diff_args)?;
+        let (diff, diff_err, diff_exit) = git_cmd_output(tool_root, &diff_args)?;
         if diff_exit == 0 && !diff.trim().is_empty() {
             diff_payload.push_str(&format!("\n[git diff] ({diff_label})\n"));
             let t = truncate_middle(&diff, max_chars);
@@ -604,7 +619,7 @@ async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
             s.push_str(git_context.trim_end());
             s.push_str("\n\n");
         }
-        s.push_str(&guidance);
+        s.push_str(guidance);
         s
     } else {
         let mut s = String::new();
@@ -621,10 +636,16 @@ async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
                 s.push_str("\n\n");
             }
         }
-        s.push_str(&guidance);
+        s.push_str(guidance);
         s.push_str("\n\n[git diff payload]\n");
         s.push_str(diff_payload.trim_end());
         s
+    };
+
+    let cot = if matches!(cfg.mode, crate::modes::Mode::Observer) {
+        "off"
+    } else {
+        "brief"
     };
 
     let resp = bot
@@ -633,8 +654,8 @@ async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
             &[],
             &cfg.mode,
             &cfg.persona,
-            None,
-            "brief",
+            lang,
+            cot,
             cfg.temperature,
             cfg.max_tokens,
             if matches!(cfg.mode, crate::modes::Mode::DiffReview) {
@@ -646,7 +667,58 @@ async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
         )
         .await?;
 
-    println!("{}", resp.content);
+    Ok(resp.content)
+}
+
+async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
+    let tool_root = args.tool_root.clone().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    let tool_root = tool_root
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+
+    if args.base.is_some() && (args.staged || args.unstaged) {
+        anyhow::bail!("--base cannot be combined with --staged/--unstaged");
+    }
+    if args.staged && args.unstaged {
+        anyhow::bail!("--staged and --unstaged are mutually exclusive (omit both for combined review)");
+    }
+
+    // Read optional prompt guidance from stdin.
+    let mut guidance = args.prompt.unwrap_or_default();
+    if common.stdin {
+        let stdin_text = read_stdin_to_string().context("failed to read stdin")?;
+        if !stdin_text.trim().is_empty() {
+            if guidance.trim().is_empty() {
+                guidance = stdin_text;
+            } else {
+                guidance = format!("{guidance}\n\n[stdin]\n{stdin_text}");
+            }
+        }
+    }
+    if guidance.trim().is_empty() {
+        guidance = "Review this git diff and critique it ruthlessly and concretely.".to_string();
+    }
+
+    let max_chars = args.max_diff_chars.unwrap_or(24_000).max(2_000).min(200_000);
+    let out = review_git_diff(
+        &tool_root,
+        args.staged,
+        args.unstaged,
+        args.base.as_deref(),
+        max_chars,
+        &guidance,
+        &common,
+        None,
+    )
+    .await?;
+
+    println!("{out}");
     Ok(())
 }
 
@@ -712,7 +784,13 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         no_edit_approval,
         session: session_path,
         new_session,
+        autofix,
+        autofix_rounds,
     } = args;
+
+    if autofix_rounds.is_some() && !autofix {
+        anyhow::bail!("--autofix-rounds requires --autofix");
+    }
 
     let mut loaded_session: Option<crate::agent_session::AgentSession> = None;
     let mut start_messages_json: Option<Vec<serde_json::Value>> = None;
@@ -770,12 +848,25 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
             "前回の状態から続けて。作業を再開して、コマンド/テストで検証して。".to_string()
         }
     }
+    let pending_user_turn = resuming
+        && start_messages_json
+            .as_ref()
+            .and_then(|m| m.last())
+            .and_then(|v| v.get("role").and_then(|r| r.as_str()))
+            == Some("user");
     let mut used_stdin_as_prompt = false;
+    let mut append_user_message = true;
     let mut user_input = match (prompt, common.stdin) {
         (Some(p), _) => p,
         (None, true) => {
             used_stdin_as_prompt = true;
             read_stdin_to_string().context("failed to read stdin")?
+        }
+        (None, false) if pending_user_turn => {
+            // Resume by answering the pending user message in the session. Do not append
+            // a synthetic "continue" prompt that could override the unfinished turn.
+            append_user_message = false;
+            String::new()
         }
         (None, false) if resuming => default_continue_prompt(&lang),
         (None, false) => anyhow::bail!("missing prompt. Provide a prompt argument or pass --stdin."),
@@ -831,7 +922,9 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         vec![json!({"role":"system","content": system})]
     };
     messages_json.extend(at_ref_messages_json);
-    messages_json.push(json!({"role":"user","content": user_input}));
+    if append_user_message {
+        messages_json.push(json!({"role":"user","content": user_input}));
+    }
 
     // Scan project context (stack/git/tree + .obstral.md/AGENTS.md + test_cmd).
     let (project_context, agents_md, test_cmd) = if let Some(ref root) = tool_root {
@@ -844,82 +937,175 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         (None, None, None)
     };
 
+    let autofix_rounds = if autofix {
+        autofix_rounds.unwrap_or(1).max(1).min(8)
+    } else {
+        0usize
+    };
+
     // Stream tokens to stdout.
     let max_iters = max_iters
         .unwrap_or(crate::tui::agent::DEFAULT_MAX_ITERS)
         .max(1)
         .min(64);
-    let approver = crate::approvals::CliApprover::new(
+    let approver = std::sync::Arc::new(crate::approvals::CliApprover::new(
         !no_command_approval,
         !no_edit_approval,
         yes,
-    );
-    let (tx, mut rx) = mpsc::channel::<streaming::StreamToken>(128);
-
-    let start_state = crate::tui::agent::AgenticStartState {
-        messages: messages_json,
-        checkpoint: start_checkpoint.clone(),
-        cur_cwd: start_cwd.clone(),
-        create_checkpoint,
-    };
-
-    let tool_root_for_task = tool_root.clone();
-    let cfg_for_task = cfg.clone();
-    let handle = tokio::spawn(async move {
-        crate::tui::agent::run_agentic_json(
-            start_state,
-            &cfg_for_task,
-            tool_root_for_task.as_deref(),
-            max_iters,
-            tx,
-            project_context,
-            agents_md,
-            test_cmd,
-            &approver,
-        )
-        .await
-    });
+    ));
 
     use std::io::Write;
     let mut stdout = std::io::stdout();
-    let mut saw_error = false;
+    let mut have_state = false;
     let mut checkpoint: Option<String> = start_checkpoint.clone();
+    let mut cur_cwd: Option<String> = start_cwd.clone();
+    let mut create_checkpoint_round = create_checkpoint;
+    let mut result: Result<()> = Ok(());
 
-    while let Some(token) = rx.recv().await {
-        match token {
-            streaming::StreamToken::Delta(s) => {
-                stdout.write_all(s.as_bytes()).ok();
-                stdout.flush().ok();
-            }
-            streaming::StreamToken::ToolCall(_) => {}
-            streaming::StreamToken::Checkpoint(hash) => {
-                checkpoint = Some(hash);
-            }
-            streaming::StreamToken::Done => break,
-            streaming::StreamToken::Error(e) => {
-                saw_error = true;
-                eprintln!("ERROR: {e}");
+    let total_rounds = 1usize + autofix_rounds;
+    for round in 0..total_rounds {
+        if round > 0 {
+            eprintln!(
+                "\n\n[autofix] round {round}/{autofix_rounds} — applying Observer proposals\n"
+            );
+        }
+
+        let mut saw_error = false;
+        let (tx, mut rx) = mpsc::channel::<streaming::StreamToken>(128);
+
+        let start_state = crate::tui::agent::AgenticStartState {
+            messages: messages_json.clone(),
+            checkpoint: checkpoint.clone(),
+            cur_cwd: cur_cwd.clone(),
+            create_checkpoint: create_checkpoint_round,
+        };
+        create_checkpoint_round = false;
+
+        let tool_root_for_task = tool_root.clone();
+        let cfg_for_task = cfg.clone();
+        let project_context_for_task = project_context.clone();
+        let agents_md_for_task = agents_md.clone();
+        let test_cmd_for_task = test_cmd.clone();
+        let approver_for_task = approver.clone();
+
+        let handle = tokio::spawn(async move {
+            crate::tui::agent::run_agentic_json(
+                start_state,
+                &cfg_for_task,
+                tool_root_for_task.as_deref(),
+                max_iters,
+                tx,
+                project_context_for_task,
+                agents_md_for_task,
+                test_cmd_for_task,
+                approver_for_task.as_ref(),
+            )
+            .await
+        });
+
+        while let Some(token) = rx.recv().await {
+            match token {
+                streaming::StreamToken::Delta(s) => {
+                    stdout.write_all(s.as_bytes()).ok();
+                    stdout.flush().ok();
+                }
+                streaming::StreamToken::ToolCall(_) => {}
+                streaming::StreamToken::Checkpoint(hash) => {
+                    checkpoint = Some(hash);
+                }
+                streaming::StreamToken::Done => break,
+                streaming::StreamToken::Error(e) => {
+                    saw_error = true;
+                    eprintln!("ERROR: {e}");
+                }
             }
         }
+
+        let end_state = match handle.await {
+            Err(e) => {
+                result = Err(anyhow::anyhow!("agent task panicked: {e}"));
+                break;
+            }
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                result = Err(e);
+                break;
+            }
+        };
+
+        have_state = true;
+        messages_json = end_state.messages;
+        cur_cwd = end_state.cur_cwd;
+        checkpoint = checkpoint.or(end_state.checkpoint);
+
+        if saw_error {
+            result = Err(anyhow::anyhow!("agent finished with errors"));
+            break;
+        }
+
+        if round + 1 == total_rounds {
+            break;
+        }
+
+        // ── Observer diff review → feed back into Coder (auto-fix loop) ───
+        let Some(ref root) = tool_root else {
+            eprintln!("[autofix] skipped: no tool_root set");
+            break;
+        };
+        let Some(ref base_hash) = checkpoint else {
+            eprintln!("[autofix] skipped: no git checkpoint available (not a git repo?)");
+            break;
+        };
+
+        match git_change_signal_since_base(root, base_hash) {
+            Ok(false) => {
+                eprintln!("[autofix] no changes since checkpoint; stopping.");
+                break;
+            }
+            Err(e) => {
+                eprintln!("[autofix] skipped: {e:#}");
+                break;
+            }
+            Ok(true) => {}
+        }
+
+        let short = &base_hash[..base_hash.len().min(8)];
+        eprintln!("\n\n[autofix] Observer review (base {short})\n");
+        let guidance = "Review changes since the session checkpoint. Output concrete, actionable proposals for the Coder to implement.";
+
+        let review = match review_git_diff(
+            root,
+            false,
+            false,
+            Some(base_hash.as_str()),
+            24_000,
+            guidance,
+            &common,
+            Some(&lang),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[autofix] Observer review failed: {e:#}");
+                result = Err(e);
+                break;
+            }
+        };
+
+        eprintln!("\n[Observer review]\n{review}\n");
+
+        let next_prompt = format!(
+            "[Auto-fix requested]\n\
+The Observer has reviewed the code and identified the following issues. Fix ALL of them.\n\
+For each proposal you address, verify with commands/tests. When finished, call done.\n\n\
+{review}"
+        );
+        messages_json.push(json!({"role":"user","content": next_prompt}));
     }
 
-    let mut end_state: Option<crate::tui::agent::AgenticEndState> = None;
-    let join_result = match handle.await {
-        Err(e) => Err(anyhow::anyhow!("agent task panicked: {e}")),
-        Ok(Ok(s)) => {
-            end_state = Some(s);
-            Ok(())
-        }
-        Ok(Err(e)) => Err(e),
-    };
-    let result = match (join_result, saw_error) {
-        (Ok(()), false) => Ok(()),
-        (Ok(()), true) => Err(anyhow::anyhow!("agent finished with errors")),
-        (Err(e), _) => Err(e),
-    };
-
     // Save session file (if requested).
-    if let (Some(ref sp), Some(state)) = (session_path.as_ref(), end_state.as_ref()) {
+    if let (Some(ref sp), true) = (session_path.as_ref(), have_state) {
         let mut sess = loaded_session.unwrap_or_else(|| {
             crate::agent_session::AgentSession::new(
                 tool_root.clone(),
@@ -929,9 +1115,9 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
             )
         });
         sess.tool_root = tool_root.clone();
-        sess.checkpoint = checkpoint.clone().or_else(|| state.checkpoint.clone());
-        sess.cur_cwd = state.cur_cwd.clone();
-        sess.messages = state.messages.clone();
+        sess.checkpoint = checkpoint.clone();
+        sess.cur_cwd = cur_cwd.clone();
+        sess.messages = messages_json.clone();
         sess.touch();
         crate::agent_session::AgentSession::save_atomic(sp, &sess)?;
     }
@@ -940,8 +1126,7 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
     if result.is_ok() {
         let checkpoint_final = checkpoint
             .as_deref()
-            .map(|s| s.to_string())
-            .or_else(|| end_state.as_ref().and_then(|s| s.checkpoint.clone()));
+            .map(|s| s.to_string());
         if let (Some(ref root), Some(ref hash)) = (tool_root, checkpoint_final.as_deref()) {
             let stat = std::process::Command::new("git")
                 .args(["-C", root, "diff", hash, "--stat"])
