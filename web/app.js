@@ -2673,6 +2673,7 @@
         sameOutRepeats: 0,
 
         pendingHint: "",
+        pendingDiag: "",
       };
 
       const deriveGovernorHint = (stderr, stdout) => {
@@ -2996,6 +2997,67 @@
       for (let iter = 0; iter < MAX_ITERS; iter++) {
         if (ac.signal.aborted) break;
         pruneToolMessages(messages);
+
+        // Auto diagnostics (outer-loop): when the governor detects a loop threshold crossing,
+        // gather a small context bundle so the model can change strategy with real state.
+        if (longrun && !config.requireCommandApproval) {
+          const diagWhy = String(governor.pendingDiag || "").trim();
+          if (diagWhy) {
+            governor.pendingDiag = "";
+            try {
+              const win = isWindowsHost();
+              const fenceLang = win ? "powershell" : "bash";
+              const prompt = win ? "PS> " : "$ ";
+              const diagCmd = win
+                ? [
+                    "$ErrorActionPreference = 'Continue'",
+                    "Write-Output ('pwd=' + (Get-Location).Path)",
+                    "Write-Output 'ls:'",
+                    "Get-ChildItem -Force | Select-Object -First 40 | ForEach-Object { $_.Name }",
+                    "try { git status -sb } catch {}",
+                    "try { git rev-parse --show-toplevel } catch {}",
+                  ].join('; ')
+                : [
+                    "pwd",
+                    "ls -la",
+                    "git status -sb 2>/dev/null || true",
+                    "git rev-parse --show-toplevel 2>/dev/null || true",
+                  ].join("; ");
+
+              display += (display ? "\n\n" : "") + "```" + fenceLang + "\n" + prompt + "# [auto] governor diagnostics (" + diagWhy + ")\n" + diagCmd;
+              flush("\n```");
+
+              const cwdUsed = cwdNow();
+              const execCmd = wrapExecWithPwd(diagCmd);
+              const execRes = await postJson("/api/exec", { command: execCmd, cwd: cwdUsed }, ac.signal);
+              const parsed = stripPwdMarker(execRes.stdout);
+              const breach = sandboxBreachReason(parsed.pwd);
+              maybeUpdateWorkdirFromPwd(parsed.pwd);
+
+              const out = truncToolTail(String(parsed.stdout || ""), TRUNC_STDOUT);
+              const err = truncToolTail(String(execRes.stderr || ""), TRUNC_STDERR);
+
+              if (out) display += "\n" + out;
+              if (err) display += "\nstderr: " + err;
+              display += "\n```\nexit: " + execRes.exit_code;
+              flush();
+
+              messages.push({
+                role: "user",
+                content: [
+                  "[governor_diagnostics]",
+                  "reason: " + diagWhy,
+                  breach ? ("sandbox_breach: " + breach) : "",
+                  out ? ("stdout:\n" + out) : "stdout: (empty)",
+                  err ? ("stderr:\n" + err) : "stderr: (empty)",
+                ].filter(Boolean).join("\n"),
+              });
+            } catch (_) {
+              // If diagnostics fails, continue without blocking the agent loop.
+            }
+          }
+        }
+
         // One-shot governor hint injection (outer-loop behavioral control).
         // Also inject periodic progress checkpoints in longrun mode so the agent doesn't drift.
         let govHint = governor.pendingHint ? String(governor.pendingHint || "").trim() : "";
@@ -3177,6 +3239,7 @@
                   else if (governor.sameOutRepeats === 2 && governor.sameCmdRepeats >= 2) stuckReason = "Stuck detected: repeated identical output.";
 
                   if (stuckReason) {
+                    governor.pendingDiag = stuckReason;
                     const stuck = [
                       stuckReason,
                       governor.lastErrSig ? ("last_error_signature: " + governor.lastErrSig) : "",
@@ -3197,6 +3260,7 @@
                   governor.sameErrRepeats = 0;
                   governor.lastOutHash = 0n;
                   governor.sameOutRepeats = 0;
+                  governor.pendingDiag = "";
                 }
 
                 toolResult = failed
@@ -3596,6 +3660,7 @@
                 else if (governor.sameOutRepeats === 2 && governor.sameCmdRepeats >= 2) stuckReason = "Stuck detected: repeated identical output.";
 
                 if (stuckReason) {
+                  governor.pendingDiag = stuckReason;
                   const stuck = [
                     stuckReason,
                     governor.lastErrSig ? ("last_error_signature: " + governor.lastErrSig) : "",
@@ -3615,6 +3680,7 @@
                 governor.sameErrRepeats = 0;
                 governor.lastOutHash = 0n;
                 governor.sameOutRepeats = 0;
+                governor.pendingDiag = "";
               }
 
               resultText = failed
