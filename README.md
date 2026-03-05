@@ -33,7 +33,7 @@ It's a development control engine.
 
 | Role | What it does | What it never does |
 |---|---|---|
-| **Coder** | Acts — files, shell commands, agentic loop (up to 12 steps), 4 built-in tools | Review or second-guess its own work |
+| **Coder** | Acts — files, shell commands, agentic loop (up to 12 steps), 5 built-in tools | Review or second-guess its own work |
 | **Observer** | Critiques — scores every proposal, escalates what you ignore | Touch any code. It only reads. |
 | **Chat** | Thinks with you — design, rubber duck, tradeoffs | Interrupt the execution loop |
 
@@ -105,6 +105,9 @@ When a command fails, OBSTRAL doesn't hand the model a raw `exit_code: 1` and ho
 | `DEPENDENCY` | Install the package first. Then retry. |
 | `NETWORK` | Check service status and proxy vars. |
 | `LOGIC` | Re-read the logic. Don't just re-run. |
+
+PowerShell caveat: `exit_code` can be `0` even when it printed errors (non-terminating error records).
+OBSTRAL flags this as `SUSPICIOUS_SUCCESS` and treats it as failure to stop false-progress drift.
 
 ### The Coder Has Five Tools
 
@@ -313,6 +316,11 @@ To work on your actual project, set `tool_root` to your project path:
 When `tool_root` is set, OBSTRAL scans it on first use to build the project context block (stack, git, tree). Subsequent sends in the same session skip the scan.
 
 Path traversal is blocked: paths with `..` components are rejected at every tool boundary.
+
+### Language
+
+- **UI language**: TUI `/lang ja|en|fr` (also affects prompts).
+- **Observer language (Web UI)**: `auto` (default) follows your last user message language even if the UI is English; `ui` follows UI; or force `ja`/`en`/`fr`.
 
 ### Sessions (CLI)
 

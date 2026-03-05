@@ -106,6 +106,9 @@ Quand une commande echoue, OBSTRAL ne donne pas au modele un brut `exit_code: 1`
 | `NETWORK` | Verifiez le service et les variables proxy. |
 | `LOGIC` | Relisez la logique. Ne relancez pas juste pour relancer. |
 
+Note PowerShell : `exit_code` peut etre `0` meme si des erreurs ont ete imprimees (erreurs non bloquantes).
+OBSTRAL le signale comme `SUSPICIOUS_SUCCESS` et le traite comme un echec pour eviter les faux progres.
+
 ### Le Coder dispose de cinq outils
 
 Le Coder n'est pas limite aux commandes shell. Il dispose de cinq outils dedies :
@@ -285,6 +288,11 @@ Pour travailler sur votre projet reel, definissez `tool_root` sur le chemin du p
 Quand `tool_root` est defini, OBSTRAL l'analyse a la premiere utilisation pour construire le bloc de contexte projet (stack, git, arborescence). Les envois suivants dans la meme session sautent l'analyse.
 
 La traversee de chemins est bloquee : les chemins avec des composantes `..` sont rejetes a chaque frontiere d'outil (jamais silencieusement).
+
+### Langue
+
+- **Langue de l'UI** : TUI `/lang ja|en|fr` (affecte aussi les prompts).
+- **Langue de l'Observer (UI Web)** : `auto` (par defaut) suit la langue de votre dernier message utilisateur meme si l'UI est en anglais ; `ui` suit l'UI ; ou forcez `ja`/`en`/`fr`.
 
 ### Approbations
 
