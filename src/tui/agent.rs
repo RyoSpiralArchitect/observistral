@@ -1533,12 +1533,33 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
             ));
         }
 
+        // ── Final iteration handoff ─────────────────────────────────────────
+        // If we hit the iteration cap, force a clean handoff via `done()` so
+        // long sessions are resumable (session JSON keeps full history).
+        if iter + 1 == max_iters {
+            let final_hint = format!(
+                "[Final Iteration — iter {}/{}]\n\
+This is the LAST model call for this run.\n\
+- If the task is fully done AND verified: run ONE final smoke test (if needed), then call `done`.\n\
+- If the task is NOT done: call `done` with (1) verified-complete items, (2) what remains, and (3) the exact next commands/files to continue on the next run.",
+                iter + 1,
+                max_iters
+            );
+            match pending_system_hint.as_mut() {
+                Some(existing) => {
+                    existing.push_str("\n\n");
+                    existing.push_str(&final_hint);
+                }
+                None => pending_system_hint = Some(final_hint),
+            }
+        }
+
         // ── Stream from model ──────────────────────────────────────────────
         // Inject a one-shot governor hint if we detected a repeated failure pattern.
         let mut msgs_for_call = messages.clone();
         if let Some(h) = pending_system_hint.take() {
             let note = format!(
-                "[Loop Governor]\nstate: {:?}\n{}\n\nYou MUST incorporate this hint in your next exec call.\nDo not repeat the same failing command.",
+                "[Loop Governor]\nstate: {:?}\n{}\n\nYou MUST incorporate this hint in your next tool call.\nDo not repeat the same failing command.",
                 state, h
             );
             let _ = tx.send(StreamToken::Delta(format!("\n[governor] {h}\n"))).await;
@@ -1803,20 +1824,26 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
                 }
             }
 
-            // Common failure mode: model "explains what to do" but never calls exec,
-            // even though the user asked to actually perform local actions.
-            if goal_wants_actions && !forced_tool_once && iter + 1 < max_iters {
+            // Common failure mode: model "explains what to do" but never calls tools.
+            // Try once to force a tool call so long sessions keep moving.
+            if !forced_tool_once && iter + 1 < max_iters {
                 forced_tool_once = true;
                 state = AgentState::Recovery;
-                let note = "\
+                let note = if goal_wants_actions {
+                    "\
 [Tool enforcement]\n\
-The user asked you to ACT on the local machine (create files/run commands).\n\
-You have exec, read_file, write_file, and patch_file tools. You MUST call one now.\n\
-Do NOT give instructions. Do NOT say you cannot run commands.\n\
-Start with ONE minimal action that moves toward the goal (write_file, exec, or read_file).\n\
-After it succeeds, verify and continue.";
+You MUST call ONE tool now to act locally (exec/read_file/write_file/patch_file/apply_diff/search_files/glob/done).\n\
+Do NOT respond with instructions only.\n\
+Start with ONE minimal safe action, then verify and continue."
+                } else {
+                    "\
+[Tool enforcement]\n\
+You responded without calling any tool.\n\
+You MUST call ONE tool now (exec/read_file/write_file/patch_file/apply_diff/search_files/glob/done).\n\
+Do NOT respond with text-only instructions."
+                };
                 let _ = tx
-                    .send(StreamToken::Delta("\n[governor] tool_call missing; forcing exec\n".to_string()))
+                    .send(StreamToken::Delta("\n[governor] tool_call missing; forcing tool call\n".to_string()))
                     .await;
                 messages.push(json!({"role":"system","content": note}));
                 continue;
