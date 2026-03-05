@@ -125,6 +125,7 @@ struct AgentArgs {
 
     /// Save and resume an agent session from this JSON file.
     /// If the file exists, OBSTRAL loads it and continues the conversation.
+    /// If `-C/--root` is set and the session path is relative, it is resolved under `tool_root`.
     #[arg(long, short = 's', num_args = 0..=1, default_missing_value = ".tmp/obstral_session.json")]
     session: Option<PathBuf>,
 
@@ -783,6 +784,16 @@ fn normalize_tool_root(tool_root: Option<String>) -> Option<String> {
     Some(abs.to_string_lossy().into_owned())
 }
 
+fn resolve_session_path(session_path: PathBuf, tool_root: Option<&str>) -> PathBuf {
+    if session_path.is_absolute() {
+        return session_path;
+    }
+    let Some(root) = tool_root.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        return session_path;
+    };
+    std::path::PathBuf::from(root).join(session_path)
+}
+
 async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
     let AgentArgs {
         prompt,
@@ -798,6 +809,8 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         autofix,
     } = args;
 
+    let session_path = session_path.map(|sp| resolve_session_path(sp, tool_root_arg.as_deref()));
+
     let mut loaded_session: Option<crate::agent_session::AgentSession> = None;
     let mut start_messages_json: Option<Vec<serde_json::Value>> = None;
     let mut start_checkpoint: Option<String> = None;
@@ -808,12 +821,29 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
     if let Some(ref sp) = session_path {
         if sp.exists() && !new_session {
             let mut sess = crate::agent_session::AgentSession::load(sp)?;
+            if let Some(warn) = sess.repair_for_resume() {
+                eprintln!("[session] WARN: {warn}");
+            }
+            let msg_count = sess.messages.len();
+            let ckpt_short = sess
+                .checkpoint
+                .as_deref()
+                .map(|h| &h[..h.len().min(8)])
+                .unwrap_or("-");
+            eprintln!(
+                "[session] resuming: {} (messages={msg_count}, checkpoint={ckpt_short})",
+                sp.display()
+            );
             start_checkpoint = sess.checkpoint.clone();
             start_cwd = sess.cur_cwd.clone();
             create_checkpoint = sess.checkpoint.is_none();
             start_messages_json = Some(std::mem::take(&mut sess.messages));
             loaded_session = Some(sess);
             resuming = true;
+        } else if new_session && sp.exists() {
+            eprintln!("[session] --new-session: starting fresh and overwriting {}", sp.display());
+        } else if new_session {
+            eprintln!("[session] --new-session: starting fresh at {}", sp.display());
         }
     }
 
@@ -975,6 +1005,11 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         ))
     });
     if let Some(ref saver) = autosaver {
+        if !resuming {
+            if let Some(ref sp) = session_path {
+                eprintln!("[session] saving: {} (autosave enabled)", sp.display());
+            }
+        }
         saver.save_or_error(
             tool_root.as_deref(),
             checkpoint.as_deref(),
@@ -984,6 +1019,7 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
     }
 
     let total_rounds = 1usize + autofix_rounds;
+    let mut interrupted = false;
     for round in 0..total_rounds {
         if round > 0 {
             eprintln!(
@@ -1026,22 +1062,48 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
             .await
         });
 
-        while let Some(token) = rx.recv().await {
-            match token {
-                streaming::StreamToken::Delta(s) => {
-                    stdout.write_all(s.as_bytes()).ok();
-                    stdout.flush().ok();
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        loop {
+            tokio::select! {
+                token = rx.recv() => {
+                    let Some(token) = token else { break };
+                    match token {
+                        streaming::StreamToken::Delta(s) => {
+                            stdout.write_all(s.as_bytes()).ok();
+                            stdout.flush().ok();
+                        }
+                        streaming::StreamToken::ToolCall(_) => {}
+                        streaming::StreamToken::Checkpoint(hash) => {
+                            checkpoint = Some(hash);
+                        }
+                        streaming::StreamToken::Done => break,
+                        streaming::StreamToken::Error(e) => {
+                            saw_error = true;
+                            eprintln!("ERROR: {e}");
+                        }
+                    }
                 }
-                streaming::StreamToken::ToolCall(_) => {}
-                streaming::StreamToken::Checkpoint(hash) => {
-                    checkpoint = Some(hash);
-                }
-                streaming::StreamToken::Done => break,
-                streaming::StreamToken::Error(e) => {
-                    saw_error = true;
-                    eprintln!("ERROR: {e}");
+                _ = &mut ctrl_c => {
+                    interrupted = true;
+                    eprintln!("\n\n[agent] interrupted (Ctrl+C). Session can be resumed.\n");
+                    handle.abort();
+                    if let Some(ref saver) = autosaver {
+                        let _ = saver.save_best_effort(
+                            tool_root.as_deref(),
+                            checkpoint.as_deref(),
+                            cur_cwd.as_deref(),
+                            &messages_json,
+                        );
+                    }
+                    break;
                 }
             }
+        }
+
+        if interrupted {
+            result = Err(anyhow::anyhow!("interrupted"));
+            break;
         }
 
         let end_state = match handle.await {

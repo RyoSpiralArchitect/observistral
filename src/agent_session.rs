@@ -65,6 +65,111 @@ impl AgentSession {
         let json = serde_json::to_string_pretty(sess).context("failed to serialize session")?;
         save_text_atomic(path, &json)
     }
+
+    /// Repairs common session corruption patterns so the agent can resume.
+    /// Returns a short warning string if the message list was modified.
+    pub fn repair_for_resume(&mut self) -> Option<String> {
+        let mut pending_ids: Vec<String> = Vec::new();
+        let mut pending_started_at: Option<usize> = None;
+        let mut trim_from: Option<usize> = None;
+        let mut reason: Option<String> = None;
+
+        for (idx, msg) in self.messages.iter().enumerate() {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            match role {
+                "assistant" => {
+                    let tool_calls = msg.get("tool_calls");
+                    let has_tool_calls = tool_calls
+                        .and_then(|tc| tc.as_array())
+                        .map(|a| !a.is_empty())
+                        .unwrap_or(false);
+                    if has_tool_calls {
+                        if !pending_ids.is_empty() {
+                            trim_from = pending_started_at.or(Some(idx));
+                            reason = Some(
+                                "found a new assistant tool_call before the previous tool_call completed"
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                        let ids: Vec<String> = tool_calls
+                            .and_then(|tc| tc.as_array())
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .collect();
+                        if !ids.is_empty() {
+                            pending_ids = ids;
+                            pending_started_at = Some(idx);
+                        }
+                    } else if !pending_ids.is_empty() {
+                        trim_from = pending_started_at;
+                        reason = Some(
+                            "found a non-tool assistant message while tool results were still pending"
+                                .to_string(),
+                        );
+                        break;
+                    }
+                }
+                "tool" => {
+                    let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) else {
+                        trim_from = Some(idx);
+                        reason = Some("tool message missing tool_call_id".to_string());
+                        break;
+                    };
+                    if pending_ids.is_empty() {
+                        trim_from = Some(idx);
+                        reason = Some(
+                            "tool result appeared without a preceding assistant tool_call".to_string(),
+                        );
+                        break;
+                    }
+                    if let Some(pos) = pending_ids.iter().position(|p| p == id) {
+                        pending_ids.remove(pos);
+                        if pending_ids.is_empty() {
+                            pending_started_at = None;
+                        }
+                    } else {
+                        trim_from = Some(idx);
+                        reason = Some(
+                            "tool result tool_call_id did not match the pending tool_call".to_string(),
+                        );
+                        break;
+                    }
+                }
+                _ => {
+                    if !pending_ids.is_empty() {
+                        trim_from = pending_started_at;
+                        reason = Some(format!(
+                            "found a '{role}' message while tool results were still pending"
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if trim_from.is_none() && !pending_ids.is_empty() {
+            trim_from = pending_started_at;
+            reason = Some("session ended mid tool_call (missing tool results)".to_string());
+        }
+
+        let Some(from) = trim_from else {
+            return None;
+        };
+
+        if from >= self.messages.len() {
+            return None;
+        }
+
+        let old_len = self.messages.len();
+        self.messages.truncate(from);
+        let trimmed = old_len - from;
+        Some(format!(
+            "repaired session: truncated {trimmed} message(s) from index {from} ({})",
+            reason.unwrap_or_else(|| "unknown reason".to_string())
+        ))
+    }
 }
 
 fn save_text_atomic(path: &Path, text: &str) -> Result<()> {
@@ -180,6 +285,11 @@ impl SessionAutoSaver {
                 .last_saved
                 .lock()
                 .expect("SessionAutoSaver last_saved poisoned");
+            // Never overwrite a newer save with an older snapshot (e.g., Ctrl+C in the CLI main loop
+            // while the agent task has already autosaved progress).
+            if key.messages_len < last.messages_len {
+                return Ok(false);
+            }
             if skip_if_unchanged && *last == key {
                 return Ok(false);
             }

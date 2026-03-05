@@ -309,6 +309,7 @@ python .\scripts\serve_lite.py
 `obstral agent` は `--session[=<path>]` で会話全体（tool call含む）をJSONに保存し、再開できる。
 
 - デフォルトパス: `.tmp/obstral_session.json`
+- `-C/--root` 指定時、相対パスの `--session` は `tool_root` からの相対として解釈される
 - 実行中も（tool call後などに）自動保存
 - プロンプト省略で再開: `obstral agent -C . --session` をもう一度実行
 - 最初からやり直し: `--new-session` を付ける（ファイルは上書き）
