@@ -297,11 +297,36 @@ pub fn glob_tool_def() -> serde_json::Value {
     })
 }
 
+pub fn done_tool_def() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "done",
+            "description": "Signal that the task is complete and end the agent loop. \
+                            Use only after verifying with commands/tests.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Brief [DONE] summary: what was built/changed and where it lives."
+                    },
+                    "next_steps": {
+                        "type": "string",
+                        "description": "How to run/verify, or any follow-up work."
+                    }
+                },
+                "required": ["summary"]
+            }
+        }
+    })
+}
+
 // ── System prompt builders ────────────────────────────────────────────────────
 
 /// Fixed base for the TUI Coder pane — always an agentic executor, not a chat bot.
 const CODER_BASE_SYSTEM: &str = "\
-You are an autonomous coding agent with 7 tools:\n\
+You are an autonomous coding agent with 8 tools:\n\
   exec(command, cwd?)                       — run shell commands (build, test, git, installs)\n\
   read_file(path)                           — read a file's exact content\n\
   write_file(path, content)                 — create or overwrite a file reliably\n\
@@ -309,6 +334,7 @@ You are an autonomous coding agent with 7 tools:\n\
   apply_diff(path, diff)                    — apply a unified @@ diff (multiple hunks)\n\
   search_files(pattern, dir?, ci?)          — find text across files (like grep -rn)\n\
   glob(pattern, dir?)                       — find files by name pattern (like find -name)\n\
+  done(summary, next_steps?)                — finish the task and end the loop\n\
 \n\
 RULE: You MUST call a tool on every single turn. Never respond with text only.\n\
 \n\
@@ -333,8 +359,8 @@ After every build/test: confirm exit_code == 0 before proceeding.\n\
 \n\
 When ALL steps from your <plan> are verified complete:\n\
   call exec one final time to run a smoke test or confirm the deliverable exists,\n\
-  then reply with a brief [DONE] summary: what was built, where it lives, how to run it.\n\
-  Do NOT reply with [DONE] while any command is still failing.";
+  then call done with a brief summary: what was built, where it lives, how to run it.\n\
+  Do NOT call done while any command is still failing.";
 
 /// Build the full Coder system prompt: base + scratchpad + OS rules + persona + language.
 pub fn coder_system(persona_prompt: &str, lang_instruction: &str) -> String {
@@ -1368,6 +1394,7 @@ pub async fn run_agentic_json(
         apply_diff_tool_def(),
         search_files_tool_def(),
         glob_tool_def(),
+        done_tool_def(),
     ]);
     let mut state = AgentState::Planning;
     let mut mem = FailureMemory::default();
@@ -1804,6 +1831,37 @@ After it succeeds, verify and continue.";
 
         // ── Execute the tool ───────────────────────────────────────────────
         let tc = tool_call.unwrap();
+
+        // ── done tool ──────────────────────────────────────────────────────
+        if tc.name.as_str() == "done" {
+            let args: serde_json::Value =
+                serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+            let summary = args["summary"].as_str().unwrap_or("").trim();
+            let next_steps = args["next_steps"].as_str().unwrap_or("").trim();
+
+            let mut final_text = String::new();
+            final_text.push_str("[DONE]\n");
+            if !summary.is_empty() {
+                final_text.push_str(summary);
+            }
+            if !next_steps.is_empty() {
+                final_text.push_str("\n\nNext:\n");
+                final_text.push_str(next_steps);
+            }
+
+            // Close out the tool call so session JSON remains valid on resume.
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": "OK: done"
+            }));
+            messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+
+            let _ = tx
+                .send(StreamToken::Delta(format!("\n\n{final_text}\n")))
+                .await;
+            break;
+        }
 
         // ── apply_diff tool ───────────────────────────────────────────────
         if tc.name.as_str() == "apply_diff" {

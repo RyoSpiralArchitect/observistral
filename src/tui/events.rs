@@ -965,6 +965,8 @@ async fn send_observer_message(
     let history = app.observer.chat_history();
     let coder_history = app.coder.chat_history();
     let cfg = app.observer_cfg.clone();
+    let tool_root = app.tool_root.clone();
+    let checkpoint = app.last_git_checkpoint.clone();
 
     // Build Observer system prompt. Persona is intentionally excluded: the Observer mode
     // has its own strict critique tone ("NO padding, ruthlessly honest") that must not be
@@ -997,21 +999,56 @@ async fn send_observer_message(
         String::new()
     };
 
-    let system = format!("{obs_system}{coder_context}").trim_end().to_string();
-    let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
+    let system_base = format!("{obs_system}{coder_context}").trim_end().to_string();
     // Exclude the last entry in history (current user message, already pushed to pane)
     // to avoid sending a duplicate user message, matching the pattern in send_coder_message.
     let hist_len = history.len();
-    for m in history.iter().take(hist_len.saturating_sub(1)) {
-        messages.push(m.clone());
-    }
-    messages.push(ChatMessage { role: "user".to_string(), content: text });
+    let history_prefix: Vec<ChatMessage> = history
+        .iter()
+        .take(hist_len.saturating_sub(1))
+        .cloned()
+        .collect();
 
     let tx = tx.clone();
     let handle = tokio::spawn(async move {
         use crate::config::ProviderKind;
         use crate::streaming::{stream_anthropic, stream_openai_compat};
         let client = reqwest::Client::new();
+
+        let mut system = system_base;
+
+        // Add project context and AGENTS.md instructions (when tool_root is set).
+        if let Some(ref root) = tool_root {
+            if let Some(ctx) = crate::project::ProjectContext::scan(root).await {
+                let ctx_text = ctx.to_context_text();
+                if !ctx_text.trim().is_empty() {
+                    system.push_str("\n\n");
+                    system.push_str(ctx_text.trim_end());
+                }
+                if let Some(a) = ctx.agents_md.as_deref() {
+                    if !a.trim().is_empty() {
+                        system.push_str("\n\n[Project Instructions]\n");
+                        system.push_str(a.trim_end());
+                    }
+                }
+            }
+        }
+
+        // Add git diff payload (status + stat + patch) so Observer can quote real code.
+        let mut user_text = text;
+        if let Some(ref root) = tool_root {
+            if let Some(payload) =
+                build_git_diff_payload(root, checkpoint.as_deref(), OBS_GIT_DIFF_MAX_CHARS).await
+            {
+                user_text.push_str("\n\n[git diff payload]\n");
+                user_text.push_str(payload.trim_end());
+            }
+        }
+
+        let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
+        messages.extend(history_prefix);
+        messages.push(ChatMessage { role: "user".to_string(), content: user_text });
+
         let result = match cfg.provider {
             ProviderKind::Anthropic => stream_anthropic(&client, &cfg, &messages, tx.clone()).await,
             _ => stream_openai_compat(&client, &cfg, &messages, None, tx.clone()).await,
@@ -1021,6 +1058,110 @@ async fn send_observer_message(
         }
     });
     app.observer_task = Some(handle);
+}
+
+const OBS_GIT_DIFF_MAX_CHARS: usize = 24_000;
+
+fn truncate_middle(s: &str, max_chars: usize) -> String {
+    let s = s.trim_end();
+    if max_chars < 20 {
+        return s.chars().take(max_chars).collect();
+    }
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+
+    let head_len = max_chars / 2;
+    let tail_len = max_chars.saturating_sub(head_len);
+    let head: String = s.chars().take(head_len).collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!(
+        "{head}\n[…truncated — middle removed, total {total} chars]\n{tail}"
+    )
+}
+
+async fn git_cmd_output(root: &str, args: &[&str]) -> (String, String, i32) {
+    let fut = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let exit = out.status.code().unwrap_or(-1);
+            (stdout, stderr, exit)
+        }
+        Ok(Err(e)) => (String::new(), e.to_string(), -1),
+        Err(_) => (
+            String::new(),
+            "git command timed out after 5s".to_string(),
+            -1,
+        ),
+    }
+}
+
+async fn build_git_diff_payload(root: &str, base: Option<&str>, max_chars: usize) -> Option<String> {
+    let base = base.map(|s| s.trim()).filter(|s| !s.is_empty());
+
+    let (status_out, _status_err, status_exit) =
+        git_cmd_output(root, &["status", "--porcelain=v1"]).await;
+    if status_exit != 0 {
+        return None; // not a git repo or git unavailable
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("[repo]\nroot: {root}\n"));
+    if let Some(b) = base {
+        out.push_str(&format!("base: {b}\n"));
+    }
+    out.push_str("\n[git status --porcelain=v1]\n");
+    out.push_str(status_out.trim_end());
+    out.push('\n');
+
+    let mut stat_args: Vec<&str> = vec!["diff", "--no-color", "--stat"];
+    if let Some(b) = base {
+        stat_args.push(b);
+    }
+    let (stat_out, stat_err, stat_exit) = git_cmd_output(root, &stat_args).await;
+    if stat_exit == 0 && !stat_out.trim().is_empty() {
+        out.push_str("\n[git diff --stat]\n");
+        out.push_str(stat_out.trim_end());
+        out.push('\n');
+    } else if stat_exit != 0 && !stat_err.trim().is_empty() {
+        out.push_str("\n[git diff --stat ERROR]\n");
+        out.push_str(stat_err.trim_end());
+        out.push('\n');
+    }
+
+    let mut diff_args: Vec<&str> = vec!["diff", "--no-color"];
+    if let Some(b) = base {
+        diff_args.push(b);
+    }
+    let (diff_out, diff_err, diff_exit) = git_cmd_output(root, &diff_args).await;
+    if diff_exit == 0 && !diff_out.trim().is_empty() {
+        out.push_str("\n[git diff]\n");
+        out.push_str(&truncate_middle(&diff_out, max_chars));
+        out.push('\n');
+    } else if diff_exit != 0 && !diff_err.trim().is_empty() {
+        out.push_str("\n[git diff ERROR]\n");
+        out.push_str(diff_err.trim_end());
+        out.push('\n');
+    }
+
+    Some(out.trim_end().to_string())
 }
 
 // ── Auto-observe ──────────────────────────────────────────────────────────────
