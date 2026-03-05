@@ -2444,9 +2444,29 @@
       };
       const suspiciousSuccessReason = (stdout, stderr) => {
         // PowerShell can exit 0 even when it printed errors (non-terminating error records).
-        // Treat strong error markers as failure to avoid "false success" drift.
+        // Cargo warnings also go to stderr; only trigger on strong error markers (and a few known critical git warnings).
+        const s = (String(stderr || "") + "\n" + String(stdout || "")).toLowerCase();
+        if (!s.trim()) return "";
+        const strong = [
+          "parsererror",
+          "unexpected token",
+          "missing expression",
+          "commandnotfoundexception",
+          "not recognized",
+          "error:",
+          "fatal:",
+          "exception",
+          "traceback",
+          "access is denied",
+          "permission denied",
+          "does not have a commit checked out",
+          "unable to index file",
+          "could not find a part of the path",
+        ];
+        const embedded = s.includes("adding embedded git repository") || s.includes("embedded git repository");
+        if (!embedded && !strong.some((k) => s.includes(k))) return "";
         const line = pickInterestingErrorLine(stdout, stderr);
-        if (!line) return "";
+        if (!line) return "exit_code was 0, but output contained error markers";
         return `exit_code was 0, but output contained error markers (e.g. \`${line}\`)`;
       };
       const blockedByRepeatFailure = (k) => {

@@ -626,6 +626,146 @@ pub fn check_dangerous_command(cmd: &str) -> Option<&'static str> {
     None
 }
 
+fn is_git_add_all_command(cmd: &str) -> bool {
+    let s = cmd.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return false;
+    }
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.is_empty() || !toks.iter().any(|t| *t == "git") {
+        return false;
+    }
+    // Support: `git add .`, `git add -A`, `git -C path add .`, etc.
+    let idx_add = toks.iter().position(|t| *t == "add");
+    let Some(i) = idx_add else {
+        return false;
+    };
+    let rest = &toks[i + 1..];
+    if rest.is_empty() {
+        return false;
+    }
+
+    // `git add -A` becomes `-a` after lowercasing; treat it as add-all.
+    if rest.iter().any(|t| *t == "-a" || *t == "--all") {
+        return true;
+    }
+
+    // `git add .` / `./` / `.\`
+    rest.iter().any(|t| *t == "." || *t == "./" || *t == ".\\")
+}
+
+fn resolve_cwd_path(cwd: Option<&str>) -> Option<std::path::PathBuf> {
+    let p = cwd.unwrap_or("").trim();
+    let base = if p.is_empty() {
+        std::env::current_dir().ok()?
+    } else {
+        let pb = std::path::PathBuf::from(p);
+        if pb.is_absolute() {
+            pb
+        } else {
+            std::env::current_dir().ok()?.join(pb)
+        }
+    };
+    Some(base)
+}
+
+fn find_git_root(mut start: &Path) -> Option<std::path::PathBuf> {
+    // Walk up a few levels; we only need this to catch `git add` invoked from a subdir.
+    for _ in 0..12 {
+        let git = start.join(".git");
+        if git.is_dir() {
+            return Some(start.to_path_buf());
+        }
+        start = start.parent()?;
+    }
+    None
+}
+
+fn find_nested_git_dirs(repo_root: &Path) -> Vec<std::path::PathBuf> {
+    // Conservative scan: shallow, with skip lists to avoid huge trees.
+    let max_depth: usize = 4;
+    let max_hits: usize = 4;
+    let mut hits: Vec<std::path::PathBuf> = Vec::new();
+
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(repo_root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > max_depth {
+            continue;
+        }
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            let ft = match ent.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !ft.is_dir() {
+                continue;
+            }
+            let name_os = ent.file_name();
+            let name = name_os.to_string_lossy();
+            let name_s = name.as_ref();
+
+            // Skip dot dirs and common heavy dirs.
+            if name_s.starts_with('.') {
+                if name_s != ".git" {
+                    continue;
+                }
+            }
+            if matches!(name_s, "node_modules" | "target" | ".tmp" | ".venv" | "dist" | "build" | "out") {
+                continue;
+            }
+
+            let p = ent.path();
+            if name_s == ".git" {
+                // Skip the root .git itself; everything else is a nested repo.
+                if p == repo_root.join(".git") {
+                    continue;
+                }
+                hits.push(p);
+                if hits.len() >= max_hits {
+                    return hits;
+                }
+                continue;
+            }
+
+            if depth < max_depth {
+                stack.push((p, depth + 1));
+            }
+        }
+    }
+
+    hits
+}
+
+fn check_nested_git_add_all_preflight(cmd: &str, cwd: Option<&str>) -> Option<String> {
+    if !is_git_add_all_command(cmd) {
+        return None;
+    }
+    let base = resolve_cwd_path(cwd)?;
+    let Some(repo_root) = find_git_root(&base) else {
+        return None;
+    };
+    let nested = find_nested_git_dirs(&repo_root);
+    if nested.is_empty() {
+        return None;
+    }
+
+    let mut rels: Vec<String> = Vec::new();
+    for p in nested.into_iter().take(3) {
+        let rel = p.strip_prefix(&repo_root).ok()
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_else(|| p.to_string_lossy().to_string());
+        rels.push(rel);
+    }
+    Some(format!(
+        "git add-all detected nested .git dirs under repo root: {}. Fix: cd into the intended repo, or move the project outside the parent repo (recommended), or use a submodule.",
+        rels.join(", ")
+    ))
+}
+
 /// Run a local shell command and return its combined output.
 ///
 /// On Windows, PowerShell is used. Here-strings (`@'...'@` / `@"..."@`) are
@@ -662,6 +802,14 @@ pub async fn run_command(command: &str, cwd: Option<&str>) -> Result<ExecResult>
         return Ok(ExecResult {
             stdout: String::new(),
             stderr: format!("[BLOCKED] dangerous command: {reason}"),
+            exit_code: -1,
+        });
+    }
+
+    if let Some(reason) = check_nested_git_add_all_preflight(&cleaned, cwd) {
+        return Ok(ExecResult {
+            stdout: String::new(),
+            stderr: format!("[BLOCKED] {reason}"),
             exit_code: -1,
         });
     }
@@ -837,6 +985,28 @@ mod tests {
         let p = std::env::temp_dir().join("..").join("x");
         let s = p.to_string_lossy().into_owned();
         assert!(validate_cwd(&s).is_err());
+    }
+
+    #[test]
+    fn nested_git_preflight_blocks_git_add_all() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path();
+        std::fs::create_dir_all(root.join(".git")).expect("mk .git");
+        std::fs::create_dir_all(root.join("MazeGame").join(".git")).expect("mk nested .git");
+
+        let reason = check_nested_git_add_all_preflight("git add .", Some(&root.to_string_lossy()));
+        assert!(reason.is_some());
+        assert!(reason.unwrap().to_lowercase().contains("mazegame"));
+    }
+
+    #[test]
+    fn nested_git_preflight_allows_git_add_all_when_no_nested_repo() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path();
+        std::fs::create_dir_all(root.join(".git")).expect("mk .git");
+
+        let reason = check_nested_git_add_all_preflight("git add -A", Some(&root.to_string_lossy()));
+        assert!(reason.is_none());
     }
 
     #[cfg(target_os = "windows")]

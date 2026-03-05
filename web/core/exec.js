@@ -80,8 +80,15 @@
     const s = s0.toLowerCase().replace(/\s+/g, " ").trim();
     if (!s) return "";
     if (s.indexOf("git reset --hard") !== -1) return "git reset --hard";
-    if (/\bgit\s+clean\b/.test(s) && /\b-[a-z]*f[a-z]*\b/.test(s) && /\b-[a-z]*d[a-z]*\b/.test(s)) return "git clean -fd";
-    if (/\bgit\s+rm\b/.test(s) && /\b(--cached|-r|--recursive)\b/.test(s) && /(^|\s)\.(\s|$)/.test(s)) return "git rm ... .";
+    if (/\bgit\s+clean\b/.test(s) && /\b-[a-z]*f[a-z]*\b/.test(s) && /\b-[a-z]*d[a-z]*\b/.test(s)) {
+      if (/\b-[a-z]*x[a-z]*\b/.test(s)) return "git clean -fdx";
+      return "git clean -fd";
+    }
+    if (/\bgit\s+rm\b/.test(s)
+      && /\b--cached\b/.test(s)
+      && (/(^|\s)-r(\s|$)/.test(s) || /\b--recursive\b/.test(s))
+      && /(^|\s)\.(?:[\\/])?(\s|$)/.test(s)
+    ) return "git rm --cached -r .";
     if (/\brm\s+-rf\b/.test(s)) return "rm -rf";
     if (s.indexOf("remove-item") !== -1 && s.indexOf("-recurse") !== -1 && s.indexOf("-force") !== -1) return "Remove-Item -Recurse -Force";
     return "";
