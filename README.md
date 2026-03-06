@@ -384,6 +384,14 @@ Five chips above the Chat composer — switch anytime, independent of Coder/Obse
 | 😏 Cynical | Points straight to the uncomfortable truth |
 | 🦆 Duck | Never answers — just asks "Why?" to unblock your thinking |
 
+### Chat = Companion (Not an Agent)
+
+Chat never executes tools. It's there to keep you thinking while the runtime (Coder/Observer) is busy.
+
+In the Web UI, Chat has two optional helpers:
+- **Attach runtime snapshot**: injects a small read-only runtime summary (cwd, last error snippet, pending approvals, open tasks) so you can ask "what's happening?" without leaving the chat tab.
+- **Auto tasks**: a behind-the-scenes TaskRouter turns chat into concrete tasks for Coder/Observer (visible in **Tasks**). You still choose what to send.
+
 ### /slash Commands (TUI)
 
 | Command | Effect |

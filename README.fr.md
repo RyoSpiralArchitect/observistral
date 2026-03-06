@@ -368,6 +368,14 @@ Cinq chips au-dessus du compositeur Chat — changez a tout moment, independant 
 | 😏 Cynique (cynical) | Va droit a la verite qui derange |
 | 🦆 Canard (duck) | Ne repond jamais — pose juste « Pourquoi ? » |
 
+### Chat = Compagnon (pas un agent)
+
+Le Chat n'execute jamais d'outils. Il est la pour vous garder dans le flux pendant que le runtime (Coder/Observer) tourne.
+
+Dans l'UI Web, deux aides optionnelles :
+- **Joindre snapshot runtime** : injecte un petit resume en lecture seule (cwd, dernier extrait d'erreur, approbations en attente, taches ouvertes) pour demander "que se passe-t-il ?" sans quitter l'onglet Chat.
+- **Tâches auto** : un TaskRouter en coulisses transforme la discussion en taches concretes pour Coder/Observer (visibles dans **Tâches**). Vous choisissez toujours quoi envoyer.
+
 ### Commandes slash (TUI)
 
 | Commande | Effet |
