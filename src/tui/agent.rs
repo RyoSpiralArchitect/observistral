@@ -1338,6 +1338,85 @@ fn extract_implied_exec_scripts(text: &str) -> Vec<ImpliedExecScript> {
 }
 
 impl FailureMemory {
+    fn from_recent_messages(messages: &[serde_json::Value]) -> Self {
+        let mut mem = FailureMemory::default();
+
+        // Map tool_call_id -> command for exec calls.
+        let mut exec_by_id: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        for msg in messages {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+
+            if role == "assistant" {
+                let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for tc in tcs {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    if id.is_empty() {
+                        continue;
+                    }
+                    let name = tc
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if name != "exec" {
+                        continue;
+                    }
+                    let args = tc
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if let Some(cmd) = parse_exec_command_from_args(args) {
+                        exec_by_id.insert(id.to_string(), cmd);
+                    }
+                }
+                continue;
+            }
+
+            if role == "tool" {
+                let tcid = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if tcid.is_empty() {
+                    continue;
+                }
+                let Some(command) = exec_by_id.remove(tcid) else {
+                    continue;
+                };
+                let content = msg
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let (exit_code, stdout, stderr) = parse_exec_tool_output_sections(&content);
+                let Some(mut effective_exit_code) = exit_code else {
+                    continue;
+                };
+                if effective_exit_code == 0
+                    && suspicious_success_reason(stdout.as_str(), stderr.as_str()).is_some()
+                {
+                    effective_exit_code = 1;
+                }
+                let _ = mem.on_tool_result(
+                    command.as_str(),
+                    stdout.as_str(),
+                    stderr.as_str(),
+                    effective_exit_code,
+                );
+            }
+        }
+
+        mem
+    }
+
     fn on_tool_result(
         &mut self,
         command: &str,
@@ -1425,6 +1504,79 @@ Action: print diagnostics and change strategy; do not repeat the same command."
 
         None
     }
+}
+
+fn parse_exec_command_from_args(args: &str) -> Option<String> {
+    // Standard tool schema uses JSON arguments: {"command":"...","cwd":"..."}.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+        if let Some(cmd) = v.get("command").and_then(|x| x.as_str()) {
+            let t = cmd.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+
+    // Fallback: some providers/models might pass a raw string.
+    let t = args.trim();
+    if !t.is_empty() {
+        return Some(t.to_string());
+    }
+    None
+}
+
+fn parse_exit_code_from_tool_text(s: &str) -> Option<i32> {
+    let low = s.to_ascii_lowercase();
+    let key = "exit_code:";
+    let idx = low.find(key)?;
+    let after = low[idx + key.len()..].trim_start();
+    let mut num = String::new();
+    for ch in after.chars() {
+        if ch == '-' || ch.is_ascii_digit() {
+            num.push(ch);
+        } else {
+            break;
+        }
+    }
+    if num.is_empty() {
+        return None;
+    }
+    num.parse::<i32>().ok()
+}
+
+fn parse_exec_tool_output_sections(tool_content: &str) -> (Option<i32>, String, String) {
+    let t = tool_content.replace("\r\n", "\n");
+    let exit_code = parse_exit_code_from_tool_text(t.as_str());
+
+    // Prefer parsing known markers so the governor sees the "real" stdout/stderr.
+    // - OK: "OK (exit_code: 0)\nstdout:\n..."
+    // - FAILED: "...FAILED (exit_code: X)\n...stdout (tail):\n...\nstderr:\n..."
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+
+    let (before_stderr, stderr_part) = match t.split_once("\nstderr:\n") {
+        Some((a, b)) => (a, Some(b)),
+        None => (t.as_str(), None),
+    };
+    if let Some(b) = stderr_part {
+        stderr = b.trim_end().to_string();
+    }
+
+    // stdout markers can exist with or without stderr.
+    if let Some((_, s_out)) = before_stderr.rsplit_once("\nstdout (tail):\n") {
+        stdout = s_out.trim_end().to_string();
+    } else if let Some((_, s_out)) = before_stderr.rsplit_once("\nstdout:\n") {
+        stdout = s_out.trim_end().to_string();
+    }
+
+    // If we can't parse anything meaningful, treat the whole tool output as stderr on failures.
+    if stdout.is_empty() && stderr.is_empty() {
+        if exit_code.unwrap_or(0) != 0 {
+            stderr = t.trim_end().to_string();
+        }
+    }
+
+    (exit_code, stdout, stderr)
 }
 
 // ── Git helpers ───────────────────────────────────────────────────────────────
@@ -1578,7 +1730,6 @@ pub async fn run_agentic_json(
         done_tool_def(),
     ]);
     let mut state = AgentState::Planning;
-    let mut mem = FailureMemory::default();
     let mut pending_system_hint: Option<String> = None;
     let mut forced_tool_once = false;
     // C — token budget guardian
@@ -1598,6 +1749,9 @@ pub async fn run_agentic_json(
 
     // Keep messages as serde_json::Value throughout to preserve tool_call_id.
     let mut messages: Vec<serde_json::Value> = start.messages;
+    // Rebuild loop governor memory from the existing session so resuming runs doesn't
+    // repeat the same failures from scratch.
+    let mut mem = FailureMemory::from_recent_messages(&messages);
 
     // Resolve tool_root once (absolute path) and track cwd across tool calls.
     // This prevents the classic "cd didn't persist, so git add ran in the wrong repo" failure.
@@ -2975,5 +3129,22 @@ mod tests {
             out.to_ascii_lowercase().contains("cargo_target_dir"),
             "should suggest isolated target dir"
         );
+    }
+
+    #[test]
+    fn rebuilds_failure_memory_from_session_messages() {
+        let messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"do thing"}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"exec","arguments":"{\"command\":\"git status\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"call_1","content":"FAILED (exit_code: 1)\nstderr:\nfatal: nope"}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"call_2","type":"function","function":{"name":"exec","arguments":"{\"command\":\"git status\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"call_2","content":"FAILED (exit_code: 1)\nstderr:\nfatal: nope"}),
+        ];
+
+        let mem = FailureMemory::from_recent_messages(&messages);
+        assert_eq!(mem.consecutive_failures, 2);
+        assert_eq!(mem.same_command_repeats, 2);
+        assert_eq!(mem.same_error_repeats, 2);
     }
 }
