@@ -2307,16 +2307,45 @@
       const threadRootNorm = threadRoot ? normalizePathSep(String(threadRoot)).replace(/\/+$/g, "") : "";
       let curWorkdir = safeWorkdir(threadWorkdir);
 
-      const cwdNow = () => resolvedCwd(config.toolRoot, threadId, curWorkdir);
-      const cwdLabelNow = () => {
-        const c = cwdNow();
-        return c ? String(c) : "(workspace root)";
-      };
-
-      const setWorkdir = (nextWorkdir) => {
-        const safe = safeWorkdir(nextWorkdir);
-        if (safe === curWorkdir) return;
-        curWorkdir = safe;
+      const cwdNow = () => resolvedCwd(config.toolRoot, threadId, curWorkdir); 
+      const cwdLabelNow = () => { 
+        const c = cwdNow(); 
+        return c ? String(c) : "(workspace root)"; 
+      }; 
+ 
+      // Resolve a relative path under the current tool_root+workdir into a workspace-relative path. 
+      // This keeps file tools aligned with exec's cwd (prevents accidental repo-root edits). 
+      const joinUnderCwd = (relPath) => { 
+        const base0 = cwdNow(); 
+        const base = base0 ? normalizePathSep(String(base0)).replace(/\/+$/g, "") : ""; 
+        let rel = normalizePathSep(String(relPath || "")).replace(/^[\\/]+/g, ""); 
+        rel = rel.replace(/^\.\//, ""); 
+        if (!base) return rel; 
+        if (!rel || rel === ".") return base; 
+        const bl = base.toLowerCase(); 
+        const rl = rel.toLowerCase(); 
+        if (rl === bl || rl.startsWith(bl + "/")) return rel; 
+        return base + "/" + rel; 
+      }; 
+ 
+      const rewriteToolPath = (text, fullPath, relPath) => { 
+        const s = String(text || ""); 
+        const full = String(fullPath || ""); 
+        const rel = String(relPath || ""); 
+        if (!s || !full || !rel) return s; 
+        if (s.startsWith("[" + full + "]")) { 
+          return "[" + rel + "]" + s.slice(("[" + full + "]").length); 
+        } 
+        return s.replaceAll("'" + full + "'", "'" + rel + "'"); 
+      }; 
+ 
+      // Minimal read-cache for safe overwrite: the model must call read_file before overwriting an existing file. 
+      const fileReadSet = new Set(); // fullPath -> true 
+ 
+      const setWorkdir = (nextWorkdir) => { 
+        const safe = safeWorkdir(nextWorkdir); 
+        if (safe === curWorkdir) return; 
+        curWorkdir = safe; 
         // Persist to thread state so subsequent manual runs start in the right directory.
         setThreadState((s) => ({
           ...s,
@@ -2838,8 +2867,9 @@
         `Working directory (tool_root): ${cwdLabelNow()}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "0. NEVER create a git repo inside another git repo. If you see 'embedded git repository' warnings, STOP and relocate to a clean directory under tool_root.",
-        "1. ALWAYS use tools to act. Available tools: exec, write_file, read_file, patch_file, search_files. NEVER just show code.",
-        "   Use read_file to inspect files before editing. Use patch_file for targeted edits. Use search_files to find code across files.",
+        "1. ALWAYS use tools to act. Available tools: read_file, list_dir, search_files, glob, patch_file, apply_diff, write_file, exec. NEVER just show code.", 
+        "   PRIORITY: 1) read_file  2) list_dir  3) search_files/glob  4) patch_file/apply_diff  5) write_file  6) exec", 
+        "   Use read_file before editing. Use patch_file/apply_diff for edits. Use list_dir/search_files/glob to discover structure quickly.", 
         "   Fallback (if tool calls are not supported): output ONE ```powershell``` code block containing ONLY commands (no `$ ` or `PS>` prompts).",
         "2. Use PowerShell syntax ONLY (cmd.exe is NOT used):",
         "   - Create directory tree: New-Item -ItemType Directory -Force -Path 'a/b/c'",
@@ -2848,7 +2878,7 @@
         "   - Append to file: Add-Content -Path 'file.txt' -Value 'more' -Encoding UTF8",
         "   - Git (new repo): New-Item -ItemType Directory -Force -Path 'MyRepo'; cd 'MyRepo'; git init; git add .; git commit -m 'init'",
         "   - NEVER use mkdir -p, touch, cat >, or any Unix syntax.",
-        "3. Execute ALL steps immediately via exec. Do NOT ask for permission or confirmation.",
+        "3. Execute ALL steps immediately via tools. Do NOT ask for permission or confirmation.", 
         "4. After each exec call, read the output and continue until the task is 100% complete.",
         "5. End with a brief summary listing every file created/modified and any remaining steps.",
       ].join("\n") : [
@@ -2856,15 +2886,16 @@
         `Working directory (tool_root): ${cwdLabelNow()}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "0. NEVER create a git repo inside another git repo. If you see 'embedded git repository' warnings, STOP and relocate to a clean directory under tool_root.",
-        "1. ALWAYS use tools to act. Available tools: exec, write_file, read_file, patch_file, search_files. NEVER just show code.",
-        "   Use read_file to inspect files before editing. Use patch_file for targeted edits. Use search_files to find code across files.",
+        "1. ALWAYS use tools to act. Available tools: read_file, list_dir, search_files, glob, patch_file, apply_diff, write_file, exec. NEVER just show code.", 
+        "   PRIORITY: 1) read_file  2) list_dir  3) search_files/glob  4) patch_file/apply_diff  5) write_file  6) exec", 
+        "   Use read_file before editing. Use patch_file/apply_diff for edits. Use list_dir/search_files/glob to discover structure quickly.", 
         "   Fallback (if tool calls are not supported): output ONE ```bash``` code block containing ONLY commands (no `$ ` prompts).",
         "2. Use Unix shell commands:",
         "   - Create directory: mkdir -p path/to/dir",
         "   - Write file: printf '%s' 'content' > file.txt   OR   python3 -c \"open('f','w').write('...')\"",
         "   - Multi-line file: use a heredoc via python3 or printf with \\n",
         "   - Git: git init, git add ., git commit -m 'init'",
-        "3. Execute ALL steps immediately via exec. Do NOT ask for permission or confirmation.",
+        "3. Execute ALL steps immediately via tools. Do NOT ask for permission or confirmation.", 
         "4. After each exec call, read the output and continue until the task is 100% complete.",
         "5. End with a brief summary listing every file created/modified and any remaining steps.",
       ].join("\n");
@@ -2965,11 +2996,11 @@
         },
       };
 
-      const searchFilesTool = {
-        type: "function",
-        function: {
-          name: "search_files",
-          description: "Search file contents for a literal text pattern (like grep -rn). Returns matching lines with file path and line number. Use to find where a function/symbol is defined or used.",
+      const searchFilesTool = { 
+        type: "function", 
+        function: { 
+          name: "search_files", 
+          description: "Search file contents for a literal text pattern (like grep -rn). Returns matching lines with file path and line number. Use to find where a function/symbol is defined or used.", 
           parameters: {
             type: "object",
             properties: {
@@ -2979,13 +3010,30 @@
             },
             required: ["pattern"],
           },
-        },
-      };
-
-      const globTool = {
-        type: "function",
-        function: {
-          name: "glob",
+        }, 
+      }; 
+ 
+      const listDirTool = { 
+        type: "function", 
+        function: { 
+          name: "list_dir", 
+          description: "List a directory (non-recursive) under tool_root. Use to quickly understand repo structure before searching or editing.", 
+          parameters: { 
+            type: "object", 
+            properties: { 
+              dir: { type: "string", description: "Directory path relative to tool_root (default: tool_root itself)" }, 
+              max_entries: { type: "number", description: "Max entries to return (default: 200)" }, 
+              include_hidden: { type: "boolean", description: "Include hidden files (default: false)" }, 
+            }, 
+            required: [], 
+          }, 
+        }, 
+      }; 
+ 
+      const globTool = { 
+        type: "function", 
+        function: { 
+          name: "glob", 
           description: "Find files by name/path pattern. Supports * (single dir), ** (any depth), ? (single char). Examples: '**/*.rs', 'src/*.ts'. Returns sorted relative paths. Prefer over exec+find/ls.",
           parameters: {
             type: "object",
@@ -3428,7 +3476,7 @@
           if (display) display += "\n\n";
            streamResult = await streamChatTools({
              messages,
-            tools: [execTool, writeFileTool, readFileTool, patchFileTool, applyDiffTool, searchFilesTool, globTool],
+            tools: [execTool, writeFileTool, readFileTool, patchFileTool, applyDiffTool, searchFilesTool, listDirTool, globTool], 
              model: String(reqCfg.codeModel || reqCfg.model || ""),
              base_url: String(reqCfg.baseUrl || ""),
              api_key: resolvedKey || undefined,
@@ -3454,14 +3502,42 @@
 
         // Append assistant turn to conversation history (OpenAI format).
         const asstMsg = { role: "assistant", content: asstText || null };
-        if (asstToolCalls.length > 0) asstMsg.tool_calls = asstToolCalls;
-        messages.push(asstMsg);
-
-        if (finishReason === "tool_calls" && asstToolCalls.length > 0) {
-          for (const tc of asstToolCalls) {
-            if (ac.signal.aborted) break;
-            if (tc.type !== "function" || !tc.function || !tc.function.name) continue;
-
+        if (asstToolCalls.length > 0) asstMsg.tool_calls = asstToolCalls; 
+        messages.push(asstMsg); 
+ 
+        if (finishReason === "tool_calls" && asstToolCalls.length > 0) { 
+          // Plan gate: require a <plan> at least once before doing any real work. 
+          // The model should include <plan> in the same assistant message as its first tool call. 
+          const hasPlan = messages.some((m) => ( 
+            m 
+            && m.role === "assistant" 
+            && typeof m.content === "string" 
+            && m.content.indexOf("<plan>") !== -1 
+          )); 
+          if (!hasPlan) { 
+            const block = "[Plan Gate] Missing <plan>.\n" 
+              + "Required now: in your next assistant message, include a <plan> (goal/steps/risks/assumptions), " 
+              + "then call ONE diagnostic tool (list_dir/search_files/glob/read_file) to start."; 
+            agentState = "recovery"; 
+            governor.pendingHint = block; 
+            display += (display ? "\n\n" : "") + "[GOVERNOR BLOCK]\n" + block; 
+            flush(); 
+            for (const tc of asstToolCalls) { 
+              const toolName = tc && tc.function && tc.function.name ? String(tc.function.name) : ""; 
+              const toolArgs = tc && tc.function && tc.function.arguments ? String(tc.function.arguments) : ""; 
+              messages.push({ 
+                role: "tool", 
+                tool_call_id: tc.id, 
+                content: "GOVERNOR BLOCKED\n\n" + block + "\n\ntool:\n" + toolName + "\narguments:\n" + toolArgs, 
+              }); 
+            } 
+            continue; 
+          } 
+ 
+          for (const tc of asstToolCalls) { 
+            if (ac.signal.aborted) break; 
+            if (tc.type !== "function" || !tc.function || !tc.function.name) continue; 
+ 
             const toolName = String(tc.function.name || "").trim();
 
             if (toolName === "exec") {
@@ -3668,14 +3744,33 @@
                   continue;
                 }
 
-                const cwdUsed = cwdNow();
-                const base = cwdUsed ? normalizePathSep(String(cwdUsed)).replace(/\/+$/g, "") : "";
-                const fullPath = base ? (base + "/" + path0.replace(/^\/+/g, "")) : path0;
-
-                if (config.requireEditApproval) {
-                  const q = await postJson("/api/queue_edit", {
-                    action: "write_file",
-                    path: fullPath,
+                const fullPath = joinUnderCwd(path0); 
+ 
+                // Safe overwrite guard: require an explicit read_file before overwriting an existing file. 
+                try { 
+                  const st = await postJson("/api/stat_path", { path: fullPath }, ac.signal); 
+                  const exists = !!(st && st.exists); 
+                  if (exists && !fileReadSet.has(fullPath)) { 
+                    toolResult = [ 
+                      "GOVERNOR BLOCKED", 
+                      "Refusing to overwrite an existing file that was not read in this session.", 
+                      "Required: call read_file on the target path first, then re-issue write_file.", 
+                      "path: " + String(path0 || fullPath), 
+                    ].join("\n");  
+                    pushRecentRun({ kind: "write_file", status: "FAIL", ok: false, path: path0 || fullPath, note: "blocked: not read before overwrite" });  
+                    messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });  
+                    agentState = "recovery";  
+                    governor.pendingHint = toolResult; 
+                    continue; 
+                  } 
+                } catch (_) { 
+                  // If stat fails, do not block the write; the server will still enforce path safety. 
+                } 
+ 
+                if (config.requireEditApproval) { 
+                  const q = await postJson("/api/queue_edit", { 
+                    action: "write_file", 
+                    path: fullPath, 
                     content,
                   }, ac.signal);
                   const aid = String((q && q.approval_id) || "");
@@ -3688,13 +3783,14 @@
                   awaitingApproval = true;
                   break;
                 }
-
-                const wr = await postJson("/api/write_file", { path: fullPath, content }, ac.signal);
-                toolResult = `OK write_file\nbytes_written: ${wr && wr.bytes_written != null ? wr.bytes_written : content.length}`;
-                pushRecentRun({ kind: "write_file", status: "OK", path: path0 || fullPath, note: `bytes=${wr && wr.bytes_written != null ? wr.bytes_written : content.length}` });
-                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
-              } catch (e2) {
-                toolResult = `error: ${prettyErr(e2)}`;
+ 
+                const wr = await postJson("/api/write_file", { path: fullPath, content }, ac.signal); 
+                toolResult = `OK write_file\nbytes_written: ${wr && wr.bytes_written != null ? wr.bytes_written : content.length}`; 
+                fileReadSet.add(fullPath); 
+                pushRecentRun({ kind: "write_file", status: "OK", path: path0 || fullPath, note: `bytes=${wr && wr.bytes_written != null ? wr.bytes_written : content.length}` }); 
+                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult }); 
+              } catch (e2) { 
+                toolResult = `error: ${prettyErr(e2)}`; 
                 pushRecentRun({ kind: "write_file", status: "FAIL", ok: false, path: path0 || "(missing)", note: clip(prettyErr(e2), 120) });
                 messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               }
@@ -3707,57 +3803,91 @@
               let args;
               try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
               const path0 = String(args.path || "").trim();
-              display += (display ? "\n\n" : "") + `📄 read_file: ${path0}`;
-              flush();
-              let toolResult;
-              try {
-                const res = await postJson("/api/read_file", { path: path0 }, ac.signal);
-                toolResult = res && res.content ? res.content : `ERROR: empty response`;
-              } catch (e2) {
-                toolResult = `ERROR reading '${path0}': ${prettyErr(e2)}`;
-              }
-              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
-              flush();
-              continue;
-            }
-
-            if (toolName === "patch_file") {
-              let args;
-              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
-              const path0 = String(args.path || "").trim();
+              display += (display ? "\n\n" : "") + `📄 read_file: ${path0}`; 
+              flush(); 
+              let toolResult; 
+              try { 
+                const fullPath = joinUnderCwd(path0); 
+                const res = await postJson("/api/read_file", { path: fullPath }, ac.signal); 
+                const raw = res && res.content ? res.content : `ERROR: empty response`; 
+                toolResult = rewriteToolPath(raw, fullPath, path0); 
+                if (res && res.content) fileReadSet.add(fullPath); 
+              } catch (e2) { 
+                toolResult = `ERROR reading '${path0}': ${prettyErr(e2)}`; 
+              } 
+              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult }); 
+              flush(); 
+              continue; 
+            } 
+ 
+            if (toolName === "list_dir") { 
+              let args; 
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; } 
+              const dir0raw = String(args.dir || "").trim(); 
+              const dir0 = (dir0raw === "." || dir0raw === "./") ? "" : dir0raw; 
+              const maxEntries0 = Number(args.max_entries || args.maxEntries || 0) || 0; 
+              const max_entries = Math.max(0, Math.min(500, Math.round(maxEntries0))); 
+              const include_hidden = !!(args.include_hidden || args.includeHidden); 
+              const shown = dir0 ? dir0 : "."; 
+              display += (display ? "\n\n" : "") + `📁 list_dir: ${shown}`; 
+              flush(); 
+              let toolResult; 
+              try { 
+                const fullDir = joinUnderCwd(dir0); 
+                const res = await postJson("/api/list_dir", { dir: fullDir, max_entries, include_hidden }, ac.signal); 
+                const raw = res && res.output ? res.output : `ERROR: empty response`; 
+                toolResult = String(raw || "") 
+                  .replace(`[list_dir: '${fullDir}'`, `[list_dir: '${shown}'`) 
+                  .trim(); 
+              } catch (e2) { 
+                toolResult = `ERROR listing '${shown}': ${prettyErr(e2)}`; 
+              } 
+              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult }); 
+              flush(); 
+              continue; 
+            } 
+ 
+            if (toolName === "patch_file") { 
+              let args; 
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; } 
+              const path0 = String(args.path || "").trim(); 
               const search = String(args.search || "");
               const replace = String(args.replace || "");
-              display += (display ? "\n\n" : "") + `✎ patch_file: ${path0}`;
-              flush();
-              let toolResult;
-              try {
-                const res = await postJson("/api/patch_file", { path: path0, search, replace }, ac.signal);
-                toolResult = res && res.message ? res.message : "OK: patched";
-                pushRecentRun({ kind: "patch_file", status: "OK", path: path0, note: firstDigestLine(toolResult) || "" });
-              } catch (e2) {
-                toolResult = `ERROR patching '${path0}': ${prettyErr(e2)}`;
-                pushRecentRun({ kind: "patch_file", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) });
-              }
+              display += (display ? "\n\n" : "") + `✎ patch_file: ${path0}`; 
+              flush(); 
+              let toolResult; 
+              try { 
+                const fullPath = joinUnderCwd(path0); 
+                const res = await postJson("/api/patch_file", { path: fullPath, search, replace }, ac.signal); 
+                const raw = res && res.message ? res.message : "OK: patched"; 
+                toolResult = rewriteToolPath(raw, fullPath, path0); 
+                pushRecentRun({ kind: "patch_file", status: "OK", path: path0, note: firstDigestLine(toolResult) || "" }); 
+              } catch (e2) { 
+                toolResult = `ERROR patching '${path0}': ${prettyErr(e2)}`; 
+                pushRecentRun({ kind: "patch_file", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) }); 
+              } 
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               flush();
               continue;
             }
 
             if (toolName === "search_files") {
-              let args;
-              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
-              const pattern = String(args.pattern || "").trim();
-              const dir = String(args.dir || "");
-              const ci = !!args.case_insensitive;
-              display += (display ? "\n\n" : "") + `🔍 search_files: ${pattern}`;
-              flush();
-              let toolResult;
-              try {
-                const res = await postJson("/api/search_files", { pattern, dir, case_insensitive: ci }, ac.signal);
-                toolResult = res && res.output ? res.output : `[search_files] No matches for '${pattern}'`;
-              } catch (e2) {
-                toolResult = `ERROR searching '${pattern}': ${prettyErr(e2)}`;
-              }
+              let args; 
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; } 
+              const pattern = String(args.pattern || "").trim(); 
+              const dir0raw = String(args.dir || ""); 
+              const dir0 = (dir0raw === "." || dir0raw === "./") ? "" : dir0raw; 
+              const ci = !!args.case_insensitive; 
+              display += (display ? "\n\n" : "") + `🔍 search_files: ${pattern}`; 
+              flush(); 
+              let toolResult; 
+              try { 
+                const dir = joinUnderCwd(dir0); 
+                const res = await postJson("/api/search_files", { pattern, dir, case_insensitive: ci }, ac.signal); 
+                toolResult = res && res.output ? res.output : `[search_files] No matches for '${pattern}'`; 
+              } catch (e2) { 
+                toolResult = `ERROR searching '${pattern}': ${prettyErr(e2)}`; 
+              } 
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               flush();
               continue;
@@ -3768,36 +3898,40 @@
               try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
               const path0 = String(args.path || "").trim();
               const diff = String(args.diff || "");
-              display += (display ? "\n\n" : "") + `⟁ apply_diff: ${path0}`;
-              flush();
-              let toolResult;
-              try {
-                const res = await postJson("/api/apply_diff", { path: path0, diff }, ac.signal);
-                toolResult = res && res.message ? res.message : "OK: diff applied";
-                pushRecentRun({ kind: "apply_diff", status: "OK", path: path0, note: firstDigestLine(toolResult) || "" });
-              } catch (e2) {
-                toolResult = `ERROR applying diff to '${path0}': ${prettyErr(e2)}`;
-                pushRecentRun({ kind: "apply_diff", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) });
-              }
+              display += (display ? "\n\n" : "") + `⟁ apply_diff: ${path0}`; 
+              flush(); 
+              let toolResult; 
+              try { 
+                const fullPath = joinUnderCwd(path0); 
+                const res = await postJson("/api/apply_diff", { path: fullPath, diff }, ac.signal); 
+                const raw = res && res.message ? res.message : "OK: diff applied"; 
+                toolResult = rewriteToolPath(raw, fullPath, path0); 
+                pushRecentRun({ kind: "apply_diff", status: "OK", path: path0, note: firstDigestLine(toolResult) || "" }); 
+              } catch (e2) { 
+                toolResult = `ERROR applying diff to '${path0}': ${prettyErr(e2)}`; 
+                pushRecentRun({ kind: "apply_diff", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) }); 
+              } 
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               flush();
               continue;
             }
 
             if (toolName === "glob") {
-              let args;
-              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
-              const pattern = String(args.pattern || "").trim();
-              const dir = String(args.dir || "");
-              display += (display ? "\n\n" : "") + `❖ glob: ${pattern}`;
-              flush();
-              let toolResult;
-              try {
-                const res = await postJson("/api/glob_files", { pattern, dir }, ac.signal);
-                toolResult = res && res.output ? res.output : `[glob] No files matching '${pattern}'`;
-              } catch (e2) {
-                toolResult = `ERROR glob '${pattern}': ${prettyErr(e2)}`;
-              }
+              let args; 
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; } 
+              const pattern = String(args.pattern || "").trim(); 
+              const dir0raw = String(args.dir || ""); 
+              const dir0 = (dir0raw === "." || dir0raw === "./") ? "" : dir0raw; 
+              display += (display ? "\n\n" : "") + `❖ glob: ${pattern}`; 
+              flush(); 
+              let toolResult; 
+              try { 
+                const dir = joinUnderCwd(dir0); 
+                const res = await postJson("/api/glob_files", { pattern, dir }, ac.signal); 
+                toolResult = res && res.output ? res.output : `[glob] No files matching '${pattern}'`; 
+              } catch (e2) { 
+                toolResult = `ERROR glob '${pattern}': ${prettyErr(e2)}`; 
+              } 
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               flush();
               continue;
