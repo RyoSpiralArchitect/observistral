@@ -2957,7 +2957,10 @@ mod tests {
     fn injects_git_proxy_hint_for_github_via_localhost() {
         let stderr = "fatal: unable to access 'https://github.com/x/y.git/': Failed to connect to github.com port 443 via 127.0.0.1 after 2041 ms: Could not connect to server";
         let out = build_failed_tool_output("", stderr, 1);
-        assert!(out.contains("ssh.github.com"), "should suggest ssh-over-443");
+        assert!(
+            out.contains("ssh.github.com"),
+            "should suggest ssh-over-443"
+        );
         assert!(
             out.contains("HTTP_PROXY") || out.contains("HTTPS_PROXY"),
             "should mention proxy env vars"

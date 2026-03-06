@@ -292,8 +292,8 @@ obstral agent "fix the failing test" -C . --vibe --session
 # resume later (omit prompt -> auto "continue")
 obstral agent -C . --vibe --session
 
-# write machine-readable artifacts (JSONL trace + final JSON snapshot)
-obstral agent "fix the failing test" -C . --vibe --trace-out .tmp/obstral_trace.jsonl --json-out .tmp/obstral_final.json
+# write machine-readable artifacts (trace + snapshot + execution graph)
+obstral agent "fix the failing test" -C . --vibe --trace-out .tmp/obstral_trace.jsonl --json-out .tmp/obstral_final.json --graph-out .tmp/obstral_graph.json
 
 # auto-fix loop (Coder → Observer diff review → Coder)
 obstral agent "fix the failing test" -C . --vibe --autofix
@@ -355,6 +355,7 @@ Path traversal is blocked: paths with `..` components are rejected at every tool
 Related artifacts:
 - `--trace-out <path>` / `--trace_out`: JSONL trace (tool calls, checkpoints, errors, done)
 - `--json-out <path>` / `--json_out`: final session snapshot JSON (messages + tool calls + tool results)
+- `--graph-out <path>` / `--graph_out`: execution graph JSON (nodes + edges) derived from the final messages
 - If `-C/--root` is set, relative output paths are resolved under `tool_root`
 
 Session JSON may contain code and tool outputs — treat it as sensitive.

@@ -15,6 +15,7 @@ mod providers;
 mod repl;
 mod server;
 mod streaming;
+mod task_graph;
 mod trace_writer;
 mod tui;
 mod types;
@@ -158,6 +159,11 @@ struct AgentArgs {
     /// If `-C/--root` is set and the path is relative, it is resolved under `tool_root`.
     #[arg(long, alias = "json_out")]
     json_out: Option<PathBuf>,
+
+    /// Write an execution graph (nodes+edges) derived from the final session messages.
+    /// If `-C/--root` is set and the path is relative, it is resolved under `tool_root`.
+    #[arg(long, alias = "graph_out")]
+    graph_out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -828,6 +834,7 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         autofix,
         trace_out,
         json_out,
+        graph_out,
     } = args;
 
     let session_path = session_path.map(|sp| resolve_session_path(sp, tool_root_arg.as_deref()));
@@ -904,6 +911,7 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
 
     let trace_out_path = trace_out.map(|p| resolve_session_path(p, tool_root.as_deref()));
     let json_out_path = json_out.map(|p| resolve_session_path(p, tool_root.as_deref()));
+    let graph_out_path = graph_out.map(|p| resolve_session_path(p, tool_root.as_deref()));
 
     // Build the user prompt text.
     fn default_continue_prompt(lang: &str) -> String {
@@ -997,6 +1005,7 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
                 "tool_root": tool_root.as_deref(),
                 "session": session_path.as_ref().map(|p| p.display().to_string()),
                 "json_out": json_out_path.as_ref().map(|p| p.display().to_string()),
+                "graph_out": graph_out_path.as_ref().map(|p| p.display().to_string()),
                 "cfg": {
                     "provider": cfg.provider.key(),
                     "base_url": cfg.base_url.as_str(),
@@ -1337,6 +1346,25 @@ For each proposal you address, verify with commands/tests. When finished, call d
             Ok(_) => eprintln!("[json_out] wrote: {}", out_path.display()),
             Err(e) => {
                 eprintln!("[json_out] ERROR: {e:#}");
+                if result.is_ok() {
+                    result = Err(e);
+                }
+            }
+        }
+    }
+
+    // Optional: write an execution graph derived from the final messages.
+    if let Some(ref out_path) = graph_out_path {
+        let graph = crate::task_graph::TaskGraph::from_session_messages(
+            tool_root.clone(),
+            checkpoint.clone(),
+            cur_cwd.clone(),
+            &messages_json,
+        );
+        match crate::task_graph::save_graph_atomic(out_path, &graph) {
+            Ok(_) => eprintln!("[graph_out] wrote: {}", out_path.display()),
+            Err(e) => {
+                eprintln!("[graph_out] ERROR: {e:#}");
                 if result.is_ok() {
                     result = Err(e);
                 }

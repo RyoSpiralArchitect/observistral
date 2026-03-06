@@ -289,8 +289,8 @@ obstral agent "fix the failing test" -C . --vibe --session
 # reprendre plus tard (sans prompt -> "continue" auto)
 obstral agent -C . --vibe --session
 
-# artefacts (trace JSONL + snapshot JSON final)
-obstral agent "fix the failing test" -C . --vibe --trace-out .tmp/obstral_trace.jsonl --json-out .tmp/obstral_final.json
+# artefacts (trace JSONL + snapshot JSON final + graphe d'execution)
+obstral agent "fix the failing test" -C . --vibe --trace-out .tmp/obstral_trace.jsonl --json-out .tmp/obstral_final.json --graph-out .tmp/obstral_graph.json
 ```
 
 **Python Lite (WDAC / pas de binaire Rust)**
@@ -338,6 +338,7 @@ La traversee de chemins est bloquee : les chemins avec des composantes `..` sont
 Artefacts associes :
 - `--trace-out <chemin>` / `--trace_out` : trace JSONL (tool calls, checkpoints, errors, done)
 - `--json-out <chemin>` / `--json_out` : snapshot JSON final (messages + tool calls + tool results)
+- `--graph-out <chemin>` / `--graph_out` : graphe d'execution JSON (noeuds + aretes) derive des messages finaux
 - Si `-C/--root` est defini, les chemins relatifs sont resolus sous `tool_root`
 
 Le JSON de session/trace peut contenir du code et des sorties d'outils; traitez-le comme sensible.
