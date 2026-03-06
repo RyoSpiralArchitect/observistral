@@ -27,6 +27,7 @@ use crate::config::RunConfig;
 use crate::exec;
 use crate::streaming::{stream_openai_compat_json, StreamToken, ToolCallData};
 use crate::types::ChatMessage;
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct AgenticStartState {
@@ -1043,6 +1044,89 @@ Fix: update the configured API key for the selected provider/model, then retry."
     None
 }
 
+fn is_git_repo_root(dir: &str) -> bool {
+    let p = Path::new(dir);
+    let dot_git = p.join(".git");
+    dot_git.is_dir() || dot_git.is_file()
+}
+
+fn gitmodules_lists_path(repo_root: &str, rel_path: &str) -> bool {
+    let p = Path::new(repo_root).join(".gitmodules");
+    let Ok(text) = std::fs::read_to_string(&p) else {
+        return false;
+    };
+    let needle = format!("path = {rel_path}");
+    text.lines().any(|l| l.trim() == needle)
+}
+
+fn nested_git_dirs_shallow(repo_root: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let root = Path::new(repo_root);
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dot_git = path.join(".git");
+        if !(dot_git.is_dir() || dot_git.is_file()) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Ignore the repo root itself (we only scan immediate children anyway).
+        if name == ".git" {
+            continue;
+        }
+        out.push(name.to_string());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn should_block_git_landmines(command: &str, tool_root_abs: Option<&str>) -> Option<String> {
+    let root = tool_root_abs?;
+    if !is_git_repo_root(root) {
+        return None;
+    }
+
+    let cmd_low = command.to_ascii_lowercase();
+
+    // 1) Never create a new git repo inside an existing repo; this causes embedded repos and breaks `git add`.
+    if cmd_low.contains("git init") {
+        return Some(format!(
+            "Refusing to run `git init` inside an existing git repo (tool_root has .git): {root}\n\
+This is a common agent failure mode that creates embedded repos and breaks `git add`.\n\
+Fix: set tool_root to a fresh directory outside this repo (e.g. `.tmp/newrepo`), or remove `git init` and just create files."
+        ));
+    }
+
+    // 2) Block `git add` when we detect nested git directories under tool_root (unless they are declared submodules).
+    if cmd_low.contains("git add") {
+        let nested = nested_git_dirs_shallow(root);
+        let mut offenders: Vec<String> = Vec::new();
+        for d in nested {
+            if !gitmodules_lists_path(root, &d) {
+                offenders.push(d);
+            }
+        }
+        if !offenders.is_empty() {
+            let list = offenders.join(", ");
+            return Some(format!(
+                "Nested git repo(s) detected under tool_root: {list}\n\
+Running `git add` will trigger embedded-repo errors or index failures.\n\
+Fix: move those directories outside tool_root, add them to `.gitignore`, or add them properly as submodules (`git submodule add <url> <path>`)."
+            ));
+        }
+    }
+
+    None
+}
+
 fn wants_local_actions(user_text: &str) -> bool {
     let s = user_text.to_ascii_lowercase();
     let kws = [
@@ -1767,6 +1851,47 @@ This is the LAST model call for this run.\n\
                                 state, im.lang_hint
                             )))
                             .await;
+
+                        if let Some(block) =
+                            should_block_git_landmines(&command, tool_root_abs.as_deref())
+                        {
+                            state = AgentState::Recovery;
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                                )))
+                                .await;
+
+                            let cwd_line = format!("cwd: {cwd_used_label}");
+                            let tool_output = inject_cwd(
+                                &format!("GOVERNOR BLOCKED\n\n{block}\n\ncommand:\n{command}"),
+                                &cwd_line,
+                                None,
+                            );
+
+                            // NOTE: do not fabricate tool_call_id. Feed the block back as user text.
+                            messages.push(json!({
+                                "role": "user",
+                                "content": format!(
+                                    "[implied_exec]\nlang_hint: {}\ncommand:\n{}\n\n{}",
+                                    im.lang_hint, command, tool_output
+                                ),
+                            }));
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
+                            .await;
+
+                            // Update memory so repeating the same blocked command triggers stronger hints.
+                            let _ = mem.on_tool_result(&command, "", &block, 1);
+                            pending_system_hint = Some(block);
+                            break;
+                        }
 
                         let approval = approver
                             .approve(ApprovalRequest::Command {
@@ -2519,6 +2644,50 @@ Do NOT respond with text-only instructions."
             )))
             .await;
 
+        if let Some(block) = should_block_git_landmines(&command, tool_root_abs.as_deref()) {
+            state = AgentState::Recovery;
+            let _ = tx
+                .send(StreamToken::Delta(format!(
+                    "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                )))
+                .await;
+
+            let cwd_line = format!("cwd: {cwd_used_label}");
+            let tool_output = inject_cwd(
+                &format!("GOVERNOR BLOCKED\n\n{block}\n\ncommand:\n{command}"),
+                &cwd_line,
+                cwd_note.as_deref(),
+            );
+
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": tool_output,
+            }));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
+
+            // Update memory so repeating the same blocked command triggers stronger hints.
+            let _ = mem.on_tool_result(&command, "", &block, 1);
+            pending_system_hint = Some(block);
+
+            if iter + 1 == max_iters {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[agent] iteration cap ({max_iters}) reached.\n"
+                    )))
+                    .await;
+            }
+            continue;
+        }
+
         let approval = approver
             .approve(ApprovalRequest::Command {
                 command: command.clone(),
@@ -2699,4 +2868,47 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
         checkpoint,
         cur_cwd,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocks_git_init_inside_existing_repo() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(td.path().join(".git")).expect("mkdir .git");
+        let root = td.path().to_string_lossy();
+        let msg = should_block_git_landmines("git init Foo", Some(root.as_ref()))
+            .expect("expected block");
+        assert!(msg.to_ascii_lowercase().contains("refusing"));
+    }
+
+    #[test]
+    fn blocks_git_add_when_nested_repo_detected() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(td.path().join(".git")).expect("mkdir .git");
+        std::fs::create_dir_all(td.path().join("MazeGame").join(".git")).expect("mkdir nested");
+        let root = td.path().to_string_lossy();
+        let msg =
+            should_block_git_landmines("git add -A", Some(root.as_ref())).expect("expected block");
+        assert!(msg.contains("MazeGame"));
+    }
+
+    #[test]
+    fn allows_git_add_when_nested_is_submodule() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(td.path().join(".git")).expect("mkdir .git");
+        std::fs::create_dir_all(td.path().join("MazeGame").join(".git")).expect("mkdir nested");
+        std::fs::write(
+            td.path().join(".gitmodules"),
+            "[submodule \"MazeGame\"]\n\tpath = MazeGame\n\turl = https://example.invalid/MazeGame.git\n",
+        )
+        .expect("write .gitmodules");
+        let root = td.path().to_string_lossy();
+        assert!(
+            should_block_git_landmines("git add -A", Some(root.as_ref())).is_none(),
+            "should not block when nested repo is declared as submodule"
+        );
+    }
 }
