@@ -69,6 +69,7 @@ pub const DEFAULT_MAX_ITERS: usize = 12;
 const MAX_STDOUT_CHARS: usize = 1500;
 const MAX_STDERR_CHARS: usize = 600;
 const KEEP_RECENT_TOOL_TURNS: usize = 4;
+const TOKEN_BUDGET_WARN_TOKENS: usize = 9000;
 
 /// Marker appended to every exec call so we can persist working directory across tool runs.
 ///
@@ -101,14 +102,15 @@ assumptions: <what you are taking as given>\n\
 </plan>\n\
 \n\
 [Reasoning Protocol — emit before EVERY tool call]\n\
-<think>\n\
-goal:   <≤12 words: what must succeed right now>\n\
-risk:   <≤12 words: most likely failure mode>\n\
+ <think>\n\
+ goal:   <≤12 words: what must succeed right now>\n\
+ step:   <which plan step number (1-7) this tool call belongs to>\n\
+ risk:   <≤12 words: most likely failure mode>\n\
 doubt:  <≤12 words: one reason this approach could be wrong>\n\
 next:   <≤12 words: exact command or step>\n\
 verify: <≤12 words: how to confirm this step succeeded>\n\
 </think>\n\
-Keep each field under 15 words. This 5-line check (~50 tokens) prevents\n\
+Keep each field under 15 words. This 6-line check (~60 tokens) prevents\n\
 wrong-direction errors that cost 300+ tokens to recover from.\n\
 \n\
 [Error Protocol]\n\
@@ -289,6 +291,35 @@ pub fn apply_diff_tool_def() -> serde_json::Value {
     })
 }
 
+pub fn list_dir_tool_def() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List a directory (non-recursive). Use this to quickly discover the project structure.\n\
+                            Prefer this over glob when you don't know the exact pattern yet.\n\
+                            Dir is relative to tool_root. If dir is empty, list tool_root/current directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dir": {
+                        "type": "string",
+                        "description": "Directory to list (relative to tool_root). Empty = tool_root/current directory."
+                    },
+                    "max_entries": {
+                        "type": "integer",
+                        "description": "Max entries to return. Default: 200. Max: 500."
+                    },
+                    "include_hidden": {
+                        "type": "boolean",
+                        "description": "Include dotfiles/directories. Default: false."
+                    }
+                }
+            }
+        }
+    })
+}
+
 pub fn glob_tool_def() -> serde_json::Value {
     json!({
         "type": "function",
@@ -347,26 +378,38 @@ pub fn done_tool_def() -> serde_json::Value {
 
 /// Fixed base for the TUI Coder pane — always an agentic executor, not a chat bot.
 const CODER_BASE_SYSTEM: &str = "\
-You are an autonomous coding agent with 8 tools:\n\
+You are an autonomous coding agent with 9 tools:\n\
   exec(command, cwd?)                       — run shell commands (build, test, git, installs)\n\
   read_file(path)                           — read a file's exact content\n\
   write_file(path, content)                 — create or overwrite a file reliably\n\
   patch_file(path, search, replace)         — replace an exact snippet in a file\n\
   apply_diff(path, diff)                    — apply a unified @@ diff (multiple hunks)\n\
   search_files(pattern, dir?, ci?)          — find text across files (like grep -rn)\n\
+  list_dir(dir?, max_entries?, include_hidden?) — list a directory (non-recursive)\n\
   glob(pattern, dir?)                       — find files by name pattern (like find -name)\n\
   done(summary, next_steps?)                — finish the task and end the loop\n\
 \n\
 RULE: You MUST call a tool on every single turn. Never respond with text only.\n\
 \n\
+PRIORITY (safety-first default when unsure):\n\
+  1) read_file                  — before editing any existing file\n\
+  2) list_dir/glob/search_files  — discover files (prefer list_dir for quick structure)\n\
+  3) patch_file/apply_diff       — prefer for edits (less destructive)\n\
+  4) write_file                  — ONLY for new files, or after read_file if overwriting\n\
+  5) exec                        — build/test/git/install; avoid for file I/O\n\
+\n\
+Plan enforcement:\n\
+  - Every tool call MUST map to a step in your <plan>. If not, update <plan> first.\n\
+\n\
 Choose the right tool:\n\
-  List files by pattern  → glob           (NOT exec+ls/find; OS-agnostic, token-efficient)\n\
-  Find text in files     → search_files   (NOT exec+grep; safer, token-efficient)\n\
-  Create/overwrite file  → write_file     (handles encoding; more reliable than exec+echo)\n\
-  Small targeted edit    → read_file → patch_file  (simple single-snippet replacement)\n\
-  Complex multi-hunk edit→ read_file → apply_diff  (multiple changes, spans many lines)\n\
-  Run programs/tests     → exec\n\
-  Git / installs         → exec\n\
+  Quick directory listing  → list_dir      (structure discovery, low token)\n\
+  List files by pattern    → glob          (NOT exec+ls/find; OS-agnostic, token-efficient)\n\
+  Find text in files       → search_files  (NOT exec+grep; safer, token-efficient)\n\
+  Create/overwrite file    → write_file    (handles encoding; more reliable than exec+echo)\n\
+  Small targeted edit      → read_file → patch_file  (simple single-snippet replacement)\n\
+  Complex multi-hunk edit  → read_file → apply_diff  (multiple changes, spans many lines)\n\
+  Run programs/tests       → exec\n\
+  Git / installs           → exec\n\
 \n\
 apply_diff format (include 2-3 context lines for reliable matching):\n\
   @@ -10,4 +10,5 @@\n\
@@ -451,6 +494,34 @@ fn truncate_preview(s: &str, max_chars: usize, max_lines: usize) -> String {
         lines += 1;
     }
     out.trim_end().to_string()
+}
+
+fn approx_tokens_text(s: &str) -> usize {
+    // Rough heuristic:
+    // - ASCII-ish text: ~4 chars/token
+    // - Non-ASCII (CJK etc): closer to 1 char/token
+    let mut ascii = 0usize;
+    let mut non_ascii = 0usize;
+    for ch in s.chars() {
+        if ch.is_ascii() {
+            ascii += 1;
+        } else {
+            non_ascii += 1;
+        }
+    }
+    (ascii + 3) / 4 + non_ascii
+}
+
+fn approx_tokens_messages(messages: &[serde_json::Value]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .map(approx_tokens_text)
+                .unwrap_or(0)
+        })
+        .sum()
 }
 
 fn simple_before_after(old: &str, new: &str) -> String {
@@ -878,6 +949,147 @@ enum AgentState {
     Done,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryStage {
+    Diagnose,
+    Fix,
+    Verify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecKind {
+    Diagnostic,
+    Action,
+    Verify,
+}
+
+#[derive(Debug, Default)]
+struct RecoveryGovernor {
+    stage: Option<RecoveryStage>,
+}
+
+impl RecoveryGovernor {
+    fn stage_label(&self) -> &'static str {
+        match self.stage {
+            None => "none",
+            Some(RecoveryStage::Diagnose) => "diagnose",
+            Some(RecoveryStage::Fix) => "fix",
+            Some(RecoveryStage::Verify) => "verify",
+        }
+    }
+
+    fn in_recovery(&self) -> bool {
+        self.stage.is_some()
+    }
+
+    fn restore_from_session(mem: &FailureMemory, messages: &[serde_json::Value]) -> Self {
+        let mut g = RecoveryGovernor::default();
+        if mem.consecutive_failures > 0 || last_tool_looks_failed(messages) {
+            g.stage = Some(RecoveryStage::Diagnose);
+        }
+        g
+    }
+
+    fn maybe_block_tool(&self, tc: &ToolCallData, test_cmd: Option<&str>) -> Option<String> {
+        let Some(stage) = self.stage else {
+            return None;
+        };
+        let name = tc.name.as_str();
+
+        // Note: `done` is handled earlier in the main loop.
+        match stage {
+            RecoveryStage::Diagnose => {
+                if is_diagnostic_tool_name(name) {
+                    return None;
+                }
+                if name == "exec" {
+                    let cmd =
+                        parse_exec_command_from_args(tc.arguments.as_str()).unwrap_or_default();
+                    if is_diagnostic_command(cmd.as_str()) {
+                        return None;
+                    }
+                }
+                Some(format!(
+                    "[Recovery Gate] stage=diagnose\n\
+You are in recovery mode. Do NOT start new work yet.\n\
+Required now: run diagnostics first (e.g. `pwd`, `ls`/`dir`, `git status`, `git rev-parse --show-toplevel`)."
+                ))
+            }
+            RecoveryStage::Fix => None, // allow edits/commands to fix
+            RecoveryStage::Verify => {
+                if name == "exec" {
+                    let cmd =
+                        parse_exec_command_from_args(tc.arguments.as_str()).unwrap_or_default();
+                    if is_verify_command(cmd.as_str(), test_cmd) {
+                        return None;
+                    }
+                }
+                Some(format!(
+                    "[Recovery Gate] stage=verify\n\
+You already applied a fix. Verify before continuing.\n\
+Required now: run ONE verification command (tests or `git status`)."
+                ))
+            }
+        }
+    }
+
+    fn on_diagnostic_result(&mut self, ok: bool) {
+        if !self.in_recovery() && !ok {
+            self.stage = Some(RecoveryStage::Diagnose);
+            return;
+        }
+        if !ok {
+            self.stage = Some(RecoveryStage::Diagnose);
+            return;
+        }
+        if self.stage == Some(RecoveryStage::Diagnose) {
+            self.stage = Some(RecoveryStage::Fix);
+        }
+    }
+
+    fn on_fix_result(&mut self, ok: bool, verified: bool) {
+        if !self.in_recovery() && !ok {
+            self.stage = Some(RecoveryStage::Diagnose);
+            return;
+        }
+        if !ok {
+            self.stage = Some(RecoveryStage::Diagnose);
+            return;
+        }
+        if verified {
+            self.stage = None;
+            return;
+        }
+        match self.stage {
+            Some(RecoveryStage::Diagnose) | Some(RecoveryStage::Fix) => {
+                self.stage = Some(RecoveryStage::Verify);
+            }
+            _ => {}
+        }
+    }
+
+    fn on_exec_result(&mut self, kind: ExecKind, ok: bool) {
+        if !ok {
+            self.stage = Some(RecoveryStage::Diagnose);
+            return;
+        }
+        if kind == ExecKind::Verify {
+            // A successful verification ends recovery regardless of the current stage.
+            self.stage = None;
+            return;
+        }
+        match (self.stage, kind) {
+            (Some(RecoveryStage::Diagnose), ExecKind::Diagnostic) => {
+                self.stage = Some(RecoveryStage::Fix);
+            }
+            (Some(RecoveryStage::Fix), ExecKind::Action) => {
+                self.stage = Some(RecoveryStage::Verify);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct FailureMemory {
     consecutive_failures: usize,
@@ -892,6 +1104,106 @@ struct FailureMemory {
     same_output_repeats: usize,
 
     last_error_class: ErrorClass,
+}
+
+fn last_tool_looks_failed(messages: &[serde_json::Value]) -> bool {
+    let Some(last_tool) = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+    else {
+        return false;
+    };
+    let content = last_tool
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let low = content.to_ascii_lowercase();
+    low.contains("failed (exit_code:")
+        || low.contains("governor blocked")
+        || low.contains("rejected by user")
+        || low.contains("[result_file_err]")
+}
+
+fn is_diagnostic_tool_name(name: &str) -> bool {
+    matches!(name, "read_file" | "search_files" | "list_dir" | "glob")
+}
+
+fn is_fix_tool_name(name: &str) -> bool {
+    matches!(name, "write_file" | "patch_file" | "apply_diff")
+}
+
+fn is_diagnostic_command(command: &str) -> bool {
+    let c = command_sig(command);
+    let pats = [
+        "pwd",
+        "cd",
+        "set-location",
+        "pushd",
+        "popd",
+        "ls",
+        "dir",
+        "get-location",
+        "get-childitem",
+        "where",
+        "which",
+        "get-command",
+        "echo",
+        "write-output",
+        "whoami",
+        "hostname",
+        "git status",
+        "git rev-parse",
+        "git remote",
+        "git branch",
+        "git diff",
+        "cargo --version",
+        "rustc --version",
+        "python --version",
+        "node --version",
+        "npm --version",
+        "pnpm --version",
+        "yarn --version",
+        "go version",
+        "dotnet --info",
+    ];
+    pats.iter().any(|p| c.contains(p))
+}
+
+fn is_verify_command(command: &str, test_cmd: Option<&str>) -> bool {
+    let c = command_sig(command);
+    let pats = [
+        "cargo test",
+        "cargo build",
+        "cargo check",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "pytest",
+        "go test",
+        "dotnet test",
+        "git status",
+    ];
+    if pats.iter().any(|p| c.contains(p)) {
+        return true;
+    }
+    if let Some(t) = test_cmd {
+        let t_sig = command_sig(t);
+        if !t_sig.is_empty() && c.contains(&t_sig) {
+            return true;
+        }
+    }
+    false
+}
+
+fn classify_exec_kind(command: &str, test_cmd: Option<&str>) -> ExecKind {
+    if is_verify_command(command, test_cmd) {
+        return ExecKind::Verify;
+    }
+    if is_diagnostic_command(command) {
+        return ExecKind::Diagnostic;
+    }
+    ExecKind::Action
 }
 
 fn normalize_for_signature(s: &str) -> String {
@@ -976,6 +1288,16 @@ fn hash_output(stdout: &str, stderr: &str) -> u64 {
     stdout.trim_end().hash(&mut h);
     stderr.trim_end().hash(&mut h);
     h.finish()
+}
+
+fn hash_text(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.trim_end().hash(&mut h);
+    h.finish()
+}
+
+fn fmt_hash(h: u64) -> String {
+    format!("{h:016x}")
 }
 
 fn suspicious_success_reason(stdout: &str, stderr: &str) -> Option<String> {
@@ -1726,6 +2048,7 @@ pub async fn run_agentic_json(
         patch_file_tool_def(),
         apply_diff_tool_def(),
         search_files_tool_def(),
+        list_dir_tool_def(),
         glob_tool_def(),
         done_tool_def(),
     ]);
@@ -1752,6 +2075,10 @@ pub async fn run_agentic_json(
     // Rebuild loop governor memory from the existing session so resuming runs doesn't
     // repeat the same failures from scratch.
     let mut mem = FailureMemory::from_recent_messages(&messages);
+    let mut recovery = RecoveryGovernor::restore_from_session(&mem, &messages);
+    if recovery.in_recovery() {
+        state = AgentState::Recovery;
+    }
 
     // Resolve tool_root once (absolute path) and track cwd across tool calls.
     // This prevents the classic "cd didn't persist, so git add ran in the wrong repo" failure.
@@ -1862,11 +2189,15 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
         prune_old_tool_results(&mut messages);
 
         // C — Token budget guardian: warn once when context grows large.
-        if !budget_warned && messages.len() > 28 && pending_system_hint.is_none() {
+        let approx_tokens = approx_tokens_messages(&messages);
+        if !budget_warned
+            && approx_tokens >= TOKEN_BUDGET_WARN_TOKENS
+            && pending_system_hint.is_none()
+        {
             budget_warned = true;
             pending_system_hint = Some(format!(
-                "[Token Budget] Context has {} messages. Be concise: prefer tool calls \
-                 over long explanations. Summarise intermediate results in 1-2 lines.",
+                "[Token Budget] Context approx {approx_tokens} tokens ({} messages).\n\
+Be concise: prefer tool calls over long explanations. Summarise intermediate results in 1-2 lines.",
                 messages.len()
             ));
         }
@@ -1910,8 +2241,10 @@ This is the LAST model call for this run.\n\
         let mut msgs_for_call = messages.clone();
         if let Some(h) = pending_system_hint.take() {
             let note = format!(
-                "[Loop Governor]\nstate: {:?}\n{}\n\nYou MUST incorporate this hint in your next tool call.\nDo not repeat the same failing command.",
-                state, h
+                "[Loop Governor]\nstate: {:?}\nrecovery_stage: {}\n{}\n\nYou MUST incorporate this hint in your next tool call.\nDo not repeat the same failing command.",
+                state,
+                recovery.stage_label(),
+                h
             );
             let _ = tx
                 .send(StreamToken::Delta(format!("\n[governor] {h}\n")))
@@ -2257,14 +2590,14 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
                 let note = if goal_wants_actions {
                     "\
 [Tool enforcement]\n\
-You MUST call ONE tool now to act locally (exec/read_file/write_file/patch_file/apply_diff/search_files/glob/done).\n\
+You MUST call ONE tool now to act locally (exec/read_file/write_file/patch_file/apply_diff/search_files/list_dir/glob/done).\n\
 Do NOT respond with instructions only.\n\
 Start with ONE minimal safe action, then verify and continue."
                 } else {
                     "\
 [Tool enforcement]\n\
 You responded without calling any tool.\n\
-You MUST call ONE tool now (exec/read_file/write_file/patch_file/apply_diff/search_files/glob/done).\n\
+You MUST call ONE tool now (exec/read_file/write_file/patch_file/apply_diff/search_files/list_dir/glob/done).\n\
 Do NOT respond with text-only instructions."
                 };
                 let _ = tx
@@ -2297,6 +2630,50 @@ Do NOT respond with text-only instructions."
 
         // ── Execute the tool ───────────────────────────────────────────────
         let tc = tool_call.unwrap();
+
+        // Plan gate: require a <plan> at least once before doing any real work.
+        // The model should include <plan> in the same assistant message as its first tool call.
+        let has_plan = messages.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|t| t.contains("<plan>"))
+                    .unwrap_or(false)
+        });
+        if !has_plan {
+            state = AgentState::Recovery;
+            recovery.stage = Some(RecoveryStage::Diagnose);
+            let block = "[Plan Gate] Missing <plan>.\n\
+Required now: in your next assistant message, include a <plan> (goal/steps/risks/assumptions), then call ONE diagnostic tool (list_dir/search_files/glob/read_file) to start."
+                .to_string();
+
+            let _ = tx
+                .send(StreamToken::Delta(format!(
+                    "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                )))
+                .await;
+
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": format!(
+                    "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                    tc.name, tc.arguments
+                ),
+            }));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
+
+            pending_system_hint = Some(block);
+            continue;
+        }
 
         // ── done tool ──────────────────────────────────────────────────────
         if tc.name.as_str() == "done" {
@@ -2339,6 +2716,49 @@ Do NOT respond with text-only instructions."
         }
 
         // ── apply_diff tool ───────────────────────────────────────────────
+        // Recovery gate: while recovering from failures, enforce a strict
+        // Diagnose -> Fix -> Verify workflow to prevent phase drift.
+        if let Some(block) = recovery.maybe_block_tool(&tc, test_cmd.as_deref()) {
+            state = AgentState::Recovery;
+            let _ = tx
+                .send(StreamToken::Delta(format!(
+                    "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                )))
+                .await;
+
+            let cwd_label = cur_cwd
+                .as_deref()
+                .or(tool_root_abs.as_deref())
+                .unwrap_or("(workspace root)")
+                .to_string();
+            let tool_output = inject_cwd(
+                &format!(
+                    "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                    tc.name, tc.arguments
+                ),
+                &format!("cwd: {cwd_label}"),
+                None,
+            );
+
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": tool_output,
+            }));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
+
+            pending_system_hint = Some(block);
+            continue;
+        }
+
         if tc.name.as_str() == "apply_diff" {
             let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
             let path = args["path"].as_str().unwrap_or("").to_string();
@@ -2386,9 +2806,20 @@ Do NOT respond with text-only instructions."
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.clone());
                 file_cache.remove(&cache_key);
-                // Seed cache with new content
+                let before_hash = old_for_cache.as_deref().map(hash_text);
+                // Seed cache with new content + hash verification
                 if let Ok(abs) = crate::file_tools::resolve_safe_path(&path, base) {
                     if let Ok(new_content) = std::fs::read_to_string(&abs) {
+                        let after_hash = hash_text(&new_content);
+                        match before_hash {
+                            Some(bh) => result.push_str(&format!(
+                                "\n[hash] before={} after={}",
+                                fmt_hash(bh),
+                                fmt_hash(after_hash)
+                            )),
+                            None => result
+                                .push_str(&format!("\n[hash] after={}", fmt_hash(after_hash))),
+                        }
                         file_cache.insert(cache_key, new_content);
                     }
                 }
@@ -2399,6 +2830,13 @@ Do NOT respond with text-only instructions."
                         result.push_str(&test_out);
                     }
                 }
+            }
+
+            let verified = result.contains("PASSED (exit 0)");
+            if is_error {
+                recovery.on_fix_result(false, false);
+            } else {
+                recovery.on_fix_result(true, verified);
             }
 
             let first_line = result.lines().next().unwrap_or("").to_string();
@@ -2422,9 +2860,17 @@ Do NOT respond with text-only instructions."
                 let _ = tx
                     .send(StreamToken::Delta(format!("[RESULT_FILE] {first_line}\n")))
                     .await;
-                state = AgentState::Planning;
+                state = if recovery.in_recovery() {
+                    AgentState::Recovery
+                } else {
+                    AgentState::Planning
+                };
                 file_tool_consec_failures = 0;
-                pending_system_hint = None;
+                pending_system_hint = if recovery.stage == Some(RecoveryStage::Verify) {
+                    Some("Recovery stage=verify: run ONE verification command (tests or `git status`) before continuing.".to_string())
+                } else {
+                    None
+                };
             }
 
             messages.push(json!({
@@ -2441,11 +2887,73 @@ Do NOT respond with text-only instructions."
                 &messages,
             )
             .await;
-            let _ = old_for_cache; // used above
             continue;
         }
 
         // ── glob tool ─────────────────────────────────────────────────────
+        // ── list_dir tool ────────────────────────────────────────────────────
+        if tc.name.as_str() == "list_dir" {
+            let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+            let dir = args["dir"].as_str().unwrap_or("").to_string();
+            let max_entries = args["max_entries"].as_u64().unwrap_or(200) as usize;
+            let include_hidden = args["include_hidden"].as_bool().unwrap_or(false);
+
+            let dir_label = if dir.trim().is_empty() { "." } else { dir.as_str() };
+            let _ = tx
+                .send(StreamToken::Delta(format!("\n\n[LIST_DIR] {dir_label}\n")))
+                .await;
+            let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
+
+            let base = tool_root_abs.as_deref();
+            let (result, is_error) =
+                crate::file_tools::tool_list_dir(&dir, max_entries, include_hidden, base);
+            recovery.on_diagnostic_result(!is_error);
+
+            let first_line = result.lines().next().unwrap_or("").to_string();
+            if is_error {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT_FILE_ERR] {first_line}\n"
+                    )))
+                    .await;
+                state = AgentState::Recovery;
+            } else {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT_LIST_DIR] {first_line}\n"
+                    )))
+                    .await;
+                state = if recovery.in_recovery() {
+                    AgentState::Recovery
+                } else {
+                    AgentState::Planning
+                };
+                pending_system_hint = if recovery.stage == Some(RecoveryStage::Fix) {
+                    Some("Recovery stage=fix: apply a minimal fix now (edit files or run a corrected command).".to_string())
+                } else if recovery.stage == Some(RecoveryStage::Verify) {
+                    Some("Recovery stage=verify: run ONE verification command (tests or `git status`) before continuing.".to_string())
+                } else {
+                    None
+                };
+            }
+
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            }));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
+            continue;
+        }
+
         if tc.name.as_str() == "glob" {
             let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
             let pattern = args["pattern"].as_str().unwrap_or("").to_string();
@@ -2458,6 +2966,7 @@ Do NOT respond with text-only instructions."
 
             let base = tool_root_abs.as_deref();
             let (result, is_error) = crate::file_tools::tool_glob_files(&pattern, &dir, base);
+            recovery.on_diagnostic_result(!is_error);
 
             let first_line = result.lines().next().unwrap_or("").to_string();
             if is_error {
@@ -2471,8 +2980,18 @@ Do NOT respond with text-only instructions."
                 let _ = tx
                     .send(StreamToken::Delta(format!("[RESULT_GLOB] {first_line}\n")))
                     .await;
-                state = AgentState::Planning;
-                pending_system_hint = None;
+                state = if recovery.in_recovery() {
+                    AgentState::Recovery
+                } else {
+                    AgentState::Planning
+                };
+                pending_system_hint = if recovery.stage == Some(RecoveryStage::Fix) {
+                    Some("Recovery stage=fix: apply a minimal fix now (edit files or run a corrected command).".to_string())
+                } else if recovery.stage == Some(RecoveryStage::Verify) {
+                    Some("Recovery stage=verify: run ONE verification command (tests or `git status`) before continuing.".to_string())
+                } else {
+                    None
+                };
             }
 
             messages.push(json!({
@@ -2508,6 +3027,7 @@ Do NOT respond with text-only instructions."
 
             let base = tool_root_abs.as_deref();
             let (result, is_error) = crate::file_tools::tool_search_files(&pattern, &dir, ci, base);
+            recovery.on_diagnostic_result(!is_error);
 
             let first_line = result.lines().next().unwrap_or("").to_string();
             if is_error {
@@ -2523,8 +3043,18 @@ Do NOT respond with text-only instructions."
                         "[RESULT_SEARCH] {first_line}\n"
                     )))
                     .await;
-                state = AgentState::Planning;
-                pending_system_hint = None;
+                state = if recovery.in_recovery() {
+                    AgentState::Recovery
+                } else {
+                    AgentState::Planning
+                };
+                pending_system_hint = if recovery.stage == Some(RecoveryStage::Fix) {
+                    Some("Recovery stage=fix: apply a minimal fix now (edit files or run a corrected command).".to_string())
+                } else if recovery.stage == Some(RecoveryStage::Verify) {
+                    Some("Recovery stage=verify: run ONE verification command (tests or `git status`) before continuing.".to_string())
+                } else {
+                    None
+                };
             }
 
             messages.push(json!({
@@ -2592,6 +3122,22 @@ Do NOT respond with text-only instructions."
                 "write_file" => {
                     let content = args["content"].as_str().unwrap_or("").to_string();
 
+                    // Safety: do not overwrite an existing file unless we already read it in this session.
+                    // This prevents accidental destructive writes when the agent guessed the path/content.
+                    let file_exists = crate::file_tools::resolve_safe_path(&path, base)
+                        .ok()
+                        .and_then(|abs| abs.metadata().ok())
+                        .map(|m| m.is_file())
+                        .unwrap_or(false);
+                    if file_exists && !file_cache.contains_key(&cache_key) {
+                        (
+                            format!(
+                                "GOVERNOR BLOCKED: write_file refused because '{path}' already exists.\n\
+Action required: call read_file(path) first to confirm current contents, then retry with patch_file/apply_diff (preferred) or write_file."
+                            ),
+                            true,
+                        )
+                    } else {
                     // Approval: show a compact before/after preview.
                     let old = file_cache
                         .get(&cache_key)
@@ -2603,6 +3149,8 @@ Do NOT respond with text-only instructions."
                         })
                         .unwrap_or_default();
                     let preview = simple_before_after(&old, &content);
+                    let before_hash = hash_text(&old);
+                    let after_hash = hash_text(&content);
                     let approval = approver
                         .approve(ApprovalRequest::Edit {
                             action: "write_file".to_string(),
@@ -2622,7 +3170,12 @@ Do NOT respond with text-only instructions."
                         let (mut r_text, r_err) =
                             crate::file_tools::tool_write_file(&path, &content, base);
                         if !r_err {
-                            file_cache.remove(&cache_key);
+                            file_cache.insert(cache_key.clone(), content.clone());
+                            r_text.push_str(&format!(
+                                "\n[hash] before={} after={}",
+                                fmt_hash(before_hash),
+                                fmt_hash(after_hash)
+                            ));
                             // A — auto-test after write
                             if let Some(ref cmd) = test_cmd {
                                 if let Some(ref root) = tool_root_abs {
@@ -2631,6 +3184,7 @@ Do NOT respond with text-only instructions."
                             }
                         }
                         (r_text, r_err)
+                    }
                     }
                 }
                 _ => {
@@ -2644,6 +3198,10 @@ Do NOT respond with text-only instructions."
                             .ok()
                             .and_then(|abs| std::fs::read_to_string(&abs).ok())
                     });
+                    let before_hash = old_content_for_diff
+                        .as_deref()
+                        .map(hash_text)
+                        .unwrap_or_else(|| hash_text(""));
 
                     // Approval: show the computed patch diff (or search/replace when diff can't be made).
                     let mut preview = old_content_for_diff
@@ -2691,6 +3249,12 @@ Do NOT respond with text-only instructions."
                             // Gap 7: auto-verify patch was applied correctly.
                             if let Ok(abs) = crate::file_tools::resolve_safe_path(&path, base) {
                                 if let Ok(new_content) = std::fs::read_to_string(&abs) {
+                                    let after_hash = hash_text(&new_content);
+                                    patch_result.push_str(&format!(
+                                        "\n[hash] before={} after={}",
+                                        fmt_hash(before_hash),
+                                        fmt_hash(after_hash)
+                                    ));
                                     if replace.is_empty() || new_content.contains(&replace) {
                                         patch_result
                                             .push_str("\n✓ auto-verify: patch confirmed in file");
@@ -2725,6 +3289,19 @@ Do NOT respond with text-only instructions."
                 file_tool_consec_failures = 0;
             }
 
+            let verified = result.contains("PASSED (exit 0)");
+            match tc.name.as_str() {
+                "read_file" => recovery.on_diagnostic_result(!is_error),
+                "write_file" | "patch_file" => {
+                    if is_error {
+                        recovery.on_fix_result(false, false);
+                    } else {
+                        recovery.on_fix_result(true, verified);
+                    }
+                }
+                _ => {}
+            }
+
             // Emit result label.
             let first_line = result.lines().next().unwrap_or("").to_string();
             if is_error {
@@ -2756,8 +3333,18 @@ Do NOT respond with text-only instructions."
                 let _ = tx
                     .send(StreamToken::Delta(format!("[RESULT_FILE] {first_line}\n")))
                     .await;
-                state = AgentState::Planning;
-                pending_system_hint = None;
+                state = if recovery.in_recovery() {
+                    AgentState::Recovery
+                } else {
+                    AgentState::Planning
+                };
+                pending_system_hint = if recovery.stage == Some(RecoveryStage::Fix) {
+                    Some("Recovery stage=fix: apply a minimal fix now (edit files or run a corrected command).".to_string())
+                } else if recovery.stage == Some(RecoveryStage::Verify) {
+                    Some("Recovery stage=verify: run ONE verification command (tests or `git status`) before continuing.".to_string())
+                } else {
+                    None
+                };
             }
 
             // Append tool result to conversation.
@@ -2841,6 +3428,7 @@ Do NOT respond with text-only instructions."
 
         if let Some(block) = should_block_git_landmines(&command, tool_root_abs.as_deref()) {
             state = AgentState::Recovery;
+            recovery.on_exec_result(ExecKind::Action, false);
             let _ = tx
                 .send(StreamToken::Delta(format!(
                     "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
@@ -2891,6 +3479,7 @@ Do NOT respond with text-only instructions."
             .await?;
         if approval == ApprovalOutcome::Rejected {
             state = AgentState::Recovery;
+            recovery.on_exec_result(ExecKind::Action, false);
             let _ = tx
                 .send(StreamToken::Delta(
                     "[RESULT][Recovery] REJECTED by user\n".to_string(),
@@ -3031,13 +3620,9 @@ This is blocked to prevent nested-repo / accidental repo-root modifications.\n\n
         )
         .await;
 
-        // Update failure memory + possibly inject a system hint on repeated failures.
-        if effective_exit_code != 0 {
-            state = AgentState::Recovery;
-        } else {
-            state = AgentState::Planning;
-        }
-        pending_system_hint = if escaped_tool_root {
+        // Update failure memory + recovery governor + possibly inject a system hint.
+        let exec_kind = classify_exec_kind(&command, test_cmd.as_deref());
+        let mut hint = if escaped_tool_root {
             Some(
                 "SANDBOX BREACH: Your command ended outside tool_root.\n\
 Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` stays under tool_root."
@@ -3045,6 +3630,29 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
             )
         } else {
             mem.on_tool_result(&command, &stdout, &stderr, effective_exit_code)
+        };
+
+        recovery.on_exec_result(exec_kind, effective_exit_code == 0 && !escaped_tool_root);
+
+        if effective_exit_code == 0 && !escaped_tool_root {
+            if recovery.stage == Some(RecoveryStage::Fix) {
+                hint = Some(
+                    "Recovery stage=fix: apply a minimal fix now (edit files or run a corrected command)."
+                        .to_string(),
+                );
+            } else if recovery.stage == Some(RecoveryStage::Verify) {
+                hint = Some(
+                    "Recovery stage=verify: run ONE verification command (tests or `git status`) before continuing."
+                        .to_string(),
+                );
+            }
+        }
+
+        pending_system_hint = hint;
+        state = if effective_exit_code != 0 || recovery.in_recovery() {
+            AgentState::Recovery
+        } else {
+            AgentState::Planning
         };
 
         // Safety: stop if we've hit the iteration cap.

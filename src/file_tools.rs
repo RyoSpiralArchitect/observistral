@@ -644,6 +644,107 @@ pub fn tool_apply_diff(path: &str, diff: &str, base: Option<&str>) -> (String, b
 
 // ── glob_files ────────────────────────────────────────────────────────────────
 
+const MAX_LIST_DIR_ENTRIES: usize = 200;
+
+/// List a single directory (non-recursive).
+/// Returns a compact, sorted listing suitable for LLM context.
+pub fn tool_list_dir(
+    dir: &str,
+    max_entries: usize,
+    include_hidden: bool,
+    base: Option<&str>,
+) -> (String, bool) {
+    let max_entries = if max_entries == 0 {
+        MAX_LIST_DIR_ENTRIES
+    } else {
+        max_entries
+    }
+    .clamp(1, 500);
+
+    let (dir_label, dir_path) = if dir.trim().is_empty() {
+        (
+            ".".to_string(),
+            base.map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+        )
+    } else {
+        match resolve_safe_path(dir, base) {
+            Ok(p) => (dir.to_string(), p),
+            Err(e) => return (format!("ERROR: {e}"), true),
+        }
+    };
+
+    if !dir_path.is_dir() {
+        return (
+            format!("ERROR: '{}' is not a directory", dir_path.display()),
+            true,
+        );
+    }
+
+    let rd = match std::fs::read_dir(&dir_path) {
+        Ok(r) => r,
+        Err(e) => return (format!("ERROR: cannot read dir '{}': {e}", dir_path.display()), true),
+    };
+
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if !include_hidden && name.starts_with('.') && name != ".obstral.md" {
+            continue;
+        }
+        if path.is_dir() {
+            dirs.push(format!("{name}/"));
+        } else {
+            let size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
+            files.push(format!("{name} ({size} bytes)"));
+        }
+    }
+
+    dirs.sort();
+    files.sort();
+
+    let total = dirs.len() + files.len();
+    let mut out: Vec<String> = Vec::new();
+    for d in dirs {
+        out.push(format!("d {d}"));
+        if out.len() >= max_entries {
+            break;
+        }
+    }
+    if out.len() < max_entries {
+        for f in files {
+            out.push(format!("f {f}"));
+            if out.len() >= max_entries {
+                break;
+            }
+        }
+    }
+
+    let shown = out.len();
+    let trunc_note = if shown < total {
+        format!(" (showing first {shown}/{total}; set max_entries higher to see more)")
+    } else {
+        String::new()
+    };
+
+    let mut s = String::new();
+    s.push_str(&format!(
+        "[list_dir: '{}' ・ {} item(s){}]\n",
+        dir_label, total, trunc_note
+    ));
+    for line in out {
+        s.push_str(&line);
+        s.push('\n');
+    }
+    (s.trim_end().to_string(), false)
+}
+
 const MAX_GLOB_RESULTS: usize = 200;
 
 /// Minimal glob matcher (no regex crate required).
@@ -904,6 +1005,22 @@ mod tests {
         assert!(err);
         assert!(r.contains("not found"));
         assert!(r.contains("hello world"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_dir_basic() {
+        let dir = std::env::temp_dir().join("obstral_test_list_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("a"));
+        let _ = std::fs::write(dir.join("b.txt"), "hi");
+        let base = dir.to_string_lossy().into_owned();
+
+        let (r, err) = tool_list_dir("", MAX_LIST_DIR_ENTRIES, false, Some(&base));
+        assert!(!err, "{r}");
+        assert!(r.contains("d a/"), "{r}");
+        assert!(r.contains("f b.txt"), "{r}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
