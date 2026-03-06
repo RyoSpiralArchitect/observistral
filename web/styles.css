@@ -1228,6 +1228,50 @@ body.looping .bubble.assistant {
   opacity: 0.9;
 }
 
+/* Context preview: show what gets injected to Chat/Observer (collapsible). */
+.ctx-details {
+  margin: 6px 10px 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.12);
+}
+.ctx-details > summary {
+  list-style: none;
+}
+.ctx-details > summary::-webkit-details-marker {
+  display: none;
+}
+.ctx-summary {
+  cursor: pointer;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  user-select: none;
+}
+.ctx-details[open] .ctx-summary {
+  border-bottom: 1px solid var(--border);
+  color: rgba(255, 255, 255, 0.92);
+}
+.ctx-actions {
+  padding: 6px 10px 0;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.ctx-pre {
+  margin: 0;
+  padding: 8px 10px 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.35;
+  color: rgba(255, 255, 255, 0.86);
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .pill-btn {
   cursor: pointer;
 }

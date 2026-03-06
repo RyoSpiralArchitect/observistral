@@ -46,6 +46,7 @@
       includeCoderContext: "Include coder context",
       chatAttachRuntime: "Attach runtime snapshot",
       chatAutoTasks: "Auto tasks",
+      contextPreview: "Context preview",
       chatExplainLastError: "Explain last error",
       chatWhatsHappening: "What's happening?",
       insertCliTemplate: "CLI template",
@@ -159,6 +160,7 @@
       includeCoderContext: "Coder状況を付与",
       chatAttachRuntime: "ランタイム状況を付与",
       chatAutoTasks: "自動タスク化",
+      contextPreview: "コンテキスト表示",
       chatExplainLastError: "直近エラー相談",
       chatWhatsHappening: "いま何してる？",
       send: "送信",
@@ -271,6 +273,7 @@
       includeCoderContext: "Inclure contexte codeur",
       chatAttachRuntime: "Joindre snapshot runtime",
       chatAutoTasks: "Tâches auto",
+      contextPreview: "Contexte",
       chatExplainLastError: "Expliquer la dernière erreur",
       chatWhatsHappening: "Que se passe-t-il ?",
       insertCliTemplate: "Template CLI",
@@ -4669,9 +4672,9 @@
         const acc = (x.match(/[\u00C0-\u017F]/g) || []).length;
         const fr = (x.match(/\b(le|la|les|des|du|de|pour|avec|sans|est|sont|pas|mais|donc|sur|dans|vous|tu|je|nous|votre)\b/gi) || []).length;
         if (acc > 0 || fr >= 2) return "fr";
-        const latin = (x.match(/[A-Za-z]/g) || []).length;
         const en = (x.match(/\b(the|and|or|to|of|in|for|with|is|are|you|we|i|this|that|it)\b/gi) || []).length;
-        if (en >= 2 || latin >= 24) return "en";
+        // Do NOT infer English from "latin letters" alone: code blocks are mostly ASCII.
+        if (en >= 2) return "en";
         return "";
       };
       const pickLastUserSample = () => {
@@ -5400,6 +5403,65 @@
         }
       }
       return null;
+    })();
+
+    // Debug/UX: show what context is being injected to Chat/Observer without forcing users to guess.
+    const chatCtxPreview = config.chatAttachRuntime ? chatRuntimePacket() : "";
+    const observerCtxPreview = (() => {
+      const uiLang = String(lang || "ja").trim().toLowerCase();
+      const ol0 = String(config.observerLang || "ui").trim().toLowerCase();
+      const inferLangFromText = (s) => {
+        const x = String(s || "");
+        const jp = (x.match(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g) || []).length;
+        if (jp >= 1) return "ja";
+        const acc = (x.match(/[\u00C0-\u017F]/g) || []).length;
+        const fr = (x.match(/\b(le|la|les|des|du|de|pour|avec|sans|est|sont|pas|mais|donc|sur|dans|vous|tu|je|nous|votre)\b/gi) || []).length;
+        if (acc > 0 || fr >= 2) return "fr";
+        const en = (x.match(/\b(the|and|or|to|of|in|for|with|is|are|you|we|i|this|that|it)\b/gi) || []).length;
+        if (en >= 2) return "en";
+        return "";
+      };
+      const pickLastUserSample = () => {
+        try {
+          const pickLastUser = (pane) => {
+            const msgs = pane ? paneMessages(pane) : (activeThread && activeThread.messages) || [];
+            if (!msgs || !msgs.length) return "";
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              const m = msgs[i];
+              if (!m || m.role !== "user") continue;
+              const t = String(m.content || "").trim();
+              if (t) return t;
+            }
+            return "";
+          };
+          return pickLastUser("observer") || pickLastUser("coder") || pickLastUser("chat") || pickLastUser("");
+        } catch (_) {
+          return "";
+        }
+      };
+      const intensity0 = String(config.observerIntensity || "critical").trim().toLowerCase();
+      const intensity = intensity0 === "polite" || intensity0 === "critical" || intensity0 === "brutal" ? intensity0 : "critical";
+      const outLang = (() => {
+        if (ol0 === "ja" || ol0 === "en" || ol0 === "fr") return ol0;
+        if (ol0 === "ui" || !ol0) return uiLang;
+        if (ol0 === "auto") {
+          const sample = String(observerInput || "").trim() || pickLastUserSample();
+          const inferred = inferLangFromText(sample);
+          return inferred || uiLang;
+        }
+        return uiLang;
+      })();
+      const head = [
+        "--- observer_injected_preview ---",
+        `out_lang: ${outLang}`,
+        `observer_intensity: ${intensity}`,
+        `include_coder_context: ${config.includeCoderContext ? "yes" : "no"}`,
+      ];
+      if (!config.includeCoderContext) {
+        head.push("(coder context is OFF — enable 'Include coder context' to show injected artifacts)");
+        return head.join("\n");
+      }
+      return head.join("\n") + "\n\n" + coderContextPacket();
     })();
 
     // Sort proposals: phase-match first, then by score descending.
@@ -6782,6 +6844,20 @@
                       },
                     }, tr(lang, "chatWhatsHappening"))
                   ),
+                  config.chatAttachRuntime
+                    ? e("details", { className: "ctx-details" },
+                        e("summary", { className: "ctx-summary" }, tr(lang, "contextPreview") + ": " + tr(lang, "chatAttachRuntime")),
+                        e("div", { className: "ctx-actions" },
+                          e("button", {
+                            className: "btn btn-icon",
+                            type: "button",
+                            title: tr(lang, "copy"),
+                            onClick: (ev) => { ev.preventDefault(); ev.stopPropagation(); copyToClipboard(chatCtxPreview || ""); },
+                          }, tr(lang, "copy"))
+                        ),
+                        e("pre", { className: "ctx-pre" }, chatCtxPreview || "")
+                      )
+                    : null,
                   e("div", { className: "composer chat-composer" },
                     e("textarea", {
                       className: "textarea",
@@ -6826,6 +6902,18 @@
                     observerFind
                       ? e("span", { className: "msg-ts", style: { marginLeft: 6 } }, `${observerMsgsView.length}/${observerMsgs.length}`)
                       : null
+                  ),
+                  e("details", { className: "ctx-details" },
+                    e("summary", { className: "ctx-summary" }, tr(lang, "contextPreview") + ": " + tr(lang, "observer")),
+                    e("div", { className: "ctx-actions" },
+                      e("button", {
+                        className: "btn btn-icon",
+                        type: "button",
+                        title: tr(lang, "copy"),
+                        onClick: (ev) => { ev.preventDefault(); ev.stopPropagation(); copyToClipboard(observerCtxPreview || ""); },
+                      }, tr(lang, "copy"))
+                    ),
+                    e("pre", { className: "ctx-pre" }, observerCtxPreview || "")
                   ),
                   e("div", { className: "chat-body", ref: observerBodyRef },
                     observerMsgs.length === 0
