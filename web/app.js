@@ -1454,9 +1454,42 @@
       const key = (activeThread && activeThread.id ? activeThread.id : "") + ":" + lastAsst.id;
       if (lastAutoObserveMsgRef.current === key) return;
       lastAutoObserveMsgRef.current = key;
+
+      // Auto-observe prompt language:
+      // - Do NOT always use UI language. If UI is English but the user is typing Japanese/French,
+      //   we want Observer to follow the conversation language to avoid "Observer stuck in English".
+      const guessLang = (sample) => {
+        try {
+          const x = String(sample || "");
+          const jp = (x.match(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g) || []).length;
+          if (jp >= 1) return "ja";
+          const acc = (x.match(/[\u00C0-\u017F]/g) || []).length;
+          const fr = (x.match(/\b(le|la|les|des|du|de|pour|avec|sans|est|sont|pas|mais|donc|sur|dans|vous|tu|je|nous|votre)\b/gi) || []).length;
+          if (acc > 0 || fr >= 2) return "fr";
+        } catch (_) {}
+        return "en";
+      };
+      const lastUserSample = (() => {
+        try {
+          const msgs = (activeThread && activeThread.messages) ? activeThread.messages : [];
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const m = msgs[i];
+            if (!m || m.role !== "user") continue;
+            const t = String(m.content || "").trim();
+            if (t) return t;
+          }
+        } catch (_) {}
+        return "";
+      })();
+      const ol0 = String(config.observerLang || "ui").trim().toLowerCase();
+      const uiLang = String(lang || "ja").trim().toLowerCase();
+      const promptLang =
+        (ol0 === "ja" || ol0 === "en" || ol0 === "fr")
+          ? ol0
+          : (ol0 === "auto" ? (lastUserSample ? guessLang(lastUserSample) : uiLang) : uiLang);
       // Slight delay to let React settle after streaming ends.
       const timer = setTimeout(() => {
-        sendObserver(autoObservePrompt(lang));
+        sendObserver(autoObservePrompt(promptLang));
       }, 700);
       return () => clearTimeout(timer);
     }, [threadState, config.autoObserve, sendingCoder, sendingObserver]);
@@ -4382,11 +4415,12 @@
       };
       const outLang = (() => {
         const ol0 = String(config.observerLang || "ui").trim().toLowerCase();
+        const isAutoObserve = overrideText != null;
         const pickLangSample = () => {
-          // Prefer the Observer prompt itself. This fixes "Observer stuck in English" when the
-          // last coder/chat user message is mostly commands/logs.
+          // Prefer a *typed* Observer prompt (not auto-observe). Auto-observe prompts are often in
+          // UI language (e.g. English), which would incorrectly force the Observer output language.
           const a = String(text || "").trim();
-          if (a) return a;
+          if (a && !isAutoObserve) return a;
           return pickLastUserSample();
         };
         if (ol0 === "auto") {
