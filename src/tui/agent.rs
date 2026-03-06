@@ -391,6 +391,15 @@ You are an autonomous coding agent with 9 tools:\n\
 \n\
 RULE: You MUST call a tool on every single turn. Never respond with text only.\n\
 \n\
+Fallback for non-tool models (implied actions):\n\
+  - To create a NEW file, output this exact pattern:\n\
+      File: path/to/file.ext\n\
+      ```lang\n\
+      file contents...\n\
+      ```\n\
+    (OBSTRAL may auto-write the file with approval; it will NOT overwrite existing files.)\n\
+  - To run commands, paste a PowerShell/bash code fence.\n\
+\n\
 PRIORITY (safety-first default when unsure):\n\
   1) read_file                  — before editing any existing file\n\
   2) list_dir/glob/search_files  — discover files (prefer list_dir for quick structure)\n\
@@ -1548,6 +1557,13 @@ struct ImpliedExecScript {
     script: String,
 }
 
+#[derive(Debug, Clone)]
+struct ImpliedWriteFile {
+    path: String,
+    lang_hint: String,
+    content: String,
+}
+
 fn is_shell_fence_lang(lang_hint: &str) -> bool {
     matches!(
         lang_hint,
@@ -1654,6 +1670,172 @@ fn extract_implied_exec_scripts(text: &str) -> Vec<ImpliedExecScript> {
                 script: joined,
             });
         }
+    }
+
+    out
+}
+
+fn sanitize_implied_path_candidate(raw: &str) -> Option<String> {
+    let mut p = raw.trim().to_string();
+    if p.is_empty() {
+        return None;
+    }
+
+    // Strip common wrappers.
+    if (p.starts_with('"') && p.ends_with('"')) || (p.starts_with('\'') && p.ends_with('\'')) {
+        p = p[1..p.len().saturating_sub(1)].to_string();
+    }
+    if p.starts_with('`') && p.ends_with('`') && p.len() >= 2 {
+        p = p[1..p.len().saturating_sub(1)].to_string();
+    }
+    p = p.trim().to_string();
+    if p.is_empty() {
+        return None;
+    }
+    if let Some(rest) = p.strip_prefix("./") {
+        p = rest.to_string();
+    }
+    if p.ends_with(':') {
+        p.pop();
+        p = p.trim().to_string();
+    }
+
+    // Avoid obvious false positives and dangerous strings.
+    if p.len() > 240 {
+        return None;
+    }
+    let low = p.to_ascii_lowercase();
+    if low.starts_with("http://") || low.starts_with("https://") {
+        return None;
+    }
+    if p.contains("```") || p.contains("<plan>") || p.contains("</plan>") {
+        return None;
+    }
+    // Avoid Windows-forbidden characters and other obvious junk.
+    if p.chars()
+        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return None;
+    }
+    // Keep it simple: paths with spaces are too ambiguous in free-form text.
+    if p.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+
+    // Must look like a file path, not a version number / heading.
+    let has_sep = p.contains('/') || p.contains('\\');
+    let has_dot = p.contains('.');
+    if !has_sep && !has_dot {
+        // Common "no extension" files.
+        let low2 = p.to_ascii_lowercase();
+        let ok = matches!(
+            low2.as_str(),
+            "license" | "makefile" | "dockerfile" | "readme"
+        );
+        if !ok {
+            return None;
+        }
+    } else if has_dot && !has_sep {
+        // Reject things like "v0.2.0" (last segment has no alphabetic chars).
+        if let Some((_, ext)) = p.rsplit_once('.') {
+            let ext = ext.trim();
+            if ext.is_empty() {
+                return None;
+            }
+            let has_alpha = ext.chars().any(|c| c.is_ascii_alphabetic());
+            if !has_alpha {
+                return None;
+            }
+        }
+    }
+    Some(p)
+}
+
+fn parse_implied_path_line(line: &str) -> Option<String> {
+    let s = line.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Examples:
+    // - File: src/main.rs
+    // - Path: README.md
+    // - ### src/main.rs
+    // - src/main.rs
+    let s = s.strip_prefix("- ").unwrap_or(s);
+    let s = s.strip_prefix("* ").unwrap_or(s);
+
+    // "File: ..."
+    let low = s.to_ascii_lowercase();
+    for key in ["file:", "path:", "filepath:", "filename:"] {
+        if let Some(rest) = low.strip_prefix(key) {
+            // Use the original string slice to preserve case.
+            let orig_rest = s[s.len().saturating_sub(rest.len())..].trim();
+            return sanitize_implied_path_candidate(orig_rest);
+        }
+    }
+
+    // Markdown headers: ### path
+    if s.starts_with('#') {
+        let rest = s.trim_start_matches('#').trim();
+        return sanitize_implied_path_candidate(rest);
+    }
+
+    None
+}
+
+fn extract_implied_write_files(text: &str) -> Vec<ImpliedWriteFile> {
+    let raw = text.replace("\r\n", "\n");
+    let mut out: Vec<ImpliedWriteFile> = Vec::new();
+
+    let mut pending_path: Option<String> = None;
+    let mut in_fence = false;
+    let mut fence_lang = String::new();
+    let mut buf: Vec<String> = Vec::new();
+
+    for line0 in raw.lines() {
+        let line = line0.trim_end_matches('\r');
+        let t = line.trim();
+
+        if !in_fence {
+            if let Some(rest) = t.strip_prefix("```") {
+                in_fence = true;
+                fence_lang = rest.trim().to_ascii_lowercase();
+                buf.clear();
+                continue;
+            }
+            if let Some(p) = parse_implied_path_line(t) {
+                pending_path = Some(p);
+            }
+            continue;
+        }
+
+        // in_fence
+        if t.starts_with("```") {
+            let body = buf.join("\n");
+            let content = body.trim_end().to_string();
+            if !content.trim().is_empty() {
+                if let Some(path) = pending_path.take() {
+                    let lang = fence_lang.trim().to_string();
+                    if !matches!(lang.as_str(), "diff" | "patch") {
+                        out.push(ImpliedWriteFile {
+                            path,
+                            lang_hint: lang,
+                            content,
+                        });
+                        if out.len() >= 6 {
+                            return out;
+                        }
+                    }
+                }
+            }
+            in_fence = false;
+            fence_lang.clear();
+            buf.clear();
+            continue;
+        }
+
+        buf.push(line.to_string());
     }
 
     out
@@ -2350,16 +2532,19 @@ This is the LAST model call for this run.\n\
             // Model didn't call tools. If the user asked for local actions, try implied scripts
             // (PowerShell/bash code fences) as a fallback so non-tool-calling models can still act.
             if goal_wants_actions && iter + 1 < max_iters {
-                let implied = extract_implied_exec_scripts(&assistant_text);
-                if !implied.is_empty() {
+                let implied_scripts = extract_implied_exec_scripts(&assistant_text);
+                let implied_files = extract_implied_write_files(&assistant_text);
+                if !implied_scripts.is_empty() || !implied_files.is_empty() {
                     let _ = tx
                         .send(StreamToken::Delta(
-                            "\n[governor] tool_call missing; executing implied commands\n"
+                            "\n[governor] tool_call missing; executing implied actions\n"
                                 .to_string(),
                         ))
                         .await;
 
-                    for im in implied {
+                    let mut implied_had_error = false;
+
+                    for im in implied_scripts {
                         let command = im.script.trim().to_string();
                         if command.is_empty() {
                             continue;
@@ -2418,6 +2603,7 @@ This is the LAST model call for this run.\n\
                             // Update memory so repeating the same blocked command triggers stronger hints.
                             let _ = mem.on_tool_result(&command, "", &block, 1);
                             pending_system_hint = Some(block);
+                            implied_had_error = true;
                             break;
                         }
 
@@ -2459,6 +2645,7 @@ This is the LAST model call for this run.\n\
                                 "The user rejected the command. Choose a safer alternative or explain why it is necessary before retrying."
                                     .to_string(),
                             );
+                            implied_had_error = true;
                             break;
                         }
 
@@ -2574,7 +2761,205 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
                         };
 
                         if effective_exit_code != 0 {
+                            implied_had_error = true;
                             break;
+                        }
+                    }
+
+                    // 2) write NEW files from markdown blocks (no overwrites)
+                    if !implied_had_error && !implied_files.is_empty() {
+                        for imf in implied_files {
+                            let path = imf.path.trim().to_string();
+                            if path.is_empty() {
+                                continue;
+                            }
+
+                            let base = tool_root_abs.as_deref();
+
+                            // Resolve safe path and check existence.
+                            let abs = match crate::file_tools::resolve_safe_path(&path, base) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    state = AgentState::Recovery;
+                                    let msg =
+                                        format!("ERROR: {e}\npath: {path}\n(action skipped)");
+                                    let _ = tx
+                                        .send(StreamToken::Delta(format!(
+                                            "[RESULT_FILE_ERR] {}\n",
+                                            msg.lines().next().unwrap_or("ERROR")
+                                        )))
+                                        .await;
+                                    messages.push(json!({
+                                        "role": "user",
+                                        "content": format!(
+                                            "[implied_write_file]\npath: {}\nlang_hint: {}\n\n{}",
+                                            path, imf.lang_hint, msg
+                                        ),
+                                    }));
+                                    autosave_best_effort(
+                                        &autosaver,
+                                        &tx,
+                                        tool_root_abs.as_deref(),
+                                        checkpoint.as_deref(),
+                                        cur_cwd.as_deref(),
+                                        &messages,
+                                    )
+                                    .await;
+                                    pending_system_hint = Some(format!(
+                                        "Implied file write failed due to an unsafe or invalid path.\n\
+Fix: use a relative path under tool_root, without '..' or absolute paths.\n\
+path: {path}"
+                                    ));
+                                    break;
+                                }
+                            };
+
+                            let exists = abs
+                                .metadata()
+                                .ok()
+                                .map(|m| m.is_file() || m.is_dir())
+                                .unwrap_or(false);
+
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "\n\n[IMPLIED_WRITE] {}\n",
+                                    path
+                                )))
+                                .await;
+
+                            if exists {
+                                // Non-fatal: skip instead of blocking the whole run.
+                                let msg = format!(
+                                    "SKIP: '{path}' already exists. I will NOT overwrite it.\n\
+Action required: call read_file(path), then use patch_file/apply_diff to modify it safely."
+                                );
+                                messages.push(json!({
+                                    "role": "user",
+                                    "content": format!(
+                                        "[implied_write_file]\npath: {}\nlang_hint: {}\n\n{}",
+                                        path, imf.lang_hint, msg
+                                    ),
+                                }));
+                                autosave_best_effort(
+                                    &autosaver,
+                                    &tx,
+                                    tool_root_abs.as_deref(),
+                                    checkpoint.as_deref(),
+                                    cur_cwd.as_deref(),
+                                    &messages,
+                                )
+                                .await;
+                                continue;
+                            }
+
+                            // Approval: show a compact preview.
+                            let before_hash = hash_text("");
+                            let after_hash = hash_text(&imf.content);
+                            let preview = simple_before_after("", &imf.content);
+                            let approval = approver
+                                .approve(ApprovalRequest::Edit {
+                                    action: "implied_write_file".to_string(),
+                                    path: path.clone(),
+                                    preview,
+                                })
+                                .await?;
+                            if approval == ApprovalOutcome::Rejected {
+                                state = AgentState::Recovery;
+                                let msg = format!(
+                                    "REJECTED BY USER\naction: implied_write_file\npath: {path}\n(no changes applied)"
+                                );
+                                messages.push(json!({
+                                    "role": "user",
+                                    "content": format!(
+                                        "[implied_write_file]\npath: {}\nlang_hint: {}\n\n{}",
+                                        path, imf.lang_hint, msg
+                                    ),
+                                }));
+                                autosave_best_effort(
+                                    &autosaver,
+                                    &tx,
+                                    tool_root_abs.as_deref(),
+                                    checkpoint.as_deref(),
+                                    cur_cwd.as_deref(),
+                                    &messages,
+                                )
+                                .await;
+                                pending_system_hint = Some(
+                                    "The user rejected the edit. Choose a safer alternative or ask again with a smaller change."
+                                        .to_string(),
+                                );
+                                break;
+                            }
+
+                            state = AgentState::Executing;
+                            let (mut r_text, r_err) =
+                                crate::file_tools::tool_write_file(&path, &imf.content, base);
+                            if !r_err {
+                                // Update cache (canonical absolute path string).
+                                let cache_key = abs.to_string_lossy().into_owned();
+                                file_cache.insert(cache_key, imf.content.clone());
+                                r_text.push_str(&format!(
+                                    "\n[hash] before={} after={}",
+                                    fmt_hash(before_hash),
+                                    fmt_hash(after_hash)
+                                ));
+                                if let Some(ref cmd) = test_cmd {
+                                    if let Some(ref root) = tool_root_abs {
+                                        r_text.push_str(&run_test_cmd(cmd, root).await);
+                                    }
+                                }
+                            }
+
+                            let first_line = r_text.lines().next().unwrap_or("").to_string();
+                            if r_err {
+                                state = AgentState::Recovery;
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "[RESULT_FILE_ERR] {first_line}\n"
+                                    )))
+                                    .await;
+                                pending_system_hint = Some(format!(
+                                    "Implied file write failed: {first_line}\n\
+Fix the path/permissions, or switch to explicit tools (write_file/read_file/patch_file)."
+                                ));
+                                messages.push(json!({
+                                    "role": "user",
+                                    "content": format!(
+                                        "[implied_write_file]\npath: {}\nlang_hint: {}\n\n{}",
+                                        path, imf.lang_hint, r_text
+                                    ),
+                                }));
+                                autosave_best_effort(
+                                    &autosaver,
+                                    &tx,
+                                    tool_root_abs.as_deref(),
+                                    checkpoint.as_deref(),
+                                    cur_cwd.as_deref(),
+                                    &messages,
+                                )
+                                .await;
+                                break;
+                            }
+
+                            let _ = tx
+                                .send(StreamToken::Delta(format!("[RESULT_FILE] {first_line}\n")))
+                                .await;
+                            messages.push(json!({
+                                "role": "user",
+                                "content": format!(
+                                    "[implied_write_file]\npath: {}\nlang_hint: {}\n\n{}",
+                                    path, imf.lang_hint, r_text
+                                ),
+                            }));
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
+                            .await;
                         }
                     }
 
@@ -3676,6 +4061,35 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_implied_write_files_from_markdown() {
+        let text = r#"
+File: README.md
+```md
+# Hello
+```
+
+### src/main.rs
+```rust
+fn main() {}
+```
+
+```diff
+--- a/x
++++ b/x
+@@ -1 +1 @@
+-a
++b
+```
+"#;
+        let files = extract_implied_write_files(text);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "README.md");
+        assert!(files[0].content.contains("# Hello"));
+        assert_eq!(files[1].path, "src/main.rs");
+        assert!(files[1].content.contains("fn main"));
+    }
 
     #[test]
     fn blocks_git_init_inside_existing_repo() {
