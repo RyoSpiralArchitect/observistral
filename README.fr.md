@@ -147,6 +147,21 @@ verify: comment confirmer que ca a fonctionne
 
 Le champ `doubt:` force le modele a formuler un doute avant d'agir. ~50 tokens. Ca empeche le mode d'echec ou le modele est confiant et faux.
 
+### Boucle a machine d'etats (Planning → Executing → Verifying → Recovery)
+
+Beaucoup de "agent loops" ne sont qu'un timer. OBSTRAL route le Coder via une petite machine d'etats :
+
+- `planning`  — reformuler l'objectif et choisir la prochaine etape concrete
+- `executing` — executer des outils (fichiers/commandes)
+- `verifying` — lancer des probes `goal_check` avant de declarer "done"
+- `recovery`  — detection de blocage -> diagnostics + changement de strategie
+
+Cela aide les runs longs a converger au lieu de tourner en rond.
+
+### Verification des objectifs a l'arret (pas de faux "Done")
+
+Quand le modele renvoie `finish_reason=stop` sans tool calls, OBSTRAL peut executer automatiquement des checks legers (repo init, tests, build) et injecter un message `[goal_check]` dans la boucle si quelque chose manque ou echoue.
+
 ### References @fichier : sautez le tour de lecture
 
 Tapez `@chemin` n'importe ou dans votre message pour injecter le contenu du fichier comme contexte avant que votre prompt atteigne le Coder :

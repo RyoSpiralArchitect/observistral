@@ -2222,7 +2222,13 @@
       const TRUNC_STDERR = 800;
       const KEEP_TOOL_TURNS = longrun ? 6 : 3;
       const WANTS_REPO_GOAL = /(?:\brepo\b|\brepository\b|\bgit\b|scaffold|bootstrap|init|setup|create\s+(?:a\s+)?repo|create\s+(?:a\s+)?repository|リポ|リポジトリ|雛形|ひな形|プロジェクト|git\s+init)/i.test(String(text || ""));
-      let goalChecks = 0;
+      const WANTS_TEST_GOAL = /(?:\btests?\b|unit\s*tests?|unittest|pytest|jest|mocha|go\s+test|cargo\s+test|npm\s+test|e2e|smoke|テスト|単体テスト|総合テスト)/i.test(String(text || ""));
+      const WANTS_BUILD_GOAL = /(?:\bbuild\b|\bcompile\b|\brelease\b|bundle|cargo\s+(?:build|check)|npm\s+run\s+build|pnpm\s+build|yarn\s+build|ビルド|コンパイル)/i.test(String(text || ""));
+      let goalChecks = {
+        repo: { attempts: 0, ok: false },
+        tests: { attempts: 0, ok: false },
+        build: { attempts: 0, ok: false },
+      };
 
       const truncTool = (s, max) => {
         const t = String(s || "").trim();
@@ -2676,6 +2682,68 @@
         pendingDiag: "",
       };
 
+      // Lightweight state machine: the system prompt sees the current state so the model can route its behavior.
+      // This is intentionally small (planning/executing/verifying/recovery/done) to keep it robust across models.
+      let agentState = "planning";
+
+      // Short-term memory: keep a compact summary of recent tool actions so the model can avoid repeats.
+      const recentRuns = [];
+      const pushRecentRun = (rec) => {
+        try {
+          const r = rec && typeof rec === "object" ? rec : { note: String(rec || "") };
+          recentRuns.push({ ts: Date.now(), ...r });
+          while (recentRuns.length > 8) recentRuns.shift();
+        } catch (_) {}
+      };
+      const firstDigestLine = (digest) => {
+        const s = String(digest || "");
+        const m = s.match(/^\s*-\s+(.+)$/m);
+        return m && m[1] ? String(m[1]).trim() : "";
+      };
+      const clip = (s, n) => {
+        const t = String(s || "").trim();
+        if (t.length <= n) return t;
+        return t.slice(0, Math.max(0, n - 3)) + "...";
+      };
+      const formatRecentRuns = () => {
+        try {
+          const last = recentRuns.slice(-6);
+          if (!last.length) return "";
+          const lines = [];
+          for (const r of last) {
+            const kind = String(r.kind || "").trim();
+            if (kind === "exec") {
+              const exitCode = Number(r.exit);
+              const cls = String(r.cls || "").trim();
+              const cmd = clip(String(r.cmd || "").trim(), 80);
+              const err = clip(String(r.err || "").trim(), 90);
+              const parts = [];
+              parts.push(`exit=${Number.isFinite(exitCode) ? exitCode : String(r.exit)}`);
+              if (cls) parts.push(`cls=${cls}`);
+              if (cmd) parts.push(`cmd=${cmd}`);
+              if (err) parts.push(`err=${err}`);
+              lines.push("- exec " + parts.join(" "));
+              continue;
+            }
+            if (kind === "write_file" || kind === "patch_file" || kind === "apply_diff") {
+              const ok = r.ok === false ? "FAIL" : "OK";
+              const path0 = clip(String(r.path || "").trim(), 90);
+              const note = clip(String(r.note || "").trim(), 90);
+              lines.push(`- ${kind} ${ok} ${path0}${note ? (" " + note) : ""}`.trim());
+              continue;
+            }
+            if (kind) {
+              lines.push(`- ${kind} ${clip(String(r.note || "").trim(), 120)}`.trim());
+            }
+          }
+          const out = lines.filter(Boolean);
+          if (!out.length) return "";
+          return ["[Recent runs]", ...out].join("\n");
+        } catch (_) {
+          return "";
+        }
+      };
+
       const deriveGovernorHint = (stderr, stdout) => {
         const sErr = String(stderr || "");
         const sOut = String(stdout || "");
@@ -2925,6 +2993,241 @@
         setMsg(threadId, asstMsgId, (display + (extra || "")).trim() || "…", coderBodyRef);
       };
 
+      // Goal verification (enterprise-style "done" criteria):
+      // On finish_reason=stop, run lightweight checks to ensure the deliverable exists (repo init, tests/build pass, etc).
+      // This prevents "looks done" replies that are missing key artifacts.
+      const canAutoExec = () => {
+        const canExec = !!(status && status.features && status.features.exec);
+        return canExec && longrun && !config.requireCommandApproval;
+      };
+      const goalPending = (k) => {
+        const st = goalChecks && goalChecks[k] ? goalChecks[k] : null;
+        if (!st) return false;
+        const attempts = Number(st.attempts) || 0;
+        return !st.ok && attempts < 3;
+      };
+      const runGoalExec = async (label, commandToRun) => {
+        const win = isWindowsHost();
+        const fenceLang = win ? "powershell" : "bash";
+        const prompt = win ? "PS> " : "$ ";
+        const shown = String(commandToRun || "").split("\n").map((l, i) => (i === 0 ? prompt : "    ") + l).join("\n");
+        display += (display ? "\n\n" : "") + "```" + fenceLang + "\n" + shown;
+        flush("\n```");
+
+        const cwdUsed = cwdNow();
+        const execCmd = wrapExecWithPwd(commandToRun);
+        const execRes = await postJson("/api/exec", { command: execCmd, cwd: cwdUsed }, ac.signal);
+        const parsed = stripPwdMarker(execRes.stdout);
+        const breach = sandboxBreachReason(parsed.pwd);
+        maybeUpdateWorkdirFromPwd(parsed.pwd);
+
+        const stdoutRaw = String(parsed.stdout || "");
+        const stderrRaw = String(execRes.stderr || "");
+        const stdout = truncToolTail(stdoutRaw, TRUNC_STDOUT);
+        const stderr = truncToolTail(stderrRaw, TRUNC_STDERR);
+        const exitCode = execRes.exit_code;
+        const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdoutRaw, stderrRaw) : "";
+        const failed = exitCode !== 0 || !!suspicious || !!breach;
+        const errClass = failed ? classifyErrorClass(stderrRaw, stdoutRaw) : "";
+        const digest = failed ? extractErrorDigest(stdoutRaw, stderrRaw) : "";
+        const errLine = failed ? (firstDigestLine(digest) || errorLineSig(stdout, stderr) || "") : "";
+        pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: exitCode, ok: !failed, cls: errClass, err: errLine, note: label });
+
+        if (stdout) display += "\n" + stdout;
+        if (stderr) display += "\nstderr: " + stderr;
+        display += "\n```\nexit: " + exitCode;
+        flush();
+
+        return { label, exitCode, failed, breach, suspicious, stdoutRaw, stderrRaw, stdout, stderr, errClass, digest };
+      };
+      const goalCheckRepo = async () => {
+        if (!WANTS_REPO_GOAL || !goalPending("repo")) return false;
+        goalChecks.repo.attempts = (Number(goalChecks.repo.attempts) || 0) + 1;
+
+        const win = isWindowsHost();
+        const probeCmd = win
+          ? [
+              "$inRepo = Test-Path -LiteralPath '.git'",
+              "$head = ''",
+              "try { $head = (git rev-parse HEAD 2>$null).Trim() } catch { $head = '' }",
+              "$readme = Test-Path -LiteralPath 'README.md'",
+              "Write-Output ('in_repo=' + $inRepo)",
+              "Write-Output ('head=' + $head)",
+              "Write-Output ('readme=' + $readme)",
+            ].join('; ')
+          : [
+              "in_repo=0; [ -d .git ] && in_repo=1; echo in_repo=$in_repo",
+              "head=$(git rev-parse HEAD 2>/dev/null || true); echo head=$head",
+              "readme=0; [ -f README.md ] && readme=1; echo readme=$readme",
+            ].join('; ');
+
+        let res;
+        try {
+          res = await runGoalExec("goal_repo", probeCmd);
+        } catch (e2) {
+          return false;
+        }
+
+        if (res.breach) {
+          messages.push({
+            role: "user",
+            content: [
+              "[sandbox_breach]",
+              "A command ended outside tool_root. This is blocked to prevent repo-root modification accidents.",
+              res.breach,
+              "Fix: re-run under tool_root; avoid `cd ..` / absolute paths. Verify `pwd` stays under tool_root.",
+            ].join("\n"),
+          });
+          agentState = "recovery";
+          return true;
+        }
+
+        const stdoutRaw = String(res.stdoutRaw || "");
+        const missing = [];
+        const inRepo = /in_repo=(true|1)/i.test(stdoutRaw);
+        const head = (() => {
+          const m = stdoutRaw.match(/^head=(.*)$/im);
+          return m ? String(m[1] || "").trim() : "";
+        })();
+        const readme = /readme=(true|1)/i.test(stdoutRaw);
+        if (!inRepo) missing.push(".git");
+        if (!head) missing.push("HEAD (commit)");
+        if (!readme) missing.push("README.md");
+
+        if (missing.length) {
+          messages.push({
+            role: "user",
+            content: [
+              "[goal_check]",
+              "The task is NOT complete yet.",
+              "Missing: " + missing.join(", "),
+              "Fix it by using exec/write_file. Do NOT stop until the goals are satisfied.",
+            ].join("\n"),
+          });
+          return true;
+        }
+
+        goalChecks.repo.ok = true;
+        return false;
+      };
+      const goalCheckTests = async () => {
+        if (!WANTS_TEST_GOAL || !goalPending("tests")) return false;
+        goalChecks.tests.attempts = (Number(goalChecks.tests.attempts) || 0) + 1;
+
+        const win = isWindowsHost();
+        const testCmd = win
+          ? [
+              "if (Test-Path -LiteralPath 'Cargo.toml') { cargo test -q }",
+              "elseif (Test-Path -LiteralPath 'package.json') { npm test --silent }",
+              "elseif ((Test-Path -LiteralPath 'pyproject.toml') -or (Test-Path -LiteralPath 'requirements.txt')) { python -m pytest -q }",
+              "else { Write-Output 'NO_TEST_RUNNER' }",
+            ].join(' ')
+          : [
+              "if [ -f Cargo.toml ]; then cargo test -q;",
+              "elif [ -f package.json ]; then npm test --silent;",
+              "elif [ -f pyproject.toml ] || [ -f requirements.txt ]; then python -m pytest -q;",
+              "else echo NO_TEST_RUNNER; fi",
+            ].join(' ');
+
+        let res;
+        try { res = await runGoalExec("goal_tests", testCmd); } catch (_) { return false; }
+
+        const out0 = String(res.stdoutRaw || "");
+        if (out0.includes("NO_TEST_RUNNER")) {
+          messages.push({
+            role: "user",
+            content: [
+              "[goal_check]",
+              "Tests were requested, but no test runner was detected in the current directory.",
+              "If tests are required, set up a runner (Cargo.toml -> cargo test, package.json -> npm test, pyproject.toml -> pytest) and re-run.",
+              "Otherwise, explicitly explain why tests are not applicable and then stop.",
+            ].join("\n"),
+          });
+          return true;
+        }
+
+        if (res.failed) {
+          messages.push({
+            role: "user",
+            content: [
+              "[goal_check]",
+              "Tests are failing (or suspicious output indicates failure).",
+              res.errClass ? ("class: " + res.errClass) : "",
+              res.digest || "",
+              "Fix the failures and re-run the tests. Do NOT stop until tests pass.",
+            ].filter(Boolean).join("\n"),
+          });
+          agentState = "recovery";
+          return true;
+        }
+
+        goalChecks.tests.ok = true;
+        return false;
+      };
+      const goalCheckBuild = async () => {
+        if (!WANTS_BUILD_GOAL || !goalPending("build")) return false;
+        goalChecks.build.attempts = (Number(goalChecks.build.attempts) || 0) + 1;
+
+        const win = isWindowsHost();
+        const buildCmd = win
+          ? [
+              "if (Test-Path -LiteralPath 'Cargo.toml') { cargo build -q }",
+              "elseif (Test-Path -LiteralPath 'package.json') { npm run build --silent }",
+              "elseif ((Test-Path -LiteralPath 'pyproject.toml') -or (Test-Path -LiteralPath 'requirements.txt')) { python -m compileall -q . }",
+              "else { Write-Output 'NO_BUILD_RUNNER' }",
+            ].join(' ')
+          : [
+              "if [ -f Cargo.toml ]; then cargo build -q;",
+              "elif [ -f package.json ]; then npm run build --silent;",
+              "elif [ -f pyproject.toml ] || [ -f requirements.txt ]; then python -m compileall -q .;",
+              "else echo NO_BUILD_RUNNER; fi",
+            ].join(' ');
+
+        let res;
+        try { res = await runGoalExec("goal_build", buildCmd); } catch (_) { return false; }
+
+        const out0 = String(res.stdoutRaw || "");
+        if (out0.includes("NO_BUILD_RUNNER")) {
+          messages.push({
+            role: "user",
+            content: [
+              "[goal_check]",
+              "A build step was requested, but no known build runner was detected in the current directory.",
+              "If build is required: add build instructions/scripts for this repo and run them.",
+              "Otherwise, explicitly explain why build is not applicable and then stop.",
+            ].join("\n"),
+          });
+          return true;
+        }
+
+        if (res.failed) {
+          messages.push({
+            role: "user",
+            content: [
+              "[goal_check]",
+              "Build is failing (or suspicious output indicates failure).",
+              res.errClass ? ("class: " + res.errClass) : "",
+              res.digest || "",
+              "Fix the build failures and re-run. Do NOT stop until build passes.",
+            ].filter(Boolean).join("\n"),
+          });
+          agentState = "recovery";
+          return true;
+        }
+
+        goalChecks.build.ok = true;
+        return false;
+      };
+      const runGoalChecksOnStop = async () => {
+        if (!canAutoExec()) return false;
+        agentState = "verifying";
+        // Run checks in order; stop at the first unmet goal (so the model can fix it).
+        if (await goalCheckRepo()) return true;
+        if (await goalCheckTests()) return true;
+        if (await goalCheckBuild()) return true;
+        return false;
+      };
+
       // SSE streaming helper — streams token deltas in real-time, returns finish event.
       const streamChatTools = async (payload, signal, onDelta) => {
         const resp = await fetch("/api/chat_tools_stream", {
@@ -3060,6 +3363,11 @@
 
         // One-shot governor hint injection (outer-loop behavioral control).
         // Also inject periodic progress checkpoints in longrun mode so the agent doesn't drift.
+        // State routing (minimal state machine): recovery > planning > executing.
+        if (iter === 0) agentState = "planning";
+        else if (governor.pendingDiag) agentState = "recovery";
+        else if (agentState !== "done") agentState = "executing";
+
         let govHint = governor.pendingHint ? String(governor.pendingHint || "").trim() : "";
         if (longrun && (iter === 3 || iter === 6 || iter === 9 || iter === 12)) {
           const cp = [
@@ -3070,11 +3378,14 @@
           ].join("\n");
           govHint = govHint ? (govHint + "\n\n" + cp) : cp;
         }
+        const sysExtras = [];
+        sysExtras.push(`[Agent state]\nstate: ${agentState}`);
+        const recentTxt = formatRecentRuns();
+        if (recentTxt) sysExtras.push(recentTxt);
+        if (govHint) sysExtras.push("[Governor]\n" + govHint);
         messages[0] = {
           role: "system",
-          content: govHint
-            ? (SYSTEM_BASE_TEXT + "\n\n[Governor]\n" + govHint)
-            : SYSTEM_BASE_TEXT,
+          content: SYSTEM_BASE_TEXT + "\n\n" + sysExtras.join("\n\n"),
         };
         governor.pendingHint = "";
 
@@ -3121,6 +3432,7 @@
             const toolName = String(tc.function.name || "").trim();
 
             if (toolName === "exec") {
+              agentState = "executing";
               let args;
               try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
               const command = stripShellTranscript(String(args.command || ""));
@@ -3139,6 +3451,8 @@
               try {
                 if (repeatBlock) {
                   toolResult = `error: blocked repeated failing command (${repeatBlock}). You MUST choose a different command/strategy.`;
+                  pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: -1, ok: false, cls: "blocked", err: clip(repeatBlock, 120) });
+                  agentState = "recovery";
                   display += `\n(blocked: ${repeatBlock})\n\`\`\`\nexit: -1`;
                   flush();
                   messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
@@ -3146,6 +3460,8 @@
                 }
                 if (danger) {
                   toolResult = `error: blocked dangerous command (${danger}). Ask the user to run it manually if truly intended.`;
+                  pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: -1, ok: false, cls: "blocked", err: clip(danger, 120) });
+                  agentState = "recovery";
                   display += `\n(blocked: ${danger})\n\`\`\`\nexit: -1`;
                   flush();
                   messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
@@ -3162,6 +3478,7 @@
                       toolResult = aid
                         ? `Awaiting approval via /api/approve_command\napproval_id: ${aid}`
                         : "Awaiting approval via /api/approve_command";
+                      pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: -1, ok: false, cls: "approval", err: aid ? ("queued:" + aid) : "queued" });
                       display += aid
                         ? `\n(queued for approval: ${aid})\n\`\`\`\nexit: -1`
                         : "\n(queued)\n```\nexit: -1";
@@ -3175,6 +3492,7 @@
                   }
                   if (!window.confirm("Run command?\n\n" + commandToRun)) {
                     toolResult = "error: command rejected by user";
+                    pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: -1, ok: false, cls: "rejected", err: "rejected by user" });
                     display += "\n(rejected)\n```\nexit: -1";
                     flush();
                     messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
@@ -3198,8 +3516,11 @@
                 noteCmd(k, failed, errorLineSig(stdout, stderr));
                 const hintGit = failed ? gitRepoHint(stderrRaw) : "";
                 const hintGov = failed ? deriveGovernorHint(stderrRaw, stdoutRaw) : "";
-                const hintClass = failed ? errorClassHint(classifyErrorClass(stderrRaw, stdoutRaw)) : "";
+                const errClass = failed ? classifyErrorClass(stderrRaw, stdoutRaw) : "";
+                const hintClass = failed ? errorClassHint(errClass) : "";
                 const digest = failed ? extractErrorDigest(stdoutRaw, stderrRaw) : "";
+                const errLine = failed ? (firstDigestLine(digest) || errorLineSig(stdout, stderr) || "") : "";
+                pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: exitCode, ok: !failed, cls: errClass, err: errLine });
                 const hintSandbox = breach ? [
                   "SANDBOX BREACH: command ended outside tool_root.",
                   breach,
@@ -3448,92 +3769,16 @@
           // finish_reason === "stop" — if the model didn't produce tool calls, try implied scripts.
           const implied = extractImpliedExecScripts(asstText);
           if (!implied.length) {
-            // Goal delta check: the model may "stop" even though the repo/task isn't actually complete.
-            // For repo-scaffolding style prompts, run ONE lightweight sanity probe and continue if goals are missing.
-            const canExec = !!(status && status.features && status.features.exec);
-            if (WANTS_REPO_GOAL && goalChecks < 1 && canExec) {
-              goalChecks++;
-
-              const win = isWindowsHost();
-              const fenceLang = win ? "powershell" : "bash";
-              const prompt = win ? "PS> " : "$ ";
-              const probeCmd = win
-                ? [
-                    "$inRepo = Test-Path -LiteralPath '.git'",
-                    "$head = ''",
-                    "try { $head = (git rev-parse HEAD 2>$null).Trim() } catch { $head = '' }",
-                    "$readme = Test-Path -LiteralPath 'README.md'",
-                    "Write-Output ('in_repo=' + $inRepo)",
-                    "Write-Output ('head=' + $head)",
-                    "Write-Output ('readme=' + $readme)",
-                  ].join('; ')
-                : [
-                    "test -d .git && echo in_repo=true || echo in_repo=false",
-                    "h=$(git rev-parse HEAD 2>/dev/null || true); echo head=$h",
-                    "test -f README.md && echo readme=true || echo readme=false",
-                  ].join("; ");
-
-              display += (display ? "\n\n" : "") + "```" + fenceLang + "\n" + prompt + "# [auto] goal check (repo)\n" + probeCmd;
-              flush("\n```");
-
-              try {
-                const cwdUsed = cwdNow();
-                const execCmd = wrapExecWithPwd(probeCmd);
-                const execRes = await postJson("/api/exec", { command: execCmd, cwd: cwdUsed }, ac.signal);
-                const parsed = stripPwdMarker(execRes.stdout);
-                const breach = sandboxBreachReason(parsed.pwd);
-                maybeUpdateWorkdirFromPwd(parsed.pwd);
-                const stdout = String(parsed.stdout || "").trim();
-
-                const mRepo = stdout.match(/(^|\n)in_repo=(true|false)\b/i);
-                const mHead = stdout.match(/(^|\n)head=([0-9a-f]{6,40})\b/i);
-                const mReadme = stdout.match(/(^|\n)readme=(true|false)\b/i);
-
-                const inRepo = !!(mRepo && String(mRepo[2] || "").toLowerCase() === "true");
-                const hasHead = !!(mHead && mHead[2]);
-                const hasReadme = !!(mReadme && String(mReadme[2] || "").toLowerCase() === "true");
-
-                const missing = [];
-                if (!inRepo) missing.push("git init (no .git)");
-                if (inRepo && !hasHead) missing.push("initial commit");
-                if (!hasReadme) missing.push("README.md");
-
-                display += (stdout ? ("\n" + truncTool(stdout, TRUNC_STDOUT)) : "\n(stdout empty)") + "\n```";
-                flush();
-
-                if (breach) {
-                  messages.push({
-                    role: "user",
-                    content: [
-                      "[sandbox_breach]",
-                      "A command ended outside tool_root. This is blocked to prevent repo-root modification accidents.",
-                      breach,
-                      "Fix: re-run under tool_root; avoid `cd ..` / absolute paths. Verify `pwd` stays under tool_root.",
-                    ].join("\n"),
-                  });
-                  continue;
-                }
-
-                if (missing.length) {
-                  messages.push({
-                    role: "user",
-                    content: [
-                      "[goal_check]",
-                      "The task is NOT complete yet.",
-                      "Missing: " + missing.join(", "),
-                      "Fix it by using exec/write_file. Do NOT stop until the goals are satisfied.",
-                    ].join("\n"),
-                  });
-                  continue;
-                }
-              } catch (e2) {
-                display += "\nerror: " + prettyErr(e2) + "\n```";
-                flush();
-                // If probe fails, don't hard-block completion; fall through to break.
-              }
+            // Goal delta check: the model may "stop" even though the deliverable isn't actually complete.
+            // In longrun mode (and when command approval is OFF), auto-run a small set of checks (repo/tests/build).
+            try {
+              if (await runGoalChecksOnStop()) continue;
+            } catch (_) {
+              // If goal checks fail, don't hard-block completion; fall through to break.
             }
             break;
           }
+          agentState = "executing";
           for (const im of implied) {
             if (ac.signal.aborted) break;
             const command = stripShellTranscript(String(im.script || ""));
@@ -3553,6 +3798,8 @@
             try {
               if (repeatBlock) {
                 resultText = `error: blocked repeated failing command (${repeatBlock}). You MUST choose a different command/strategy.`;
+                pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: -1, ok: false, cls: "blocked", err: clip(repeatBlock, 120) });
+                agentState = "recovery";
                 display += `\n(blocked: ${repeatBlock})\n\`\`\`\nexit: -1`;
                 flush();
                 messages.push({ role: "user", content: `[exec blocked repeated-failure]\n${repeatBlock}\ncommand:\n${commandToRun}` });
@@ -3560,6 +3807,8 @@
               }
               if (danger) {
                 resultText = `error: blocked dangerous command (${danger}). Ask the user to run it manually if truly intended.`;
+                pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: -1, ok: false, cls: "blocked", err: clip(danger, 120) });
+                agentState = "recovery";
                 display += `\n(blocked: ${danger})\n\`\`\`\nexit: -1`;
                 flush();
                 messages.push({ role: "user", content: `[exec blocked]\nreason: ${danger}\ncommand:\n${commandToRun}` });
@@ -3576,6 +3825,7 @@
                     resultText = aid
                       ? `Awaiting approval via /api/approve_command\napproval_id: ${aid}`
                       : "Awaiting approval via /api/approve_command";
+                    pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: -1, ok: false, cls: "approval", err: aid ? ("queued:" + aid) : "queued" });
                     display += aid
                       ? `\n(queued for approval: ${aid})\n\`\`\`\nexit: -1`
                       : "\n(queued)\n```\nexit: -1";
@@ -3596,6 +3846,7 @@
                 }
                 if (!window.confirm("Run command?\n\n" + commandToRun)) {
                   resultText = "error: command rejected by user";
+                  pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: -1, ok: false, cls: "rejected", err: "rejected by user" });
                   display += "\n(rejected)\n```\nexit: -1";
                   flush();
                   messages.push({ role: "user", content: `[exec rejected]\ncommand:\n${commandToRun}` });
@@ -3619,8 +3870,11 @@
               noteCmd(k, failed, errorLineSig(stdout, stderr));
               const hintGit = failed ? gitRepoHint(stderrRaw) : "";
               const hintGov = failed ? deriveGovernorHint(stderrRaw, stdoutRaw) : "";
-              const hintClass = failed ? errorClassHint(classifyErrorClass(stderrRaw, stdoutRaw)) : "";
+              const errClass = failed ? classifyErrorClass(stderrRaw, stdoutRaw) : "";
+              const hintClass = failed ? errorClassHint(errClass) : "";
               const digest = failed ? extractErrorDigest(stdoutRaw, stderrRaw) : "";
+              const errLine = failed ? (firstDigestLine(digest) || errorLineSig(stdout, stderr) || "") : "";
+              pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: exitCode, ok: !failed, cls: errClass, err: errLine });
               const hintSandbox = breach ? [
                 "SANDBOX BREACH: command ended outside tool_root.",
                 breach,

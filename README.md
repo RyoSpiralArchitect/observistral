@@ -147,6 +147,21 @@ verify: how to confirm it worked
 
 The `doubt:` field forces the model to surface one self-criticism before acting. ~50 tokens. It prevents the failure mode where the model is confidently wrong.
 
+### State-Machine Loop (Planning → Executing → Verifying → Recovery)
+
+Most "agent loops" are just a max-iteration timer. OBSTRAL routes the Coder through a tiny state machine instead:
+
+- `planning`  — restate the goal and pick the next concrete step
+- `executing` — run tools (files/commands)
+- `verifying` — run `goal_check` probes before declaring done
+- `recovery`  — stuck detection triggers diagnostics + strategy shift
+
+This makes long runs converge instead of drifting into README-polish loops.
+
+### Goal Verification on Stop (No False "Done")
+
+When the model returns `finish_reason=stop` without tool calls, OBSTRAL can automatically run lightweight checks (repo init, tests, build) and push a `[goal_check]` message back into the loop if anything is missing or failing.
+
 ### @file References: Skip the Read Turn
 
 Type `@path` anywhere in your message to inject that file's content as context before your prompt reaches the Coder:
