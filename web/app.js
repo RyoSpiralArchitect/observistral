@@ -2726,10 +2726,10 @@
               continue;
             }
             if (kind === "write_file" || kind === "patch_file" || kind === "apply_diff") {
-              const ok = r.ok === false ? "FAIL" : "OK";
+              const status = String(r.status || "").trim() || (r.ok === false ? "FAIL" : "OK");
               const path0 = clip(String(r.path || "").trim(), 90);
               const note = clip(String(r.note || "").trim(), 90);
-              lines.push(`- ${kind} ${ok} ${path0}${note ? (" " + note) : ""}`.trim());
+              lines.push(`- ${kind} ${status} ${path0}${note ? (" " + note) : ""}`.trim());
               continue;
             }
             if (kind) {
@@ -3624,11 +3624,13 @@
               try {
                 if (unsafePath) {
                   toolResult = "error: unsafe path (must be relative, no '..', no drive letters)";
+                  pushRecentRun({ kind: "write_file", status: "FAIL", ok: false, path: path0 || "(missing)", note: "unsafe path" });
                   messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
                   continue;
                 }
                 if (!content) {
                   toolResult = "error: write_file content is empty";
+                  pushRecentRun({ kind: "write_file", status: "FAIL", ok: false, path: path0 || "(missing)", note: "empty content" });
                   messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
                   continue;
                 }
@@ -3648,6 +3650,7 @@
                   toolResult = aid
                     ? `Awaiting approval via /api/approve_edit\napproval_id: ${aid}`
                     : "Awaiting approval via /api/approve_edit";
+                  pushRecentRun({ kind: "write_file", status: "PENDING", path: path0 || fullPath, note: aid ? ("approval_id=" + aid) : "approval queued" });
                   messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
                   awaitingApproval = true;
                   break;
@@ -3655,9 +3658,11 @@
 
                 const wr = await postJson("/api/write_file", { path: fullPath, content }, ac.signal);
                 toolResult = `OK write_file\nbytes_written: ${wr && wr.bytes_written != null ? wr.bytes_written : content.length}`;
+                pushRecentRun({ kind: "write_file", status: "OK", path: path0 || fullPath, note: `bytes=${wr && wr.bytes_written != null ? wr.bytes_written : content.length}` });
                 messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               } catch (e2) {
                 toolResult = `error: ${prettyErr(e2)}`;
+                pushRecentRun({ kind: "write_file", status: "FAIL", ok: false, path: path0 || "(missing)", note: clip(prettyErr(e2), 120) });
                 messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               }
               flush();
@@ -3695,8 +3700,10 @@
               try {
                 const res = await postJson("/api/patch_file", { path: path0, search, replace }, ac.signal);
                 toolResult = res && res.message ? res.message : "OK: patched";
+                pushRecentRun({ kind: "patch_file", status: "OK", path: path0, note: firstDigestLine(toolResult) || "" });
               } catch (e2) {
                 toolResult = `ERROR patching '${path0}': ${prettyErr(e2)}`;
+                pushRecentRun({ kind: "patch_file", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) });
               }
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               flush();
@@ -3734,8 +3741,10 @@
               try {
                 const res = await postJson("/api/apply_diff", { path: path0, diff }, ac.signal);
                 toolResult = res && res.message ? res.message : "OK: diff applied";
+                pushRecentRun({ kind: "apply_diff", status: "OK", path: path0, note: firstDigestLine(toolResult) || "" });
               } catch (e2) {
                 toolResult = `ERROR applying diff to '${path0}': ${prettyErr(e2)}`;
+                pushRecentRun({ kind: "apply_diff", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) });
               }
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               flush();

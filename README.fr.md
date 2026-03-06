@@ -158,6 +158,8 @@ Beaucoup de "agent loops" ne sont qu'un timer. OBSTRAL route le Coder via une pe
 
 Cela aide les runs longs a converger au lieu de tourner en rond.
 
+OBSTRAL injecte aussi une memoire compacte `[Recent runs]` (commandes + `write_file` / `patch_file` / `apply_diff`) pour que le Coder n'oublie pas ce qu'il vient de faire et ne repete pas les memes actions.
+
 ### Verification des objectifs a l'arret (pas de faux "Done")
 
 Quand le modele renvoie `finish_reason=stop` sans tool calls, OBSTRAL peut executer automatiquement des checks legers (repo init, tests, build) et injecter un message `[goal_check]` dans la boucle si quelque chose manque ou echoue.

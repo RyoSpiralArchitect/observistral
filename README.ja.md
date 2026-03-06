@@ -158,6 +158,8 @@ verify: 成功を確認する方法
 
 これにより、長距離ランがREADME整形ループに沈まず、収束しやすくなります。
 
+さらに、直近のツール実行（コマンド + `write_file` / `patch_file` / `apply_diff`）を `[Recent runs]` としてコンパクトに注入し、「やったことを忘れて同じ作業を繰り返す」ループを減らします。
+
 ### stop時のゴール検証（偽の「Done」を防ぐ）
 
 モデルが `finish_reason=stop` でツール呼び出しなしに止まった場合でも、OBSTRALは軽いチェック（repo init / tests / build など）を自動実行し、足りない・失敗している場合は `[goal_check]` を差し戻してループを継続させられます。

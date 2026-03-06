@@ -158,6 +158,8 @@ Most "agent loops" are just a max-iteration timer. OBSTRAL routes the Coder thro
 
 This makes long runs converge instead of drifting into README-polish loops.
 
+OBSTRAL also injects a compact `[Recent runs]` memory (commands + `write_file` / `patch_file` / `apply_diff`) so the Coder doesn't forget what it just did and repeat itself.
+
 ### Goal Verification on Stop (No False "Done")
 
 When the model returns `finish_reason=stop` without tool calls, OBSTRAL can automatically run lightweight checks (repo init, tests, build) and push a `[goal_check]` message back into the loop if anything is missing or failing.
