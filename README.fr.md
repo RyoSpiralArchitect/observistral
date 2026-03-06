@@ -279,6 +279,20 @@ Chaque champ est intentionnel. `quote` epingle la ligne exacte incriminee sur la
 .\scripts\run-tui.ps1
 ```
 
+**Coder headless (CLI)**
+```powershell
+# (optionnel) generer le template .obstral.md (stack + test_cmd)
+obstral init -C .
+
+# lancer l'agent de code dans votre projet
+obstral agent "fix the failing test" -C . --vibe --session
+# reprendre plus tard (sans prompt -> "continue" auto)
+obstral agent -C . --vibe --session
+
+# artefacts (trace JSONL + snapshot JSON final)
+obstral agent "fix the failing test" -C . --vibe --trace-out .tmp/obstral_trace.jsonl --json-out .tmp/obstral_final.json
+```
+
 **Python Lite (WDAC / pas de binaire Rust)**
 ```powershell
 python .\scripts\serve_lite.py
@@ -310,6 +324,23 @@ La traversee de chemins est bloquee : les chemins avec des composantes `..` sont
 
 - **Langue de l'UI** : TUI `/lang ja|en|fr` (affecte aussi les prompts).
 - **Langue de l'Observer (UI Web)** : `auto` (par defaut) suit la langue de votre dernier message utilisateur meme si l'UI est en anglais ; `ui` suit l'UI ; ou forcez `ja`/`en`/`fr`.
+
+### Sessions (CLI)
+
+`obstral agent` peut sauvegarder et reprendre la conversation complete (y compris les tool calls) avec `--session[=<chemin>]`.
+
+- Chemin par defaut : `.tmp/obstral_session.json`
+- Si `-C/--root` est defini, les chemins relatifs de sortie sont resolus sous `tool_root`
+- Auto-sauvegarde pendant l'execution (apres les tool calls)
+- Reprendre sans prompt : relancez `obstral agent -C . --session`
+- Recommencer : ajoutez `--new-session` (ecrase le fichier)
+
+Artefacts associes :
+- `--trace-out <chemin>` / `--trace_out` : trace JSONL (tool calls, checkpoints, errors, done)
+- `--json-out <chemin>` / `--json_out` : snapshot JSON final (messages + tool calls + tool results)
+- Si `-C/--root` est defini, les chemins relatifs sont resolus sous `tool_root`
+
+Le JSON de session/trace peut contenir du code et des sorties d'outils; traitez-le comme sensible.
 
 ### Approbations
 

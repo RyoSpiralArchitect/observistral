@@ -292,6 +292,9 @@ obstral agent "fix the failing test" -C . --vibe --session
 # 後で再開（プロンプト省略 -> 自動で「続けて」）
 obstral agent -C . --vibe --session
 
+# 機械可読な成果物を出力（JSONL trace + 最終JSONスナップショット）
+obstral agent "fix the failing test" -C . --vibe --trace-out .tmp/obstral_trace.jsonl --json-out .tmp/obstral_final.json
+
 # 自動修正ループ（Coder → Observer差分レビュー → Coder）
 obstral agent "fix the failing test" -C . --vibe --autofix
 obstral agent "fix the failing test" -C . --vibe --autofix 3
@@ -348,6 +351,11 @@ python .\scripts\serve_lite.py
 - 実行中も（tool call後などに）自動保存
 - プロンプト省略で再開: `obstral agent -C . --session` をもう一度実行
 - 最初からやり直し: `--new-session` を付ける（ファイルは上書き）
+
+関連する成果物出力:
+- `--trace-out <path>` / `--trace_out`: JSONL trace（tool call / checkpoint / error / done）
+- `--json-out <path>` / `--json_out`: 最終セッションスナップショットJSON（messages + tool calls + tool results）
+- `-C/--root` 指定時、相対パスは `tool_root` 配下で解決される
 
 セッションJSONにはコードやツール出力が入るので、取り扱い注意。
 

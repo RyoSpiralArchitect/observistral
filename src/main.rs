@@ -1,22 +1,23 @@
+mod agent_session;
+mod approvals;
 mod chatbot;
 mod config;
 mod exec;
+mod file_tools;
 mod lang_detect;
 mod loop_detect;
 mod modes;
-mod approvals;
-mod agent_session;
 mod pending_commands;
 mod pending_edits;
 mod personas;
+mod project;
+mod providers;
 mod repl;
 mod server;
 mod streaming;
+mod trace_writer;
 mod tui;
 mod types;
-mod file_tools;
-mod project;
-mod providers;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -147,6 +148,16 @@ struct AgentArgs {
         alias = "autofix-rounds"
     )]
     autofix: Option<usize>,
+
+    /// Write a JSONL trace of the agent run (tool calls, checkpoints, errors, done).
+    /// If `-C/--root` is set and the path is relative, it is resolved under `tool_root`.
+    #[arg(long, alias = "trace_out")]
+    trace_out: Option<PathBuf>,
+
+    /// Write the final session snapshot as JSON (messages + tool_calls + tool results).
+    /// If `-C/--root` is set and the path is relative, it is resolved under `tool_root`.
+    #[arg(long, alias = "json_out")]
+    json_out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -389,7 +400,10 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
     let head_len = max_chars / 2;
     let tail_len = max_chars.saturating_sub(head_len);
     let head: String = s.chars().take(head_len).collect();
-    let tail: String = s.chars().skip(char_count.saturating_sub(tail_len)).collect();
+    let tail: String = s
+        .chars()
+        .skip(char_count.saturating_sub(tail_len))
+        .collect();
     let total_lines = s.lines().count();
     format!(
         "{head}\n...[truncated — {total_lines} lines total, {char_count} chars total]...\n{tail}"
@@ -536,8 +550,7 @@ async fn review_git_diff(
             diff_payload.push('\n');
         }
 
-        let (stat_u, err_u, exit_u) =
-            git_cmd_output(tool_root, &["diff", "--no-color", "--stat"])?;
+        let (stat_u, err_u, exit_u) = git_cmd_output(tool_root, &["diff", "--no-color", "--stat"])?;
         if exit_u == 0 && !stat_u.trim().is_empty() {
             diff_payload.push_str("\n[git diff --stat]\n");
             diff_payload.push_str(stat_u.trim_end());
@@ -697,7 +710,9 @@ async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
         anyhow::bail!("--base cannot be combined with --staged/--unstaged");
     }
     if args.staged && args.unstaged {
-        anyhow::bail!("--staged and --unstaged are mutually exclusive (omit both for combined review)");
+        anyhow::bail!(
+            "--staged and --unstaged are mutually exclusive (omit both for combined review)"
+        );
     }
 
     // Read optional prompt guidance from stdin.
@@ -716,7 +731,11 @@ async fn run_review(args: ReviewArgs, common: CommonArgs) -> Result<()> {
         guidance = "Review this git diff and critique it ruthlessly and concretely.".to_string();
     }
 
-    let max_chars = args.max_diff_chars.unwrap_or(24_000).max(2_000).min(200_000);
+    let max_chars = args
+        .max_diff_chars
+        .unwrap_or(24_000)
+        .max(2_000)
+        .min(200_000);
     let out = review_git_diff(
         &tool_root,
         args.staged,
@@ -807,6 +826,8 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         session: session_path,
         new_session,
         autofix,
+        trace_out,
+        json_out,
     } = args;
 
     let session_path = session_path.map(|sp| resolve_session_path(sp, tool_root_arg.as_deref()));
@@ -841,9 +862,15 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
             loaded_session = Some(sess);
             resuming = true;
         } else if new_session && sp.exists() {
-            eprintln!("[session] --new-session: starting fresh and overwriting {}", sp.display());
+            eprintln!(
+                "[session] --new-session: starting fresh and overwriting {}",
+                sp.display()
+            );
         } else if new_session {
-            eprintln!("[session] --new-session: starting fresh at {}", sp.display());
+            eprintln!(
+                "[session] --new-session: starting fresh at {}",
+                sp.display()
+            );
         }
     }
 
@@ -854,15 +881,17 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         tool_root_arg
             .clone()
             .or_else(|| saved_tool_root.clone())
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        }),
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            }),
     );
 
     if resuming && tool_root_arg.is_some() {
-        if let (Some(ref chosen), Some(ref saved)) = (tool_root.as_ref(), saved_tool_root_norm.as_ref()) {
+        if let (Some(ref chosen), Some(ref saved)) =
+            (tool_root.as_ref(), saved_tool_root_norm.as_ref())
+        {
             if normalize_path_for_compare(chosen) != normalize_path_for_compare(saved) {
                 eprintln!(
                     "WARN: --root/--tool-root ({}) differs from saved session tool_root ({}). Continuing with provided tool root.",
@@ -873,13 +902,17 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         }
     }
 
+    let trace_out_path = trace_out.map(|p| resolve_session_path(p, tool_root.as_deref()));
+    let json_out_path = json_out.map(|p| resolve_session_path(p, tool_root.as_deref()));
+
     // Build the user prompt text.
     fn default_continue_prompt(lang: &str) -> String {
         let l = lang.trim().to_ascii_lowercase();
         if l == "fr" {
             "Continue depuis l’état précédent. Reprends la tâche et vérifie avec des commandes/tests.".to_string()
         } else if l == "en" {
-            "Continue from the previous state. Resume the task and verify with commands/tests.".to_string()
+            "Continue from the previous state. Resume the task and verify with commands/tests."
+                .to_string()
         } else {
             "前回の状態から続けて。作業を再開して、コマンド/テストで検証して。".to_string()
         }
@@ -905,7 +938,9 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
             String::new()
         }
         (None, false) if resuming => default_continue_prompt(&lang),
-        (None, false) => anyhow::bail!("missing prompt. Provide a prompt argument or pass --stdin."),
+        (None, false) => {
+            anyhow::bail!("missing prompt. Provide a prompt argument or pass --stdin.")
+        }
     };
 
     // If --stdin and a prompt was provided, append stdin as extra context (like `run_chat`).
@@ -944,6 +979,39 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         partial.mode = Some(crate::modes::Mode::Vibe);
     }
     let cfg = partial.resolve()?;
+
+    let trace: Option<crate::trace_writer::TraceWriter> = match trace_out_path.clone() {
+        Some(p) => {
+            eprintln!("[trace] writing: {}", p.display());
+            Some(crate::trace_writer::TraceWriter::new(p)?)
+        }
+        None => None,
+    };
+    if let Some(ref tw) = trace {
+        let _ = tw.event(
+            "agent_start",
+            json!({
+                "resuming": resuming,
+                "lang": lang.as_str(),
+                "max_iters": max_iters.unwrap_or(crate::tui::agent::DEFAULT_MAX_ITERS).max(1).min(64),
+                "tool_root": tool_root.as_deref(),
+                "session": session_path.as_ref().map(|p| p.display().to_string()),
+                "json_out": json_out_path.as_ref().map(|p| p.display().to_string()),
+                "cfg": {
+                    "provider": cfg.provider.key(),
+                    "base_url": cfg.base_url.as_str(),
+                    "mode": cfg.mode.label(),
+                    "persona": cfg.persona.as_str(),
+                    "model": cfg.model.as_str(),
+                    "chat_model": cfg.chat_model.as_str(),
+                    "code_model": cfg.code_model.as_str(),
+                    "temperature": cfg.temperature,
+                    "max_tokens": cfg.max_tokens,
+                    "timeout_seconds": cfg.timeout_seconds,
+                }
+            }),
+        );
+    }
 
     // Build initial message list (OpenAI-compatible JSON).
     let mut messages_json: Vec<serde_json::Value> = if let Some(m) = start_messages_json.take() {
@@ -1021,6 +1089,16 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
     let total_rounds = 1usize + autofix_rounds;
     let mut interrupted = false;
     for round in 0..total_rounds {
+        if let Some(ref tw) = trace {
+            let _ = tw.event(
+                "round_start",
+                json!({
+                    "round": round,
+                    "total_rounds": total_rounds,
+                    "autofix": round > 0,
+                }),
+            );
+        }
         if round > 0 {
             eprintln!(
                 "\n\n[autofix] round {round}/{autofix_rounds} — applying Observer proposals\n"
@@ -1073,20 +1151,45 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
                             stdout.write_all(s.as_bytes()).ok();
                             stdout.flush().ok();
                         }
-                        streaming::StreamToken::ToolCall(_) => {}
-                        streaming::StreamToken::Checkpoint(hash) => {
-                            checkpoint = Some(hash);
+                        streaming::StreamToken::ToolCall(tc) => {
+                            if let Some(ref tw) = trace {
+                                let _ = tw.event(
+                                    "tool_call",
+                                    json!({
+                                        "id": tc.id,
+                                        "name": tc.name,
+                                        "arguments": tc.arguments,
+                                    }),
+                                );
+                            }
                         }
-                        streaming::StreamToken::Done => break,
+                        streaming::StreamToken::Checkpoint(hash) => {
+                            checkpoint = Some(hash.clone());
+                            if let Some(ref tw) = trace {
+                                let _ = tw.event("checkpoint", json!({"hash": hash}));
+                            }
+                        }
+                        streaming::StreamToken::Done => {
+                            if let Some(ref tw) = trace {
+                                let _ = tw.event("done", json!({}));
+                            }
+                            break
+                        },
                         streaming::StreamToken::Error(e) => {
                             saw_error = true;
                             eprintln!("ERROR: {e}");
+                            if let Some(ref tw) = trace {
+                                let _ = tw.event("error", json!({"message": e}));
+                            }
                         }
                     }
                 }
                 _ = &mut ctrl_c => {
                     interrupted = true;
                     eprintln!("\n\n[agent] interrupted (Ctrl+C). Session can be resumed.\n");
+                    if let Some(ref tw) = trace {
+                        let _ = tw.event("interrupted", json!({}));
+                    }
                     handle.abort();
                     if let Some(ref saver) = autosaver {
                         let _ = saver.save_best_effort(
@@ -1121,6 +1224,17 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         messages_json = end_state.messages;
         cur_cwd = end_state.cur_cwd;
         checkpoint = checkpoint.or(end_state.checkpoint);
+        if let Some(ref tw) = trace {
+            let _ = tw.event(
+                "round_end",
+                json!({
+                    "round": round,
+                    "messages_len": messages_json.len(),
+                    "checkpoint": checkpoint.as_deref(),
+                    "cur_cwd": cur_cwd.as_deref(),
+                }),
+            );
+        }
 
         if saw_error {
             result = Err(anyhow::anyhow!("agent finished with errors"));
@@ -1208,11 +1322,31 @@ For each proposal you address, verify with commands/tests. When finished, call d
         )?;
     }
 
+    // Optional: write a final session snapshot separate from --session autosave.
+    if let Some(ref out_path) = json_out_path {
+        let mut sess = crate::agent_session::AgentSession::new(
+            tool_root.clone(),
+            checkpoint.clone(),
+            cur_cwd.clone(),
+            messages_json.clone(),
+        );
+        if let Some(ref loaded) = loaded_session {
+            sess.created_at_ms = loaded.created_at_ms;
+        }
+        match crate::agent_session::AgentSession::save_atomic(out_path, &sess) {
+            Ok(_) => eprintln!("[json_out] wrote: {}", out_path.display()),
+            Err(e) => {
+                eprintln!("[json_out] ERROR: {e:#}");
+                if result.is_ok() {
+                    result = Err(e);
+                }
+            }
+        }
+    }
+
     // CLI nicety: show a compact git diff summary from the auto-created checkpoint.
     if result.is_ok() {
-        let checkpoint_final = checkpoint
-            .as_deref()
-            .map(|s| s.to_string());
+        let checkpoint_final = checkpoint.as_deref().map(|s| s.to_string());
         if let (Some(ref root), Some(ref hash)) = (tool_root, checkpoint_final.as_deref()) {
             let stat = std::process::Command::new("git")
                 .args(["-C", root, "diff", hash, "--stat"])
@@ -1225,14 +1359,38 @@ For each proposal you address, verify with commands/tests. When finished, call d
                     let s_txt = String::from_utf8_lossy(&s.stdout).trim().to_string();
                     let n_txt = String::from_utf8_lossy(&n.stdout).trim().to_string();
                     if !s_txt.is_empty() || !n_txt.is_empty() {
-                        println!("\n\n[git diff from checkpoint]\n{}\n\nFiles:\n{}",
-                            if s_txt.is_empty() { "(no changes)".to_string() } else { s_txt },
-                            if n_txt.is_empty() { "(no files)".to_string() } else { n_txt },
+                        println!(
+                            "\n\n[git diff from checkpoint]\n{}\n\nFiles:\n{}",
+                            if s_txt.is_empty() {
+                                "(no changes)".to_string()
+                            } else {
+                                s_txt
+                            },
+                            if n_txt.is_empty() {
+                                "(no files)".to_string()
+                            } else {
+                                n_txt
+                            },
                         );
                     }
                 }
             }
         }
+    }
+
+    if let Some(ref tw) = trace {
+        let ok = result.is_ok();
+        let err = result.as_ref().err().map(|e| format!("{e:#}"));
+        let _ = tw.event(
+            "agent_end",
+            json!({
+                "ok": ok,
+                "error": err,
+                "messages_len": messages_json.len(),
+                "checkpoint": checkpoint.as_deref(),
+                "cur_cwd": cur_cwd.as_deref(),
+            }),
+        );
     }
 
     result
@@ -1288,7 +1446,7 @@ async fn run_init(args: InitArgs, _common: CommonArgs) -> Result<()> {
         stack.clone()
     };
     let content = format!(
-"# .obstral.md — Project Instructions for OBSTRAL Coder
+        "# .obstral.md — Project Instructions for OBSTRAL Coder
 #
 # This file is automatically injected into the Coder's system prompt.
 # Edit it to set project rules, test commands, and coding conventions.
@@ -1313,7 +1471,8 @@ test_cmd: {test_cmd}
 
 ## Notes
 # Add any project-specific context, architecture notes, or constraints here.
-");
+"
+    );
 
     std::fs::create_dir_all(root_p)
         .with_context(|| format!("failed to create tool_root: {}", root_p.display()))?;

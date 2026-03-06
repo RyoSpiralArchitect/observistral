@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,7 +96,9 @@ impl AgentSession {
                             .and_then(|tc| tc.as_array())
                             .into_iter()
                             .flatten()
-                            .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .filter_map(|tc| {
+                                tc.get("id").and_then(|v| v.as_str()).map(|s| s.to_string())
+                            })
                             .collect();
                         if !ids.is_empty() {
                             pending_ids = ids;
@@ -120,7 +122,8 @@ impl AgentSession {
                     if pending_ids.is_empty() {
                         trim_from = Some(idx);
                         reason = Some(
-                            "tool result appeared without a preceding assistant tool_call".to_string(),
+                            "tool result appeared without a preceding assistant tool_call"
+                                .to_string(),
                         );
                         break;
                     }
@@ -132,7 +135,8 @@ impl AgentSession {
                     } else {
                         trim_from = Some(idx);
                         reason = Some(
-                            "tool result tool_call_id did not match the pending tool_call".to_string(),
+                            "tool result tool_call_id did not match the pending tool_call"
+                                .to_string(),
                         );
                         break;
                     }
@@ -173,7 +177,13 @@ impl AgentSession {
 }
 
 fn save_text_atomic(path: &Path, text: &str) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent0 = path.parent().unwrap_or_else(|| Path::new("."));
+    // For "session.json", `parent()` can be empty ("") which should behave like ".".
+    let parent = if parent0.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent0
+    };
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create session directory: {}", parent.display()))?;
 
@@ -323,4 +333,35 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_path(prefix: &str, ext: &str) -> PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        PathBuf::from(format!("{prefix}-{n}.{ext}"))
+    }
+
+    #[test]
+    fn save_atomic_supports_parentless_paths() {
+        // This must work for paths like "session.json" where Path::parent() is empty ("").
+        let path = unique_path("obstral-session-test", "json");
+        let sess = AgentSession::new(
+            None,
+            None,
+            None,
+            vec![json!({"role":"user","content":"hi"})],
+        );
+        AgentSession::save_atomic(&path, &sess).expect("save_atomic");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("\"messages\""));
+        let _ = std::fs::remove_file(&path);
+    }
 }
