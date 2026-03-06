@@ -661,6 +661,40 @@ fn error_class_hint(class: &ErrorClass) -> &'static str {
     }
 }
 
+/// Extra targeted hints for known high-frequency Windows/Git failure modes.
+fn specific_recovery_hint(stderr: &str, stdout: &str) -> &'static str {
+    let combined = format!("{stderr}\n{stdout}");
+    let low = combined.to_ascii_lowercase();
+
+    // GitHub HTTPS routed via a dead local proxy (common in locked-down networks).
+    // Example: "Failed to connect to github.com port 443 via 127.0.0.1 ... Could not connect to server"
+    let git_github_proxy = (low.contains("github.com") || low.contains("ssh.github.com"))
+        && low.contains("port 443")
+        && (low.contains("via 127.0.0.1") || low.contains("via localhost"))
+        && (low.contains("could not connect") || low.contains("failed to connect"));
+    if git_github_proxy {
+        return "HINT: Git HTTPS appears to be routed via a dead local proxy (127.0.0.1/localhost).\n\
+- Try clearing proxy env vars: HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / GIT_HTTP_PROXY / GIT_HTTPS_PROXY.\n\
+- For GitHub, prefer SSH-over-443:\n\
+  git push ssh://git@ssh.github.com:443/<owner>/<repo>.git main\n\
+  (and similarly for fetch/pull).";
+    }
+
+    // Windows: `cargo run` cannot overwrite a running .exe (locked file handle).
+    // Example: "failed to remove file ... obstral.exe ... access is denied (os error 5)"
+    let cargo_exe_lock = low.contains("failed to remove file")
+        && low.contains("obstral.exe")
+        && (low.contains("os error 5") || low.contains("access is denied"));
+    if cargo_exe_lock {
+        return "HINT: On Windows, a running .exe cannot be overwritten.\n\
+- Stop the running process (`Stop-Process -Name obstral -Force`) OR restart the terminal.\n\
+- Or run cargo with an isolated target dir to avoid the lock:\n\
+  $env:CARGO_TARGET_DIR = '.tmp/cargo-target-tui'; cargo run -- tui";
+    }
+
+    ""
+}
+
 // ── Tool output builders ──────────────────────────────────────────────────────
 
 /// Build the tool result string for a failed command with structured
@@ -668,12 +702,19 @@ fn error_class_hint(class: &ErrorClass) -> &'static str {
 /// than blindly retrying or continuing.
 fn build_failed_tool_output(stdout: &str, stderr: &str, exit_code: i32) -> String {
     let class = classify_error(stderr, stdout);
-    let hint = error_class_hint(&class);
-    let hint_prefix = if hint.is_empty() {
-        String::new()
-    } else {
-        format!("{hint}\n\n")
-    };
+
+    let specific_hint = specific_recovery_hint(stderr, stdout);
+    let class_hint = error_class_hint(&class);
+
+    let mut hint_prefix = String::new();
+    if !specific_hint.is_empty() {
+        hint_prefix.push_str(specific_hint);
+        hint_prefix.push_str("\n\n");
+    }
+    if !class_hint.is_empty() {
+        hint_prefix.push_str(class_hint);
+        hint_prefix.push_str("\n\n");
+    }
     let mut out = format!(
         "{hint_prefix}FAILED (exit_code: {exit_code})\n\
          \n\
@@ -2909,6 +2950,27 @@ mod tests {
         assert!(
             should_block_git_landmines("git add -A", Some(root.as_ref())).is_none(),
             "should not block when nested repo is declared as submodule"
+        );
+    }
+
+    #[test]
+    fn injects_git_proxy_hint_for_github_via_localhost() {
+        let stderr = "fatal: unable to access 'https://github.com/x/y.git/': Failed to connect to github.com port 443 via 127.0.0.1 after 2041 ms: Could not connect to server";
+        let out = build_failed_tool_output("", stderr, 1);
+        assert!(out.contains("ssh.github.com"), "should suggest ssh-over-443");
+        assert!(
+            out.contains("HTTP_PROXY") || out.contains("HTTPS_PROXY"),
+            "should mention proxy env vars"
+        );
+    }
+
+    #[test]
+    fn injects_cargo_exe_lock_hint_on_windows_style_error() {
+        let stderr = "error: failed to remove file `C:\\\\Users\\\\user\\\\observistral\\\\target\\\\debug\\\\obstral.exe`\nCaused by: Access is denied. (os error 5)";
+        let out = build_failed_tool_output("", stderr, 1);
+        assert!(
+            out.to_ascii_lowercase().contains("cargo_target_dir"),
+            "should suggest isolated target dir"
         );
     }
 }
