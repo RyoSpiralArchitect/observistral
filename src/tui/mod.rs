@@ -1,15 +1,15 @@
+pub mod agent;
 pub mod app;
 pub mod events;
 pub mod ui;
-pub mod agent;
 
 use anyhow::{Context, Result};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::PartialConfig;
@@ -57,13 +57,18 @@ fn default_tui_tool_root() -> String {
 
 pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
     // Resolve the Coder config from the shared partial config.
-    let coder_cfg = partial_cfg.clone().resolve().context("failed to resolve coder config")?;
+    let coder_cfg = partial_cfg
+        .clone()
+        .resolve()
+        .context("failed to resolve coder config")?;
 
     // Chat uses Chat mode (no tools) and should default to chat_model (not code_model).
     let chat_cfg = {
         let mut chat_partial = partial_cfg.clone();
         chat_partial.mode = Some(Mode::Chat);
-        chat_partial.resolve().context("failed to resolve chat config")?
+        chat_partial
+            .resolve()
+            .context("failed to resolve chat config")?
     };
 
     // For the Observer we allow a different model via --observer-model.
@@ -76,10 +81,15 @@ pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
         }
         // Observer always uses Observer mode.
         obs_partial.mode = Some(crate::modes::Mode::Observer);
-        obs_partial.resolve().context("failed to resolve observer config")?
+        obs_partial
+            .resolve()
+            .context("failed to resolve observer config")?
     };
 
-    let tool_root = args.tool_root.clone().or_else(|| Some(default_tui_tool_root()));
+    let tool_root = args
+        .tool_root
+        .clone()
+        .or_else(|| Some(default_tui_tool_root()));
     if let Some(ref r) = tool_root {
         if !r.trim().is_empty() {
             std::fs::create_dir_all(r).context("failed to create tool_root")?;
@@ -121,13 +131,25 @@ pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
     // ── Run ───────────────────────────────────────────────────────────────────
-    let mut app = app::App::new(coder_cfg, observer_cfg, chat_cfg, tool_root, auto_observe, lang, max_iters);
+    let mut app = app::App::new(
+        coder_cfg,
+        observer_cfg,
+        chat_cfg,
+        tool_root,
+        auto_observe,
+        lang,
+        max_iters,
+    );
     let result = events::run_event_loop(&mut app, &mut terminal).await;
 
     // ── Restore terminal ──────────────────────────────────────────────────────
     // Always restore even if run errored.
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     let _ = terminal.show_cursor();
 
     result

@@ -58,10 +58,18 @@ pub struct Message {
 
 impl Message {
     pub fn new_streaming(role: Role) -> Self {
-        Self { role, content: String::new(), complete: false }
+        Self {
+            role,
+            content: String::new(),
+            complete: false,
+        }
     }
     pub fn new_complete(role: Role, content: String) -> Self {
-        Self { role, content, complete: true }
+        Self {
+            role,
+            content,
+            complete: true,
+        }
     }
 }
 
@@ -208,7 +216,11 @@ impl App {
         coder_max_iters: Option<usize>,
     ) -> Self {
         let l = lang.trim().to_ascii_lowercase();
-        let lang = if l == "en" || l == "fr" { l } else { "ja".to_string() };
+        let lang = if l == "en" || l == "fr" {
+            l
+        } else {
+            "ja".to_string()
+        };
         Self {
             coder: Pane::new(),
             observer: Pane::new(),
@@ -279,20 +291,26 @@ impl App {
     /// Returns `(message_index, content)` if a new completed Coder message
     /// hasn't been observed yet.
     pub fn auto_observe_trigger(&self) -> Option<(usize, String)> {
-        if !self.auto_observe { return None; }
-        if self.observer.streaming || self.coder.streaming { return None; }
+        if !self.auto_observe {
+            return None;
+        }
+        if self.observer.streaming || self.coder.streaming {
+            return None;
+        }
 
-        let (idx, msg) = self.coder.messages
+        let (idx, msg) = self
+            .coder
+            .messages
             .iter()
             .enumerate()
             .rev()
             .find(|(_, m)| {
-                matches!(m.role, Role::Assistant)
-                    && m.complete
-                    && m.content.trim().len() > 40
+                matches!(m.role, Role::Assistant) && m.complete && m.content.trim().len() > 40
             })?;
 
-        if Some(idx) == self.last_auto_obs_idx { return None; }
+        if Some(idx) == self.last_auto_obs_idx {
+            return None;
+        }
         Some((idx, msg.content.clone()))
     }
 }

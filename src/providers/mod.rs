@@ -49,4 +49,3 @@ pub fn build_provider(client: reqwest::Client, cfg: &RunConfig) -> Arc<dyn ChatP
         )),
     }
 }
-

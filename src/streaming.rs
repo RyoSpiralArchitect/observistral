@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -43,7 +43,10 @@ fn should_use_v1_completions(status: reqwest::StatusCode, body: &str) -> bool {
     if msg.contains("not a chat model") {
         return true;
     }
-    if status == reqwest::StatusCode::NOT_FOUND && msg.contains("v1/completions") && msg.contains("chat/complet") {
+    if status == reqwest::StatusCode::NOT_FOUND
+        && msg.contains("v1/completions")
+        && msg.contains("chat/complet")
+    {
         return true;
     }
     false
@@ -375,11 +378,13 @@ pub async fn stream_openai_compat_json(
             let data = data_lines.join("\n");
             if data.trim() == "[DONE]" {
                 if in_tool_call && !tc_name.is_empty() {
-                    let _ = tx.send(StreamToken::ToolCall(ToolCallData {
-                        id: tc_id.clone(),
-                        name: tc_name.clone(),
-                        arguments: tc_args.clone(),
-                    })).await;
+                    let _ = tx
+                        .send(StreamToken::ToolCall(ToolCallData {
+                            id: tc_id.clone(),
+                            name: tc_name.clone(),
+                            arguments: tc_args.clone(),
+                        }))
+                        .await;
                 }
                 let _ = tx.send(StreamToken::Done).await;
                 return Ok(());
@@ -419,12 +424,16 @@ pub async fn stream_openai_compat_json(
                                 in_tool_call = true;
                             }
                         }
-                        if let Some(fn_name) = call.pointer("/function/name").and_then(|x| x.as_str()) {
+                        if let Some(fn_name) =
+                            call.pointer("/function/name").and_then(|x| x.as_str())
+                        {
                             if !fn_name.is_empty() {
                                 tc_name = fn_name.to_string();
                             }
                         }
-                        if let Some(args_chunk) = call.pointer("/function/arguments").and_then(|x| x.as_str()) {
+                        if let Some(args_chunk) =
+                            call.pointer("/function/arguments").and_then(|x| x.as_str())
+                        {
                             tc_args.push_str(args_chunk);
                         }
                     }
@@ -432,11 +441,13 @@ pub async fn stream_openai_compat_json(
             }
 
             if finish_reason == "tool_calls" && in_tool_call && !tc_name.is_empty() {
-                let _ = tx.send(StreamToken::ToolCall(ToolCallData {
-                    id: tc_id.clone(),
-                    name: tc_name.clone(),
-                    arguments: tc_args.clone(),
-                })).await;
+                let _ = tx
+                    .send(StreamToken::ToolCall(ToolCallData {
+                        id: tc_id.clone(),
+                        name: tc_name.clone(),
+                        arguments: tc_args.clone(),
+                    }))
+                    .await;
                 tc_id.clear();
                 tc_name.clear();
                 tc_args.clear();
@@ -495,7 +506,10 @@ pub async fn stream_anthropic(
         let r = client
             .post(&url)
             .header("x-api-key", api_key)
-            .header("anthropic-version", crate::providers::anthropic::ANTHROPIC_VERSION)
+            .header(
+                "anthropic-version",
+                crate::providers::anthropic::ANTHROPIC_VERSION,
+            )
             .header("Accept", "text/event-stream")
             .header("Content-Type", "application/json")
             .timeout(Duration::from_secs(cfg.timeout_seconds))
@@ -566,7 +580,11 @@ pub async fn stream_anthropic(
                 Err(_) => continue,
             };
 
-            let ty = v.get("type").and_then(|x| x.as_str()).or(event).unwrap_or("");
+            let ty = v
+                .get("type")
+                .and_then(|x| x.as_str())
+                .or(event)
+                .unwrap_or("");
 
             if ty == "error" {
                 let msg = v.to_string();
@@ -575,7 +593,10 @@ pub async fn stream_anthropic(
             }
 
             if ty == "content_block_delta" {
-                let delta = v.pointer("/delta/text").and_then(|x| x.as_str()).unwrap_or("");
+                let delta = v
+                    .pointer("/delta/text")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
                 if !delta.is_empty() {
                     let _ = tx.send(StreamToken::Delta(delta.to_string())).await;
                 }
@@ -601,7 +622,11 @@ fn take_next_sse_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }?;
-    let sep_len = if buf[pos..].starts_with(b"\r\n\r\n") { 4 } else { 2 };
+    let sep_len = if buf[pos..].starts_with(b"\r\n\r\n") {
+        4
+    } else {
+        2
+    };
     let frame = buf[..pos].to_vec();
     buf.drain(..pos + sep_len);
     Some(frame)

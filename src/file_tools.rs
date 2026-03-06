@@ -6,7 +6,7 @@
 ///   patch_file — exact SEARCH/REPLACE (no quoting issues)
 ///
 /// All paths are validated to stay within `base` (tool_root).
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::path::{Component, Path, PathBuf};
 
 // ── Path safety ───────────────────────────────────────────────────────────────
@@ -60,7 +60,9 @@ pub fn resolve_safe_path(rel: &str, base: Option<&str>) -> Result<PathBuf> {
             let root_p = Path::new(root);
             if !is_within_root(p, root_p) {
                 return Err(anyhow!(
-                    "absolute path '{}' is outside tool_root '{}'", rel, root
+                    "absolute path '{}' is outside tool_root '{}'",
+                    rel,
+                    root
                 ));
             }
         }
@@ -257,9 +259,24 @@ const MAX_LINE_DISPLAY: usize = 200;
 fn skip_dir(name: &str) -> bool {
     matches!(
         name,
-        "target" | "node_modules" | ".git" | "__pycache__" | "dist" | "build"
-            | ".next" | ".nuxt" | "vendor" | ".venv" | "venv" | ".tox"
-            | "coverage" | ".cache" | ".idea" | ".vscode" | "out" | ".svn"
+        "target"
+            | "node_modules"
+            | ".git"
+            | "__pycache__"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".nuxt"
+            | "vendor"
+            | ".venv"
+            | "venv"
+            | ".tox"
+            | "coverage"
+            | ".cache"
+            | ".idea"
+            | ".vscode"
+            | "out"
+            | ".svn"
     )
 }
 
@@ -267,12 +284,51 @@ fn skip_dir(name: &str) -> bool {
 fn skip_extension(ext: &str) -> bool {
     matches!(
         ext,
-        "exe" | "dll" | "so" | "dylib" | "bin" | "o" | "a" | "obj" | "wasm"
-            | "zip" | "tar" | "gz" | "bz2" | "7z" | "rar" | "xz" | "zst"
-            | "jpg" | "jpeg" | "png" | "gif" | "bmp" | "ico" | "webp" | "avif"
-            | "mp3" | "mp4" | "wav" | "avi" | "mov" | "mkv" | "flac" | "ogg"
-            | "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx"
-            | "db" | "sqlite" | "sqlite3" | "parquet" | "arrow"
+        "exe"
+            | "dll"
+            | "so"
+            | "dylib"
+            | "bin"
+            | "o"
+            | "a"
+            | "obj"
+            | "wasm"
+            | "zip"
+            | "tar"
+            | "gz"
+            | "bz2"
+            | "7z"
+            | "rar"
+            | "xz"
+            | "zst"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "bmp"
+            | "ico"
+            | "webp"
+            | "avif"
+            | "mp3"
+            | "mp4"
+            | "wav"
+            | "avi"
+            | "mov"
+            | "mkv"
+            | "flac"
+            | "ogg"
+            | "pdf"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+            | "db"
+            | "sqlite"
+            | "sqlite3"
+            | "parquet"
+            | "arrow"
             | "lock" // Cargo.lock / package-lock.json can be enormous
     )
 }
@@ -328,10 +384,7 @@ pub fn tool_search_files(
 
         for entry in rd.flatten() {
             let path = entry.path();
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.starts_with('.') && name != ".obstral.md" {
                 continue; // skip hidden
             }
@@ -368,8 +421,7 @@ pub fn tool_search_files(
                     line.to_string()
                 };
                 if cmp.contains(&needle) {
-                    let display: String =
-                        line.trim_end().chars().take(MAX_LINE_DISPLAY).collect();
+                    let display: String = line.trim_end().chars().take(MAX_LINE_DISPLAY).collect();
                     results.push(format!("{}:{}: {}", rel, ln + 1, display));
                     if results.len() >= MAX_SEARCH_RESULTS {
                         truncated = true;
@@ -450,7 +502,11 @@ fn parse_diff_hunks(diff: &str) -> Vec<DiffHunk> {
                 hunk.lines.push(DiffLine::Add(rest.to_string()));
             } else {
                 // Context line — may start with a space or be empty.
-                let ctx = if line.starts_with(' ') { &line[1..] } else { line };
+                let ctx = if line.starts_with(' ') {
+                    &line[1..]
+                } else {
+                    line
+                };
                 hunk.lines.push(DiffLine::Context(ctx.to_string()));
             }
         }
@@ -481,7 +537,10 @@ pub fn tool_apply_diff(path: &str, diff: &str, base: Option<&str>) -> (String, b
 
     let hunks = parse_diff_hunks(diff);
     if hunks.is_empty() {
-        return ("ERROR: no valid @@ hunks found in diff — make sure to include @@ markers".to_string(), true);
+        return (
+            "ERROR: no valid @@ hunks found in diff — make sure to include @@ markers".to_string(),
+            true,
+        );
     }
 
     let mut new_content = content.clone();
@@ -490,13 +549,17 @@ pub fn tool_apply_diff(path: &str, diff: &str, base: Option<&str>) -> (String, b
 
     for (i, hunk) in hunks.iter().enumerate() {
         // Build the "old block" (context + remove lines) and "new block" (context + add lines).
-        let old_lines: Vec<&str> = hunk.lines.iter()
+        let old_lines: Vec<&str> = hunk
+            .lines
+            .iter()
             .filter_map(|l| match l {
                 DiffLine::Context(s) | DiffLine::Remove(s) => Some(s.as_str()),
                 DiffLine::Add(_) => None,
             })
             .collect();
-        let new_lines: Vec<&str> = hunk.lines.iter()
+        let new_lines: Vec<&str> = hunk
+            .lines
+            .iter()
             .filter_map(|l| match l {
                 DiffLine::Context(s) | DiffLine::Add(s) => Some(s.as_str()),
                 DiffLine::Remove(_) => None,
@@ -513,10 +576,22 @@ pub fn tool_apply_diff(path: &str, diff: &str, base: Option<&str>) -> (String, b
 
         let count = new_content.matches(&old_block).count();
         if count == 0 {
-            let preview: String = old_lines.iter().take(3).cloned().collect::<Vec<_>>().join("\\n");
-            errors.push(format!("hunk {}: old block not found (starts: {:?})", i + 1, preview));
+            let preview: String = old_lines
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\\n");
+            errors.push(format!(
+                "hunk {}: old block not found (starts: {:?})",
+                i + 1,
+                preview
+            ));
         } else if count > 1 {
-            errors.push(format!("hunk {}: old block not unique ({count} matches) — add more context lines", i + 1));
+            errors.push(format!(
+                "hunk {}: old block not unique ({count} matches) — add more context lines",
+                i + 1
+            ));
         } else {
             new_content = new_content.replacen(&old_block, &new_block, 1);
             applied += 1;
@@ -550,7 +625,12 @@ pub fn tool_apply_diff(path: &str, diff: &str, base: Option<&str>) -> (String, b
     let warn = if errors.is_empty() {
         String::new()
     } else {
-        format!("\n⚠ {}/{} hunks skipped: {}", errors.len(), hunks.len(), errors.join("; "))
+        format!(
+            "\n⚠ {}/{} hunks skipped: {}",
+            errors.len(),
+            hunks.len(),
+            errors.join("; ")
+        )
     };
 
     (
@@ -582,7 +662,11 @@ fn glob_inner(pat: &[u8], s: &[u8]) -> bool {
     }
     // `**` — matches any sequence including path separators.
     if pat.starts_with(b"**") {
-        let rest = if pat.get(2) == Some(&b'/') { &pat[3..] } else { &pat[2..] };
+        let rest = if pat.get(2) == Some(&b'/') {
+            &pat[3..]
+        } else {
+            &pat[2..]
+        };
         if rest.is_empty() {
             return true;
         }
@@ -626,7 +710,10 @@ pub fn tool_glob_files(pattern: &str, dir: &str, base: Option<&str>) -> (String,
     };
 
     if !search_root.is_dir() {
-        return (format!("ERROR: '{}' is not a directory", search_root.display()), true);
+        return (
+            format!("ERROR: '{}' is not a directory", search_root.display()),
+            true,
+        );
     }
 
     let mut results: Vec<String> = Vec::new();
@@ -643,7 +730,11 @@ pub fn tool_glob_files(pattern: &str, dir: &str, base: Option<&str>) -> (String,
 
         for entry in rd.flatten() {
             let path = entry.path();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             if name.starts_with('.') {
                 continue;
             }
@@ -669,7 +760,14 @@ pub fn tool_glob_files(pattern: &str, dir: &str, base: Option<&str>) -> (String,
     }
 
     if results.is_empty() {
-        return (format!("[glob] No files matching '{}' in '{}'", pattern, search_root.display()), false);
+        return (
+            format!(
+                "[glob] No files matching '{}' in '{}'",
+                pattern,
+                search_root.display()
+            ),
+            false,
+        );
     }
 
     results.sort();
@@ -678,7 +776,12 @@ pub fn tool_glob_files(pattern: &str, dir: &str, base: Option<&str>) -> (String,
     } else {
         String::new()
     };
-    let header = format!("[glob: '{}' — {} file(s){}]\n", pattern, results.len(), cap_note);
+    let header = format!(
+        "[glob: '{}' — {} file(s){}]\n",
+        pattern,
+        results.len(),
+        cap_note
+    );
     (format!("{}{}", header, results.join("\n")), false)
 }
 

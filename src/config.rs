@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -227,7 +227,11 @@ impl PartialConfig {
             .api_key
             .and_then(|k| {
                 let k = k.trim().to_string();
-                if k.is_empty() { None } else { Some(k) }
+                if k.is_empty() {
+                    None
+                } else {
+                    Some(k)
+                }
             })
             .or_else(|| resolve_api_key_from_env(&provider));
 
@@ -309,7 +313,11 @@ fn validate_base_url(base_url: &str) -> Result<()> {
 fn env_trimmed(key: &str) -> Option<String> {
     std::env::var(key).ok().and_then(|v| {
         let v = v.trim().to_string();
-        if v.is_empty() { None } else { Some(v) }
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
     })
 }
 

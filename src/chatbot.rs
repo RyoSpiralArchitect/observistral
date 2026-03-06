@@ -91,7 +91,10 @@ impl ChatBot {
                 }
             }
 
-            fn collect_prev_asst_texts<'a>(history: &'a [ChatMessage], max_n: usize) -> Vec<&'a str> {
+            fn collect_prev_asst_texts<'a>(
+                history: &'a [ChatMessage],
+                max_n: usize,
+            ) -> Vec<&'a str> {
                 let mut prev: Vec<&'a str> = Vec::new();
                 for m in history.iter().rev() {
                     if m.role != "assistant" {
@@ -216,8 +219,7 @@ impl ChatBot {
             if !prev_texts.is_empty() && !loop_detect::is_skippable_for_loop(cur_text) {
                 let (max_sim, max_prev_len) = max_similarity(&prev_texts, cur_text);
                 let threshold = loop_threshold_for_len(max_prev_len.max(cur_text.len()));
-                let loopish =
-                    max_prev_len >= 120 && cur_text.len() >= 180 && max_sim >= threshold;
+                let loopish = max_prev_len >= 120 && cur_text.len() >= 180 && max_sim >= threshold;
                 if loopish {
                     let loop_fix = if lang.unwrap_or("").eq_ignore_ascii_case("fr") {
                         "CORRECTION BOUCLE: Ton dernier message se répète. Fais une critique NOUVELLE basée UNIQUEMENT sur les informations NOUVELLES depuis le message précédent. Ne répète pas les mêmes proposals. S'il n'y a rien de nouveau, réponds exactement: [Observer] No new critique. Loop detected."
@@ -299,10 +301,7 @@ Output ONLY the rewritten text.\n\
 Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost)."
                 };
 
-                let user_fix = format!(
-                    "TEXT:\n```text\n{}\n```",
-                    resp.content.trim_end()
-                );
+                let user_fix = format!("TEXT:\n```text\n{}\n```", resp.content.trim_end());
 
                 let request2 = ChatRequest {
                     messages: vec![

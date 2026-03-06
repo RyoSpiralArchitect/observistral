@@ -1,9 +1,9 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::path::{Component, Path};
 use std::sync::{
-    Arc,
     atomic::{AtomicU64, Ordering},
+    Arc,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -111,11 +111,9 @@ fn simple_diff(old: &str, new: &str) -> String {
     }
     let old_p = truncate_preview(old, 1200, 40);
     let new_p = truncate_preview(new, 1200, 40);
-    format!(
-        "--- before ---\n{old_p}\n\n--- after ---\n{new_p}\n"
-    )
-    .trim_end()
-    .to_string()
+    format!("--- before ---\n{old_p}\n\n--- after ---\n{new_p}\n")
+        .trim_end()
+        .to_string()
 }
 
 impl PendingEditStore {
@@ -151,7 +149,9 @@ impl PendingEditStore {
     ) -> Result<String> {
         let rel = Path::new(rel_path);
         if !is_safe_rel_path(rel) {
-            return Err(anyhow!("unsafe path (must be relative, no '..'): {rel_path}"));
+            return Err(anyhow!(
+                "unsafe path (must be relative, no '..'): {rel_path}"
+            ));
         }
 
         let abs = workspace_root.join(rel);
@@ -195,7 +195,11 @@ impl PendingEditStore {
         })
     }
 
-    pub async fn approve(&self, workspace_root: &Path, id: &str) -> Result<PendingEditResolvedItem> {
+    pub async fn approve(
+        &self,
+        workspace_root: &Path,
+        id: &str,
+    ) -> Result<PendingEditResolvedItem> {
         let mut items = self.items.lock().await;
         let it = items
             .iter_mut()
@@ -214,7 +218,10 @@ impl PendingEditStore {
 
         let rel = Path::new(&it.path);
         if !is_safe_rel_path(rel) {
-            return Err(anyhow!("unsafe path (must be relative, no '..'): {}", it.path));
+            return Err(anyhow!(
+                "unsafe path (must be relative, no '..'): {}",
+                it.path
+            ));
         }
         let abs = workspace_root.join(rel);
         if let Some(parent) = abs.parent() {

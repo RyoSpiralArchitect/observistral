@@ -15,17 +15,17 @@
 ///      provider, so the id field is never silently dropped.
 ///   6. Progress checkpoints  — at iter 3/6/9 the model self-evaluates goal distance
 ///      (DONE / REMAINING / ON_TRACK) before continuing.
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use crate::approvals::{ApprovalOutcome, ApprovalRequest, Approver};
 use crate::config::RunConfig;
 use crate::exec;
-use crate::approvals::{ApprovalOutcome, ApprovalRequest, Approver};
-use crate::streaming::{StreamToken, ToolCallData, stream_openai_compat_json};
+use crate::streaming::{stream_openai_compat_json, StreamToken, ToolCallData};
 use crate::types::ChatMessage;
 
 #[derive(Debug, Clone)]
@@ -468,10 +468,10 @@ fn simple_before_after(old: &str, new: &str) -> String {
 /// Returns None when no clear error lines are found.
 fn extract_error_digest(stdout: &str, stderr: &str) -> Option<String> {
     let patterns: &[&str] = &[
-        "error[e",          // Rust: error[E0XXX]
-        "error: aborting",  // Rust: summary line
-        " --> ",            // Rust: file:line pointer
-        "syntaxerror:",     // Python / JS
+        "error[e",         // Rust: error[E0XXX]
+        "error: aborting", // Rust: summary line
+        " --> ",           // Rust: file:line pointer
+        "syntaxerror:",    // Python / JS
         "typeerror:",
         "nameerror:",
         "attributeerror:",
@@ -479,9 +479,9 @@ fn extract_error_digest(stdout: &str, stderr: &str) -> Option<String> {
         "runtimeerror:",
         "importerror:",
         "modulenotfounderror:",
-        "referenceerror:",  // JS
+        "referenceerror:", // JS
         "traceback (most recent call last)",
-        "error: ",          // generic (space avoids false positives)
+        "error: ", // generic (space avoids false positives)
         "fatal: ",
         "fatal error:",
     ];
@@ -492,20 +492,32 @@ fn extract_error_digest(stdout: &str, stderr: &str) -> Option<String> {
     for src in [stderr, stdout] {
         for line in src.lines() {
             let t = line.trim();
-            if t.is_empty() { continue; }
+            if t.is_empty() {
+                continue;
+            }
             let low = t.to_ascii_lowercase();
             if patterns.iter().any(|p| low.contains(p)) {
                 if seen.insert(t.to_string()) {
                     lines.push(t.to_string());
-                    if lines.len() >= 20 { break; }
+                    if lines.len() >= 20 {
+                        break;
+                    }
                 }
             }
         }
-        if lines.len() >= 20 { break; }
+        if lines.len() >= 20 {
+            break;
+        }
     }
 
-    if lines.is_empty() { return None; }
-    Some(format!("[ERROR DIGEST — {} line(s)]\n{}", lines.len(), lines.join("\n")))
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "[ERROR DIGEST — {} line(s)]\n{}",
+        lines.len(),
+        lines.join("\n")
+    ))
 }
 
 /// Returns true if a tool result can safely be pruned (= it was a success).
@@ -608,8 +620,7 @@ fn classify_error(stderr: &str, stdout: &str) -> ErrorClass {
         || low.contains("no module named")
         || low.contains("package not found")
         || low.contains("no such package")
-        || (low.contains("could not find")
-            && (low.contains("package") || low.contains("crate")))
+        || (low.contains("could not find") && (low.contains("package") || low.contains("crate")))
     {
         ErrorClass::Dependency
     } else if low.contains("connection refused")
@@ -750,8 +761,16 @@ fn normalize_path_sep(s: &str) -> String {
 }
 
 fn is_within_root(path: &str, root: &str) -> bool {
-    let p = normalize_path_sep(path).replace('\u{0}', "").trim().trim_end_matches('/').to_string();
-    let r = normalize_path_sep(root).replace('\u{0}', "").trim().trim_end_matches('/').to_string();
+    let p = normalize_path_sep(path)
+        .replace('\u{0}', "")
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let r = normalize_path_sep(root)
+        .replace('\u{0}', "")
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
     if p.is_empty() || r.is_empty() {
         return false;
     }
@@ -971,14 +990,18 @@ Fix: send ONLY the command (e.g. `git status`), not `$ git status`."
                 .to_string(),
         );
     }
-    if low.contains("unexpected token '}'") || (low.contains("unexpected token") && low.contains('}')) {
+    if low.contains("unexpected token '}'")
+        || (low.contains("unexpected token") && low.contains('}'))
+    {
         return Some(
             "PowerShell saw a stray `}` in the command.\n\
 Fix: remove the trailing `}` and retry."
                 .to_string(),
         );
     }
-    if low.contains("adding embedded git repository") || low.contains("does not have a commit checked out") {
+    if low.contains("adding embedded git repository")
+        || low.contains("does not have a commit checked out")
+    {
         return Some(
             "You are trying to `git add` a nested repo directory.\n\
 Fix: `cd` into the intended repo before `git add .`, or add the nested repo dir to `.gitignore` (or use `git submodule add ...`)."
@@ -996,7 +1019,10 @@ Tip (Windows): use `scripts/run-tui.ps1` / `scripts/run-ui.ps1` which build in a
                 .to_string(),
         );
     }
-    if low.contains("could not connect to server") && low.contains("127.0.0.1") && cmd_low.contains("git") {
+    if low.contains("could not connect to server")
+        && low.contains("127.0.0.1")
+        && cmd_low.contains("git")
+    {
         return Some(
             "Git network failed via a dead local proxy (127.0.0.1).\n\
 Fix: clear proxy env vars: `Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY -ErrorAction SilentlyContinue`."
@@ -1312,24 +1338,32 @@ async fn run_git_cmd(root: &str, args: &[&str]) -> Option<String> {
         .stderr(std::process::Stdio::null())
         .output();
     let out = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
-        .await.ok()?.ok()?;
-    if !out.status.success() { return None; }
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Run the project's test command after a file edit. Returns a formatted result string.
 /// Capped at 120 seconds; stdout/stderr truncated to MAX_STDOUT_CHARS.
 async fn run_test_cmd(cmd: &str, cwd: &str) -> String {
-    let fut = tokio::process::Command::new(if cfg!(target_os = "windows") { "powershell" } else { "sh" })
-        .args(if cfg!(target_os = "windows") {
-            vec!["-Command", cmd]
-        } else {
-            vec!["-c", cmd]
-        })
-        .current_dir(cwd)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output();
+    let fut = tokio::process::Command::new(if cfg!(target_os = "windows") {
+        "powershell"
+    } else {
+        "sh"
+    })
+    .args(if cfg!(target_os = "windows") {
+        vec!["-Command", cmd]
+    } else {
+        vec!["-c", cmd]
+    })
+    .current_dir(cwd)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .output();
 
     let result = match tokio::time::timeout(std::time::Duration::from_secs(120), fut).await {
         Ok(Ok(out)) => {
@@ -1465,9 +1499,11 @@ pub async fn run_agentic_json(
                 checkpoint = Some(hash.clone());
                 let short = hash[..hash.len().min(8)].to_string();
                 let _ = tx.send(StreamToken::Checkpoint(hash)).await;
-                let _ = tx.send(StreamToken::Delta(
-                    format!("[git checkpoint] {short} saved — use /rollback to restore\n\n")
-                )).await;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[git checkpoint] {short} saved — use /rollback to restore\n\n"
+                    )))
+                    .await;
             }
         } else if let Some(ref hash) = checkpoint {
             // Resume: re-emit checkpoint token for UI/CLI consumers.
@@ -1505,7 +1541,10 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
     // These take precedence over generic instructions and can override coding conventions.
     if let Some(agents_text) = agents_md {
         if !agents_text.is_empty() {
-            if !has_system_prefix(&messages, "[Project Instructions — .obstral.md / AGENTS.md]") {
+            if !has_system_prefix(
+                &messages,
+                "[Project Instructions — .obstral.md / AGENTS.md]",
+            ) {
                 let pos = messages.len().min(3);
                 messages.insert(pos, json!({
                     "role": "system",
@@ -1595,7 +1634,9 @@ This is the LAST model call for this run.\n\
                 "[Loop Governor]\nstate: {:?}\n{}\n\nYou MUST incorporate this hint in your next tool call.\nDo not repeat the same failing command.",
                 state, h
             );
-            let _ = tx.send(StreamToken::Delta(format!("\n[governor] {h}\n"))).await;
+            let _ = tx
+                .send(StreamToken::Delta(format!("\n[governor] {h}\n")))
+                .await;
             msgs_for_call.push(json!({"role":"system","content": note}));
         }
 
@@ -1701,7 +1742,8 @@ This is the LAST model call for this run.\n\
                 if !implied.is_empty() {
                     let _ = tx
                         .send(StreamToken::Delta(
-                            "\n[governor] tool_call missing; executing implied commands\n".to_string(),
+                            "\n[governor] tool_call missing; executing implied commands\n"
+                                .to_string(),
                         ))
                         .await;
 
@@ -1712,7 +1754,8 @@ This is the LAST model call for this run.\n\
                         }
 
                         state = AgentState::Executing;
-                        let cwd_used: Option<String> = cur_cwd.clone().or_else(|| tool_root_abs.clone());
+                        let cwd_used: Option<String> =
+                            cur_cwd.clone().or_else(|| tool_root_abs.clone());
                         let cwd_used_label = cwd_used
                             .as_deref()
                             .unwrap_or("(workspace root)")
@@ -1781,8 +1824,9 @@ This is the LAST model call for this run.\n\
                                 if is_within_root(&p, root) {
                                     cur_cwd = Some(p);
                                 } else {
-                                    cwd_after_note =
-                                        Some(format!("NOTE: cwd_after was outside tool_root; ignored: {p}"));
+                                    cwd_after_note = Some(format!(
+                                        "NOTE: cwd_after was outside tool_root; ignored: {p}"
+                                    ));
                                 }
                             } else {
                                 cur_cwd = Some(p);
@@ -1806,12 +1850,13 @@ This is the LAST model call for this run.\n\
                         } else {
                             None
                         };
-                        let effective_exit_code =
-                            if exit_code == 0 && (suspicious_reason.is_some() || escaped_tool_root) {
-                                1
-                            } else {
-                                exit_code
-                            };
+                        let effective_exit_code = if exit_code == 0
+                            && (suspicious_reason.is_some() || escaped_tool_root)
+                        {
+                            1
+                        } else {
+                            exit_code
+                        };
 
                         let note = cwd_after_note.as_deref();
                         let tool_output = if effective_exit_code == 0 {
@@ -1903,7 +1948,9 @@ You MUST call ONE tool now (exec/read_file/write_file/patch_file/apply_diff/sear
 Do NOT respond with text-only instructions."
                 };
                 let _ = tx
-                    .send(StreamToken::Delta("\n[governor] tool_call missing; forcing tool call\n".to_string()))
+                    .send(StreamToken::Delta(
+                        "\n[governor] tool_call missing; forcing tool call\n".to_string(),
+                    ))
                     .await;
                 messages.push(json!({"role":"system","content": note}));
                 autosave_best_effort(
@@ -1920,7 +1967,10 @@ Do NOT respond with text-only instructions."
 
             state = AgentState::Done;
             let _ = tx
-                .send(StreamToken::Delta(format!("\n[agent] state: {:?}\n", state)))
+                .send(StreamToken::Delta(format!(
+                    "\n[agent] state: {:?}\n",
+                    state
+                )))
                 .await;
             break; // Model finished without tool call
         }
@@ -1930,8 +1980,7 @@ Do NOT respond with text-only instructions."
 
         // ── done tool ──────────────────────────────────────────────────────
         if tc.name.as_str() == "done" {
-            let args: serde_json::Value =
-                serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+            let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
             let summary = args["summary"].as_str().unwrap_or("").trim();
             let next_steps = args["next_steps"].as_str().unwrap_or("").trim();
 
@@ -1971,14 +2020,13 @@ Do NOT respond with text-only instructions."
 
         // ── apply_diff tool ───────────────────────────────────────────────
         if tc.name.as_str() == "apply_diff" {
-            let args: serde_json::Value = serde_json::from_str(&tc.arguments)
-                .unwrap_or(json!({}));
+            let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
             let path = args["path"].as_str().unwrap_or("").to_string();
             let diff = args["diff"].as_str().unwrap_or("").to_string();
 
-            let _ = tx.send(StreamToken::Delta(
-                format!("\n\n[APPLY_DIFF] {path}\n")
-            )).await;
+            let _ = tx
+                .send(StreamToken::Delta(format!("\n\n[APPLY_DIFF] {path}\n")))
+                .await;
             let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
 
             let base = tool_root_abs.as_deref();
@@ -2035,7 +2083,11 @@ Do NOT respond with text-only instructions."
 
             let first_line = result.lines().next().unwrap_or("").to_string();
             if is_error {
-                let _ = tx.send(StreamToken::Delta(format!("[RESULT_FILE_ERR] {first_line}\n"))).await;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT_FILE_ERR] {first_line}\n"
+                    )))
+                    .await;
                 state = AgentState::Recovery;
                 if !rejected_by_user {
                     file_tool_consec_failures += 1;
@@ -2047,7 +2099,9 @@ Do NOT respond with text-only instructions."
                     );
                 }
             } else {
-                let _ = tx.send(StreamToken::Delta(format!("[RESULT_FILE] {first_line}\n"))).await;
+                let _ = tx
+                    .send(StreamToken::Delta(format!("[RESULT_FILE] {first_line}\n")))
+                    .await;
                 state = AgentState::Planning;
                 file_tool_consec_failures = 0;
                 pending_system_hint = None;
@@ -2073,30 +2127,30 @@ Do NOT respond with text-only instructions."
 
         // ── glob tool ─────────────────────────────────────────────────────
         if tc.name.as_str() == "glob" {
-            let args: serde_json::Value = serde_json::from_str(&tc.arguments)
-                .unwrap_or(json!({}));
+            let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
             let pattern = args["pattern"].as_str().unwrap_or("").to_string();
             let dir = args["dir"].as_str().unwrap_or("").to_string();
 
-            let _ = tx.send(StreamToken::Delta(
-                format!("\n\n[GLOB] {pattern}\n")
-            )).await;
+            let _ = tx
+                .send(StreamToken::Delta(format!("\n\n[GLOB] {pattern}\n")))
+                .await;
             let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
 
             let base = tool_root_abs.as_deref();
-            let (result, is_error) =
-                crate::file_tools::tool_glob_files(&pattern, &dir, base);
+            let (result, is_error) = crate::file_tools::tool_glob_files(&pattern, &dir, base);
 
             let first_line = result.lines().next().unwrap_or("").to_string();
             if is_error {
-                let _ = tx.send(StreamToken::Delta(
-                    format!("[RESULT_FILE_ERR] {first_line}\n")
-                )).await;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT_FILE_ERR] {first_line}\n"
+                    )))
+                    .await;
                 state = AgentState::Recovery;
             } else {
-                let _ = tx.send(StreamToken::Delta(
-                    format!("[RESULT_GLOB] {first_line}\n")
-                )).await;
+                let _ = tx
+                    .send(StreamToken::Delta(format!("[RESULT_GLOB] {first_line}\n")))
+                    .await;
                 state = AgentState::Planning;
                 pending_system_hint = None;
             }
@@ -2120,31 +2174,35 @@ Do NOT respond with text-only instructions."
 
         // ── search_files tool ─────────────────────────────────────────────
         if tc.name.as_str() == "search_files" {
-            let args: serde_json::Value = serde_json::from_str(&tc.arguments)
-                .unwrap_or(json!({}));
+            let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
             let pattern = args["pattern"].as_str().unwrap_or("").to_string();
             let dir = args["dir"].as_str().unwrap_or("").to_string();
             let ci = args["case_insensitive"].as_bool().unwrap_or(false);
 
-            let _ = tx.send(StreamToken::Delta(
-                format!("\n\n[SEARCH_FILES] {pattern}\n")
-            )).await;
+            let _ = tx
+                .send(StreamToken::Delta(format!(
+                    "\n\n[SEARCH_FILES] {pattern}\n"
+                )))
+                .await;
             let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
 
             let base = tool_root_abs.as_deref();
-            let (result, is_error) =
-                crate::file_tools::tool_search_files(&pattern, &dir, ci, base);
+            let (result, is_error) = crate::file_tools::tool_search_files(&pattern, &dir, ci, base);
 
             let first_line = result.lines().next().unwrap_or("").to_string();
             if is_error {
-                let _ = tx.send(StreamToken::Delta(
-                    format!("[RESULT_FILE_ERR] {first_line}\n")
-                )).await;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT_FILE_ERR] {first_line}\n"
+                    )))
+                    .await;
                 state = AgentState::Recovery;
             } else {
-                let _ = tx.send(StreamToken::Delta(
-                    format!("[RESULT_SEARCH] {first_line}\n")
-                )).await;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT_SEARCH] {first_line}\n"
+                    )))
+                    .await;
                 state = AgentState::Planning;
                 pending_system_hint = None;
             }
@@ -2169,15 +2227,14 @@ Do NOT respond with text-only instructions."
 
         // ── File tools: read_file / write_file / patch_file ────────────────
         if matches!(tc.name.as_str(), "read_file" | "write_file" | "patch_file") {
-            let args: serde_json::Value = serde_json::from_str(&tc.arguments)
-                .unwrap_or(json!({}));
+            let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
             let path = args["path"].as_str().unwrap_or("").to_string();
 
             // Emit annotation (visible in TUI).
             let tool_upper = tc.name.to_ascii_uppercase();
-            let _ = tx.send(StreamToken::Delta(
-                format!("\n\n[{tool_upper}] {path}\n")
-            )).await;
+            let _ = tx
+                .send(StreamToken::Delta(format!("\n\n[{tool_upper}] {path}\n")))
+                .await;
             let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
 
             let base = tool_root_abs.as_deref();
@@ -2194,10 +2251,16 @@ Do NOT respond with text-only instructions."
                     // ── Gap 6: serve from cache if file hasn't changed ──────
                     if let Some(cached) = file_cache.get(&cache_key) {
                         let header = cached.lines().next().unwrap_or(&path).to_string();
-                        let _ = tx.send(StreamToken::Delta(
-                            format!("[CACHE_HIT] {header}\n")
-                        )).await;
-                        (format!("{} [⚡ cached — unchanged since last read]\n{cached}", header), false)
+                        let _ = tx
+                            .send(StreamToken::Delta(format!("[CACHE_HIT] {header}\n")))
+                            .await;
+                        (
+                            format!(
+                                "{} [⚡ cached — unchanged since last read]\n{cached}",
+                                header
+                            ),
+                            false,
+                        )
                     } else {
                         let (content, err) = crate::file_tools::tool_read_file(&path, base);
                         if !err {
@@ -2210,11 +2273,15 @@ Do NOT respond with text-only instructions."
                     let content = args["content"].as_str().unwrap_or("").to_string();
 
                     // Approval: show a compact before/after preview.
-                    let old = file_cache.get(&cache_key).cloned().or_else(|| {
-                        crate::file_tools::resolve_safe_path(&path, base)
-                            .ok()
-                            .and_then(|abs| std::fs::read_to_string(&abs).ok())
-                    }).unwrap_or_default();
+                    let old = file_cache
+                        .get(&cache_key)
+                        .cloned()
+                        .or_else(|| {
+                            crate::file_tools::resolve_safe_path(&path, base)
+                                .ok()
+                                .and_then(|abs| std::fs::read_to_string(&abs).ok())
+                        })
+                        .unwrap_or_default();
                     let preview = simple_before_after(&old, &content);
                     let approval = approver
                         .approve(ApprovalRequest::Edit {
@@ -2305,9 +2372,8 @@ Do NOT respond with text-only instructions."
                             if let Ok(abs) = crate::file_tools::resolve_safe_path(&path, base) {
                                 if let Ok(new_content) = std::fs::read_to_string(&abs) {
                                     if replace.is_empty() || new_content.contains(&replace) {
-                                        patch_result.push_str(
-                                            "\n✓ auto-verify: patch confirmed in file",
-                                        );
+                                        patch_result
+                                            .push_str("\n✓ auto-verify: patch confirmed in file");
                                     } else {
                                         patch_result.push_str(
                                             "\n✗ auto-verify FAILED: replacement text not found — \
@@ -2342,9 +2408,11 @@ Do NOT respond with text-only instructions."
             // Emit result label.
             let first_line = result.lines().next().unwrap_or("").to_string();
             if is_error {
-                let _ = tx.send(StreamToken::Delta(
-                    format!("[RESULT_FILE_ERR] {first_line}\n")
-                )).await;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT_FILE_ERR] {first_line}\n"
+                    )))
+                    .await;
                 state = AgentState::Recovery;
                 // D — escalate after 3 consecutive file-tool failures.
                 let hint = if rejected_by_user {
@@ -2365,9 +2433,9 @@ Do NOT respond with text-only instructions."
                 };
                 pending_system_hint = Some(hint);
             } else {
-                let _ = tx.send(StreamToken::Delta(
-                    format!("[RESULT_FILE] {first_line}\n")
-                )).await;
+                let _ = tx
+                    .send(StreamToken::Delta(format!("[RESULT_FILE] {first_line}\n")))
+                    .await;
                 state = AgentState::Planning;
                 pending_system_hint = None;
             }
@@ -2389,9 +2457,11 @@ Do NOT respond with text-only instructions."
             .await;
 
             if iter + 1 == max_iters {
-                let _ = tx.send(StreamToken::Delta(
-                    format!("\n[agent] iteration cap ({max_iters}) reached.\n")
-                )).await;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[agent] iteration cap ({max_iters}) reached.\n"
+                    )))
+                    .await;
             }
             continue; // skip exec block below
         }
@@ -2400,8 +2470,8 @@ Do NOT respond with text-only instructions."
             return Err(anyhow!("unknown tool: {}", tc.name));
         }
 
-        let args: serde_json::Value = serde_json::from_str(&tc.arguments)
-            .unwrap_or(json!({"command": tc.arguments}));
+        let args: serde_json::Value =
+            serde_json::from_str(&tc.arguments).unwrap_or(json!({"command": tc.arguments}));
         let command = args["command"].as_str().unwrap_or("").to_string();
 
         // Resolve an optional cwd (absolute or relative). Relative cwd is resolved against
@@ -2485,9 +2555,11 @@ Do NOT respond with text-only instructions."
             );
 
             if iter + 1 == max_iters {
-                let _ = tx.send(StreamToken::Delta(
-                    format!("\n[agent] iteration cap ({max_iters}) reached.\n")
-                )).await;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[agent] iteration cap ({max_iters}) reached.\n"
+                    )))
+                    .await;
             }
             continue;
         }
@@ -2546,11 +2618,12 @@ Do NOT respond with text-only instructions."
         } else {
             None
         };
-        let effective_exit_code = if exit_code == 0 && (suspicious_reason.is_some() || escaped_tool_root) {
-            1
-        } else {
-            exit_code
-        };
+        let effective_exit_code =
+            if exit_code == 0 && (suspicious_reason.is_some() || escaped_tool_root) {
+                1
+            } else {
+                exit_code
+            };
 
         let tool_output = if effective_exit_code == 0 {
             let base = build_ok_tool_output(&stdout);
@@ -2612,9 +2685,11 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
 
         // Safety: stop if we've hit the iteration cap.
         if iter + 1 == max_iters {
-            let _ = tx.send(StreamToken::Delta(
-                format!("\n[agent] iteration cap ({max_iters}) reached.\n")
-            )).await;
+            let _ = tx
+                .send(StreamToken::Delta(format!(
+                    "\n[agent] iteration cap ({max_iters}) reached.\n"
+                )))
+                .await;
         }
     }
 

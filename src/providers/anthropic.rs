@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use reqwest::StatusCode;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 use crate::types::{ChatMessage, ChatRequest, ChatResponse};
@@ -74,7 +74,10 @@ fn to_anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
 #[async_trait]
 impl ChatProvider for AnthropicProvider {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
-        let api_key = self.api_key.as_ref().ok_or_else(|| anyhow!("missing API key"))?;
+        let api_key = self
+            .api_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing API key"))?;
         let url = format!("{}/messages", self.base_url);
 
         let mut payload = json!({
@@ -114,7 +117,11 @@ impl ChatProvider for AnthropicProvider {
         }
 
         let data: Value = resp.json().await.context("invalid JSON response")?;
-        let blocks = data.get("content").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+        let blocks = data
+            .get("content")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
         let mut text = String::new();
         for b in blocks {
             if b.get("type").and_then(|x| x.as_str()) == Some("text") {
@@ -140,8 +147,14 @@ mod tests {
     fn make_request_with_system(system: &str, user: &str) -> ChatRequest {
         ChatRequest {
             messages: vec![
-                ChatMessage { role: "system".to_string(), content: system.to_string() },
-                ChatMessage { role: "user".to_string(), content: user.to_string() },
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: system.to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: user.to_string(),
+                },
             ],
             temperature: Some(0.4),
             max_tokens: Some(64),

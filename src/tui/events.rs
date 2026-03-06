@@ -1,20 +1,19 @@
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::modes::{mode_prompt, language_instruction};
+use crate::modes::{language_instruction, mode_prompt};
 use crate::personas::resolve_persona;
 use crate::providers;
 use crate::streaming::StreamToken;
 use crate::types::{ChatMessage, ChatRequest};
 
 use super::agent;
-use super::app::{App, Focus, RightTab, Task, TaskPhase, TaskTarget, Message, Role};
+use super::app::{App, Focus, Message, RightTab, Role, Task, TaskPhase, TaskTarget};
 
 // ── Clipboard ─────────────────────────────────────────────────────────────────
 
@@ -167,11 +166,19 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
             push!(format!(
                 "auto-fix mode: {} — Observer reviews will {} be forwarded to Coder",
                 if app.auto_fix_mode { "ON" } else { "OFF" },
-                if app.auto_fix_mode { "automatically" } else { "NOT" }
+                if app.auto_fix_mode {
+                    "automatically"
+                } else {
+                    "NOT"
+                }
             ));
         }
         "/diff" => {
-            let root = app.tool_root.as_ref().cloned().unwrap_or_else(|| ".".to_string());
+            let root = app
+                .tool_root
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| ".".to_string());
             let base = app.last_git_checkpoint.as_deref().unwrap_or("HEAD~1");
             let stat = std::process::Command::new("git")
                 .args(["-C", &root, "diff", base, "--stat"])
@@ -197,32 +204,55 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
             }
         }
         "/init" => {
-            let root = app.tool_root.as_ref().cloned().unwrap_or_else(|| ".".to_string());
+            let root = app
+                .tool_root
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| ".".to_string());
             let obstral_path = std::path::Path::new(&root).join(".obstral.md");
             if obstral_path.exists() {
-                push!(format!(".obstral.md already exists at {}", obstral_path.display()));
+                push!(format!(
+                    ".obstral.md already exists at {}",
+                    obstral_path.display()
+                ));
             } else {
                 // Detect stack and test_cmd synchronously.
                 let has_cargo = std::path::Path::new(&root).join("Cargo.toml").exists();
-                let has_pkg   = std::path::Path::new(&root).join("package.json").exists();
-                let has_py    = std::path::Path::new(&root).join("pyproject.toml").exists()
-                             || std::path::Path::new(&root).join("requirements.txt").exists();
-                let has_go    = std::path::Path::new(&root).join("go.mod").exists();
+                let has_pkg = std::path::Path::new(&root).join("package.json").exists();
+                let has_py = std::path::Path::new(&root).join("pyproject.toml").exists()
+                    || std::path::Path::new(&root)
+                        .join("requirements.txt")
+                        .exists();
+                let has_go = std::path::Path::new(&root).join("go.mod").exists();
                 let stack = [
                     if has_cargo { Some("Rust") } else { None },
-                    if has_pkg   { Some("Node/React") } else { None },
-                    if has_py    { Some("Python") } else { None },
-                    if has_go    { Some("Go") } else { None },
-                ].iter().flatten().cloned().collect::<Vec<_>>().join(", ");
-                let test_cmd = if has_cargo { "cargo test 2>&1" }
-                               else if has_pkg { "npm test --passWithNoTests 2>&1" }
-                               else if has_py  { "pytest -q 2>&1" }
-                               else if has_go  { "go test ./... 2>&1" }
-                               else { "# add your test command here" };
-                let stack_line = if stack.is_empty() { "# auto-detected: unknown".to_string() }
-                                 else { stack.clone() };
+                    if has_pkg { Some("Node/React") } else { None },
+                    if has_py { Some("Python") } else { None },
+                    if has_go { Some("Go") } else { None },
+                ]
+                .iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+                let test_cmd = if has_cargo {
+                    "cargo test 2>&1"
+                } else if has_pkg {
+                    "npm test --passWithNoTests 2>&1"
+                } else if has_py {
+                    "pytest -q 2>&1"
+                } else if has_go {
+                    "go test ./... 2>&1"
+                } else {
+                    "# add your test command here"
+                };
+                let stack_line = if stack.is_empty() {
+                    "# auto-detected: unknown".to_string()
+                } else {
+                    stack.clone()
+                };
                 let content = format!(
-"# .obstral.md — Project Instructions for OBSTRAL Coder
+                    "# .obstral.md — Project Instructions for OBSTRAL Coder
 #
 # This file is automatically injected into the Coder's system prompt.
 # Edit it to set project rules, test commands, and coding conventions.
@@ -250,7 +280,10 @@ test_cmd: {test_cmd}
 "
                 );
                 match std::fs::write(&obstral_path, &content) {
-                    Ok(_) => push!(format!("✓ created .obstral.md at {} — edit it to customize", obstral_path.display())),
+                    Ok(_) => push!(format!(
+                        "✓ created .obstral.md at {} — edit it to customize",
+                        obstral_path.display()
+                    )),
                     Err(e) => push!(format!("✗ failed to create .obstral.md: {e}")),
                 }
             }
@@ -282,8 +315,7 @@ test_cmd: {test_cmd}
             }
         }
         "/help" | "/?" => {
-            push!(
-                "/model <name>       set model\n\
+            push!("/model <name>       set model\n\
 /persona <name>     set persona\n\
 /temp <0.0-2.0>     set temperature\n\
 /lang <ja|en|fr>    set language\n\
@@ -294,8 +326,7 @@ test_cmd: {test_cmd}
 /init               generate .obstral.md template\n\
 /rollback           restore git checkpoint from session start\n\
 Ctrl+R              cycle right tab\n"
-                    .to_string()
-            );
+                .to_string());
         }
         _ => push!(format!("unknown command: {cmd} (try /help)")),
     }
@@ -365,12 +396,12 @@ pub async fn run_event_loop(
                     break;
                 }
             }
-            AppEvent::Mouse(m)                  => handle_mouse(m, app),
-            AppEvent::CoderToken(token)         => handle_coder_token(token, app),
-            AppEvent::ObserverToken(token)      => handle_observer_token(token, app),
-            AppEvent::ChatToken(token)          => handle_chat_token(token, app),
-            AppEvent::TasksPlanned(tasks)       => handle_tasks_planned(tasks, app),
-            AppEvent::TaskPlanError(e)          => handle_task_plan_error(e, app),
+            AppEvent::Mouse(m) => handle_mouse(m, app),
+            AppEvent::CoderToken(token) => handle_coder_token(token, app),
+            AppEvent::ObserverToken(token) => handle_observer_token(token, app),
+            AppEvent::ChatToken(token) => handle_chat_token(token, app),
+            AppEvent::TasksPlanned(tasks) => handle_tasks_planned(tasks, app),
+            AppEvent::TaskPlanError(e) => handle_task_plan_error(e, app),
             AppEvent::Tick => {
                 app.tick_count = app.tick_count.wrapping_add(1);
                 maybe_auto_observe(app, &observer_tx).await;
@@ -385,13 +416,21 @@ pub async fn run_event_loop(
             }
         }
 
-        if app.quit { break; }
+        if app.quit {
+            break;
+        }
     }
 
     // Abort any in-flight tasks on clean exit.
-    if let Some(t) = app.coder_task.take() { t.abort(); }
-    if let Some(t) = app.observer_task.take() { t.abort(); }
-    if let Some(t) = app.chat_task.take() { t.abort(); }
+    if let Some(t) = app.coder_task.take() {
+        t.abort();
+    }
+    if let Some(t) = app.observer_task.take() {
+        t.abort();
+    }
+    if let Some(t) = app.chat_task.take() {
+        t.abort();
+    }
 
     Ok(())
 }
@@ -418,7 +457,9 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 app.coder.scroll = app.coder.scroll.saturating_add(3);
             } else {
                 match app.right_tab {
-                    RightTab::Observer => app.observer.scroll = app.observer.scroll.saturating_add(3),
+                    RightTab::Observer => {
+                        app.observer.scroll = app.observer.scroll.saturating_add(3)
+                    }
                     RightTab::Chat => app.chat.scroll = app.chat.scroll.saturating_add(3),
                     RightTab::Tasks => app.tasks_cursor = app.tasks_cursor.saturating_sub(1),
                 }
@@ -429,11 +470,14 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 app.coder.scroll = app.coder.scroll.saturating_sub(3);
             } else {
                 match app.right_tab {
-                    RightTab::Observer => app.observer.scroll = app.observer.scroll.saturating_sub(3),
+                    RightTab::Observer => {
+                        app.observer.scroll = app.observer.scroll.saturating_sub(3)
+                    }
                     RightTab::Chat => app.chat.scroll = app.chat.scroll.saturating_sub(3),
                     RightTab::Tasks => {
                         if !app.tasks.is_empty() {
-                            app.tasks_cursor = (app.tasks_cursor + 1).min(app.tasks.len().saturating_sub(1));
+                            app.tasks_cursor =
+                                (app.tasks_cursor + 1).min(app.tasks.len().saturating_sub(1));
                         }
                     }
                 }
@@ -443,7 +487,11 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
         // Left-click in the body: focus that pane.
         MouseEventKind::Down(MouseButton::Left) => {
             if mouse.row >= body_start && mouse.row < body_end {
-                app.focus = if mouse.column < coder_w { Focus::Coder } else { Focus::Right };
+                app.focus = if mouse.column < coder_w {
+                    Focus::Coder
+                } else {
+                    Focus::Right
+                };
             }
         }
 
@@ -463,7 +511,9 @@ async fn handle_key(
     internal_tx: &mpsc::Sender<AppEvent>,
 ) -> anyhow::Result<bool> {
     use crossterm::event::KeyEventKind;
-    if key.kind == KeyEventKind::Release { return Ok(false); }
+    if key.kind == KeyEventKind::Release {
+        return Ok(false);
+    }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -490,13 +540,16 @@ async fn handle_key(
                         RightTab::Tasks => &app.observer,
                     },
                 };
-                pane.messages.iter().rev()
+                pane.messages
+                    .iter()
+                    .rev()
                     .find(|m| matches!(m.role, Role::Assistant) && m.complete)
                     .map(|m| m.content.clone())
             };
             if let Some(text) = content {
                 copy_to_clipboard(&text);
-                app.focused_pane_mut().push_tool("✓ クリップボードにコピー".to_string());
+                app.focused_pane_mut()
+                    .push_tool("✓ クリップボードにコピー".to_string());
             }
         }
 
@@ -518,7 +571,9 @@ async fn handle_key(
         }
 
         // Stop streaming (Ctrl+K)
-        KeyCode::Char('k') if ctrl && app.focus == Focus::Right && app.right_tab == RightTab::Chat => {
+        KeyCode::Char('k')
+            if ctrl && app.focus == Focus::Right && app.right_tab == RightTab::Chat =>
+        {
             if let Some(handle) = app.chat_task.take() {
                 handle.abort();
             }
@@ -526,26 +581,24 @@ async fn handle_key(
             app.chat.finish_stream();
             app.chat.push_tool("(stream canceled)".to_string());
         }
-        KeyCode::Char('k') if ctrl => {
-            match app.focus {
-                Focus::Coder => {
-                    if let Some(handle) = app.coder_task.take() {
-                        handle.abort();
-                    }
-                    app.ignore_coder_tokens = true;
-                    app.coder.finish_stream();
-                    app.coder.push_tool("(ストリーミング停止)".to_string());
+        KeyCode::Char('k') if ctrl => match app.focus {
+            Focus::Coder => {
+                if let Some(handle) = app.coder_task.take() {
+                    handle.abort();
                 }
-                Focus::Right => {
-                    if let Some(handle) = app.observer_task.take() {
-                        handle.abort();
-                    }
-                    app.ignore_observer_tokens = true;
-                    app.observer.finish_stream();
-                    app.observer.push_tool("(ストリーミング停止)".to_string());
-                }
+                app.ignore_coder_tokens = true;
+                app.coder.finish_stream();
+                app.coder.push_tool("(ストリーミング停止)".to_string());
             }
-        }
+            Focus::Right => {
+                if let Some(handle) = app.observer_task.take() {
+                    handle.abort();
+                }
+                app.ignore_observer_tokens = true;
+                app.observer.finish_stream();
+                app.observer.push_tool("(ストリーミング停止)".to_string());
+            }
+        },
 
         // Scroll (lines-from-bottom semantics: 0 = pinned, N = above)
         KeyCode::PageUp => {
@@ -558,7 +611,8 @@ async fn handle_key(
         KeyCode::PageDown => {
             if app.focus == Focus::Right && app.right_tab == RightTab::Tasks {
                 if !app.tasks.is_empty() {
-                    app.tasks_cursor = (app.tasks_cursor + 5).min(app.tasks.len().saturating_sub(1));
+                    app.tasks_cursor =
+                        (app.tasks_cursor + 5).min(app.tasks.len().saturating_sub(1));
                 }
             } else {
                 app.focused_pane_mut().scroll = app.focused_pane_mut().scroll.saturating_sub(5);
@@ -597,46 +651,40 @@ async fn handle_key(
         }
 
         // Send message
-        KeyCode::Enter if !shift => {
-            match app.focus {
-                Focus::Coder => send_coder_message(app, coder_tx).await,
-                Focus::Right => match app.right_tab {
-                    RightTab::Observer => send_observer_message(app, observer_tx, None).await,
-                    RightTab::Chat => send_chat_message(app, chat_tx, internal_tx).await,
-                    RightTab::Tasks => dispatch_selected_task(app, coder_tx, observer_tx).await,
-                },
-            }
-        }
+        KeyCode::Enter if !shift => match app.focus {
+            Focus::Coder => send_coder_message(app, coder_tx).await,
+            Focus::Right => match app.right_tab {
+                RightTab::Observer => send_observer_message(app, observer_tx, None).await,
+                RightTab::Chat => send_chat_message(app, chat_tx, internal_tx).await,
+                RightTab::Tasks => dispatch_selected_task(app, coder_tx, observer_tx).await,
+            },
+        },
 
         // Insert newline
-        KeyCode::Enter if shift => {
-            match app.focus {
-                Focus::Coder => app.coder.textarea.insert_newline(),
-                Focus::Right => match app.right_tab {
-                    RightTab::Observer => app.observer.textarea.insert_newline(),
-                    RightTab::Chat => app.chat.textarea.insert_newline(),
-                    RightTab::Tasks => {}
-                },
-            }
-        }
+        KeyCode::Enter if shift => match app.focus {
+            Focus::Coder => app.coder.textarea.insert_newline(),
+            Focus::Right => match app.right_tab {
+                RightTab::Observer => app.observer.textarea.insert_newline(),
+                RightTab::Chat => app.chat.textarea.insert_newline(),
+                RightTab::Tasks => {}
+            },
+        },
 
         // Pass everything else to tui-textarea
-        _ => {
-            match app.focus {
-                Focus::Coder => {
-                    app.coder.textarea.input(key);
-                }
-                Focus::Right => match app.right_tab {
-                    RightTab::Observer => {
-                        app.observer.textarea.input(key);
-                    }
-                    RightTab::Chat => {
-                        app.chat.textarea.input(key);
-                    }
-                    RightTab::Tasks => {}
-                },
+        _ => match app.focus {
+            Focus::Coder => {
+                app.coder.textarea.input(key);
             }
-        }
+            Focus::Right => match app.right_tab {
+                RightTab::Observer => {
+                    app.observer.textarea.input(key);
+                }
+                RightTab::Chat => {
+                    app.chat.textarea.input(key);
+                }
+                RightTab::Tasks => {}
+            },
+        },
     }
 
     Ok(false)
@@ -645,7 +693,9 @@ async fn handle_key(
 // ── Token handlers ────────────────────────────────────────────────────────────
 
 fn handle_coder_token(token: StreamToken, app: &mut App) {
-    if app.ignore_coder_tokens { return; }
+    if app.ignore_coder_tokens {
+        return;
+    }
     match token {
         StreamToken::Delta(s) => {
             app.coder.push_delta(&s);
@@ -668,7 +718,9 @@ fn handle_coder_token(token: StreamToken, app: &mut App) {
 }
 
 fn handle_observer_token(token: StreamToken, app: &mut App) {
-    if app.ignore_observer_tokens { return; }
+    if app.ignore_observer_tokens {
+        return;
+    }
     match token {
         StreamToken::Delta(s) => {
             app.observer.push_delta(&s);
@@ -678,7 +730,10 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
             app.observer.finish_stream();
             // A — auto-fix pipeline: queue the review text for Coder on next Tick.
             if app.auto_fix_mode && !app.coder.streaming {
-                if let Some(review) = app.observer.messages.iter()
+                if let Some(review) = app
+                    .observer
+                    .messages
+                    .iter()
                     .filter(|m| matches!(m.role, crate::tui::app::Role::Assistant) && m.complete)
                     .last()
                     .map(|m| m.content.trim().to_string())
@@ -699,7 +754,11 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
                     .observer
                     .messages
                     .iter()
-                    .filter(|m| matches!(m.role, Role::Assistant) && m.complete && !m.content.trim().is_empty())
+                    .filter(|m| {
+                        matches!(m.role, Role::Assistant)
+                            && m.complete
+                            && !m.content.trim().is_empty()
+                    })
                     .last()
                 {
                     if crate::lang_detect::needs_language_rewrite(expected, &last.content) {
@@ -720,19 +779,28 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
             // Detect repeated Observer replies and schedule a one-shot diff-only retry.
             // This prevents the common "template critique loop" when nothing new happened.
             if app.observer_loop_retry_budget > 0 {
-                let asst: Vec<&Message> = app.observer.messages.iter()
-                    .filter(|m| matches!(m.role, Role::Assistant) && m.complete && !m.content.trim().is_empty())
+                let asst: Vec<&Message> = app
+                    .observer
+                    .messages
+                    .iter()
+                    .filter(|m| {
+                        matches!(m.role, Role::Assistant)
+                            && m.complete
+                            && !m.content.trim().is_empty()
+                    })
                     .collect();
                 if asst.len() >= 2 {
                     let last = asst[asst.len() - 1];
                     if !crate::loop_detect::is_skippable_for_loop(&last.content) {
                         let mut max_sim: f64 = 0.0;
                         for prev in asst[..asst.len() - 1].iter().rev().take(4) {
-                            max_sim = max_sim.max(crate::loop_detect::similarity(&last.content, &prev.content));
+                            max_sim = max_sim
+                                .max(crate::loop_detect::similarity(&last.content, &prev.content));
                         }
                         let detected = last.content.trim().len() >= 180 && max_sim >= 0.80;
                         if detected {
-                            app.observer_loop_retry_budget = app.observer_loop_retry_budget.saturating_sub(1);
+                            app.observer_loop_retry_budget =
+                                app.observer_loop_retry_budget.saturating_sub(1);
                             app.observer_loop_pending = Some(max_sim);
                         }
                     }
@@ -770,7 +838,8 @@ fn handle_chat_token(token: StreamToken, app: &mut App) {
 fn handle_tasks_planned(tasks: Vec<Task>, app: &mut App) {
     app.planning_tasks = false;
     if tasks.is_empty() {
-        app.chat.push_tool("(task router) no tasks planned".to_string());
+        app.chat
+            .push_tool("(task router) no tasks planned".to_string());
         return;
     }
     let n = tasks.len();
@@ -794,11 +863,15 @@ fn parse_at_refs(text: &str) -> Vec<String> {
     let mut refs = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for word in text.split_whitespace() {
-        if !word.starts_with('@') { continue; }
+        if !word.starts_with('@') {
+            continue;
+        }
         let path = word.trim_start_matches('@');
         // Strip common trailing punctuation.
         let path = path.trim_end_matches(|c: char| matches!(c, ',' | ')' | ']' | ';' | ':' | '.'));
-        if path.is_empty() { continue; }
+        if path.is_empty() {
+            continue;
+        }
         if seen.insert(path.to_string()) {
             refs.push(path.to_string());
         }
@@ -818,16 +891,20 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
     }
 
     // Abort any previous task before starting a new one.
-    if let Some(handle) = app.coder_task.take() { handle.abort(); }
+    if let Some(handle) = app.coder_task.take() {
+        handle.abort();
+    }
 
     // Reset state for the new send.
     app.coder_iter = 0;
-    app.coder.scroll = 0;         // pin to bottom for new output
+    app.coder.scroll = 0; // pin to bottom for new output
     app.ignore_coder_tokens = false;
 
     // Resolve tool_root early (needed for @ref file reads below).
     let tool_root = app.tool_root.clone().or_else(|| {
-        std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
     });
 
     // Expand @file references: read files and collect system messages to inject.
@@ -840,7 +917,11 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
             app.coder.push_tool(format!("📎 @{ref_path}: not found"));
         } else {
             // Header line is "[path] (N lines, B bytes)" — use it as the notification.
-            let header = content.lines().next().unwrap_or(ref_path.as_str()).to_string();
+            let header = content
+                .lines()
+                .next()
+                .unwrap_or(ref_path.as_str())
+                .to_string();
             app.coder.push_tool(format!("📎 injected: {header}"));
             at_ref_messages.push(ChatMessage {
                 role: "system".to_string(),
@@ -849,23 +930,33 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
         }
     }
     app.coder.streaming = true;
-    app.coder.messages.push(Message::new_streaming(Role::Assistant));
+    app.coder
+        .messages
+        .push(Message::new_streaming(Role::Assistant));
 
     let history = app.coder.chat_history();
     let cfg = app.coder_cfg.clone();
     let max_iters = app.coder_max_iters.unwrap_or(agent::DEFAULT_MAX_ITERS);
 
-    let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
+    let persona_prompt = resolve_persona(&cfg.persona)
+        .map(|p| p.prompt)
+        .unwrap_or("");
     let lang = language_instruction(Some(&app.lang), &cfg.mode);
     let system = agent::coder_system(persona_prompt, lang);
-    let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: system,
+    }];
     let hist_len = history.len();
     for m in history.iter().take(hist_len.saturating_sub(1)) {
         messages.push(m.clone());
     }
     // Inject @file system messages immediately before the user turn.
     messages.extend(at_ref_messages);
-    messages.push(ChatMessage { role: "user".to_string(), content: text });
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: text,
+    });
 
     // Scan project context once per session (guarded by stack_label being None).
     let (project_context, agents_md): (Option<String>, Option<String>) =
@@ -994,9 +1085,7 @@ fn build_recent_tool_outputs(messages: &[Message]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
-    format!(
-        "\n\n[Recent tool outputs — last {count}]\n{snippet}"
-    )
+    format!("\n\n[Recent tool outputs — last {count}]\n{snippet}")
 }
 
 async fn send_observer_message(
@@ -1008,7 +1097,9 @@ async fn send_observer_message(
         Some(t) => t,
         None => {
             let t = app.observer.textarea.lines().join("\n").trim().to_string();
-            if t.is_empty() { return; }
+            if t.is_empty() {
+                return;
+            }
             // Handle slash commands before sending to AI.
             if handle_slash_command(&t, app, PaneId::Observer) {
                 app.observer.textarea = tui_textarea::TextArea::default();
@@ -1018,9 +1109,13 @@ async fn send_observer_message(
             t
         }
     };
-    if app.observer.streaming { return; }
+    if app.observer.streaming {
+        return;
+    }
 
-    if let Some(handle) = app.observer_task.take() { handle.abort(); }
+    if let Some(handle) = app.observer_task.take() {
+        handle.abort();
+    }
 
     app.observer.scroll = 0;
     app.ignore_observer_tokens = false;
@@ -1032,7 +1127,9 @@ async fn send_observer_message(
     app.observer_lang_pending = None;
     app.observer.push_user(text.clone());
     app.observer.streaming = true;
-    app.observer.messages.push(Message::new_streaming(Role::Assistant));
+    app.observer
+        .messages
+        .push(Message::new_streaming(Role::Assistant));
 
     let history = app.observer.chat_history();
     let coder_history = app.coder.chat_history();
@@ -1063,7 +1160,7 @@ async fn send_observer_message(
                     m.role,
                     m.content.chars().take(800).collect::<String>()
                 )
-             })
+            })
             .collect::<Vec<_>>()
             .join("\n");
         format!("\n\n[Recent Coder activity — last 10 turns]\n{snippet}")
@@ -1121,9 +1218,15 @@ async fn send_observer_message(
             }
         }
 
-        let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
+        let mut messages = vec![ChatMessage {
+            role: "system".to_string(),
+            content: system,
+        }];
         messages.extend(history_prefix);
-        messages.push(ChatMessage { role: "user".to_string(), content: user_text });
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: user_text,
+        });
 
         let result = match cfg.provider {
             ProviderKind::Anthropic => stream_anthropic(&client, &cfg, &messages, tx.clone()).await,
@@ -1159,9 +1262,7 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
         .into_iter()
         .rev()
         .collect();
-    format!(
-        "{head}\n[…truncated — middle removed, total {total} chars]\n{tail}"
-    )
+    format!("{head}\n[…truncated — middle removed, total {total} chars]\n{tail}")
 }
 
 async fn git_cmd_output(root: &str, args: &[&str]) -> (String, String, i32) {
@@ -1189,7 +1290,11 @@ async fn git_cmd_output(root: &str, args: &[&str]) -> (String, String, i32) {
     }
 }
 
-async fn build_git_diff_payload(root: &str, base: Option<&str>, max_chars: usize) -> Option<String> {
+async fn build_git_diff_payload(
+    root: &str,
+    base: Option<&str>,
+    max_chars: usize,
+) -> Option<String> {
     let base = base.map(|s| s.trim()).filter(|s| !s.is_empty());
 
     let (status_out, _status_err, status_exit) =
@@ -1270,14 +1375,18 @@ async fn send_chat_message(
 
     app.chat.push_user(text.clone());
     app.chat.streaming = true;
-    app.chat.messages.push(Message::new_streaming(Role::Assistant));
+    app.chat
+        .messages
+        .push(Message::new_streaming(Role::Assistant));
 
     // Start background task planning (TaskRouter) in parallel.
     spawn_task_planner(app, internal_tx);
 
     let history = app.chat.chat_history();
     let cfg = app.chat_cfg.clone();
-    let persona_prompt = resolve_persona(&cfg.persona).map(|p| p.prompt).unwrap_or("");
+    let persona_prompt = resolve_persona(&cfg.persona)
+        .map(|p| p.prompt)
+        .unwrap_or("");
     let lang = language_instruction(Some(&app.lang), &cfg.mode);
     let mode = mode_prompt(&cfg.mode);
 
@@ -1495,18 +1604,33 @@ async fn maybe_auto_observe(app: &mut App, observer_tx: &mpsc::Sender<StreamToke
 }
 
 async fn maybe_observer_lang_retry(app: &mut App, observer_tx: &mpsc::Sender<StreamToken>) {
-    let Some(expected) = app.observer_lang_pending.take() else { return; };
-    if app.observer.streaming { return; }
+    let Some(expected) = app.observer_lang_pending.take() else {
+        return;
+    };
+    if app.observer.streaming {
+        return;
+    }
 
     // Best-effort: abort the previous task handle (it should already be complete).
-    if let Some(handle) = app.observer_task.take() { handle.abort(); }
+    if let Some(handle) = app.observer_task.take() {
+        handle.abort();
+    }
 
     let idx_opt = app.observer.messages.iter().rposition(|m| {
         matches!(m.role, Role::Assistant) && m.complete && !m.content.trim().is_empty()
     });
-    let Some(idx) = idx_opt else { return; };
-    let original = app.observer.messages.get(idx).map(|m| m.content.clone()).unwrap_or_default();
-    if original.trim().is_empty() { return; }
+    let Some(idx) = idx_opt else {
+        return;
+    };
+    let original = app
+        .observer
+        .messages
+        .get(idx)
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    if original.trim().is_empty() {
+        return;
+    }
 
     // Overwrite the last assistant message if it's the tail; otherwise append a new streaming assistant.
     if idx + 1 == app.observer.messages.len() {
@@ -1515,7 +1639,9 @@ async fn maybe_observer_lang_retry(app: &mut App, observer_tx: &mpsc::Sender<Str
             m.complete = false;
         }
     } else {
-        app.observer.messages.push(Message::new_streaming(Role::Assistant));
+        app.observer
+            .messages
+            .push(Message::new_streaming(Role::Assistant));
     }
 
     app.observer.scroll = 0;
@@ -1540,8 +1666,14 @@ Keep proposals block keys in English (title/to_coder/severity/score/phase/impact
 
     let cfg = app.observer_cfg.clone();
     let messages = vec![
-        ChatMessage { role: "system".to_string(), content: system_fix.to_string() },
-        ChatMessage { role: "user".to_string(), content: user_fix },
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_fix.to_string(),
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: user_fix,
+        },
     ];
 
     let tx = observer_tx.clone();
@@ -1582,11 +1714,17 @@ Keep proposals block keys in English (title/to_coder/severity/score/phase/impact
 }
 
 async fn maybe_observer_loop_retry(app: &mut App, observer_tx: &mpsc::Sender<StreamToken>) {
-    let Some(sim) = app.observer_loop_pending.take() else { return; };
-    if app.observer.streaming { return; }
+    let Some(sim) = app.observer_loop_pending.take() else {
+        return;
+    };
+    if app.observer.streaming {
+        return;
+    }
 
     // Best-effort: abort the previous task handle (it should already be complete).
-    if let Some(handle) = app.observer_task.take() { handle.abort(); }
+    if let Some(handle) = app.observer_task.take() {
+        handle.abort();
+    }
 
     // Build the retry request using the already-visible history (including the repeated reply),
     // but do not add a visible user message for the loop fix.
@@ -1624,8 +1762,13 @@ async fn maybe_observer_loop_retry(app: &mut App, observer_tx: &mpsc::Sender<Str
     let system = format!("{obs_system}{coder_context}{tool_context}")
         .trim_end()
         .to_string();
-    let mut messages = vec![ChatMessage { role: "system".to_string(), content: system }];
-    for m in &history { messages.push(m.clone()); }
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: system,
+    }];
+    for m in &history {
+        messages.push(m.clone());
+    }
 
     let loop_fix = match app.lang.as_str() {
         "fr" => format!(
@@ -1641,20 +1784,32 @@ async fn maybe_observer_loop_retry(app: &mut App, observer_tx: &mpsc::Sender<Str
             (sim * 100.0).round() as i64
         ),
     };
-    messages.push(ChatMessage { role: "user".to_string(), content: loop_fix });
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: loop_fix,
+    });
 
     // Overwrite the last assistant message if it's the tail; otherwise append a new streaming assistant.
-    if let Some(idx) = app.observer.messages.iter().rposition(|m| matches!(m.role, Role::Assistant) && m.complete) {
+    if let Some(idx) = app
+        .observer
+        .messages
+        .iter()
+        .rposition(|m| matches!(m.role, Role::Assistant) && m.complete)
+    {
         if idx + 1 == app.observer.messages.len() {
             if let Some(m) = app.observer.messages.get_mut(idx) {
                 m.content.clear();
                 m.complete = false;
             }
         } else {
-            app.observer.messages.push(Message::new_streaming(Role::Assistant));
+            app.observer
+                .messages
+                .push(Message::new_streaming(Role::Assistant));
         }
     } else {
-        app.observer.messages.push(Message::new_streaming(Role::Assistant));
+        app.observer
+            .messages
+            .push(Message::new_streaming(Role::Assistant));
     }
 
     app.observer.scroll = 0;

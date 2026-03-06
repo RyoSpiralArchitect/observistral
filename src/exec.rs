@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
 use anyhow::anyhow;
+use anyhow::{Context, Result};
 use std::path::{Component, Path};
 use std::process::Stdio;
 use tokio::process::Command;
@@ -161,7 +161,10 @@ fn sanitize_shellish_command(cmd: &str) -> String {
         if low.starts_with("----") {
             return true;
         }
-        if low.starts_with("modified:") || low.starts_with("new file:") || low.starts_with("deleted:") {
+        if low.starts_with("modified:")
+            || low.starts_with("new file:")
+            || low.starts_with("deleted:")
+        {
             return true;
         }
 
@@ -540,8 +543,14 @@ pub fn check_dangerous_command(cmd: &str) -> Option<&'static str> {
 
     // Git destructive patterns (cross-platform).
     let git_dangerous = [
-        ("git reset --hard", "git reset --hard discards local changes"),
-        ("git clean -fd", "git clean -fd removes untracked files/dirs"),
+        (
+            "git reset --hard",
+            "git reset --hard discards local changes",
+        ),
+        (
+            "git clean -fd",
+            "git clean -fd removes untracked files/dirs",
+        ),
         ("git clean -xdf", "git clean -xdf removes ignored files too"),
     ];
     for (pat, reason) in &git_dangerous {
@@ -596,7 +605,10 @@ pub fn check_dangerous_command(cmd: &str) -> Option<&'static str> {
         ("del /s /q c:\\", "recursive delete of C: drive"),
         ("del /f /s /q c:\\", "recursive delete of C: drive"),
         ("rd /s /q c:\\", "recursive remove of C: drive"),
-        ("remove-item -recurse -force c:\\", "recursive remove of C: drive"),
+        (
+            "remove-item -recurse -force c:\\",
+            "recursive remove of C: drive",
+        ),
         ("remove-item -recurse c:\\", "recursive remove of C: drive"),
         ("stop-computer", "stop-computer shuts down the machine"),
         ("restart-computer", "restart-computer reboots the machine"),
@@ -612,10 +624,22 @@ pub fn check_dangerous_command(cmd: &str) -> Option<&'static str> {
 
     // Repo-destructive git patterns (avoid self-sabotage in agentic runs).
     let git_dangerous = [
-        ("git reset --hard", "git reset --hard discards local changes"),
-        ("git clean -fdx", "git clean -fdx deletes untracked files/directories"),
-        ("git rm --cached -r .", "git rm --cached -r . can remove the entire repo from the index"),
-        ("git rm -r --cached .", "git rm -r --cached . can remove the entire repo from the index"),
+        (
+            "git reset --hard",
+            "git reset --hard discards local changes",
+        ),
+        (
+            "git clean -fdx",
+            "git clean -fdx deletes untracked files/directories",
+        ),
+        (
+            "git rm --cached -r .",
+            "git rm --cached -r . can remove the entire repo from the index",
+        ),
+        (
+            "git rm -r --cached .",
+            "git rm -r --cached . can remove the entire repo from the index",
+        ),
     ];
     for (pat, reason) in &git_dangerous {
         if s.contains(pat) {
@@ -714,7 +738,10 @@ fn find_nested_git_dirs(repo_root: &Path) -> Vec<std::path::PathBuf> {
                     continue;
                 }
             }
-            if matches!(name_s, "node_modules" | "target" | ".tmp" | ".venv" | "dist" | "build" | "out") {
+            if matches!(
+                name_s,
+                "node_modules" | "target" | ".tmp" | ".venv" | "dist" | "build" | "out"
+            ) {
                 continue;
             }
 
@@ -755,7 +782,9 @@ fn check_nested_git_add_all_preflight(cmd: &str, cwd: Option<&str>) -> Option<St
 
     let mut rels: Vec<String> = Vec::new();
     for p in nested.into_iter().take(3) {
-        let rel = p.strip_prefix(&repo_root).ok()
+        let rel = p
+            .strip_prefix(&repo_root)
+            .ok()
             .map(|x| x.to_string_lossy().to_string())
             .unwrap_or_else(|| p.to_string_lossy().to_string());
         rels.push(rel);
@@ -837,9 +866,8 @@ pub async fn run_command(command: &str, cwd: Option<&str>) -> Result<ExecResult>
 async fn build_command(cmd_str: &str) -> Result<Command> {
     if cfg!(target_os = "windows") {
         // Detect here-strings or multi-line scripts that need a temp file.
-        let needs_tempfile = cmd_str.contains("@'")
-            || cmd_str.contains("@\"")
-            || cmd_str.contains('\n');
+        let needs_tempfile =
+            cmd_str.contains("@'") || cmd_str.contains("@\"") || cmd_str.contains('\n');
 
         if needs_tempfile {
             let mut tmp = tempfile::Builder::new()
@@ -848,7 +876,10 @@ async fn build_command(cmd_str: &str) -> Result<Command> {
                 .tempfile()
                 .context("failed to create temp ps1 file")?;
             use std::io::Write;
-            writeln!(tmp, "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8")?;
+            writeln!(
+                tmp,
+                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8"
+            )?;
             writeln!(tmp, "[Console]::InputEncoding=[System.Text.Encoding]::UTF8")?;
             writeln!(tmp, "$OutputEncoding=[System.Text.Encoding]::UTF8")?;
             writeln!(tmp)?;
@@ -859,7 +890,14 @@ async fn build_command(cmd_str: &str) -> Result<Command> {
             // (tokio::process::Command needs it to exist until `output()` returns.)
             let _ = path.keep();
             let mut c = Command::new("powershell");
-            c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", &path_str]);
+            c.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &path_str,
+            ]);
             return Ok(c);
         }
 
@@ -897,14 +935,22 @@ pub fn decode_output(bytes: &[u8]) -> String {
             } else {
                 bytes.len() as i32
             };
-            let needed = MultiByteToWideChar(CP_932, MB_ERR_INVALID_CHARS, src, src_len, std::ptr::null_mut(), 0);
+            let needed = MultiByteToWideChar(
+                CP_932,
+                MB_ERR_INVALID_CHARS,
+                src,
+                src_len,
+                std::ptr::null_mut(),
+                0,
+            );
             if needed <= 0 {
                 let needed2 = MultiByteToWideChar(CP_932, 0, src, src_len, std::ptr::null_mut(), 0);
                 if needed2 <= 0 {
                     return String::from_utf8_lossy(bytes).into_owned();
                 }
                 let mut buf = vec![0u16; needed2 as usize];
-                let written = MultiByteToWideChar(CP_932, 0, src, src_len, buf.as_mut_ptr(), needed2);
+                let written =
+                    MultiByteToWideChar(CP_932, 0, src, src_len, buf.as_mut_ptr(), needed2);
                 if written <= 0 {
                     return String::from_utf8_lossy(bytes).into_owned();
                 }
@@ -912,7 +958,14 @@ pub fn decode_output(bytes: &[u8]) -> String {
                 return String::from_utf16_lossy(&buf);
             }
             let mut buf = vec![0u16; needed as usize];
-            let written = MultiByteToWideChar(CP_932, MB_ERR_INVALID_CHARS, src, src_len, buf.as_mut_ptr(), needed);
+            let written = MultiByteToWideChar(
+                CP_932,
+                MB_ERR_INVALID_CHARS,
+                src,
+                src_len,
+                buf.as_mut_ptr(),
+                needed,
+            );
             if written <= 0 {
                 return String::from_utf8_lossy(bytes).into_owned();
             }
@@ -1005,7 +1058,8 @@ mod tests {
         let root = td.path();
         std::fs::create_dir_all(root.join(".git")).expect("mk .git");
 
-        let reason = check_nested_git_add_all_preflight("git add -A", Some(&root.to_string_lossy()));
+        let reason =
+            check_nested_git_add_all_preflight("git add -A", Some(&root.to_string_lossy()));
         assert!(reason.is_none());
     }
 

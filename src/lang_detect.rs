@@ -78,10 +78,7 @@ fn strip_structured_observer_blocks(s: &str) -> String {
     for line in s.lines() {
         let t = line.trim();
         if t.starts_with("---") {
-            let low = t
-                .trim_matches('-')
-                .trim()
-                .to_ascii_lowercase();
+            let low = t.trim_matches('-').trim().to_ascii_lowercase();
             if low.starts_with("phase")
                 || low.starts_with("proposals")
                 || low.starts_with("critical_path")
@@ -140,27 +137,8 @@ pub fn looks_french(s: &str) -> bool {
     }
 
     const FR: [&str; 21] = [
-        "le",
-        "la",
-        "les",
-        "des",
-        "du",
-        "de",
-        "pour",
-        "avec",
-        "sans",
-        "est",
-        "sont",
-        "pas",
-        "mais",
-        "donc",
-        "sur",
-        "dans",
-        "vous",
-        "tu",
-        "je",
-        "nous",
-        "votre",
+        "le", "la", "les", "des", "du", "de", "pour", "avec", "sans", "est", "sont", "pas", "mais",
+        "donc", "sur", "dans", "vous", "tu", "je", "nous", "votre",
     ];
     const EN: [&str; 16] = [
         "the", "and", "you", "your", "should", "this", "that", "with", "for", "not", "are", "is",
@@ -206,7 +184,9 @@ mod tests {
     #[test]
     fn japanese_heuristic_basic() {
         assert!(looks_japanese("これはテストです。バグを直してください。"));
-        assert!(!looks_japanese("Coder attempted to create a repo but failed."));
+        assert!(!looks_japanese(
+            "Coder attempted to create a repo but failed."
+        ));
     }
 
     #[test]
@@ -223,13 +203,16 @@ mod tests {
 
     #[test]
     fn french_heuristic_basic() {
-        assert!(looks_french("Ceci est un test. Vous devez corriger ce bug."));
+        assert!(looks_french(
+            "Ceci est un test. Vous devez corriger ce bug."
+        ));
         assert!(!looks_french("This is a test and you should fix it."));
     }
 
     #[test]
     fn fenced_code_does_not_break_french_detection() {
-        let s = "Ceci est un test.\n```python\nprint('hello world')\n```\nVous devez corriger ce bug.";
+        let s =
+            "Ceci est un test.\n```python\nprint('hello world')\n```\nVous devez corriger ce bug.";
         assert!(looks_french(s));
     }
 

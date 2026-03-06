@@ -117,4 +117,3 @@ mod tests {
         assert_eq!(p.key, "thoughtful");
     }
 }
-

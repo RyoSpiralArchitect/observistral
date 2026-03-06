@@ -1,6 +1,6 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -56,7 +56,10 @@ impl ChatProvider for HuggingFaceSubprocessProvider {
             .spawn()
             .context("failed to spawn hf subprocess")?;
 
-        let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("failed to open stdin"))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open stdin"))?;
         stdin
             .write_all(&input)
             .await
@@ -126,7 +129,9 @@ mod tests {
         };
 
         let resp = provider.chat(&request).await.unwrap();
-        assert!(!resp.content.is_empty(), "expected non-empty content from HF subprocess");
+        assert!(
+            !resp.content.is_empty(),
+            "expected non-empty content from HF subprocess"
+        );
     }
 }
-

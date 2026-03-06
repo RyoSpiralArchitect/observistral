@@ -102,10 +102,7 @@ pub fn normalize_for_sim(s: &str) -> String {
             c = ' ';
         }
 
-        let allowed = c == ' '
-            || c.is_ascii_alphanumeric()
-            || is_latin_ext(c)
-            || is_cjk(c);
+        let allowed = c == ' ' || c.is_ascii_alphanumeric() || is_latin_ext(c) || is_cjk(c);
         if !allowed {
             c = ' ';
         }
@@ -188,4 +185,3 @@ pub fn is_skippable_for_loop(s: &str) -> bool {
     }
     false
 }
-

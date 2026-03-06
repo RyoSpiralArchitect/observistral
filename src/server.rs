@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -148,7 +148,10 @@ fn should_use_v1_completions(status: reqwest::StatusCode, body: &str) -> bool {
     if msg.contains("not a chat model") {
         return true;
     }
-    if status == reqwest::StatusCode::NOT_FOUND && msg.contains("v1/completions") && msg.contains("chat/complet") {
+    if status == reqwest::StatusCode::NOT_FOUND
+        && msg.contains("v1/completions")
+        && msg.contains("chat/complet")
+    {
         return true;
     }
     false
@@ -349,7 +352,8 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
                     "Forbidden",
                     "text/plain; charset=utf-8",
                     "cross-origin requests not allowed\n",
-                ).await;
+                )
+                .await;
             }
         }
     }
@@ -357,14 +361,8 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => {
             if let Some(bytes) = read_dev_asset("index.html") {
-                return write_response(
-                    &mut stream,
-                    200,
-                    "OK",
-                    "text/html; charset=utf-8",
-                    &bytes,
-                )
-                .await;
+                return write_response(&mut stream, 200, "OK", "text/html; charset=utf-8", &bytes)
+                    .await;
             }
             write_response(
                 &mut stream,
@@ -383,26 +381,31 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/exec") => api_exec(&mut stream, &req.body).await,
         ("POST", "/api/open") => api_open(&mut stream, &req.body).await,
         ("POST", "/api/chat_tools") => api_chat_tools(&mut stream, state, &req.body).await,
-        ("POST", "/api/chat_tools_stream") => api_chat_tools_stream(&mut stream, state, &req.body).await,
+        ("POST", "/api/chat_tools_stream") => {
+            api_chat_tools_stream(&mut stream, state, &req.body).await
+        }
         ("GET", "/api/pending_edits") => api_pending_edits(&mut stream, state).await,
         ("POST", "/api/queue_edit") => api_queue_edit(&mut stream, state, &req.body).await,
         ("POST", "/api/approve_edit") => api_approve_edit(&mut stream, state, &req.body).await,
         ("POST", "/api/reject_edit") => api_reject_edit(&mut stream, state, &req.body).await,
         ("GET", "/api/pending_commands") => api_pending_commands(&mut stream, state).await,
         ("POST", "/api/queue_command") => api_queue_command(&mut stream, state, &req.body).await,
-        ("POST", "/api/approve_command") => api_approve_command(&mut stream, state, &req.body).await,
+        ("POST", "/api/approve_command") => {
+            api_approve_command(&mut stream, state, &req.body).await
+        }
         ("POST", "/api/reject_command") => api_reject_command(&mut stream, state, &req.body).await,
         ("GET", "/api/meta_prompts") => api_meta_prompts_get(&mut stream, state).await,
         ("POST", "/api/meta_prompts") => api_meta_prompts_post(&mut stream, state, &req.body).await,
         ("POST", "/api/write_file") => api_write_file(&mut stream, state, &req.body).await,
         ("POST", "/api/read_file") => api_read_file(&mut stream, state, &req.body).await,
         ("POST", "/api/patch_file") => api_patch_file(&mut stream, state, &req.body).await,
-        ("POST", "/api/search_files") => api_search_files_endpoint(&mut stream, state, &req.body).await,
+        ("POST", "/api/search_files") => {
+            api_search_files_endpoint(&mut stream, state, &req.body).await
+        }
         ("POST", "/api/glob_files") => api_glob_files(&mut stream, state, &req.body).await,
         ("POST", "/api/apply_diff") => api_apply_diff(&mut stream, state, &req.body).await,
         ("POST", "/api/rollback") => api_rollback(&mut stream, state, &req.body).await,
-        ("GET", p) if p.starts_with("/api/project/scan") =>
-            api_project_scan(&mut stream, p).await,
+        ("GET", p) if p.starts_with("/api/project/scan") => api_project_scan(&mut stream, p).await,
         _ => {
             write_text(
                 &mut stream,
@@ -454,8 +457,18 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
         Ok(r) => r,
         Err(e) => {
             #[derive(Serialize)]
-            struct E { error: String }
-            return write_json(stream, 400, "Bad Request", &E { error: e.to_string() }).await;
+            struct E {
+                error: String,
+            }
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &E {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
 
@@ -486,7 +499,8 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
     let mut ok_json: Option<serde_json::Value> = None;
 
     for url in openai_compat_chat_urls(&base_url) {
-        let mut http_req = state.client
+        let mut http_req = state
+            .client
             .post(&url)
             .header("Content-Type", "application/json")
             .timeout(timeout)
@@ -500,8 +514,18 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
             Ok(r) => r,
             Err(e) => {
                 #[derive(Serialize)]
-                struct E { error: String }
-                return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+                struct E {
+                    error: String,
+                }
+                return write_json(
+                    stream,
+                    502,
+                    "Bad Gateway",
+                    &E {
+                        error: e.to_string(),
+                    },
+                )
+                .await;
             }
         };
 
@@ -510,22 +534,37 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
 
         if status.is_success() {
             match serde_json::from_str(&resp_text) {
-                Ok(v) => { ok_json = Some(v); break; }
+                Ok(v) => {
+                    ok_json = Some(v);
+                    break;
+                }
                 Err(e) => {
                     #[derive(Serialize)]
-                    struct E { error: String }
-                    return write_json(stream, 502, "Bad Gateway",
-                        &E { error: format!("invalid JSON from API: {e}") }).await;
+                    struct E {
+                        error: String,
+                    }
+                    return write_json(
+                        stream,
+                        502,
+                        "Bad Gateway",
+                        &E {
+                            error: format!("invalid JSON from API: {e}"),
+                        },
+                    )
+                    .await;
                 }
             }
         }
 
         // Retry once with max_completion_tokens if suggested.
-        if should_swap_to_max_completion_tokens(status, &resp_text) && payload_cur.get("max_tokens").is_some() {
+        if should_swap_to_max_completion_tokens(status, &resp_text)
+            && payload_cur.get("max_tokens").is_some()
+        {
             let mut payload2 = payload_cur.clone();
             swap_max_tokens_to_max_completion_tokens(&mut payload2);
 
-            let mut http_req2 = state.client
+            let mut http_req2 = state
+                .client
                 .post(&url)
                 .header("Content-Type", "application/json")
                 .timeout(timeout)
@@ -538,20 +577,42 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
                 Ok(r) => r,
                 Err(e) => {
                     #[derive(Serialize)]
-                    struct E { error: String }
-                    return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+                    struct E {
+                        error: String,
+                    }
+                    return write_json(
+                        stream,
+                        502,
+                        "Bad Gateway",
+                        &E {
+                            error: e.to_string(),
+                        },
+                    )
+                    .await;
                 }
             };
             let status2 = resp2.status();
             let resp_text2 = resp2.text().await.unwrap_or_default();
             if status2.is_success() {
                 match serde_json::from_str(&resp_text2) {
-                    Ok(v) => { ok_json = Some(v); break; }
+                    Ok(v) => {
+                        ok_json = Some(v);
+                        break;
+                    }
                     Err(e) => {
                         #[derive(Serialize)]
-                        struct E { error: String }
-                        return write_json(stream, 502, "Bad Gateway",
-                            &E { error: format!("invalid JSON from API: {e}") }).await;
+                        struct E {
+                            error: String,
+                        }
+                        return write_json(
+                            stream,
+                            502,
+                            "Bad Gateway",
+                            &E {
+                                error: format!("invalid JSON from API: {e}"),
+                            },
+                        )
+                        .await;
                     }
                 }
             }
@@ -571,9 +632,18 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
         }
 
         #[derive(Serialize)]
-        struct E { error: String }
-        return write_json(stream, 502, "Bad Gateway",
-            &E { error: format!("API error (HTTP {status}): {resp_text}") }).await;
+        struct E {
+            error: String,
+        }
+        return write_json(
+            stream,
+            502,
+            "Bad Gateway",
+            &E {
+                error: format!("API error (HTTP {status}): {resp_text}"),
+            },
+        )
+        .await;
     }
 
     if ok_json.is_none() && want_completions {
@@ -584,7 +654,8 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
             "temperature": req.temperature.unwrap_or(0.7),
             "max_tokens": req.max_tokens.unwrap_or(4096),
         });
-        let mut http_req = state.client
+        let mut http_req = state
+            .client
             .post(&url)
             .header("Content-Type", "application/json")
             .timeout(timeout)
@@ -596,16 +667,29 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
             Ok(r) => r,
             Err(e) => {
                 #[derive(Serialize)]
-                struct E { error: String }
-                return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+                struct E {
+                    error: String,
+                }
+                return write_json(
+                    stream,
+                    502,
+                    "Bad Gateway",
+                    &E {
+                        error: e.to_string(),
+                    },
+                )
+                .await;
             }
         };
         let status = resp.status();
         let resp_text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            if should_swap_to_max_completion_tokens(status, &resp_text) && comp_payload.get("max_tokens").is_some() {
+            if should_swap_to_max_completion_tokens(status, &resp_text)
+                && comp_payload.get("max_tokens").is_some()
+            {
                 swap_max_tokens_to_max_completion_tokens(&mut comp_payload);
-                let mut http_req2 = state.client
+                let mut http_req2 = state
+                    .client
                     .post(&url)
                     .header("Content-Type", "application/json")
                     .timeout(timeout)
@@ -617,24 +701,52 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
                     Ok(r) => r,
                     Err(e) => {
                         #[derive(Serialize)]
-                        struct E { error: String }
-                        return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+                        struct E {
+                            error: String,
+                        }
+                        return write_json(
+                            stream,
+                            502,
+                            "Bad Gateway",
+                            &E {
+                                error: e.to_string(),
+                            },
+                        )
+                        .await;
                     }
                 };
                 let status2 = resp2.status();
                 let resp_text2 = resp2.text().await.unwrap_or_default();
                 if !status2.is_success() {
                     #[derive(Serialize)]
-                    struct E { error: String }
-                    return write_json(stream, 502, "Bad Gateway",
-                        &E { error: format!("API error (HTTP {status2}): {resp_text2}") }).await;
+                    struct E {
+                        error: String,
+                    }
+                    return write_json(
+                        stream,
+                        502,
+                        "Bad Gateway",
+                        &E {
+                            error: format!("API error (HTTP {status2}): {resp_text2}"),
+                        },
+                    )
+                    .await;
                 }
                 ok_json = Some(serde_json::from_str(&resp_text2).context("invalid JSON from API")?);
             } else {
                 #[derive(Serialize)]
-                struct E { error: String }
-                return write_json(stream, 502, "Bad Gateway",
-                    &E { error: format!("API error (HTTP {status}): {resp_text}") }).await;
+                struct E {
+                    error: String,
+                }
+                return write_json(
+                    stream,
+                    502,
+                    "Bad Gateway",
+                    &E {
+                        error: format!("API error (HTTP {status}): {resp_text}"),
+                    },
+                )
+                .await;
             }
         } else {
             ok_json = Some(serde_json::from_str(&resp_text).context("invalid JSON from API")?);
@@ -645,9 +757,18 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
         write_json(stream, 200, "OK", &v).await
     } else {
         #[derive(Serialize)]
-        struct E { error: String }
-        write_json(stream, 502, "Bad Gateway",
-            &E { error: last_err.unwrap_or_else(|| "API request failed".to_string()) }).await
+        struct E {
+            error: String,
+        }
+        write_json(
+            stream,
+            502,
+            "Bad Gateway",
+            &E {
+                error: last_err.unwrap_or_else(|| "API request failed".to_string()),
+            },
+        )
+        .await
     }
 }
 
@@ -672,8 +793,18 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
         Ok(r) => r,
         Err(e) => {
             #[derive(Serialize)]
-            struct E { error: String }
-            return write_json(stream, 400, "Bad Request", &E { error: e.to_string() }).await;
+            struct E {
+                error: String,
+            }
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &E {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
 
@@ -689,15 +820,21 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
                     // 1. Project context (stack, git, tree).
                     let txt = ctx.to_context_text();
                     if !txt.is_empty() {
-                        let pos = msgs.iter().position(|m| m["role"] == "system")
-                            .map(|i| i + 1).unwrap_or(0);
+                        let pos = msgs
+                            .iter()
+                            .position(|m| m["role"] == "system")
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
                         msgs.insert(pos, serde_json::json!({"role":"system","content": txt}));
                     }
                     // 2. AGENTS.md / .obstral.md — project-specific rules.
                     if let Some(agents_text) = ctx.agents_md {
                         if !agents_text.is_empty() {
-                            let pos = msgs.iter().position(|m| m["role"] == "system")
-                                .map(|i| i + 2).unwrap_or(1);
+                            let pos = msgs
+                                .iter()
+                                .position(|m| m["role"] == "system")
+                                .map(|i| i + 2)
+                                .unwrap_or(1);
                             msgs.insert(pos.min(msgs.len()), serde_json::json!({
                                 "role": "system",
                                 "content": format!("[Project Instructions — .obstral.md / AGENTS.md]\n{agents_text}")
@@ -717,7 +854,10 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
             let root_str = root.trim();
             if !root_str.is_empty() {
                 if let Some(last_user_pos) = msgs.iter().rposition(|m| m["role"] == "user") {
-                    let user_text = msgs[last_user_pos]["content"].as_str().unwrap_or("").to_string();
+                    let user_text = msgs[last_user_pos]["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
                     let at_refs = parse_at_refs_str(&user_text);
                     if !at_refs.is_empty() {
                         let mut inject_msgs: Vec<serde_json::Value> = Vec::new();
@@ -770,7 +910,8 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
         let mut attempt: usize = 0;
 
         loop {
-            let mut http_req = state.client
+            let mut http_req = state
+                .client
                 .post(&url)
                 .header("Content-Type", "application/json")
                 .timeout(timeout)
@@ -791,8 +932,18 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
                         continue;
                     }
                     #[derive(Serialize)]
-                    struct E { error: String }
-                    return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+                    struct E {
+                        error: String,
+                    }
+                    return write_json(
+                        stream,
+                        502,
+                        "Bad Gateway",
+                        &E {
+                            error: e.to_string(),
+                        },
+                    )
+                    .await;
                 }
             };
 
@@ -805,7 +956,9 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
             let ra = retry_after_duration(r.headers());
             let body_text = r.text().await.unwrap_or_default();
 
-            if should_swap_to_max_completion_tokens(status, &body_text) && payload_try.get("max_tokens").is_some() {
+            if should_swap_to_max_completion_tokens(status, &body_text)
+                && payload_try.get("max_tokens").is_some()
+            {
                 swap_max_tokens_to_max_completion_tokens(&mut payload_try);
                 continue;
             }
@@ -842,9 +995,18 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
             }
 
             #[derive(Serialize)]
-            struct E { error: String }
-            return write_json(stream, 502, "Bad Gateway",
-                &E { error: format!("API error (HTTP {status}): {body_text}") }).await;
+            struct E {
+                error: String,
+            }
+            return write_json(
+                stream,
+                502,
+                "Bad Gateway",
+                &E {
+                    error: format!("API error (HTTP {status}): {body_text}"),
+                },
+            )
+            .await;
         }
 
         if resp.is_some() || want_completions {
@@ -862,7 +1024,8 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
             "stream": true,
         });
 
-        let mut http_req = state.client
+        let mut http_req = state
+            .client
             .post(&url)
             .header("Content-Type", "application/json")
             .timeout(timeout)
@@ -874,8 +1037,18 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
             Ok(r) => r,
             Err(e) => {
                 #[derive(Serialize)]
-                struct E { error: String }
-                return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+                struct E {
+                    error: String,
+                }
+                return write_json(
+                    stream,
+                    502,
+                    "Bad Gateway",
+                    &E {
+                        error: e.to_string(),
+                    },
+                )
+                .await;
             }
         };
         let status = r.status();
@@ -883,9 +1056,12 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
             resp = Some(r);
         } else {
             let body_text = r.text().await.unwrap_or_default();
-            if should_swap_to_max_completion_tokens(status, &body_text) && comp_payload.get("max_tokens").is_some() {
+            if should_swap_to_max_completion_tokens(status, &body_text)
+                && comp_payload.get("max_tokens").is_some()
+            {
                 swap_max_tokens_to_max_completion_tokens(&mut comp_payload);
-                let mut http_req2 = state.client
+                let mut http_req2 = state
+                    .client
                     .post(&url)
                     .header("Content-Type", "application/json")
                     .timeout(timeout)
@@ -897,8 +1073,18 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
                     Ok(r) => r,
                     Err(e) => {
                         #[derive(Serialize)]
-                        struct E { error: String }
-                        return write_json(stream, 502, "Bad Gateway", &E { error: e.to_string() }).await;
+                        struct E {
+                            error: String,
+                        }
+                        return write_json(
+                            stream,
+                            502,
+                            "Bad Gateway",
+                            &E {
+                                error: e.to_string(),
+                            },
+                        )
+                        .await;
                     }
                 };
                 let status2 = r2.status();
@@ -907,15 +1093,33 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
                 } else {
                     let body2 = r2.text().await.unwrap_or_default();
                     #[derive(Serialize)]
-                    struct E { error: String }
-                    return write_json(stream, 502, "Bad Gateway",
-                        &E { error: format!("API error (HTTP {status2}): {body2}") }).await;
+                    struct E {
+                        error: String,
+                    }
+                    return write_json(
+                        stream,
+                        502,
+                        "Bad Gateway",
+                        &E {
+                            error: format!("API error (HTTP {status2}): {body2}"),
+                        },
+                    )
+                    .await;
                 }
             } else {
                 #[derive(Serialize)]
-                struct E { error: String }
-                return write_json(stream, 502, "Bad Gateway",
-                    &E { error: format!("API error (HTTP {status}): {body_text}") }).await;
+                struct E {
+                    error: String,
+                }
+                return write_json(
+                    stream,
+                    502,
+                    "Bad Gateway",
+                    &E {
+                        error: format!("API error (HTTP {status}): {body_text}"),
+                    },
+                )
+                .await;
             }
         }
     }
@@ -924,9 +1128,18 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
         Some(r) => r,
         None => {
             #[derive(Serialize)]
-            struct E { error: String }
-            return write_json(stream, 502, "Bad Gateway",
-                &E { error: last_err.unwrap_or_else(|| "API request failed".to_string()) }).await;
+            struct E {
+                error: String,
+            }
+            return write_json(
+                stream,
+                502,
+                "Bad Gateway",
+                &E {
+                    error: last_err.unwrap_or_else(|| "API request failed".to_string()),
+                },
+            )
+            .await;
         }
     };
 
@@ -947,7 +1160,9 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
 
     let mut resp = resp;
     while let Some(chunk) = resp.chunk().await? {
-        if done { break; }
+        if done {
+            break;
+        }
         buf.extend_from_slice(&chunk);
 
         while let Some(frame) = take_next_sse_frame(&mut buf) {
@@ -955,14 +1170,21 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
             let mut data_lines: Vec<&str> = Vec::new();
             for line in frame_str.split('\n') {
                 let line = line.trim_end_matches('\r');
-                if line.is_empty() || line.starts_with(':') { continue; }
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
                 if let Some(rest) = line.strip_prefix("data:") {
                     data_lines.push(rest.trim_start());
                 }
             }
-            if data_lines.is_empty() { continue; }
+            if data_lines.is_empty() {
+                continue;
+            }
             let data = data_lines.join("\n");
-            if data.trim() == "[DONE]" { done = true; break; }
+            if data.trim() == "[DONE]" {
+                done = true;
+                break;
+            }
 
             let v: serde_json::Value = match serde_json::from_str(&data) {
                 Ok(v) => v,
@@ -977,12 +1199,18 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
             }
 
             // Track finish_reason.
-            if let Some(fr) = v.pointer("/choices/0/finish_reason").and_then(|x| x.as_str()) {
-                if !fr.is_empty() { finish_reason = fr.to_string(); }
+            if let Some(fr) = v
+                .pointer("/choices/0/finish_reason")
+                .and_then(|x| x.as_str())
+            {
+                if !fr.is_empty() {
+                    finish_reason = fr.to_string();
+                }
             }
 
             // Text delta.
-            let delta_text = v.pointer("/choices/0/delta/content")
+            let delta_text = v
+                .pointer("/choices/0/delta/content")
                 .and_then(|x| x.as_str())
                 .or_else(|| v.pointer("/choices/0/delta/text").and_then(|x| x.as_str()))
                 .or_else(|| v.pointer("/choices/0/text").and_then(|x| x.as_str()))
@@ -993,12 +1221,17 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
             }
 
             // Tool-call delta accumulation (OpenAI streaming format).
-            if let Some(tc_arr) = v.pointer("/choices/0/delta/tool_calls").and_then(|x| x.as_array()) {
+            if let Some(tc_arr) = v
+                .pointer("/choices/0/delta/tool_calls")
+                .and_then(|x| x.as_array())
+            {
                 for tc in tc_arr {
                     let idx = tc["index"].as_u64().unwrap_or(0) as usize;
                     let acc = tool_calls.entry(idx).or_default();
                     if let Some(id) = tc["id"].as_str() {
-                        if !id.is_empty() { acc.id = id.to_string(); }
+                        if !id.is_empty() {
+                            acc.id = id.to_string();
+                        }
                     }
                     if let Some(nm) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
                         acc.name.push_str(nm);
@@ -1014,14 +1247,17 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
     // Emit finish event with accumulated tool calls.
     let mut tc_sorted: Vec<usize> = tool_calls.keys().copied().collect();
     tc_sorted.sort_unstable();
-    let tc_json: Vec<serde_json::Value> = tc_sorted.iter().map(|idx| {
-        let tc = &tool_calls[idx];
-        json!({
-            "id": tc.id,
-            "type": "function",
-            "function": { "name": tc.name, "arguments": tc.arguments }
+    let tc_json: Vec<serde_json::Value> = tc_sorted
+        .iter()
+        .map(|idx| {
+            let tc = &tool_calls[idx];
+            json!({
+                "id": tc.id,
+                "type": "function",
+                "function": { "name": tc.name, "arguments": tc.arguments }
+            })
         })
-    }).collect();
+        .collect();
 
     let finish_data = serde_json::to_string(&json!({
         "finish_reason": finish_reason,
@@ -1034,49 +1270,82 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
 
 async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     #[derive(Deserialize)]
-    struct Req { command: String, cwd: Option<String> }
+    struct Req {
+        command: String,
+        cwd: Option<String>,
+    }
     #[derive(Serialize)]
-    struct Res { stdout: String, stderr: String, exit_code: i32 }
+    struct Res {
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+    }
 
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(_) => {
             #[derive(Serialize)]
-            struct E { error: String }
-            return write_json(stream, 400, "Bad Request",
-                &E { error: "invalid JSON".into() }).await;
+            struct E {
+                error: String,
+            }
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &E {
+                    error: "invalid JSON".into(),
+                },
+            )
+            .await;
         }
     };
 
     let cmd_str = req.command.trim();
     if cmd_str.is_empty() {
         #[derive(Serialize)]
-        struct E { error: String }
-        return write_json(stream, 400, "Bad Request",
-            &E { error: "command is empty".into() }).await;
+        struct E {
+            error: String,
+        }
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &E {
+                error: "command is empty".into(),
+            },
+        )
+        .await;
     }
 
     if let Some(cwd) = req.cwd.as_deref().filter(|s| !s.trim().is_empty()) {
         if let Err(err) = crate::exec::validate_cwd(cwd) {
             #[derive(Serialize)]
-            struct E { error: String }
+            struct E {
+                error: String,
+            }
             return write_json(
                 stream,
                 400,
                 "Bad Request",
-                &E { error: format!("invalid cwd: {err}") },
+                &E {
+                    error: format!("invalid cwd: {err}"),
+                },
             )
             .await;
         }
         let cwd_path = Path::new(cwd);
         if let Err(err) = std::fs::create_dir_all(cwd_path) {
             #[derive(Serialize)]
-            struct E { error: String }
+            struct E {
+                error: String,
+            }
             return write_json(
                 stream,
                 400,
                 "Bad Request",
-                &E { error: format!("invalid cwd (create_dir_all failed): {err}") },
+                &E {
+                    error: format!("invalid cwd (create_dir_all failed): {err}"),
+                },
             )
             .await;
         }
@@ -1089,8 +1358,16 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     // - Windows output decoding (CP932 fallback)
     let r = crate::exec::run_command(&req.command, req.cwd.as_deref()).await;
     let out = match r {
-        Ok(r) => Res { stdout: r.stdout, stderr: r.stderr, exit_code: r.exit_code },
-        Err(e) => Res { stdout: String::new(), stderr: format!("spawn failed: {e:#}"), exit_code: -1 },
+        Ok(r) => Res {
+            stdout: r.stdout,
+            stderr: r.stderr,
+            exit_code: r.exit_code,
+        },
+        Err(e) => Res {
+            stdout: String::new(),
+            stderr: format!("spawn failed: {e:#}"),
+            exit_code: -1,
+        },
     };
     write_json(stream, 200, "OK", &out).await
 }
@@ -1119,18 +1396,43 @@ async fn api_queue_command(stream: &mut TcpStream, state: AppState, body: &[u8])
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
 
     let id = match state.pending_commands.queue(&req.command, req.cwd).await {
         Ok(id) => id,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
 
-    write_json(stream, 200, "OK", &Res { ok: true, approval_id: id }).await
+    write_json(
+        stream,
+        200,
+        "OK",
+        &Res {
+            ok: true,
+            approval_id: id,
+        },
+    )
+    .await
 }
 
 async fn api_approve_command(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
@@ -1141,18 +1443,42 @@ async fn api_approve_command(stream: &mut TcpStream, state: AppState, body: &[u8
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
     let id = req.id.trim();
     if id.is_empty() {
-        return write_json(stream, 400, "Bad Request", &ApiError { error: "id is required".into() }).await;
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "id is required".into(),
+            },
+        )
+        .await;
     }
 
     let item = match state.pending_commands.approve(id).await {
         Ok(it) => it,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
     write_json(
@@ -1172,18 +1498,42 @@ async fn api_reject_command(stream: &mut TcpStream, state: AppState, body: &[u8]
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
     let id = req.id.trim();
     if id.is_empty() {
-        return write_json(stream, 400, "Bad Request", &ApiError { error: "id is required".into() }).await;
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "id is required".into(),
+            },
+        )
+        .await;
     }
 
     let item = match state.pending_commands.reject(id).await {
         Ok(it) => it,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
     write_json(
@@ -1220,14 +1570,30 @@ async fn api_queue_edit(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
 
     let action = req.action.unwrap_or_else(|| "write_file".to_string());
     let path = req.path.trim();
     if path.is_empty() {
-        return write_json(stream, 400, "Bad Request", &ApiError { error: "path is required".into() }).await;
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "path is required".into(),
+            },
+        )
+        .await;
     }
     let approval_id = match state
         .pending_edits
@@ -1236,11 +1602,28 @@ async fn api_queue_edit(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
     {
         Ok(id) => id,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
 
-    write_json(stream, 200, "OK", &Res { ok: true, approval_id }).await
+    write_json(
+        stream,
+        200,
+        "OK",
+        &Res {
+            ok: true,
+            approval_id,
+        },
+    )
+    .await
 }
 
 async fn api_approve_edit(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
@@ -1252,18 +1635,42 @@ async fn api_approve_edit(stream: &mut TcpStream, state: AppState, body: &[u8]) 
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
     let id = req.id.trim();
     if id.is_empty() {
-        return write_json(stream, 400, "Bad Request", &ApiError { error: "id is required".into() }).await;
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "id is required".into(),
+            },
+        )
+        .await;
     }
 
     let item = match state.pending_edits.approve(&state.workspace_root, id).await {
         Ok(it) => it,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
     write_json(
@@ -1284,18 +1691,42 @@ async fn api_reject_edit(stream: &mut TcpStream, state: AppState, body: &[u8]) -
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
     let id = req.id.trim();
     if id.is_empty() {
-        return write_json(stream, 400, "Bad Request", &ApiError { error: "id is required".into() }).await;
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "id is required".into(),
+            },
+        )
+        .await;
     }
 
     let item = match state.pending_edits.reject(id).await {
         Ok(it) => it,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
     write_json(
@@ -1356,7 +1787,15 @@ async fn api_meta_prompts_post(stream: &mut TcpStream, state: AppState, body: &[
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
 
@@ -1364,13 +1803,37 @@ async fn api_meta_prompts_post(stream: &mut TcpStream, state: AppState, body: &[
     let target = req.target.trim().to_ascii_lowercase();
     let text = req.text;
     if op != "set" && op != "append" {
-        return write_json(stream, 400, "Bad Request", &ApiError { error: "op must be 'set' or 'append'".into() }).await;
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "op must be 'set' or 'append'".into(),
+            },
+        )
+        .await;
     }
     if target != "coder" && target != "observer" {
-        return write_json(stream, 400, "Bad Request", &ApiError { error: "target must be 'coder' or 'observer'".into() }).await;
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "target must be 'coder' or 'observer'".into(),
+            },
+        )
+        .await;
     }
     if text.len() > 20000 {
-        return write_json(stream, 400, "Bad Request", &ApiError { error: "text too large".into() }).await;
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "text too large".into(),
+            },
+        )
+        .await;
     }
 
     let mut cur = load_meta_prompts(&state.workspace_root);
@@ -1382,7 +1845,11 @@ async fn api_meta_prompts_post(stream: &mut TcpStream, state: AppState, body: &[
     } else {
         "coder_system_append"
     };
-    let base = cur.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let base = cur
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let text = text.trim().to_string();
     let new_val = if op == "append" {
         if base.trim().is_empty() {
@@ -1408,11 +1875,28 @@ async fn api_meta_prompts_post(stream: &mut TcpStream, state: AppState, body: &[
     {
         Ok(id) => id,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
 
-    write_json(stream, 200, "OK", &Res { ok: true, approval_id }).await
+    write_json(
+        stream,
+        200,
+        "OK",
+        &Res {
+            ok: true,
+            approval_id,
+        },
+    )
+    .await
 }
 
 async fn api_write_file(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
@@ -1430,26 +1914,73 @@ async fn api_write_file(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
         }
     };
     let rel_path = req.path.trim();
     if rel_path.is_empty() {
-        return write_json(stream, 400, "Bad Request", &ApiError { error: "path is required".into() }).await;
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "path is required".into(),
+            },
+        )
+        .await;
     }
     let rel = Path::new(rel_path);
     // Local path safety (keep consistent with pending store).
-    if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
-        return write_json(stream, 400, "Bad Request", &ApiError { error: format!("unsafe path: {rel_path}") }).await;
+    if rel.is_absolute()
+        || rel.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: format!("unsafe path: {rel_path}"),
+            },
+        )
+        .await;
     }
     let abs = state.workspace_root.join(rel);
     if let Some(parent) = abs.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            return write_json(stream, 400, "Bad Request", &ApiError { error: format!("create_dir_all failed: {e}") }).await;
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: format!("create_dir_all failed: {e}"),
+                },
+            )
+            .await;
         }
     }
     if let Err(e) = std::fs::write(&abs, req.content.as_bytes()) {
-        return write_json(stream, 400, "Bad Request", &ApiError { error: format!("write failed: {e}") }).await;
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: format!("write failed: {e}"),
+            },
+        )
+        .await;
     }
     write_json(
         stream,
@@ -1465,13 +1996,30 @@ async fn api_write_file(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
 
 async fn api_read_file(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
     #[derive(Deserialize)]
-    struct Req { path: String }
+    struct Req {
+        path: String,
+    }
     #[derive(Serialize)]
-    struct Res { ok: bool, content: String, lines: usize, bytes: usize }
+    struct Res {
+        ok: bool,
+        content: String,
+        lines: usize,
+        bytes: usize,
+    }
 
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
-        Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
     };
     let base = state.workspace_root.to_string_lossy().into_owned();
     let (text, is_err) = crate::file_tools::tool_read_file(&req.path, Some(&base));
@@ -1480,28 +2028,70 @@ async fn api_read_file(stream: &mut TcpStream, state: AppState, body: &[u8]) -> 
     }
     let lines = text.lines().count();
     let bytes = text.len();
-    write_json(stream, 200, "OK", &Res { ok: true, content: text, lines, bytes }).await
+    write_json(
+        stream,
+        200,
+        "OK",
+        &Res {
+            ok: true,
+            content: text,
+            lines,
+            bytes,
+        },
+    )
+    .await
 }
 
 async fn api_patch_file(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
     #[derive(Deserialize)]
-    struct Req { path: String, search: String, replace: String }
+    struct Req {
+        path: String,
+        search: String,
+        replace: String,
+    }
     #[derive(Serialize)]
-    struct Res { ok: bool, message: String }
+    struct Res {
+        ok: bool,
+        message: String,
+    }
 
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
-        Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
     };
     let base = state.workspace_root.to_string_lossy().into_owned();
-    let (msg, is_err) = crate::file_tools::tool_patch_file(&req.path, &req.search, &req.replace, Some(&base));
+    let (msg, is_err) =
+        crate::file_tools::tool_patch_file(&req.path, &req.search, &req.replace, Some(&base));
     if is_err {
         return write_json(stream, 400, "Bad Request", &ApiError { error: msg }).await;
     }
-    write_json(stream, 200, "OK", &Res { ok: true, message: msg }).await
+    write_json(
+        stream,
+        200,
+        "OK",
+        &Res {
+            ok: true,
+            message: msg,
+        },
+    )
+    .await
 }
 
-async fn api_search_files_endpoint(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+async fn api_search_files_endpoint(
+    stream: &mut TcpStream,
+    state: AppState,
+    body: &[u8],
+) -> Result<()> {
     #[derive(Deserialize)]
     struct Req {
         pattern: String,
@@ -1511,15 +2101,32 @@ async fn api_search_files_endpoint(stream: &mut TcpStream, state: AppState, body
         case_insensitive: bool,
     }
     #[derive(Serialize)]
-    struct Res { ok: bool, output: String }
+    struct Res {
+        ok: bool,
+        output: String,
+    }
 
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
-        Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
     };
     let base = state.workspace_root.to_string_lossy().into_owned();
-    let (output, is_err) =
-        crate::file_tools::tool_search_files(&req.pattern, &req.dir, req.case_insensitive, Some(&base));
+    let (output, is_err) = crate::file_tools::tool_search_files(
+        &req.pattern,
+        &req.dir,
+        req.case_insensitive,
+        Some(&base),
+    );
     if is_err {
         return write_json(stream, 400, "Bad Request", &ApiError { error: output }).await;
     }
@@ -1534,11 +2141,24 @@ async fn api_glob_files(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
         dir: String,
     }
     #[derive(Serialize)]
-    struct Res { ok: bool, output: String }
+    struct Res {
+        ok: bool,
+        output: String,
+    }
 
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
-        Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
     };
     let base = state.workspace_root.to_string_lossy().into_owned();
     let (output, is_err) = crate::file_tools::tool_glob_files(&req.pattern, &req.dir, Some(&base));
@@ -1550,20 +2170,45 @@ async fn api_glob_files(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
 
 async fn api_apply_diff(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
     #[derive(Deserialize)]
-    struct Req { path: String, diff: String }
+    struct Req {
+        path: String,
+        diff: String,
+    }
     #[derive(Serialize)]
-    struct Res { ok: bool, message: String }
+    struct Res {
+        ok: bool,
+        message: String,
+    }
 
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
-        Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
     };
     let base = state.workspace_root.to_string_lossy().into_owned();
     let (msg, is_err) = crate::file_tools::tool_apply_diff(&req.path, &req.diff, Some(&base));
     if is_err {
         return write_json(stream, 400, "Bad Request", &ApiError { error: msg }).await;
     }
-    write_json(stream, 200, "OK", &Res { ok: true, message: msg }).await
+    write_json(
+        stream,
+        200,
+        "OK",
+        &Res {
+            ok: true,
+            message: msg,
+        },
+    )
+    .await
 }
 
 async fn api_rollback(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
@@ -1576,11 +2221,24 @@ async fn api_rollback(stream: &mut TcpStream, state: AppState, body: &[u8]) -> R
         hash: String,
     }
     #[derive(Serialize)]
-    struct Res { ok: bool, message: String }
+    struct Res {
+        ok: bool,
+        message: String,
+    }
 
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
-        Err(e) => return write_json(stream, 400, "Bad Request", &ApiError { error: e.to_string() }).await,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
     };
     let checkpoint_in = if req.checkpoint.trim().is_empty() {
         req.hash
@@ -1590,7 +2248,15 @@ async fn api_rollback(stream: &mut TcpStream, state: AppState, body: &[u8]) -> R
     let checkpoint = checkpoint_in.trim();
     // Safety: only allow hex strings (git hashes).
     if checkpoint.is_empty() || !checkpoint.chars().all(|c| c.is_ascii_hexdigit()) {
-        return write_json(stream, 400, "Bad Request", &ApiError { error: "invalid checkpoint hash".into() }).await;
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "invalid checkpoint hash".into(),
+            },
+        )
+        .await;
     }
     let root = state.workspace_root.to_string_lossy().into_owned();
     let out = std::process::Command::new("git")
@@ -1599,32 +2265,72 @@ async fn api_rollback(stream: &mut TcpStream, state: AppState, body: &[u8]) -> R
     match out {
         Ok(o) if o.status.success() => {
             let short = &checkpoint[..checkpoint.len().min(8)];
-            write_json(stream, 200, "OK", &Res { ok: true, message: format!("rolled back to {short}") }).await
+            write_json(
+                stream,
+                200,
+                "OK",
+                &Res {
+                    ok: true,
+                    message: format!("rolled back to {short}"),
+                },
+            )
+            .await
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
             write_json(stream, 400, "Bad Request", &ApiError { error: stderr }).await
         }
-        Err(e) => write_json(stream, 500, "Internal Server Error", &ApiError { error: e.to_string() }).await,
+        Err(e) => {
+            write_json(
+                stream,
+                500,
+                "Internal Server Error",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
     }
 }
 
 async fn api_open(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     #[derive(Deserialize)]
-    struct Req { path: String, cwd: Option<String> }
+    struct Req {
+        path: String,
+        cwd: Option<String>,
+    }
     #[derive(Serialize)]
-    struct Res { ok: bool }
+    struct Res {
+        ok: bool,
+    }
 
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
-        Err(_) => return write_json(stream, 400, "Bad Request",
-            &ApiError { error: "invalid JSON".into() }).await,
+        Err(_) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: "invalid JSON".into(),
+                },
+            )
+            .await
+        }
     };
 
     let target = req.path.trim().to_string();
     if target.is_empty() {
-        return write_json(stream, 400, "Bad Request",
-            &ApiError { error: "path is required".into() }).await;
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "path is required".into(),
+            },
+        )
+        .await;
     }
 
     // Resolve relative paths against cwd.
@@ -1652,8 +2358,17 @@ async fn api_open(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
 
     match spawn_result {
         Ok(_) => write_json(stream, 200, "OK", &Res { ok: true }).await,
-        Err(err) => write_json(stream, 500, "Internal Server Error",
-            &ApiError { error: err.to_string() }).await,
+        Err(err) => {
+            write_json(
+                stream,
+                500,
+                "Internal Server Error",
+                &ApiError {
+                    error: err.to_string(),
+                },
+            )
+            .await
+        }
     }
 }
 
@@ -1790,7 +2505,10 @@ async fn api_models(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Res
                 .client
                 .get(url)
                 .header("x-api-key", api_key)
-                .header("anthropic-version", crate::providers::anthropic::ANTHROPIC_VERSION)
+                .header(
+                    "anthropic-version",
+                    crate::providers::anthropic::ANTHROPIC_VERSION,
+                )
                 .header("Accept", "application/json")
                 .timeout(Duration::from_secs(cfg.timeout_seconds))
                 .send()
@@ -1799,7 +2517,9 @@ async fn api_models(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Res
             let status = resp.status();
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                return Err(anyhow!("Anthropic models API error (HTTP {status})\n{body}"));
+                return Err(anyhow!(
+                    "Anthropic models API error (HTTP {status})\n{body}"
+                ));
             }
 
             let v: serde_json::Value = resp.json().await.context("invalid JSON response")?;
@@ -1822,15 +2542,17 @@ async fn api_models(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Res
             models.dedup();
             write_json(stream, 200, "OK", &ApiModelsResponse { models }).await
         }
-        Err(err) => write_json(
-            stream,
-            502,
-            "Bad Gateway",
-            &ApiError {
-                error: err.to_string(),
-            },
-        )
-        .await,
+        Err(err) => {
+            write_json(
+                stream,
+                502,
+                "Bad Gateway",
+                &ApiError {
+                    error: err.to_string(),
+                },
+            )
+            .await
+        }
     }
 }
 
@@ -2180,7 +2902,12 @@ struct BuiltHistory {
 fn build_chat_request(
     defaults: PartialConfig,
     req: ApiChatRequest,
-) -> Result<(crate::config::RunConfig, BuiltHistory, Option<String>, Option<String>)> {
+) -> Result<(
+    crate::config::RunConfig,
+    BuiltHistory,
+    Option<String>,
+    Option<String>,
+)> {
     let mut partial = defaults;
 
     if req.vibe.unwrap_or(false) {
@@ -2374,7 +3101,9 @@ async fn stream_openai_compat(
 
         let body = r.text().await.unwrap_or_default();
 
-        if should_swap_to_max_completion_tokens(status, &body) && payload.get("max_tokens").is_some() {
+        if should_swap_to_max_completion_tokens(status, &body)
+            && payload.get("max_tokens").is_some()
+        {
             let mut payload2 = payload.clone();
             swap_max_tokens_to_max_completion_tokens(&mut payload2);
 
@@ -2393,22 +3122,30 @@ async fn stream_openai_compat(
                 break;
             }
             let body2 = r2.text().await.unwrap_or_default();
-            last_err = Some(anyhow!("{provider_label} API error (HTTP {status2})\n{body2}"));
+            last_err = Some(anyhow!(
+                "{provider_label} API error (HTTP {status2})\n{body2}"
+            ));
             continue;
         }
 
         if should_use_v1_completions(status, &body) {
             want_completions = true;
-            last_err = Some(anyhow!("{provider_label} API error (HTTP {status})\n{body}"));
+            last_err = Some(anyhow!(
+                "{provider_label} API error (HTTP {status})\n{body}"
+            ));
             break;
         }
 
         if status == reqwest::StatusCode::NOT_FOUND {
-            last_err = Some(anyhow!("{provider_label} API error (HTTP {status})\n{body}"));
+            last_err = Some(anyhow!(
+                "{provider_label} API error (HTTP {status})\n{body}"
+            ));
             continue;
         }
 
-        return Err(anyhow!("{provider_label} API error (HTTP {status})\n{body}"));
+        return Err(anyhow!(
+            "{provider_label} API error (HTTP {status})\n{body}"
+        ));
     }
 
     let mut resp = if let Some(r) = resp {
@@ -2436,7 +3173,9 @@ async fn stream_openai_compat(
             r
         } else {
             let body = r.text().await.unwrap_or_default();
-            if should_swap_to_max_completion_tokens(status, &body) && comp_payload.get("max_tokens").is_some() {
+            if should_swap_to_max_completion_tokens(status, &body)
+                && comp_payload.get("max_tokens").is_some()
+            {
                 swap_max_tokens_to_max_completion_tokens(&mut comp_payload);
                 let mut req2 = client
                     .post(&url)
@@ -2452,10 +3191,14 @@ async fn stream_openai_compat(
                     r2
                 } else {
                     let body2 = r2.text().await.unwrap_or_default();
-                    return Err(anyhow!("{provider_label} API error (HTTP {status2})\n{body2}"));
+                    return Err(anyhow!(
+                        "{provider_label} API error (HTTP {status2})\n{body2}"
+                    ));
                 }
             } else {
-                return Err(anyhow!("{provider_label} API error (HTTP {status})\n{body}"));
+                return Err(anyhow!(
+                    "{provider_label} API error (HTTP {status})\n{body}"
+                ));
             }
         }
     } else {
@@ -2559,7 +3302,10 @@ async fn stream_anthropic(
     let resp = client
         .post(url)
         .header("x-api-key", api_key)
-        .header("anthropic-version", crate::providers::anthropic::ANTHROPIC_VERSION)
+        .header(
+            "anthropic-version",
+            crate::providers::anthropic::ANTHROPIC_VERSION,
+        )
         .header("Accept", "text/event-stream")
         .header("Content-Type", "application/json")
         .timeout(Duration::from_secs(cfg.timeout_seconds))
@@ -2734,7 +3480,10 @@ async fn stream_hf_subprocess(
         Err(_) => {
             // Best-effort: terminate runaway subprocess on timeout.
             let _ = child.kill().await;
-            return Err(anyhow!("hf subprocess timed out after {}s", cfg.timeout_seconds));
+            return Err(anyhow!(
+                "hf subprocess timed out after {}s",
+                cfg.timeout_seconds
+            ));
         }
     };
 
@@ -2778,10 +3527,14 @@ fn parse_at_refs_str(text: &str) -> Vec<String> {
     let mut refs = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for word in text.split_whitespace() {
-        if !word.starts_with('@') { continue; }
+        if !word.starts_with('@') {
+            continue;
+        }
         let path = word.trim_start_matches('@');
         let path = path.trim_end_matches(|c: char| matches!(c, ',' | ')' | ']' | ';' | ':' | '.'));
-        if path.is_empty() { continue; }
+        if path.is_empty() {
+            continue;
+        }
         if seen.insert(path.to_string()) {
             refs.push(path.to_string());
         }
@@ -2830,8 +3583,14 @@ async fn api_project_scan(stream: &mut TcpStream, path: &str) -> Result<()> {
     let raw_root = match extract_query_param(path, "root") {
         Some(r) => r,
         None => {
-            return write_text(stream, 400, "Bad Request",
-                "text/plain; charset=utf-8", "missing ?root= parameter\n").await;
+            return write_text(
+                stream,
+                400,
+                "Bad Request",
+                "text/plain; charset=utf-8",
+                "missing ?root= parameter\n",
+            )
+            .await;
         }
     };
 
@@ -2839,8 +3598,14 @@ async fn api_project_scan(stream: &mut TcpStream, path: &str) -> Result<()> {
 
     // Path traversal guard.
     if root.contains("..") {
-        return write_text(stream, 400, "Bad Request",
-            "text/plain; charset=utf-8", "invalid path: '..' not allowed\n").await;
+        return write_text(
+            stream,
+            400,
+            "Bad Request",
+            "text/plain; charset=utf-8",
+            "invalid path: '..' not allowed\n",
+        )
+        .await;
     }
 
     let result = match crate::project::ProjectContext::scan(&root).await {
@@ -2976,7 +3741,12 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         body.truncate(content_length);
     }
 
-    Ok(HttpRequest { method, path, origin, body })
+    Ok(HttpRequest {
+        method,
+        path,
+        origin,
+        body,
+    })
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {

@@ -1,25 +1,25 @@
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
+    Frame,
 };
 
-use super::app::{App, Focus, RightTab, TaskPhase, TaskTarget, Message, Role};
+use super::app::{App, Focus, Message, RightTab, Role, TaskPhase, TaskTarget};
 
 // ── Brand palette (mirrors web UI) ────────────────────────────────────────────
 
-const CODER_BLUE: Color = Color::Rgb(96, 165, 250);   // blue-400
-const OBS_MAG:    Color = Color::Rgb(217, 70, 239);   // fuchsia-500
-const ACCENT:     Color = Color::Rgb(45, 212, 191);   // teal-400
-const WARN:       Color = Color::Rgb(251, 191, 36);   // amber-400
-const DANGER:     Color = Color::Rgb(248, 113, 113);  // red-400
-const SUCCESS:    Color = Color::Rgb(74, 222, 128);   // green-400
-const MUTED:      Color = Color::Rgb(100, 116, 139);  // slate-500
-const TEXT_BODY:  Color = Color::Rgb(226, 232, 240);  // slate-200
-const BG_DARK:    Color = Color::Rgb(15, 23, 42);     // slate-950
-const UNFOCUSED:  Color = Color::Rgb(51, 65, 85);     // slate-700
+const CODER_BLUE: Color = Color::Rgb(96, 165, 250); // blue-400
+const OBS_MAG: Color = Color::Rgb(217, 70, 239); // fuchsia-500
+const ACCENT: Color = Color::Rgb(45, 212, 191); // teal-400
+const WARN: Color = Color::Rgb(251, 191, 36); // amber-400
+const DANGER: Color = Color::Rgb(248, 113, 113); // red-400
+const SUCCESS: Color = Color::Rgb(74, 222, 128); // green-400
+const MUTED: Color = Color::Rgb(100, 116, 139); // slate-500
+const TEXT_BODY: Color = Color::Rgb(226, 232, 240); // slate-200
+const BG_DARK: Color = Color::Rgb(15, 23, 42); // slate-950
+const UNFOCUSED: Color = Color::Rgb(51, 65, 85); // slate-700
 
 // ── Animation ─────────────────────────────────────────────────────────────────
 
@@ -97,17 +97,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("C: ", Style::default().fg(MUTED)),
         Span::styled(
             format!("{c_m}{c_spin}"),
-            Style::default()
-                .fg(CODER_BLUE)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(CODER_BLUE).add_modifier(Modifier::BOLD),
         ),
         Span::styled(iter, Style::default().fg(ACCENT)),
         Span::styled("  │  O: ", Style::default().fg(MUTED)),
         Span::styled(
             format!("{o_m}{o_spin}"),
-            Style::default()
-                .fg(OBS_MAG)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(OBS_MAG).add_modifier(Modifier::BOLD),
         ),
         if app.auto_observe {
             Span::styled(
@@ -136,8 +132,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     ));
 
     frame.render_widget(
-        Paragraph::new(Text::from(vec![row1, row2]))
-            .style(Style::default().bg(BG_DARK)),
+        Paragraph::new(Text::from(vec![row1, row2])).style(Style::default().bg(BG_DARK)),
         area,
     );
 }
@@ -162,10 +157,19 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App) {
 
     let horiz = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(left_pct), Constraint::Percentage(right_pct)])
+        .constraints([
+            Constraint::Percentage(left_pct),
+            Constraint::Percentage(right_pct),
+        ])
         .split(area);
 
-    render_message_pane(frame, horiz[0], app, PaneView::Coder, app.focus == Focus::Coder);
+    render_message_pane(
+        frame,
+        horiz[0],
+        app,
+        PaneView::Coder,
+        app.focus == Focus::Coder,
+    );
 
     let right_focused = app.focus == Focus::Right;
     match app.right_tab {
@@ -272,9 +276,7 @@ fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView,
                 lines.push(Line::from(vec![
                     Span::styled(
                         "  you ",
-                        Style::default()
-                            .fg(SUCCESS)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("›", Style::default().fg(MUTED)),
                 ]));
@@ -294,9 +296,7 @@ fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView,
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("  {lbl} "),
-                        Style::default()
-                            .fg(lbl_color)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(lbl_color).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("›", Style::default().fg(MUTED)),
                 ]));
@@ -317,9 +317,7 @@ fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView,
         if !msg.complete {
             lines.push(Line::from(Span::styled(
                 format!("  {} ", spinner_char(app.tick_count)),
-                Style::default()
-                    .fg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )));
         }
 
@@ -364,7 +362,10 @@ fn render_tasks_pane(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
 
     let title = Line::from(vec![
         Span::raw(" "),
-        Span::styled("TASKS", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "TASKS",
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(spin, Style::default().fg(ACCENT)),
         Span::styled(count, Style::default().fg(MUTED)),
         Span::raw(" "),
@@ -431,18 +432,12 @@ fn render_tasks_pane(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn key_row(key: &'static str, desc: &'static str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("  {key:<18}"),
-            Style::default().fg(ACCENT),
-        ),
+        Span::styled(format!("  {key:<18}"), Style::default().fg(ACCENT)),
         Span::styled(desc, Style::default().fg(MUTED)),
     ])
 }
@@ -569,16 +564,15 @@ fn render_observer_content(content: &str) -> Vec<Line<'static>> {
         }
 
         let line = match section {
-            ObsSection::Body => {
-                Line::from(Span::styled(raw.to_string(), Style::default().fg(TEXT_BODY)))
-            }
+            ObsSection::Body => Line::from(Span::styled(
+                raw.to_string(),
+                Style::default().fg(TEXT_BODY),
+            )),
             ObsSection::Phase => Line::from(vec![
                 Span::styled("  ◈ ", Style::default().fg(ACCENT)),
                 Span::styled(
                     trimmed.to_string(),
-                    Style::default()
-                        .fg(ACCENT)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
             ]),
             ObsSection::Proposals => proposal_line(trimmed),
@@ -589,9 +583,7 @@ fn render_observer_content(content: &str) -> Vec<Line<'static>> {
                     Line::from(vec![
                         Span::styled(
                             "  ⚠ ",
-                            Style::default()
-                                .fg(DANGER)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(trimmed.to_string(), Style::default().fg(DANGER)),
                     ])
@@ -607,7 +599,12 @@ fn render_observer_content(content: &str) -> Vec<Line<'static>> {
 fn parse_score_from(s: &str) -> Option<u32> {
     let low = s.to_ascii_lowercase();
     let idx = low.find("score:")?;
-    low[idx + 6..].trim().split_whitespace().next()?.parse().ok()
+    low[idx + 6..]
+        .trim()
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn score_color(score: u32) -> Color {
@@ -630,9 +627,7 @@ fn proposal_line(trimmed: &str) -> Line<'static> {
             Span::raw("  "),
             Span::styled(
                 trimmed.to_string(),
-                Style::default()
-                    .fg(TEXT_BODY)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT_BODY).add_modifier(Modifier::BOLD),
             ),
         ]);
     }
@@ -806,9 +801,7 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
                     Span::styled("  │ ", Style::default().fg(UNFOCUSED)),
                     Span::styled(
                         trimmed.to_string(),
-                        Style::default()
-                            .fg(MUTED)
-                            .add_modifier(Modifier::ITALIC),
+                        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
                     ),
                 ]));
             }
@@ -823,9 +816,7 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
                 Span::styled("  ╭── ", Style::default().fg(UNFOCUSED)),
                 Span::styled(
                     "think",
-                    Style::default()
-                        .fg(MUTED)
-                        .add_modifier(Modifier::ITALIC),
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
                 ),
                 Span::styled(" ──────────────────", Style::default().fg(UNFOCUSED)),
             ]));
@@ -850,37 +841,25 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
                 let (label_style, rest_style) = match label {
                     "goal" => (
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        Style::default()
-                            .fg(ACCENT)
-                            .add_modifier(Modifier::ITALIC),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::ITALIC),
                     ),
                     "risk" => (
                         Style::default().fg(WARN).add_modifier(Modifier::BOLD),
                         Style::default().fg(WARN).add_modifier(Modifier::ITALIC),
                     ),
                     "next" => (
-                        Style::default()
-                            .fg(CODER_BLUE)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(CODER_BLUE).add_modifier(Modifier::BOLD),
                         Style::default()
                             .fg(CODER_BLUE)
                             .add_modifier(Modifier::ITALIC),
                     ),
                     "verify" => (
-                        Style::default()
-                            .fg(SUCCESS)
-                            .add_modifier(Modifier::BOLD),
-                        Style::default()
-                            .fg(SUCCESS)
-                            .add_modifier(Modifier::ITALIC),
+                        Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                        Style::default().fg(SUCCESS).add_modifier(Modifier::ITALIC),
                     ),
                     _ => (
-                        Style::default()
-                            .fg(MUTED)
-                            .add_modifier(Modifier::ITALIC),
-                        Style::default()
-                            .fg(MUTED)
-                            .add_modifier(Modifier::ITALIC),
+                        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
                     ),
                 };
                 if label.is_empty() {
@@ -1023,7 +1002,11 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
         if trimmed.starts_with("[auto-test]") {
             in_diff = false;
             let rest = trimmed.trim_start_matches("[auto-test]").trim();
-            let (icon, col) = if rest.starts_with('✓') { ("  ✓ TEST ", SUCCESS) } else { ("  ✗ TEST ", DANGER) };
+            let (icon, col) = if rest.starts_with('✓') {
+                ("  ✓ TEST ", SUCCESS)
+            } else {
+                ("  ✗ TEST ", DANGER)
+            };
             lines.push(Line::from(vec![
                 Span::styled(icon, Style::default().fg(col).add_modifier(Modifier::BOLD)),
                 Span::styled(rest.to_string(), Style::default().fg(col)),
@@ -1140,18 +1123,14 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
         }
         if in_diff {
             let style = if trimmed.starts_with("diff ") {
-                Style::default()
-                    .fg(CODER_BLUE)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(CODER_BLUE).add_modifier(Modifier::BOLD)
             } else if trimmed.starts_with("+++ ")
                 || trimmed.starts_with("--- ")
                 || trimmed.starts_with("index ")
                 || trimmed.starts_with("new file")
                 || trimmed.starts_with("deleted file")
             {
-                Style::default()
-                    .fg(TEXT_BODY)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(TEXT_BODY).add_modifier(Modifier::BOLD)
             } else if trimmed.starts_with("@@ ") {
                 Style::default().fg(ACCENT)
             } else if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
@@ -1199,9 +1178,7 @@ fn code_line_style(lang: &str, line: &str) -> Style {
     }
     if l == "powershell" || l == "ps1" || l == "ps" || l == "pwsh" {
         if line.trim_start().starts_with('#') {
-            return Style::default()
-                .fg(MUTED)
-                .add_modifier(Modifier::ITALIC);
+            return Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
         }
         if line.trim_start().starts_with("$") || line.contains(" $") {
             return Style::default().fg(CODER_BLUE);
@@ -1209,14 +1186,10 @@ fn code_line_style(lang: &str, line: &str) -> Style {
     }
     if l == "bash" || l == "sh" || l == "shell" || l == "console" {
         if line.trim_start().starts_with('#') {
-            return Style::default()
-                .fg(MUTED)
-                .add_modifier(Modifier::ITALIC);
+            return Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
         }
         if line.starts_with("$ ") || line.starts_with("PS> ") {
-            return Style::default()
-                .fg(CODER_BLUE)
-                .add_modifier(Modifier::BOLD);
+            return Style::default().fg(CODER_BLUE).add_modifier(Modifier::BOLD);
         }
     }
     Style::default().fg(TEXT_BODY)
@@ -1246,7 +1219,10 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(" "),
         Span::styled(">", Style::default().fg(brand).add_modifier(Modifier::BOLD)),
         Span::raw(" "),
-        Span::styled(label, Style::default().fg(brand).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            label,
+            Style::default().fg(brand).add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
         Span::styled(hint, Style::default().fg(MUTED)),
         Span::raw(" "),
@@ -1266,7 +1242,10 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     if read_only {
         let mut lines: Vec<Line> = Vec::new();
         if app.tasks.is_empty() {
-            lines.push(Line::from(Span::styled("  (no tasks)", Style::default().fg(MUTED))));
+            lines.push(Line::from(Span::styled(
+                "  (no tasks)",
+                Style::default().fg(MUTED),
+            )));
         } else {
             let idx = app.tasks_cursor.min(app.tasks.len().saturating_sub(1));
             let t = &app.tasks[idx];
@@ -1299,4 +1278,3 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         },
     };
 }
-

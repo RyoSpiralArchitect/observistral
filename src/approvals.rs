@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,9 +104,7 @@ enum PromptDecision {
 
 fn prompt_approval(header: &str, body: &str, kind_hint: &str) -> Result<PromptDecision> {
     let mut reader = open_tty_reader().ok_or_else(|| {
-        anyhow!(
-            "cannot prompt for approval (no TTY). Pass --yes or disable approvals."
-        )
+        anyhow!("cannot prompt for approval (no TTY). Pass --yes or disable approvals.")
     })?;
 
     let mut stderr = std::io::stderr();
@@ -179,7 +177,11 @@ impl Approver for CliApprover {
                     PromptDecision::Reject => Ok(ApprovalOutcome::Rejected),
                 }
             }
-            ApprovalRequest::Edit { action, path, preview } => {
+            ApprovalRequest::Edit {
+                action,
+                path,
+                preview,
+            } => {
                 if !self.edit_approval {
                     return Ok(ApprovalOutcome::Approved);
                 }

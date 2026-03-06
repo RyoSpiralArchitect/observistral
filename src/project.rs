@@ -5,8 +5,8 @@
 /// without having to ask.
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use tokio::time::timeout;
 use std::time::Duration;
+use tokio::time::timeout;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -81,8 +81,7 @@ impl ProjectContext {
         let readme_excerpt = read_readme_excerpt(&root);
 
         // Git info: run async with tight timeouts.
-        let (git_branch, git_modified, git_untracked, git_recent) =
-            scan_git(&root).await;
+        let (git_branch, git_modified, git_untracked, git_recent) = scan_git(&root).await;
 
         // Project-specific instruction file (.obstral.md > AGENTS.md > CLAUDE.md).
         let agents_md = try_read_agents_file(&root);
@@ -148,7 +147,9 @@ impl ProjectContext {
 
         // Recent commits
         if !self.git_recent.is_empty() {
-            let commits: Vec<String> = self.git_recent.iter()
+            let commits: Vec<String> = self
+                .git_recent
+                .iter()
                 .map(|c| format!("\"{}\"", c))
                 .collect();
             out.push_str(&format!("recent: {}\n", commits.join(" · ")));
@@ -254,7 +255,9 @@ async fn scan_git(root: &str) -> (Option<String>, u32, u32, Vec<String>) {
         return (None, 0, 0, vec![]);
     }
 
-    let status_out = run_git(root, &["status", "--short"]).await.unwrap_or_default();
+    let status_out = run_git(root, &["status", "--short"])
+        .await
+        .unwrap_or_default();
     let mut modified = 0u32;
     let mut untracked = 0u32;
     for line in status_out.lines() {
@@ -302,8 +305,15 @@ async fn run_git(root: &str, args: &[&str]) -> Option<String> {
 // ── Directory tree ────────────────────────────────────────────────────────────
 
 const SKIP_DIRS: &[&str] = &[
-    "target", "node_modules", "__pycache__", ".git",
-    "dist", "build", ".next", ".nuxt", "vendor",
+    "target",
+    "node_modules",
+    "__pycache__",
+    ".git",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    "vendor",
 ];
 
 fn scan_tree(root: &str) -> Vec<(String, usize)> {
@@ -340,15 +350,27 @@ fn scan_tree(root: &str) -> Vec<(String, usize)> {
 
 fn count_direct_files(dir: &std::path::PathBuf) -> usize {
     std::fs::read_dir(dir)
-        .map(|rd| rd.flatten().filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false)).count())
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .count()
+        })
         .unwrap_or(0)
 }
 
 // ── Key files ─────────────────────────────────────────────────────────────────
 
 const KEY_CANDIDATES: &[&str] = &[
-    "Cargo.toml", "package.json", "pyproject.toml", "go.mod", "pom.xml",
-    "README.md", "readme.md", "Makefile", "docker-compose.yml", "Dockerfile",
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "pom.xml",
+    "README.md",
+    "readme.md",
+    "Makefile",
+    "docker-compose.yml",
+    "Dockerfile",
     ".env.example",
 ];
 
@@ -408,14 +430,21 @@ fn detect_test_cmd(root: &str, agents_md: Option<&str>) -> Option<String> {
         // Check for a "test" script in package.json
         if let Ok(src) = std::fs::read_to_string(p.join("package.json")) {
             if src.contains("\"test\"") {
-                let mgr = if p.join("pnpm-lock.yaml").is_file() { "pnpm" }
-                          else if p.join("yarn.lock").is_file() { "yarn" }
-                          else { "npm" };
+                let mgr = if p.join("pnpm-lock.yaml").is_file() {
+                    "pnpm"
+                } else if p.join("yarn.lock").is_file() {
+                    "yarn"
+                } else {
+                    "npm"
+                };
                 return Some(format!("{mgr} test --passWithNoTests 2>&1"));
             }
         }
     }
-    if p.join("pyproject.toml").is_file() || p.join("pytest.ini").is_file() || p.join("setup.cfg").is_file() {
+    if p.join("pyproject.toml").is_file()
+        || p.join("pytest.ini").is_file()
+        || p.join("setup.cfg").is_file()
+    {
         return Some("pytest -q 2>&1".to_string());
     }
     if p.join("go.mod").is_file() {
@@ -433,13 +462,11 @@ fn try_read_agents_file(root: &str) -> Option<String> {
         let path = Path::new(root).join(name);
         if let Ok(content) = std::fs::read_to_string(&path) {
             let trimmed = content.trim();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             // Cap at 200 lines to avoid blowing the context window.
-            let capped: String = trimmed
-                .lines()
-                .take(200)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let capped: String = trimmed.lines().take(200).collect::<Vec<_>>().join("\n");
             return Some(capped);
         }
     }

@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use reqwest::StatusCode;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 use crate::types::{ChatMessage, ChatRequest, ChatResponse};
@@ -36,7 +36,11 @@ impl OpenAICompatibleProvider {
         }
     }
 
-    async fn post_json(&self, url: &str, payload: &Value) -> Result<Result<Value, (StatusCode, String)>> {
+    async fn post_json(
+        &self,
+        url: &str,
+        payload: &Value,
+    ) -> Result<Result<Value, (StatusCode, String)>> {
         let mut req = self
             .client
             .post(url)
@@ -104,7 +108,10 @@ fn should_use_v1_completions(status: StatusCode, body: &str) -> bool {
     if msg.contains("not a chat model") {
         return true;
     }
-    if status == StatusCode::NOT_FOUND && msg.contains("v1/completions") && msg.contains("chat/complet") {
+    if status == StatusCode::NOT_FOUND
+        && msg.contains("v1/completions")
+        && msg.contains("chat/complet")
+    {
         return true;
     }
     false
@@ -275,7 +282,9 @@ impl ChatProvider for OpenAICompatibleProvider {
                         }
                         match self.post_json(&url, &payload2).await? {
                             Ok(v2) => v2,
-                            Err((status2, body2)) => return Err(http_error(self.kind_label, status2, &body2)),
+                            Err((status2, body2)) => {
+                                return Err(http_error(self.kind_label, status2, &body2))
+                            }
                         }
                     } else {
                         return Err(http_error(self.kind_label, status, &body));
@@ -445,7 +454,11 @@ mod tests {
         );
 
         let resp = provider.chat(&make_request("hi")).await.unwrap();
-        assert!(resp.content.contains("hello from completions"), "{}", resp.content);
+        assert!(
+            resp.content.contains("hello from completions"),
+            "{}",
+            resp.content
+        );
         mock2.assert();
     }
 }

@@ -9,13 +9,7 @@ fn pick_free_port() -> u16 {
 
 fn spawn_server(exe: &str, port: u16) -> Child {
     Command::new(exe)
-        .args([
-            "serve",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-        ])
+        .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -29,7 +23,11 @@ async fn serve_smoke_assets() {
     let exe_path = std::path::Path::new(&root)
         .join("target")
         .join("debug")
-        .join(if cfg!(windows) { "obstral.exe" } else { "obstral" });
+        .join(if cfg!(windows) {
+            "obstral.exe"
+        } else {
+            "obstral"
+        });
     assert!(
         exe_path.exists(),
         "expected obstral binary at {}",
@@ -82,7 +80,10 @@ async fn serve_smoke_assets() {
         .text()
         .await
         .expect("read app.js body");
-    assert!(app_js.contains("sendObserver"), "app.js should include sendObserver");
+    assert!(
+        app_js.contains("sendObserver"),
+        "app.js should include sendObserver"
+    );
 
     let styles = client
         .get(format!("{base}/assets/styles.css"))
@@ -92,7 +93,10 @@ async fn serve_smoke_assets() {
         .text()
         .await
         .expect("read styles.css body");
-    assert!(styles.contains(".bubble"), "styles.css should include .bubble rules");
+    assert!(
+        styles.contains(".bubble"),
+        "styles.css should include .bubble rules"
+    );
 
     let status_json: serde_json::Value = client
         .get(format!("{base}/api/status"))
@@ -103,16 +107,26 @@ async fn serve_smoke_assets() {
         .await
         .expect("parse /api/status JSON");
     assert!(
-        status_json.get("host_os").and_then(|v| v.as_str()).unwrap_or("") != "",
+        status_json
+            .get("host_os")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            != "",
         "/api/status should include host_os"
     );
     assert_eq!(
-        status_json.pointer("/features/pending_edits").and_then(|v| v.as_bool()).unwrap_or(false),
+        status_json
+            .pointer("/features/pending_edits")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         true,
         "/api/status features.pending_edits should be true"
     );
     assert_eq!(
-        status_json.pointer("/features/meta_prompts").and_then(|v| v.as_bool()).unwrap_or(false),
+        status_json
+            .pointer("/features/meta_prompts")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         true,
         "/api/status features.meta_prompts should be true"
     );
@@ -126,7 +140,10 @@ async fn serve_smoke_assets() {
         .await
         .expect("parse /api/pending_edits JSON");
     assert!(
-        pending_json.get("pending").map(|v| v.is_array()).unwrap_or(false),
+        pending_json
+            .get("pending")
+            .map(|v| v.is_array())
+            .unwrap_or(false),
         "/api/pending_edits should return {{ pending: [] }}"
     );
 

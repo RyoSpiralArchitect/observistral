@@ -1,6 +1,6 @@
-use anyhow::{Context, Result, anyhow};
-use rustyline::DefaultEditor;
+use anyhow::{anyhow, Context, Result};
 use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 
 use crate::chatbot::ChatBot;
 use crate::config::{PartialConfig, ProviderKind};
@@ -251,12 +251,18 @@ mod tests {
 
     #[test]
     fn parse_provider_accepts_aliases() {
-        assert!(matches!(parse_provider("openai").unwrap(), ProviderKind::OpenAiCompatible));
+        assert!(matches!(
+            parse_provider("openai").unwrap(),
+            ProviderKind::OpenAiCompatible
+        ));
         assert!(matches!(
             parse_provider("openai_compat").unwrap(),
             ProviderKind::OpenAiCompatible
         ));
-        assert!(matches!(parse_provider("mistral").unwrap(), ProviderKind::Mistral));
+        assert!(matches!(
+            parse_provider("mistral").unwrap(),
+            ProviderKind::Mistral
+        ));
         assert!(parse_provider("nope").is_err());
     }
 
