@@ -2276,14 +2276,18 @@
         return `[…truncated — ${lines} lines total, last ${max} chars shown]\n` + t.slice(-max);
       };
 
-      const isPrunableToolSuccess = (content) => {
-        const s = String(content || "").trimStart();
-        if (s.startsWith("OK (exit_code: 0)")) return true;           // exec success
-        if (/^OK: (wrote|patched) '/.test(s)) return true;            // write_file / patch_file
-        if (/^\[.+\] \(\d+ lines?,/.test(s)) return true;             // read_file header
-        if (s.startsWith("[search_files:")) return true;               // search_files header
-        return false;
-      };
+      const isPrunableToolSuccess = (content) => { 
+        const s = String(content || "").trimStart(); 
+        if (s.startsWith("OK (exit_code: 0)")) return true;           // exec success 
+        if (/^OK: (wrote|patched) '/.test(s)) return true;            // write_file / patch_file 
+        if (s.startsWith("OK: applied ")) return true;               // apply_diff 
+        if (s.startsWith("OK write_file")) return true;              // GUI write_file wrapper 
+        if (/^\[.+\] \(\d+ lines?,/.test(s)) return true;             // read_file header 
+        if (s.startsWith("[search_files:")) return true;               // search_files header 
+        if (s.startsWith("[list_dir:")) return true;                 // list_dir header 
+        if (s.startsWith("[glob:") || s.startsWith("[glob]")) return true; // glob header 
+        return false; 
+      }; 
 
       const pruneToolMessages = (msgs) => {
         const toolIdxs = msgs.reduce((acc, m, i) => m.role === "tool" ? [...acc, i] : acc, []);
@@ -4578,11 +4582,11 @@
         return uiLang;
       })();
       const proposalKeysLine = "Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).";
-      const langLine = outLang === "fr"
-        ? [
-            "Language: French.",
-            "Langue: français.",
-            "Write the critique in French.",
+      const langLine = outLang === "fr" 
+        ? [ 
+            "Language: French.", 
+            "Langue: français.", 
+            "Write the critique in French.", 
             "Écris la critique en français.",
             "Do not write in English.",
             "N'écris pas en anglais.",
@@ -4602,13 +4606,64 @@
               "批評は日本語で書いてください。",
               "Do not write in English.",
               "英語で書かないでください。",
-              proposalKeysLine,
-              "proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。",
-            ].join("\n");
+              proposalKeysLine, 
+              "proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。", 
+            ].join("\n"); 
+ 
+      // Localize the intensity guidelines to reduce "Observer stuck in English" bias. 
+      if (outLang === "ja") { 
+        if (intensity === "polite") { 
+          intensityInstr = [ 
+            "強度: polite（丁寧）。建設的かつ前向きに。", 
+            "ただし5軸（正しさ/セキュリティ/信頼性/性能/保守性）で具体的な指摘は必ず入れる。", 
+            "各proposalのto_coderは具体的な1アクションにする。", 
+            "アンチループ: 新規の指摘のみ。新規が無ければ過去の未解決事項を[OPEN]で要約。", 
+          ].join("\n"); 
+        } else if (intensity === "brutal") { 
+          intensityInstr = [ 
+            "強度: brutal（容赦なし）。今夜0時に1万人へ出荷される前提で潰す。", 
+            "必須: 失敗モードを最低2つ（正しさ/データ + 運用リスク）挙げる。", 
+            "必須: 各proposalはto_coder（具体）とimpact（現実的）を含める。", 
+            "禁止: 『良さそう』『検討』などの抽象。具体的欠陥と具体的修正のみ。", 
+            "アンチループ: 既出が未解決ならスコア+10し[ESCALATED]。それ以外は新規のみ。", 
+          ].join("\n"); 
+        } else { 
+          intensityInstr = [ 
+            "強度: critical（批評）。本番マージ前レビューとして扱う。", 
+            "必須: 具体的なバグ/セキュリティ/設計弱点を最低1つ、to_coderで具体修正を書く。", 
+            "観点: 入力検証、未処理エラー、ハードコード、テスト不足。", 
+            "アンチループ: 既出は[UNRESOLVED]と明記して繰り返さない。新規無しなら次の一文だけ: [Observer] No new critique. Loop detected.", 
+          ].join("\n"); 
+        } 
+      } else if (outLang === "fr") { 
+        if (intensity === "polite") { 
+          intensityInstr = [ 
+            "Intensité: polite. Constructif et encourageant.", 
+            "Mais: signale des problèmes concrets sur les 5 axes (exactitude/sécurité/fiabilité/performance/maintenabilité).", 
+            "Chaque proposal doit inclure un message to_coder spécifique et actionnable.", 
+            "Anti-boucle: nouveaux points seulement. Sinon résume les points encore ouverts en [OPEN].", 
+          ].join("\n"); 
+        } else if (intensity === "brutal") { 
+          intensityInstr = [ 
+            "Intensité: brutal. Ça part en prod à minuit pour 10 000 utilisateurs.", 
+            "Obligatoire: au moins 2 modes de panne (un bug exactitude/données + un risque opérationnel).", 
+            "Obligatoire: chaque proposal doit inclure to_coder concret + impact réaliste.", 
+            "Interdit: 'ça a l'air bien', 'on pourrait'. Seulement défauts concrets + fixes concrets.", 
+            "Anti-boucle: si non résolu, +10 score et tag [ESCALATED]. Sinon nouveaux points uniquement.", 
+          ].join("\n"); 
+        } else { 
+          intensityInstr = [ 
+            "Intensité: critical. Revue pré-merge pour un service de prod.", 
+            "Obligatoire: au moins 1 bug/risque sécu/faiblesse d'archi avec un to_coder concret.", 
+            "Vérifie: validation d'entrées, erreurs non gérées, valeurs en dur, manque de tests.", 
+            "Anti-boucle: si déjà mentionné, marque [UNRESOLVED] et passe à autre chose. Pas de nouveau signal → réponds exactement: [Observer] No new critique. Loop detected.", 
+          ].join("\n"); 
+        } 
+      } 
 
-      // Lightweight proposal memory: provide the Observer with a compact list of recent proposals and approvals
-      // so it can avoid repeating the same template critique and can mark items UNRESOLVED/ESCALATED accurately.
-      const priorProposalsSummary = (() => {
+      // Lightweight proposal memory: provide the Observer with a compact list of recent proposals and approvals 
+      // so it can avoid repeating the same template critique and can mark items UNRESOLVED/ESCALATED accurately. 
+      const priorProposalsSummary = (() => { 
         try {
           const normTitle = (s) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
           const approved = new Set();
