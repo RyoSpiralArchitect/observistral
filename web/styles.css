@@ -1207,6 +1207,57 @@ body.looping .bubble.assistant {
 }
 .chat-persona-bar::-webkit-scrollbar { display: none; }
 
+.chat-quick-bar {
+  display: flex;
+  gap: 6px;
+  padding: 6px 10px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.chat-quick-spacer {
+  flex: 1;
+}
+
+.chat-runtime-badge {
+  font-size: 11px;
+  color: var(--faint);
+  font-family: var(--mono);
+  opacity: 0.9;
+}
+
+.pill-btn {
+  cursor: pointer;
+}
+
+.pill-btn:hover {
+  border-color: rgba(201, 125, 78, 0.65);
+  background: rgba(201, 125, 78, 0.09);
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.pill-btn.active {
+  border-color: rgba(201, 125, 78, 0.75);
+  background: rgba(201, 125, 78, 0.14);
+  color: #d4935e;
+  font-weight: 700;
+}
+
+.msg-pane-chat .msg-ts {
+  display: none;
+}
+
+.msg.msg-pane-chat .mini {
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+.msg.msg-pane-chat:hover .mini {
+  opacity: 1;
+}
+
 .persona-chip {
   background: transparent;
   border: 1px solid var(--border);

@@ -44,6 +44,10 @@
       phaseMismatchConfirm: "Phase mismatch (current: {cur} / proposal: {prop}). Send anyway?",
       applyMeta: "Apply",
       includeCoderContext: "Include coder context",
+      chatAttachRuntime: "Attach runtime snapshot",
+      chatAutoTasks: "Auto tasks",
+      chatExplainLastError: "Explain last error",
+      chatWhatsHappening: "What's happening?",
       insertCliTemplate: "CLI template",
       editApproval: "Edit approval",
       commandApproval: "Command approval",
@@ -153,6 +157,10 @@
       phaseMismatchConfirm: "フェーズが一致しません（現在: {cur} / 提案: {prop}）。それでもCoderへ送りますか？",
       applyMeta: "適用",
       includeCoderContext: "Coder状況を付与",
+      chatAttachRuntime: "ランタイム状況を付与",
+      chatAutoTasks: "自動タスク化",
+      chatExplainLastError: "直近エラー相談",
+      chatWhatsHappening: "いま何してる？",
       send: "送信",
       stop: "停止",
       exportMd: "Markdown",
@@ -261,6 +269,10 @@
       phaseMismatchConfirm: "Phase incompatible (actuelle: {cur} / proposition: {prop}). Envoyer quand même ?",
       applyMeta: "Appliquer",
       includeCoderContext: "Inclure contexte codeur",
+      chatAttachRuntime: "Joindre snapshot runtime",
+      chatAutoTasks: "Tâches auto",
+      chatExplainLastError: "Expliquer la dernière erreur",
+      chatWhatsHappening: "Que se passe-t-il ?",
       insertCliTemplate: "Template CLI",
       editApproval: "Approbation édition",
       commandApproval: "Approbation commande",
@@ -554,6 +566,8 @@
     // Default to auto so Observer follows the conversation language even if the UI is in English.
     observerLang: "auto",
     includeCoderContext: true,
+    chatAttachRuntime: true,
+    chatAutoTasks: true,
     temperature: "0.7",
     maxTokens: "1024",
     timeoutSeconds: "120",
@@ -651,7 +665,7 @@
       lines.push("```", "");
     }
     (thread.messages || []).forEach((m) => {
-      const pane = m.pane === "observer" ? "observer" : "coder";
+      const pane = m.pane === "observer" ? "observer" : m.pane === "chat" ? "chat" : "coder";
       lines.push(`## ${pane} / ${m.role}`, "", String(m.content || "").trimEnd(), "");
     });
     return lines.join("\\n");
@@ -1144,6 +1158,8 @@
         else cfg.observerLang = DEFAULT_CONFIG.observerLang;
       }
       if (typeof cfg.includeCoderContext !== "boolean") cfg.includeCoderContext = !!DEFAULT_CONFIG.includeCoderContext;
+      if (typeof cfg.chatAttachRuntime !== "boolean") cfg.chatAttachRuntime = !!DEFAULT_CONFIG.chatAttachRuntime;
+      if (typeof cfg.chatAutoTasks !== "boolean") cfg.chatAutoTasks = !!DEFAULT_CONFIG.chatAutoTasks;
       if (typeof cfg.requireEditApproval !== "boolean") cfg.requireEditApproval = !!DEFAULT_CONFIG.requireEditApproval;
       if (typeof cfg.requireCommandApproval !== "boolean") cfg.requireCommandApproval = !!DEFAULT_CONFIG.requireCommandApproval;
       if (typeof cfg.autoObserve !== "boolean") cfg.autoObserve = !!DEFAULT_CONFIG.autoObserve;
@@ -2003,6 +2019,32 @@
                 className: copiedId === m.id ? "copied" : "",
                 onClick: () => copyText(m.content || "", m.id),
               }, copiedId === m.id ? "✓" : tr(lang, "copy"))
+              ,
+              (!m.streaming && m.role === "assistant" && m.pane === "chat") ? e("button", {
+                title: lang === "fr" ? "Mettre dans l'entrée Coder" : lang === "en" ? "Put into Coder input" : "Coder入力に入れる",
+                onClick: () => {
+                  const t = String(m.content || "").trim();
+                  if (!t) return;
+                  setCoderInput((prev) => {
+                    const p = String(prev || "").trim();
+                    return p ? (p + "\n\n" + t) : t;
+                  });
+                  showToast(lang === "fr" ? "Ajouté à l'entrée Coder." : lang === "en" ? "Added to Coder input." : "Coder入力に追加しました。", "success");
+                },
+              }, "→C") : null,
+              (!m.streaming && m.role === "assistant" && m.pane === "chat") ? e("button", {
+                title: lang === "fr" ? "Mettre dans l'entrée Observer" : lang === "en" ? "Put into Observer input" : "Observer入力に入れる",
+                onClick: () => {
+                  const t = String(m.content || "").trim();
+                  if (!t) return;
+                  setObserverSubTab("analysis");
+                  setObserverInput((prev) => {
+                    const p = String(prev || "").trim();
+                    return p ? (p + "\n\n" + t) : t;
+                  });
+                  showToast(lang === "fr" ? "Ajouté à l'entrée Observer." : lang === "en" ? "Added to Observer input." : "Observer入力に追加しました。", "success");
+                },
+              }, "→O") : null
             )
           ),
           e(
@@ -2239,6 +2281,102 @@
       }
       if (diff && String(diff).trim()) parts.push("diff: (present)");
       return parts.join("\n");
+    };
+
+    // Chat is not a runtime agent, but it can optionally "see" a small read-only snapshot of
+    // what the runtime is doing. Keep this short to avoid token waste and role confusion.
+    const lastCoderErrorDigest = (maxChars) => {
+      const max = typeof maxChars === "number" ? maxChars : 900;
+      const isErrLine = (line) =>
+        /(?:\berror\b|fatal:|stderr:|\[error\]|exception|traceback|unauthorized|forbidden|access is denied|アクセスが拒否|認証|権限|not recognized|pathspec|cannot|failed)/i.test(
+          String(line || "")
+        );
+      try {
+        const msgs = paneMessages("coder");
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i];
+          if (!m || m.role !== "assistant" || m.streaming) continue;
+          const t = String(m.content || "");
+          if (!t || !isErrLine(t)) continue;
+          const lines = t.split("\n");
+          let idx = -1;
+          for (let j = lines.length - 1; j >= 0; j--) {
+            if (isErrLine(lines[j])) { idx = j; break; }
+          }
+          const start = Math.max(0, idx - 6);
+          const end = Math.min(lines.length, idx + 12);
+          let snippet = lines.slice(start, end).join("\n").trim();
+          if (!snippet) snippet = t.trim();
+          if (snippet.length > max) snippet = snippet.slice(0, max) + "...";
+          return snippet;
+        }
+      } catch (_) {}
+      return "";
+    };
+
+    const chatRuntimePacket = () => {
+      try {
+        if (!activeThread) return "";
+        const threadId = activeThread.id;
+        const cut = (t, n) => {
+          const s = String(t || "").trim().replace(/\s+\n/g, "\n");
+          return s.length > n ? s.slice(0, n) + "..." : s;
+        };
+        const pickLast = (msgs, role) => {
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const m = msgs[i];
+            if (!m || m.streaming) continue;
+            if (role && m.role !== role) continue;
+            const t = String(m.content || "").trim();
+            if (!t) continue;
+            return m;
+          }
+          return null;
+        };
+
+        const cwdNow = resolvedCwd(config.toolRoot, threadId, activeThread.workdir);
+        const coderMsgs = paneMessages("coder");
+        const obsMsgs = paneMessages("observer");
+        const lastCoderUser = pickLast(coderMsgs, "user");
+        const lastCoderAsst = pickLast(coderMsgs, "assistant");
+        const lastObsAsst = pickLast(obsMsgs, "assistant");
+        const err = lastCoderErrorDigest(700);
+
+        const tasks0 = Array.isArray(activeThread.tasks) ? activeThread.tasks : [];
+        const tasks = tasks0
+          .filter((t) => t && typeof t === "object" && String(t.status || "new") !== "done")
+          .slice(0, 6);
+
+        const parts = [];
+        parts.push("[Runtime snapshot (read-only)]");
+        parts.push(`thread: ${String(activeThread.title || "Untitled")} (id=${threadId})`);
+        if (cwdNow) parts.push(`cwd: ${String(cwdNow)}`);
+        parts.push(`coder: sending=${sendingCoder ? "yes" : "no"} mode=${String(config.mode || "")} model=${coderActiveModel()}`);
+        if (lastCoderUser) parts.push("last_coder_user:\n" + cut(lastCoderUser.content, 500));
+        if (lastCoderAsst) parts.push("last_coder_assistant:\n" + cut(lastCoderAsst.content, 900));
+        if (err) parts.push("last_error_snippet:\n" + err);
+        parts.push(
+          `observer: sending=${sendingObserver ? "yes" : "no"} mode=${String(config.observerMode || "")} persona=${String(config.observerPersona || "")} intensity=${String(config.observerIntensity || "")} phase=${String(observerPhase || "")} loop_depth=${(loopInfo && loopInfo.depth) ? loopInfo.depth : 0}`
+        );
+        parts.push(`pending_approvals: edits=${pendingEdits.length} commands=${pendingCommands.length}`);
+        if (tasks.length) {
+          parts.push(
+            "tasks:\n- " +
+            tasks
+              .map((t) => {
+                const tgt = String(t.target || "").toLowerCase() === "observer" ? "observer" : "coder";
+                const st = String(t.status || "new");
+                return `${tgt} (${st}): ${cut(String(t.title || ""), 90)}`;
+              })
+              .join("\n- ")
+          );
+        }
+        if (lastObsAsst) parts.push("last_observer_assistant:\n" + cut(lastObsAsst.content, 700));
+        parts.push("[/Runtime snapshot]");
+        return parts.join("\n");
+      } catch (_) {
+        return "";
+      }
     };
 
       const runCoderAgentic = async (text, threadId, asstMsgId, reqCfg, resolvedKey, history, ac, threadWorkdir) => {
@@ -4531,7 +4669,10 @@
         const acc = (x.match(/[\u00C0-\u017F]/g) || []).length;
         const fr = (x.match(/\b(le|la|les|des|du|de|pour|avec|sans|est|sont|pas|mais|donc|sur|dans|vous|tu|je|nous|votre)\b/gi) || []).length;
         if (acc > 0 || fr >= 2) return "fr";
-        return "en";
+        const latin = (x.match(/[A-Za-z]/g) || []).length;
+        const en = (x.match(/\b(the|and|or|to|of|in|for|with|is|are|you|we|i|this|that|it)\b/gi) || []).length;
+        if (en >= 2 || latin >= 24) return "en";
+        return "";
       };
       const pickLastUserSample = () => {
         try {
@@ -4565,7 +4706,8 @@
           const sample = pickLangSample();
           const sampleTrim = String(sample || "").trim();
           if (!sampleTrim) return String(lang || "ja").trim().toLowerCase();
-          return inferLangFromText(sampleTrim);
+          const inferred = inferLangFromText(sampleTrim);
+          return inferred || String(lang || "ja").trim().toLowerCase();
         }
         if (ol0 === "ja" || ol0 === "en" || ol0 === "fr") return ol0;
 
@@ -5107,8 +5249,8 @@
       setSendingChat(true);
       requestAnimationFrame(() => scrollBottom(chatBodyRef));
       const history = paneMessages("chat").filter((m) => !m.streaming && m.content).map((m) => ({ role: m.role, content: m.content }));
-      const ctx = config.includeCoderContext ? coderContextPacket() : "";
-      planTasksFromChat(text, ctx);
+      const ctx = config.chatAttachRuntime ? chatRuntimePacket() : "";
+      if (config.chatAutoTasks) planTasksFromChat(text, ctx);
       const fullInput = ctx ? `${ctx}\n\n${text}` : text;
       const reqBody = buildReq(chatCfg, apiKey, history, fullInput, null);
       reqBody.lang = lang;
@@ -6584,6 +6726,61 @@
                         title: lang === "en" ? p.en : lang === "fr" ? p.fr : p.ja,
                       }, p.icon + "\u00a0" + (lang === "en" ? p.en : lang === "fr" ? p.fr : p.ja))
                     )
+                  ),
+                  e("div", { className: "chat-quick-bar" },
+                    e("button", {
+                      type: "button",
+                      className: "pill pill-btn" + (config.chatAttachRuntime ? " active" : ""),
+                      title: tr(lang, "chatAttachRuntime"),
+                      onClick: () => setConfig({ ...config, chatAttachRuntime: !config.chatAttachRuntime }),
+                    }, tr(lang, "chatAttachRuntime")),
+                    e("button", {
+                      type: "button",
+                      className: "pill pill-btn" + (config.chatAutoTasks ? " active" : ""),
+                      title: tr(lang, "chatAutoTasks"),
+                      onClick: () => setConfig({ ...config, chatAutoTasks: !config.chatAutoTasks }),
+                    }, tr(lang, "chatAutoTasks")),
+                    (sendingCoder || sendingObserver)
+                      ? e("span", { className: "chat-runtime-badge" },
+                          (sendingCoder ? (lang === "fr" ? "Codeur: en cours" : lang === "en" ? "Coder: running" : "Coder: 実行中") : null),
+                          (sendingCoder && sendingObserver) ? " / " : null,
+                          (sendingObserver ? (lang === "fr" ? "Observer: en cours" : lang === "en" ? "Observer: running" : "Observer: 実行中") : null)
+                        )
+                      : null,
+                    e("span", { className: "chat-quick-spacer" }),
+                    e("button", {
+                      type: "button",
+                      className: "pill pill-btn",
+                      title: tr(lang, "chatExplainLastError"),
+                      onClick: () => {
+                        const err = lastCoderErrorDigest(600);
+                        if (!err) {
+                          showToast(lang === "fr" ? "Aucune erreur récente détectée." : lang === "en" ? "No recent error detected." : "直近のエラーが見つかりませんでした。", "info");
+                          return;
+                        }
+                        const prompt =
+                          lang === "fr"
+                            ? "Analyse le dernier échec (voir snapshot runtime) et propose la prochaine action concrète (commande/fichier)."
+                            : lang === "en"
+                              ? "Diagnose the latest failure (see runtime snapshot) and propose the next concrete action (command/file)."
+                              : "直近の失敗（runtime snapshot参照）を原因分析して、次の具体アクション（コマンド/ファイル）を1つ提案して。";
+                        sendChat(prompt);
+                      },
+                    }, tr(lang, "chatExplainLastError")),
+                    e("button", {
+                      type: "button",
+                      className: "pill pill-btn",
+                      title: tr(lang, "chatWhatsHappening"),
+                      onClick: () => {
+                        const prompt =
+                          lang === "fr"
+                            ? "Résume ce que fait le runtime (Coder/Observer) en ce moment (snapshot) et quel est le prochain pas probable."
+                            : lang === "en"
+                              ? "Summarize what the runtime (Coder/Observer) is doing right now (snapshot) and the most likely next step."
+                              : "いまランタイム（Coder/Observer）が何をしているか（snapshot参照）を要約して、次に起きそうな一手も教えて。";
+                        sendChat(prompt);
+                      },
+                    }, tr(lang, "chatWhatsHappening"))
                   ),
                   e("div", { className: "composer chat-composer" },
                     e("textarea", {
