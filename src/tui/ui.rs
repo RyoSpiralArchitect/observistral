@@ -6,6 +6,8 @@ use ratatui::{
     Frame,
 };
 
+use crate::config::ProviderKind;
+
 use super::app::{App, Focus, Message, RightTab, Role, TaskPhase, TaskTarget};
 
 // ── Brand palette (mirrors web UI) ────────────────────────────────────────────
@@ -85,6 +87,8 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
     let c_m = truncate_model(&app.coder_cfg.model, 20);
     let o_m = truncate_model(&app.observer_cfg.model, 20);
+    let c_p = provider_abbrev(&app.coder_cfg.provider);
+    let o_p = provider_abbrev(&app.observer_cfg.provider);
 
     let row1 = Line::from(vec![
         Span::styled(
@@ -99,12 +103,14 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             format!("{c_m}{c_spin}"),
             Style::default().fg(CODER_BLUE).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(format!("@{c_p}"), Style::default().fg(MUTED)),
         Span::styled(iter, Style::default().fg(ACCENT)),
         Span::styled("  │  O: ", Style::default().fg(MUTED)),
         Span::styled(
             format!("{o_m}{o_spin}"),
             Style::default().fg(OBS_MAG).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(format!("@{o_p}"), Style::default().fg(MUTED)),
         if app.auto_observe {
             Span::styled(
                 "  ◉ AUTO",
@@ -142,6 +148,15 @@ fn truncate_model(name: &str, max: usize) -> String {
         name.to_string()
     } else {
         format!("{}…", name.chars().take(max - 1).collect::<String>())
+    }
+}
+
+fn provider_abbrev(p: &ProviderKind) -> &'static str {
+    match p {
+        ProviderKind::OpenAiCompatible => "oai",
+        ProviderKind::Mistral => "mis",
+        ProviderKind::Anthropic => "ant",
+        ProviderKind::Hf => "hf",
     }
 }
 
@@ -191,6 +206,11 @@ fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView,
         PaneView::Observer => (&app.observer, OBS_MAG, "OBSERVER"),
         PaneView::Chat => (&app.chat, ACCENT, "CHAT"),
     };
+    let prov = match view {
+        PaneView::Coder => provider_abbrev(&app.coder_cfg.provider),
+        PaneView::Observer => provider_abbrev(&app.observer_cfg.provider),
+        PaneView::Chat => provider_abbrev(&app.chat_cfg.provider),
+    };
 
     let border_style = if focused {
         Style::default().fg(brand)
@@ -221,7 +241,7 @@ fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView,
     let focus_dot = if focused { "◉" } else { "○" };
     // `label` is determined by PaneView.
 
-    let title = Line::from(vec![
+    let mut spans = vec![
         Span::raw(" "),
         Span::styled(focus_dot, Style::default().fg(brand)),
         Span::raw(" "),
@@ -229,11 +249,51 @@ fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView,
             label,
             Style::default().fg(brand).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(format!(" @{prov}"), Style::default().fg(MUTED)),
         Span::styled(spin, Style::default().fg(ACCENT)),
         Span::styled(scroll_badge, Style::default().fg(WARN)),
         Span::styled(find_badge, Style::default().fg(MUTED)),
-        Span::raw(" "),
-    ]);
+    ];
+
+    if view == PaneView::Coder {
+        if let Some(ref g) = app.coder_governor {
+            if let Some(ref stage) = g.recovery_stage {
+                spans.push(Span::styled(
+                    format!(" rec:{stage}"),
+                    Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                ));
+            }
+            if g.done_verify_required {
+                spans.push(Span::styled(
+                    " VERIFY!",
+                    Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+                ));
+            }
+            if g.same_command_repeats >= 2 {
+                let col = if g.same_command_repeats >= 3 {
+                    DANGER
+                } else {
+                    WARN
+                };
+                spans.push(Span::styled(
+                    format!(" same_cmd:{}", g.same_command_repeats),
+                    Style::default().fg(col).add_modifier(Modifier::BOLD),
+                ));
+            }
+            if let Some(ref r) = g.last_reflection {
+                let goal = r.goal_delta.as_deref().unwrap_or("?");
+                let strat = r.strategy_change.as_deref().unwrap_or("?");
+                spans.push(Span::styled(
+                    format!(" refl:{goal}/{strat}"),
+                    Style::default().fg(MUTED),
+                ));
+            }
+        }
+    }
+
+    spans.push(Span::raw(" "));
+
+    let title = Line::from(spans);
 
     let block = Block::default()
         .title(title)
@@ -747,6 +807,7 @@ fn health_line(trimmed: &str) -> Line<'static> {
 // Visual zones:
 //   <plan>…</plan>      Blue box-drawing frame (CODER_BLUE/UNFOCUSED)
 //   <think>…</think>    Gray box-drawing frame; per-field colors
+//   <reflect>…</reflect> Gray box-drawing frame; dim italic
 //   ```lang…```         Bordered code block
 //   [TOOL] cmd          ▶ EXEC label (WARN)
 //   [RESULT] exit=0     ✓ OK (SUCCESS)
@@ -759,6 +820,7 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut in_think = false;
     let mut in_plan = false;
+    let mut in_reflect = false;
     let mut in_diff = false;
     let mut in_code = false;
     let mut code_lang = String::new();
@@ -770,6 +832,7 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
         if trimmed.starts_with("<plan>") {
             in_plan = true;
             in_think = false;
+            in_reflect = false;
             lines.push(Line::from(vec![
                 Span::styled("  ╭── ", Style::default().fg(CODER_BLUE)),
                 Span::styled(
@@ -804,6 +867,55 @@ fn render_coder_content(content: &str) -> Vec<Line<'static>> {
                         Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
                     ),
                 ]));
+            }
+            continue;
+        }
+
+        // ── <reflect> block ───────────────────────────────────────────────────
+        if trimmed.starts_with("<reflect>") {
+            in_reflect = true;
+            in_think = false;
+            in_diff = false;
+            lines.push(Line::from(vec![
+                Span::styled("  ╭── ", Style::default().fg(UNFOCUSED)),
+                Span::styled(
+                    "reflect",
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                ),
+                Span::styled(" ────────────────", Style::default().fg(UNFOCUSED)),
+            ]));
+            if trimmed.contains("</reflect>") {
+                in_reflect = false;
+                lines.push(Line::from(Span::styled(
+                    "  ╰─────────────────────────",
+                    Style::default().fg(UNFOCUSED),
+                )));
+            }
+            continue;
+        }
+        if in_reflect {
+            if trimmed.contains("</reflect>") {
+                in_reflect = false;
+                lines.push(Line::from(Span::styled(
+                    "  ╰─────────────────────────",
+                    Style::default().fg(UNFOCUSED),
+                )));
+            } else {
+                let (label, rest) = split_field(trimmed);
+                let label_style = Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
+                let rest_style = Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
+                if label.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(UNFOCUSED)),
+                        Span::styled(trimmed.to_string(), rest_style),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(UNFOCUSED)),
+                        Span::styled(format!("{label}: "), label_style),
+                        Span::styled(rest.to_string(), rest_style),
+                    ]));
+                }
             }
             continue;
         }

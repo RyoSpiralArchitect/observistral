@@ -4,6 +4,95 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LastReflectionSummary {
+    pub last_outcome: Option<String>,
+    pub goal_delta: Option<String>,
+    pub wrong_assumption: Option<String>,
+    pub strategy_change: Option<String>,
+    pub next_minimal_action: Option<String>,
+}
+
+fn extract_tag_block<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)?;
+    let rest = &text[start + open.len()..];
+    let end = rest.find(&close)?;
+    Some(rest[..end].trim())
+}
+
+fn parse_reflection_summary(text: &str) -> Option<LastReflectionSummary> {
+    let body = extract_tag_block(text, "reflect")?;
+    let mut s = LastReflectionSummary::default();
+
+    for line in body.lines() {
+        let (k, v) = match line.split_once(':') {
+            Some((k, v)) => (k.trim().to_ascii_lowercase(), v.trim().to_string()),
+            None => continue,
+        };
+        if v.is_empty() {
+            continue;
+        }
+        match k.as_str() {
+            "last_outcome" => s.last_outcome = Some(v),
+            "goal_delta" => s.goal_delta = Some(v.to_ascii_lowercase()),
+            "wrong_assumption" => s.wrong_assumption = Some(v),
+            "strategy_change" => s.strategy_change = Some(v.to_ascii_lowercase()),
+            "next_minimal_action" => s.next_minimal_action = Some(v),
+            _ => {}
+        }
+    }
+
+    if s.last_outcome.is_none()
+        && s.goal_delta.is_none()
+        && s.wrong_assumption.is_none()
+        && s.strategy_change.is_none()
+        && s.next_minimal_action.is_none()
+    {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+pub fn last_reflection_summary_from_messages(
+    messages: &[serde_json::Value],
+) -> Option<LastReflectionSummary> {
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if let Some(s) = parse_reflection_summary(content) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+pub fn recent_reflection_summaries_from_messages(
+    messages: &[serde_json::Value],
+    max: usize,
+) -> Vec<LastReflectionSummary> {
+    let max = max.max(1).min(12);
+    let mut out: Vec<LastReflectionSummary> = Vec::new();
+    for msg in messages.iter().rev() {
+        if out.len() >= max {
+            break;
+        }
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if let Some(s) = parse_reflection_summary(content) {
+            out.push(s);
+        }
+    }
+    out.reverse(); // chronological
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSession {
     pub version: u32,
@@ -13,6 +102,12 @@ pub struct AgentSession {
     pub tool_root: Option<String>,
     pub checkpoint: Option<String>,
     pub cur_cwd: Option<String>,
+
+    #[serde(default)]
+    pub last_reflection: Option<LastReflectionSummary>,
+
+    #[serde(default)]
+    pub recent_reflections: Vec<LastReflectionSummary>,
 
     /// OpenAI-compatible message array (includes tool_calls + tool_call_id).
     pub messages: Vec<serde_json::Value>,
@@ -29,6 +124,8 @@ impl AgentSession {
         messages: Vec<serde_json::Value>,
     ) -> Self {
         let now = now_ms();
+        let last_reflection = last_reflection_summary_from_messages(&messages);
+        let recent_reflections = recent_reflection_summaries_from_messages(&messages, 3);
         Self {
             version: Self::VERSION,
             created_at_ms: now,
@@ -36,6 +133,8 @@ impl AgentSession {
             tool_root,
             checkpoint,
             cur_cwd,
+            last_reflection,
+            recent_reflections,
             messages,
         }
     }
@@ -221,6 +320,8 @@ struct AgentSessionSnapshot<'a> {
     tool_root: Option<&'a str>,
     checkpoint: Option<&'a str>,
     cur_cwd: Option<&'a str>,
+    last_reflection: Option<LastReflectionSummary>,
+    recent_reflections: Vec<LastReflectionSummary>,
     messages: &'a [serde_json::Value],
 }
 
@@ -312,6 +413,8 @@ impl SessionAutoSaver {
             tool_root,
             checkpoint,
             cur_cwd,
+            last_reflection: last_reflection_summary_from_messages(messages),
+            recent_reflections: recent_reflection_summaries_from_messages(messages, 3),
             messages,
         };
         let json = serde_json::to_string_pretty(&snap).context("failed to serialize session")?;

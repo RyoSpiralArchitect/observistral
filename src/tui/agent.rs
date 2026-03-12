@@ -2,7 +2,7 @@
 /// and loops until finish_reason == "stop" or max iterations are reached.
 ///
 /// Reasoning improvements applied here:
-///   1. Scratchpad protocol  — model outputs <think>goal/risk/doubt/next/verify</think>
+///   1. Scratchpad protocol  — model outputs structured <plan>/<think> blocks
 ///      before every tool call (~50 tokens).  Prevents wrong-direction errors.
 ///   2. Tool output truncation  — stdout > 1500 chars / stderr > 600 chars are trimmed.
 ///      This is the single largest token-saver on long runs.
@@ -13,19 +13,29 @@
 ///      hint before the generic diagnosis protocol.
 ///   5. tool_call_id preserved  — messages stay as serde_json::Value all the way to the
 ///      provider, so the id field is never silently dropped.
-///   6. Progress checkpoints  — at iter 3/6/9 the model self-evaluates goal distance
-///      (DONE / REMAINING / ON_TRACK) before continuing.
+///   6. Progress checkpoints  — at iter 3/6/9 the model emits a short <reflect> block
+///      (goal_delta, wrong_assumption, strategy_change, next_minimal_action) before continuing.
+///   7. Working memory  — rebuilds confirmed facts / completed steps / known-good
+///      verification commands from session messages, so resume runs continue from
+///      verified context instead of only remembering failures.
+///   8. Impact check  — after every successful mutation, require a short <impact>
+///      block that states what changed and what acceptance criterion moved before
+///      allowing the next tool call.
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::approvals::{ApprovalOutcome, ApprovalRequest, Approver};
-use crate::config::RunConfig;
+use crate::config::{ProviderKind, RunConfig};
 use crate::exec;
-use crate::streaming::{stream_openai_compat_json, StreamToken, ToolCallData};
+use crate::governor_contract;
+use crate::streaming::{
+    stream_openai_compat_json, GovernorState, ReflectionSummary, StreamToken, ToolCallData,
+};
 use crate::types::ChatMessage;
 use std::path::Path;
 
@@ -86,37 +96,6 @@ const WIN_SYSTEM_ADDON: &str = "\n\n[Windows execution rules]\n\
 - Use single-line commands or semicolons to chain statements.\n\
 - Check $LASTEXITCODE after commands that may fail.\n\
 - Prefer relative paths inside the project directory.";
-
-/// Compact reasoning protocol injected into every agentic system prompt.
-///
-/// Cost: ~50 tokens per iteration in the response.
-/// Benefit: avoids wrong-direction mistakes that cost 300-500 tokens to correct.
-/// The <plan> block runs once; <think> runs before every tool call.
-const SCRATCHPAD_ADDON: &str = "\n\n\
-[Planning Protocol — emit ONCE before your very first tool call]\n\
-<plan>\n\
-goal: <one sentence: what the finished task looks like when done>\n\
-steps: 1) ... 2) ... 3) ... (3-7 concrete, ordered steps)\n\
-risks: <the 2 most likely failure modes for this specific task>\n\
-assumptions: <what you are taking as given>\n\
-</plan>\n\
-\n\
-[Reasoning Protocol — emit before EVERY tool call]\n\
- <think>\n\
- goal:   <≤12 words: what must succeed right now>\n\
- step:   <which plan step number (1-7) this tool call belongs to>\n\
- risk:   <≤12 words: most likely failure mode>\n\
-doubt:  <≤12 words: one reason this approach could be wrong>\n\
-next:   <≤12 words: exact command or step>\n\
-verify: <≤12 words: how to confirm this step succeeded>\n\
-</think>\n\
-Keep each field under 15 words. This 6-line check (~60 tokens) prevents\n\
-wrong-direction errors that cost 300+ tokens to recover from.\n\
-\n\
-[Error Protocol]\n\
-If exit_code ≠ 0: STOP. Quote the exact error. State root cause in one sentence.\n\
-Fix with one corrected command. If the SAME approach fails 3 consecutive times:\n\
-abandon it, explain why, and propose a completely different strategy.";
 
 // ── Tool definition ───────────────────────────────────────────────────────────
 
@@ -350,6 +329,8 @@ pub fn glob_tool_def() -> serde_json::Value {
 }
 
 pub fn done_tool_def() -> serde_json::Value {
+    let acceptance_evidence_required = governor_contract::done_acceptance_evidence_fields();
+    let required_args = governor_contract::done_required_args();
     json!({
         "type": "function",
         "function": {
@@ -363,12 +344,44 @@ pub fn done_tool_def() -> serde_json::Value {
                         "type": "string",
                         "description": "Brief [DONE] summary: what was built/changed and where it lives."
                     },
+                    "completed_acceptance": {
+                        "type": "array",
+                        "description": "Current plan acceptance criteria that are already satisfied. Cite by number and/or criterion text.",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "remaining_acceptance": {
+                        "type": "array",
+                        "description": "Current plan acceptance criteria that are still not satisfied. Must cover the rest of the current plan criteria.",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "acceptance_evidence": {
+                        "type": "array",
+                        "description": "For each completed acceptance criterion, cite the real verification command that proved it.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "criterion": {
+                                    "type": "string",
+                                    "description": "Acceptance criterion reference by number and/or text."
+                                },
+                                "command": {
+                                    "type": "string",
+                                    "description": "Verification command that already succeeded for this criterion."
+                                }
+                            },
+                            "required": acceptance_evidence_required
+                        }
+                    },
                     "next_steps": {
                         "type": "string",
                         "description": "How to run/verify, or any follow-up work."
                     }
                 },
-                "required": ["summary"]
+                "required": required_args
             }
         }
     })
@@ -387,7 +400,8 @@ You are an autonomous coding agent with 9 tools:\n\
   search_files(pattern, dir?, ci?)          — find text across files (like grep -rn)\n\
   list_dir(dir?, max_entries?, include_hidden?) — list a directory (non-recursive)\n\
   glob(pattern, dir?)                       — find files by name pattern (like find -name)\n\
-  done(summary, next_steps?)                — finish the task and end the loop\n\
+  done(summary, completed_acceptance, remaining_acceptance, acceptance_evidence, next_steps?)\n\
+                                           — finish the task and end the loop\n\
 \n\
 RULE: You MUST call a tool on every single turn. Never respond with text only.\n\
 \n\
@@ -409,6 +423,7 @@ PRIORITY (safety-first default when unsure):\n\
 \n\
 Plan enforcement:\n\
   - Every tool call MUST map to a step in your <plan>. If not, update <plan> first.\n\
+  - Your <plan> MUST include explicit `acceptance:` criteria. Verification must satisfy them.\n\
 \n\
 Choose the right tool:\n\
   Quick directory listing  → list_dir      (structure discovery, low token)\n\
@@ -432,13 +447,116 @@ After every build/test: confirm exit_code == 0 before proceeding.\n\
 \n\
 When ALL steps from your <plan> are verified complete:\n\
   call exec one final time to run a smoke test or confirm the deliverable exists,\n\
-  then call done with a brief summary: what was built, where it lives, how to run it.\n\
+  then call done with: (1) a brief summary, (2) which acceptance criteria are satisfied,\n\
+  (3) which acceptance criteria remain, if any, and (4) the exact verification command used for each completed criterion.\n\
   Do NOT call done while any command is still failing.";
+
+fn has_in_path(cmd: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let exts: Vec<String> = if cfg!(target_os = "windows") {
+        let pathext =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string());
+        pathext
+            .split(';')
+            .map(|e| e.trim())
+            .filter(|e| !e.is_empty())
+            .map(|e| e.to_ascii_lowercase())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for dir in std::env::split_paths(&path) {
+        if cfg!(target_os = "windows") {
+            for ext in &exts {
+                let name = if ext.is_empty() {
+                    cmd.to_string()
+                } else if cmd.to_ascii_lowercase().ends_with(ext) {
+                    cmd.to_string()
+                } else {
+                    format!("{cmd}{ext}")
+                };
+                if dir.join(&name).is_file() {
+                    return true;
+                }
+            }
+        } else if dir.join(cmd).is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+fn host_capability_addon() -> String {
+    let os = if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unknown"
+    };
+
+    let bash = has_in_path("bash");
+    let sh = has_in_path("sh");
+    let shell = if cfg!(target_os = "windows") {
+        "powershell"
+    } else if bash {
+        "bash"
+    } else if sh {
+        "sh"
+    } else {
+        "unknown"
+    };
+
+    let mut has: Vec<&'static str> = Vec::new();
+    if has_in_path("git") {
+        has.push("git");
+    }
+    if has_in_path("rg") {
+        has.push("rg");
+    }
+    if has_in_path("node") {
+        has.push("node");
+    }
+    if has_in_path("python3") {
+        has.push("python3");
+    } else if has_in_path("python") {
+        has.push("python");
+    }
+    if has_in_path("cargo") {
+        has.push("cargo");
+    }
+    if has_in_path("npm") {
+        has.push("npm");
+    }
+
+    let has_list = if has.is_empty() {
+        "(none detected)".to_string()
+    } else {
+        has.join(", ")
+    };
+
+    format!(
+        "[Host Capability Probe]\n\
+os: {os}\n\
+exec_shell: {shell}\n\
+tools_in_path: {has_list}\n\
+Rules:\n\
+- If os != windows: do NOT use PowerShell syntax.\n\
+- Prefer built-in tools (list_dir/search_files/glob) over exec-based discovery.\n\
+- Use bash-compatible syntax only when exec_shell=bash."
+    )
+}
 
 /// Build the full Coder system prompt: base + scratchpad + OS rules + persona + language.
 pub fn coder_system(persona_prompt: &str, lang_instruction: &str) -> String {
     let mut s = CODER_BASE_SYSTEM.to_string();
-    s.push_str(SCRATCHPAD_ADDON);
+    s.push_str(&governor_contract::scratchpad_addon());
+    s.push_str("\n\n");
+    s.push_str(&host_capability_addon());
     if cfg!(target_os = "windows") {
         s.push_str(WIN_SYSTEM_ADDON);
     }
@@ -503,6 +621,30 @@ fn truncate_preview(s: &str, max_chars: usize, max_lines: usize) -> String {
         lines += 1;
     }
     out.trim_end().to_string()
+}
+
+fn compact_one_line(s: &str, max_chars: usize) -> String {
+    let flat = s
+        .replace("\r\n", "\n")
+        .lines()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let collapsed = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    let mut n = 0usize;
+    for ch in collapsed.chars() {
+        if n >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+        n += 1;
+    }
+    if out.is_empty() {
+        "-".to_string()
+    } else {
+        out
+    }
 }
 
 fn approx_tokens_text(s: &str) -> usize {
@@ -709,6 +851,9 @@ fn classify_error(stderr: &str, stdout: &str) -> ErrorClass {
         || low.contains("network unreachable")
         || low.contains("could not connect")
         || low.contains("name resolution failed")
+        || low.contains("could not resolve host")
+        || low.contains("couldn't resolve host")
+        || low.contains("temporary failure in name resolution")
     {
         ErrorClass::Network
     } else if low.contains("assertion")
@@ -729,8 +874,13 @@ fn error_class_hint(class: &ErrorClass) -> &'static str {
             "⚠ ENVIRONMENT ERROR: The binary/permission is missing. Fix the environment first — do NOT modify source code.",
         ErrorClass::Syntax =>
             "⚠ SYNTAX ERROR: There is a language/parser mistake. Fix the exact line — do NOT change unrelated code.",
-        ErrorClass::Path =>
-            "⚠ PATH ERROR: A file or directory is missing. Verify paths with ls/Get-ChildItem before creating or reading.",
+        ErrorClass::Path => {
+            if cfg!(target_os = "windows") {
+                "⚠ PATH ERROR: A file or directory is missing. Verify paths with Get-ChildItem/dir before creating or reading."
+            } else {
+                "⚠ PATH ERROR: A file or directory is missing. Verify paths with ls before creating or reading."
+            }
+        }
         ErrorClass::Dependency =>
             "⚠ DEPENDENCY ERROR: A required package is missing. Install it first, then retry the original command.",
         ErrorClass::Network =>
@@ -758,6 +908,23 @@ fn specific_recovery_hint(stderr: &str, stdout: &str) -> &'static str {
 - For GitHub, prefer SSH-over-443:\n\
   git push ssh://git@ssh.github.com:443/<owner>/<repo>.git main\n\
   (and similarly for fetch/pull).";
+    }
+
+    let dns_failure = low.contains("could not resolve host")
+        || low.contains("couldn't resolve host")
+        || low.contains("temporary failure in name resolution")
+        || low.contains("name resolution failed");
+    if dns_failure && (low.contains("crates.io") || low.contains("index.crates.io")) {
+        return "HINT: Cargo could not reach crates.io/index (DNS/network failure).\n\
+- If this environment is offline/sandboxed, you cannot download new crates; stop retrying `cargo` in a loop.\n\
+- Try `cargo ... --offline` only if dependencies are already cached.\n\
+- Otherwise proceed with static edits and defer builds/tests to a networked environment.";
+    }
+    if dns_failure {
+        return "HINT: Network/DNS failure (host name resolution failed).\n\
+- Stop retrying the same command.\n\
+- Check connectivity and clear proxy env vars if needed (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY).\n\
+- If running in an offline sandbox, installs/downloads will not work; switch to an offline strategy.";
     }
 
     // Windows: `cargo run` cannot overwrite a running .exe (locked file handle).
@@ -972,9 +1139,66 @@ enum ExecKind {
     Verify,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+enum VerificationLevel {
+    #[default]
+    Build,
+    Behavioral,
+}
+
+impl VerificationLevel {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Behavioral => "behavioral",
+        }
+    }
+
+    fn satisfies(self, required: Self) -> bool {
+        matches!(
+            (self, required),
+            (VerificationLevel::Behavioral, _)
+                | (VerificationLevel::Build, VerificationLevel::Build)
+        )
+    }
+
+    fn max(self, other: Self) -> Self {
+        if self >= other {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct GoalCheckStatus {
+    attempts: usize,
+    ok: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GoalCheckTracker {
+    repo: GoalCheckStatus,
+    tests: GoalCheckStatus,
+    build: GoalCheckStatus,
+}
+
+impl GoalCheckTracker {
+    fn get_mut(&mut self, key: &str) -> Option<&mut GoalCheckStatus> {
+        match key {
+            "repo" => Some(&mut self.repo),
+            "tests" => Some(&mut self.tests),
+            "build" => Some(&mut self.build),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct RecoveryGovernor {
     stage: Option<RecoveryStage>,
+    required_verification: VerificationLevel,
 }
 
 impl RecoveryGovernor {
@@ -991,8 +1215,15 @@ impl RecoveryGovernor {
         self.stage.is_some()
     }
 
-    fn restore_from_session(mem: &FailureMemory, messages: &[serde_json::Value]) -> Self {
-        let mut g = RecoveryGovernor::default();
+    fn restore_from_session(
+        mem: &FailureMemory,
+        messages: &[serde_json::Value],
+        required_verification: VerificationLevel,
+    ) -> Self {
+        let mut g = RecoveryGovernor {
+            stage: None,
+            required_verification,
+        };
         if mem.consecutive_failures > 0 || last_tool_looks_failed(messages) {
             g.stage = Some(RecoveryStage::Diagnose);
         }
@@ -1029,14 +1260,19 @@ Required now: run diagnostics first (e.g. `pwd`, `ls`/`dir`, `git status`, `git 
                 if name == "exec" {
                     let cmd =
                         parse_exec_command_from_args(tc.arguments.as_str()).unwrap_or_default();
-                    if is_verify_command(cmd.as_str(), test_cmd) {
+                    let verify_level = classify_verify_level(cmd.as_str(), test_cmd);
+                    if verify_level
+                        .map(|level| level.satisfies(self.required_verification))
+                        .unwrap_or(false)
+                    {
                         return None;
                     }
                 }
                 Some(format!(
                     "[Recovery Gate] stage=verify\n\
 You already applied a fix. Verify before continuing.\n\
-Required now: run ONE verification command (tests or `git status`)."
+Required now: {}",
+                    verification_requirement_hint(self.required_verification, test_cmd)
                 ))
             }
         }
@@ -1056,7 +1292,7 @@ Required now: run ONE verification command (tests or `git status`)."
         }
     }
 
-    fn on_fix_result(&mut self, ok: bool, verified: bool) {
+    fn on_fix_result(&mut self, ok: bool, verified_level: Option<VerificationLevel>) {
         if !self.in_recovery() && !ok {
             self.stage = Some(RecoveryStage::Diagnose);
             return;
@@ -1065,7 +1301,10 @@ Required now: run ONE verification command (tests or `git status`)."
             self.stage = Some(RecoveryStage::Diagnose);
             return;
         }
-        if verified {
+        if verified_level
+            .map(|level| level.satisfies(self.required_verification))
+            .unwrap_or(false)
+        {
             self.stage = None;
             return;
         }
@@ -1077,12 +1316,21 @@ Required now: run ONE verification command (tests or `git status`)."
         }
     }
 
-    fn on_exec_result(&mut self, kind: ExecKind, ok: bool) {
+    fn on_exec_result(
+        &mut self,
+        kind: ExecKind,
+        verify_level: Option<VerificationLevel>,
+        ok: bool,
+    ) {
         if !ok {
             self.stage = Some(RecoveryStage::Diagnose);
             return;
         }
-        if kind == ExecKind::Verify {
+        if kind == ExecKind::Verify
+            && verify_level
+                .map(|level| level.satisfies(self.required_verification))
+                .unwrap_or(false)
+        {
             // A successful verification ends recovery regardless of the current stage.
             self.stage = None;
             return;
@@ -1115,6 +1363,1653 @@ struct FailureMemory {
     last_error_class: ErrorClass,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoalDelta {
+    Closer,
+    Same,
+    Farther,
+    Unknown,
+}
+
+impl GoalDelta {
+    fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "closer" => Self::Closer,
+            "same" => Self::Same,
+            "farther" | "further" => Self::Farther,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Closer => "closer",
+            Self::Same => "same",
+            Self::Farther => "farther",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrategyChange {
+    Keep,
+    Adjust,
+    Abandon,
+    Unknown,
+}
+
+impl StrategyChange {
+    fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "keep" => Self::Keep,
+            "adjust" => Self::Adjust,
+            "abandon" => Self::Abandon,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Adjust => "adjust",
+            Self::Abandon => "abandon",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PlanBlock {
+    goal: String,
+    steps: Vec<String>,
+    acceptance_criteria: Vec<String>,
+    risks: String,
+    assumptions: String,
+}
+
+#[derive(Debug, Clone)]
+struct ThinkBlock {
+    goal: String,
+    step: usize,
+    tool: String,
+    risk: String,
+    doubt: String,
+    next: String,
+    verify: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReflectionBlock {
+    last_outcome: String,
+    goal_delta: GoalDelta,
+    wrong_assumption: String,
+    strategy_change: StrategyChange,
+    next_minimal_action: String,
+}
+
+#[derive(Debug, Clone)]
+struct ImpactBlock {
+    changed: String,
+    progress: String,
+    remaining_gap: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkingMemory {
+    facts: Vec<String>,
+    completed_steps: Vec<String>,
+    successful_verifications: Vec<String>,
+    chosen_strategy: Option<String>,
+}
+
+impl WorkingMemory {
+    fn is_empty(&self) -> bool {
+        self.facts.is_empty()
+            && self.completed_steps.is_empty()
+            && self.successful_verifications.is_empty()
+            && self
+                .chosen_strategy
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+    }
+
+    fn remember_fact(&mut self, fact: &str) {
+        remember_recent_unique(&mut self.facts, fact, 6, 120);
+    }
+
+    fn remember_completed_step(&mut self, step: &str) {
+        remember_recent_unique(&mut self.completed_steps, step, 7, 120);
+    }
+
+    fn remember_successful_verification(&mut self, command: &str) {
+        remember_recent_unique(&mut self.successful_verifications, command, 4, 120);
+    }
+
+    fn set_strategy(&mut self, strategy: &str) {
+        let value = compact_one_line(strategy.trim(), 140);
+        if value == "-" {
+            return;
+        }
+        self.chosen_strategy = Some(value);
+    }
+
+    fn sync_to_plan(&mut self, plan: &PlanBlock) {
+        self.completed_steps.retain(|step| {
+            let want = normalize_memory_entry(step);
+            plan.steps
+                .iter()
+                .any(|candidate| normalize_memory_entry(candidate) == want)
+        });
+    }
+
+    fn from_messages(messages: &[serde_json::Value], test_cmd: Option<&str>) -> Self {
+        #[derive(Debug, Clone)]
+        struct PendingToolIntent {
+            name: String,
+            command: Option<String>,
+            next_action: Option<String>,
+            step_label: Option<String>,
+        }
+
+        let mut mem = Self::default();
+        let mut active_plan: Option<PlanBlock> = None;
+        let mut pending: std::collections::HashMap<String, PendingToolIntent> =
+            std::collections::HashMap::new();
+
+        for msg in messages {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+
+            if role == "assistant" {
+                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+                if let Some(plan) = parse_plan_block(content).filter(|p| validate_plan(p).is_ok()) {
+                    mem.sync_to_plan(&plan);
+                    active_plan = Some(plan);
+                }
+
+                if let Some(reflect) = parse_reflection_block(content) {
+                    if matches!(
+                        reflect.strategy_change,
+                        StrategyChange::Adjust | StrategyChange::Abandon
+                    ) {
+                        mem.set_strategy(reflect.next_minimal_action.as_str());
+                    }
+                }
+
+                let parsed_think = parse_think_block(content);
+                if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tcs {
+                        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                        if id.is_empty() {
+                            continue;
+                        }
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let args = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let command = if name == "exec" {
+                            parse_exec_command_from_args(args.as_str())
+                        } else {
+                            None
+                        };
+                        let step_label =
+                            resolve_step_label(active_plan.as_ref(), parsed_think.as_ref());
+                        let next_action = parsed_think
+                            .as_ref()
+                            .map(|think| think.next.clone())
+                            .filter(|s| !s.trim().is_empty());
+                        pending.insert(
+                            id.to_string(),
+                            PendingToolIntent {
+                                name,
+                                command,
+                                next_action,
+                                step_label,
+                            },
+                        );
+                    }
+                }
+                continue;
+            }
+
+            if role != "tool" {
+                continue;
+            }
+
+            let id = msg
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if id.is_empty() {
+                continue;
+            }
+
+            let Some(intent) = pending.remove(id) else {
+                continue;
+            };
+
+            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            match intent.name.as_str() {
+                "exec" => {
+                    let command = intent.command.unwrap_or_default();
+                    let (exit_code, stdout, stderr) = parse_exec_tool_output_sections(content);
+                    let Some(exit_code) = exit_code else {
+                        continue;
+                    };
+                    let effective_exit_code = if exit_code == 0
+                        && suspicious_success_reason(stdout.as_str(), stderr.as_str()).is_some()
+                    {
+                        1
+                    } else {
+                        exit_code
+                    };
+                    if effective_exit_code != 0 {
+                        continue;
+                    }
+                    let exec_kind = classify_exec_kind(command.as_str(), test_cmd);
+                    update_working_memory_after_exec(
+                        &mut mem,
+                        command.as_str(),
+                        stdout.as_str(),
+                        content,
+                        exec_kind,
+                        intent.step_label.as_deref(),
+                        intent.next_action.as_deref(),
+                    );
+                }
+                "read_file" | "list_dir" | "glob" | "search_files" | "write_file"
+                | "patch_file" | "apply_diff" => {
+                    if !non_exec_tool_succeeded(content) {
+                        continue;
+                    }
+                    let verified = content.contains("PASSED (exit 0)");
+                    update_working_memory_after_non_exec(
+                        &mut mem,
+                        intent.name.as_str(),
+                        verified,
+                        intent.step_label.as_deref(),
+                        intent.next_action.as_deref(),
+                        test_cmd,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        mem
+    }
+}
+
+fn normalize_memory_entry(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn remember_recent_unique(
+    items: &mut Vec<String>,
+    value: &str,
+    max_items: usize,
+    max_chars: usize,
+) {
+    let candidate = compact_one_line(value.trim(), max_chars);
+    if candidate == "-" {
+        return;
+    }
+    let sig = normalize_memory_entry(candidate.as_str());
+    if sig.is_empty() {
+        return;
+    }
+    if let Some(pos) = items
+        .iter()
+        .position(|existing| normalize_memory_entry(existing) == sig)
+    {
+        items.remove(pos);
+    }
+    items.push(candidate);
+    if items.len() > max_items {
+        let drop_n = items.len() - max_items;
+        items.drain(0..drop_n);
+    }
+}
+
+fn resolve_step_label(plan: Option<&PlanBlock>, think: Option<&ThinkBlock>) -> Option<String> {
+    let plan = plan?;
+    let think = think?;
+    think
+        .step
+        .checked_sub(1)
+        .and_then(|idx| plan.steps.get(idx))
+        .cloned()
+}
+
+fn extract_cwd_from_tool_output(content: &str) -> Option<String> {
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("cwd_after:") {
+            let value = rest.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("cwd:") {
+            let value = rest.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn first_non_empty_line(s: &str) -> Option<&str> {
+    s.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn working_memory_facts_for_exec(command: &str, stdout: &str, tool_output: &str) -> Vec<String> {
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(cwd) = extract_cwd_from_tool_output(tool_output) {
+        facts.push(format!("cwd: {cwd}"));
+    }
+
+    let sig = command_sig(command);
+    if sig.contains("git rev-parse") {
+        if let Some(line) = first_non_empty_line(stdout) {
+            facts.push(format!("git top-level: {}", compact_one_line(line, 120)));
+        }
+    }
+    if sig.contains("git status") {
+        let low = stdout.to_ascii_lowercase();
+        if low.contains("nothing to commit, working tree clean") {
+            facts.push("git working tree: clean".to_string());
+        } else if low.contains("changes not staged")
+            || low.contains("changes to be committed")
+            || low.contains("untracked files")
+        {
+            facts.push("git working tree: dirty".to_string());
+        }
+    }
+
+    facts
+}
+
+fn non_exec_tool_succeeded(content: &str) -> bool {
+    let low = content.to_ascii_lowercase();
+    !low.starts_with("error:")
+        && !low.contains("rejected by user")
+        && !low.contains("governor blocked")
+        && !low.contains("failed (exit_code:")
+}
+
+fn update_working_memory_after_exec(
+    mem: &mut WorkingMemory,
+    command: &str,
+    stdout: &str,
+    tool_output: &str,
+    exec_kind: ExecKind,
+    step_label: Option<&str>,
+    next_action: Option<&str>,
+) {
+    if let Some(next) = next_action {
+        mem.set_strategy(next);
+    }
+    for fact in working_memory_facts_for_exec(command, stdout, tool_output) {
+        mem.remember_fact(fact.as_str());
+    }
+    if exec_kind == ExecKind::Verify {
+        mem.remember_successful_verification(command);
+    }
+    if matches!(exec_kind, ExecKind::Diagnostic | ExecKind::Verify) {
+        if let Some(step) = step_label {
+            mem.remember_completed_step(step);
+        }
+    }
+}
+
+fn update_working_memory_after_non_exec(
+    mem: &mut WorkingMemory,
+    tool_name: &str,
+    verified: bool,
+    step_label: Option<&str>,
+    next_action: Option<&str>,
+    test_cmd: Option<&str>,
+) {
+    if let Some(next) = next_action {
+        mem.set_strategy(next);
+    }
+    if matches!(
+        tool_name,
+        "read_file"
+            | "list_dir"
+            | "glob"
+            | "search_files"
+            | "write_file"
+            | "patch_file"
+            | "apply_diff"
+    ) {
+        if let Some(step) = step_label {
+            mem.remember_completed_step(step);
+        }
+    }
+    if verified {
+        mem.remember_successful_verification(test_cmd.unwrap_or("post-edit auto-test"));
+    }
+}
+
+fn build_working_memory_prompt(mem: &WorkingMemory) -> Option<String> {
+    if mem.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from("[Working Memory]\n");
+
+    if let Some(strategy) = mem
+        .chosen_strategy
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        out.push_str(&format!("Current strategy:\n- {strategy}\n"));
+    }
+    if !mem.facts.is_empty() {
+        out.push_str("Confirmed facts:\n");
+        for fact in &mem.facts {
+            out.push_str(&format!("- {fact}\n"));
+        }
+    }
+    if !mem.completed_steps.is_empty() {
+        out.push_str("Completed steps:\n");
+        for step in &mem.completed_steps {
+            out.push_str(&format!("- {step}\n"));
+        }
+    }
+    if !mem.successful_verifications.is_empty() {
+        out.push_str("Known-good verification commands:\n");
+        for verify in &mem.successful_verifications {
+            out.push_str(&format!("- {verify}\n"));
+        }
+    }
+    out.push_str(
+        "Use this memory to avoid redoing solved work. Re-check only when new tool output contradicts it.",
+    );
+    Some(out)
+}
+
+fn parse_impact_block(text: &str) -> Option<ImpactBlock> {
+    let fields = parse_block_fields(text, "impact")?;
+
+    Some(ImpactBlock {
+        changed: block_text_value(&fields, "changed"),
+        progress: block_text_value(&fields, "progress"),
+        remaining_gap: block_text_value(&fields, "remaining_gap"),
+    })
+}
+
+fn impact_progress_matches_entry(progress: &str, entry: &str) -> bool {
+    let progress_sig = normalize_memory_entry(progress);
+    let entry_sig = normalize_memory_entry(entry);
+    if progress_sig.is_empty() || entry_sig.is_empty() {
+        return false;
+    }
+    progress_sig.contains(&entry_sig) || entry_sig.contains(&progress_sig)
+}
+
+fn impact_progress_matches_plan(progress: &str, plan: &PlanBlock) -> bool {
+    let progress_sig = normalize_memory_entry(progress);
+    if progress_sig.is_empty() {
+        return false;
+    }
+
+    if progress_sig.contains("step") {
+        if let Some(n) = parse_first_usize(progress) {
+            if n <= plan.steps.len() {
+                return true;
+            }
+        }
+    }
+
+    if progress_sig.contains("acceptance")
+        || progress_sig.contains("criterion")
+        || progress_sig.contains("criteria")
+    {
+        if let Some(n) = parse_first_usize(progress) {
+            if n <= plan.acceptance_criteria.len() {
+                return true;
+            }
+        }
+    }
+
+    plan.steps
+        .iter()
+        .any(|step| impact_progress_matches_entry(progress, step))
+        || plan
+            .acceptance_criteria
+            .iter()
+            .any(|criterion| impact_progress_matches_entry(progress, criterion))
+}
+
+fn validate_impact(impact: &ImpactBlock, plan: Option<&PlanBlock>) -> Result<()> {
+    if impact.changed.trim().is_empty() {
+        return Err(anyhow!(governor_contract::impact_missing_changed_message()));
+    }
+    if impact.progress.trim().is_empty() {
+        return Err(anyhow!(governor_contract::impact_missing_progress_message()));
+    }
+    if impact.remaining_gap.trim().is_empty() {
+        return Err(anyhow!(
+            governor_contract::impact_missing_remaining_gap_message()
+        ));
+    }
+    let Some(plan) = plan else {
+        return Err(anyhow!(governor_contract::impact_requires_plan_message()));
+    };
+    if !impact_progress_matches_plan(impact.progress.as_str(), plan) {
+        return Err(anyhow!(
+            governor_contract::impact_invalid_progress_reference_message()
+        ));
+    }
+    Ok(())
+}
+
+fn parse_string_list_arg(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(|item| compact_one_line(item.trim(), 160))
+            .filter(|item| !item.is_empty())
+            .collect(),
+        serde_json::Value::String(s) => parse_plan_items(s),
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoneAcceptanceEvidence {
+    criterion: String,
+    command: String,
+}
+
+fn parse_done_acceptance_evidence(value: &serde_json::Value) -> Vec<DoneAcceptanceEvidence> {
+    let serde_json::Value::Array(items) = value else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let serde_json::Value::Object(map) = item else {
+                return None;
+            };
+            let criterion = map
+                .get("criterion")
+                .and_then(|v| v.as_str())
+                .map(|v| compact_one_line(v.trim(), 160))
+                .filter(|v| !v.is_empty())?;
+            let command = map
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(|v| compact_one_line(v.trim(), 200))
+                .filter(|v| !v.is_empty())?;
+            Some(DoneAcceptanceEvidence { criterion, command })
+        })
+        .collect()
+}
+
+fn resolve_acceptance_reference(reference: &str, plan: &PlanBlock) -> Option<usize> {
+    let reference_sig = normalize_memory_entry(reference);
+    if reference_sig.is_empty() {
+        return None;
+    }
+
+    if reference_sig.contains("acceptance")
+        || reference_sig.contains("criterion")
+        || reference_sig.contains("criteria")
+    {
+        if let Some(n) = parse_first_usize(reference) {
+            if n <= plan.acceptance_criteria.len() {
+                return Some(n - 1);
+            }
+        }
+    }
+
+    plan.acceptance_criteria
+        .iter()
+        .position(|criterion| impact_progress_matches_entry(reference, criterion))
+}
+
+fn acceptance_reference_label(plan: &PlanBlock, idx: usize) -> String {
+    let criterion = plan
+        .acceptance_criteria
+        .get(idx)
+        .map(|s| s.as_str())
+        .unwrap_or("-");
+    format!("acceptance {}: {}", idx + 1, criterion)
+}
+
+fn resolve_known_verification_command<'a>(
+    command: &str,
+    working_mem: &'a WorkingMemory,
+) -> Option<&'a str> {
+    let want = normalize_memory_entry(command);
+    if want.is_empty() {
+        return None;
+    }
+
+    working_mem
+        .successful_verifications
+        .iter()
+        .find(|candidate| {
+            let sig = normalize_memory_entry(candidate);
+            !sig.is_empty() && (sig == want || sig.contains(&want) || want.contains(&sig))
+        })
+        .map(|s| s.as_str())
+}
+
+fn validate_done_acceptance(
+    plan: Option<&PlanBlock>,
+    completed_acceptance: &[String],
+    remaining_acceptance: &[String],
+    acceptance_evidence: &[DoneAcceptanceEvidence],
+    working_mem: &WorkingMemory,
+) -> Result<Vec<(usize, String)>> {
+    let Some(plan) = plan else {
+        return Err(anyhow!(governor_contract::done_requires_plan_message()));
+    };
+
+    if completed_acceptance.is_empty() && remaining_acceptance.is_empty() {
+        return Err(anyhow!(governor_contract::done_missing_criteria_message()));
+    }
+
+    let mut covered = std::collections::BTreeSet::new();
+    let mut completed_indices = std::collections::BTreeSet::new();
+
+    for entry in completed_acceptance {
+        let Some(idx) = resolve_acceptance_reference(entry, plan) else {
+            return Err(anyhow!(
+                governor_contract::done_completed_invalid_reference_message()
+            ));
+        };
+        if !covered.insert(idx) {
+            return Err(anyhow!(governor_contract::done_duplicate_criteria_message()));
+        }
+        completed_indices.insert(idx);
+    }
+
+    for entry in remaining_acceptance {
+        let Some(idx) = resolve_acceptance_reference(entry, plan) else {
+            return Err(anyhow!(
+                governor_contract::done_remaining_invalid_reference_message()
+            ));
+        };
+        if !covered.insert(idx) {
+            return Err(anyhow!(governor_contract::done_duplicate_criteria_message()));
+        }
+    }
+
+    if covered.len() != plan.acceptance_criteria.len() {
+        return Err(anyhow!(
+            governor_contract::done_incomplete_coverage_message()
+        ));
+    }
+
+    if acceptance_evidence.len() != completed_indices.len() {
+        return Err(anyhow!(
+            governor_contract::done_evidence_incomplete_message()
+        ));
+    }
+
+    let mut evidence_rows = Vec::new();
+    let mut evidence_indices = std::collections::BTreeSet::new();
+    for evidence in acceptance_evidence {
+        let Some(idx) = resolve_acceptance_reference(evidence.criterion.as_str(), plan) else {
+            return Err(anyhow!(
+                governor_contract::done_evidence_invalid_reference_message()
+            ));
+        };
+        if !completed_indices.contains(&idx) {
+            return Err(anyhow!(
+                governor_contract::done_evidence_only_completed_message()
+            ));
+        }
+        if !evidence_indices.insert(idx) {
+            return Err(anyhow!(
+                governor_contract::done_evidence_duplicate_criteria_message()
+            ));
+        }
+        let Some(known_command) =
+            resolve_known_verification_command(evidence.command.as_str(), working_mem)
+        else {
+            return Err(anyhow!(
+                governor_contract::done_evidence_unknown_command_message()
+            ));
+        };
+        evidence_rows.push((idx, known_command.to_string()));
+    }
+
+    Ok(evidence_rows)
+}
+
+fn build_impact_prompt(
+    reason: &str,
+    plan: Option<&PlanBlock>,
+    working_mem: &WorkingMemory,
+) -> String {
+    let goal = plan
+        .map(|p| compact_one_line(p.goal.as_str(), 100))
+        .unwrap_or_else(|| "-".to_string());
+
+    let mut out = format!(
+        "[Impact Check Required]\n\
+Reason: {reason}\n\
+Current goal: {goal}\n\
+\n\
+Before your next tool call, emit exactly:\n\
+<impact>\n\
+changed: <one short sentence>\n\
+progress: <which plan step or acceptance criterion moved>\n\
+remaining_gap: <one short sentence>\n\
+</impact>\n\
+\n\
+Rules:\n\
+- Keep the whole block under 60 tokens.\n\
+- Mention the actual mutation effect, not intent.\n\
+- `progress` must name a real step or acceptance criterion.\n\
+- After the <impact> block, call exactly one tool."
+    );
+
+    if !working_mem.completed_steps.is_empty() {
+        out.push_str("\n\n[Already Completed]\n");
+        for step in working_mem.completed_steps.iter().rev().take(2).rev() {
+            out.push_str(&format!("- {step}\n"));
+        }
+    }
+
+    if let Some(plan) = plan {
+        if !plan.steps.is_empty() {
+            out.push_str("\n[Plan Steps]\n");
+            for (idx, step) in plan.steps.iter().enumerate() {
+                out.push_str(&format!("- step {}: {}\n", idx + 1, step));
+            }
+        }
+        if !plan.acceptance_criteria.is_empty() {
+            out.push_str("[Acceptance Criteria]\n");
+            for (idx, criterion) in plan.acceptance_criteria.iter().enumerate() {
+                out.push_str(&format!("- acceptance {}: {}\n", idx + 1, criterion));
+            }
+        }
+    }
+
+    out
+}
+
+fn extract_tag_block<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)?;
+    let rest = &text[start + open.len()..];
+    let end = rest.find(&close)?;
+    Some(rest[..end].trim())
+}
+
+fn parse_tag_fields(body: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut current_key: Option<String> = None;
+    let mut current_value = String::new();
+
+    for raw_line in body.lines() {
+        let line = raw_line.trim();
+        if let Some((k, v)) = line.split_once(':') {
+            if let Some(key) = current_key.take() {
+                out.push((key, current_value.trim().to_string()));
+            }
+            current_key = Some(k.trim().to_ascii_lowercase());
+            current_value = v.trim().to_string();
+            continue;
+        }
+
+        if current_key.is_some() && !line.is_empty() {
+            if !current_value.is_empty() {
+                current_value.push(' ');
+            }
+            current_value.push_str(line);
+        }
+    }
+
+    if let Some(key) = current_key {
+        out.push((key, current_value.trim().to_string()));
+    }
+
+    out
+}
+
+fn parse_first_usize(s: &str) -> Option<usize> {
+    let mut digits = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if !digits.is_empty() {
+            break;
+        }
+    }
+    digits.parse::<usize>().ok().filter(|n| *n > 0)
+}
+
+#[derive(Debug, Clone)]
+enum ParsedBlockValue {
+    Text(String),
+    List(Vec<String>),
+    PositiveInt(usize),
+    Canonical(String),
+}
+
+impl ParsedBlockValue {
+    fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(value) | Self::Canonical(value) => Some(value.as_str()),
+            Self::List(_) | Self::PositiveInt(_) => None,
+        }
+    }
+
+    fn as_list(&self) -> Option<&[String]> {
+        match self {
+            Self::List(items) => Some(items.as_slice()),
+            Self::Text(_) | Self::PositiveInt(_) | Self::Canonical(_) => None,
+        }
+    }
+
+    fn as_positive_int(&self) -> Option<usize> {
+        match self {
+            Self::PositiveInt(value) => Some(*value),
+            Self::Text(_) | Self::List(_) | Self::Canonical(_) => None,
+        }
+    }
+}
+
+fn parse_numbered_steps(s: &str) -> Vec<String> {
+    let normalized = s.replace("\r\n", "\n").replace('\n', " ");
+    let bytes = normalized.as_bytes();
+    let mut markers: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            let marker_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < bytes.len() && matches!(bytes[i], b')' | b'.' | b':' | b'-') {
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                markers.push((marker_start, i));
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    if markers.is_empty() {
+        return Vec::new();
+    }
+
+    let mut steps = Vec::new();
+    for (idx, (_, content_start)) in markers.iter().enumerate() {
+        let content_end = markers
+            .get(idx + 1)
+            .map(|(next_start, _)| *next_start)
+            .unwrap_or(normalized.len());
+        let step = normalized[*content_start..content_end]
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        if !step.is_empty() {
+            steps.push(step);
+        }
+    }
+
+    steps
+}
+
+fn parse_plan_items(s: &str) -> Vec<String> {
+    let numbered = parse_numbered_steps(s);
+    if !numbered.is_empty() {
+        return numbered;
+    }
+
+    s.replace("\r\n", "\n")
+        .split(['\n', ';'])
+        .map(|part| compact_one_line(part.trim(), 120))
+        .filter(|part| part != "-")
+        .collect()
+}
+
+fn parse_block_fields(text: &str, tag: &str) -> Option<BTreeMap<String, ParsedBlockValue>> {
+    let body = extract_tag_block(text, tag)?;
+    let mut out = BTreeMap::new();
+
+    for (raw_key, raw_value) in parse_tag_fields(body) {
+        let Some(field) = governor_contract::block_field(tag, raw_key.as_str()) else {
+            continue;
+        };
+        let parsed = match field.kind.as_deref() {
+            Some("list") => ParsedBlockValue::List(parse_plan_items(raw_value.as_str())),
+            Some("positive_int") => {
+                ParsedBlockValue::PositiveInt(parse_first_usize(raw_value.as_str()).unwrap_or(0))
+            }
+            Some("tool_name") | Some("enum") => ParsedBlockValue::Canonical(
+                governor_contract::canonical_field_value(
+                    tag,
+                    field.key.as_str(),
+                    raw_value.as_str(),
+                )
+                .unwrap_or_default(),
+            ),
+            _ => ParsedBlockValue::Text(raw_value),
+        };
+        out.insert(field.key.clone(), parsed);
+    }
+
+    Some(out)
+}
+
+fn block_text_value(fields: &BTreeMap<String, ParsedBlockValue>, key: &str) -> String {
+    fields
+        .get(key)
+        .and_then(ParsedBlockValue::as_text)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn block_list_value(fields: &BTreeMap<String, ParsedBlockValue>, key: &str) -> Vec<String> {
+    fields
+        .get(key)
+        .and_then(ParsedBlockValue::as_list)
+        .map(|items| items.to_vec())
+        .unwrap_or_default()
+}
+
+fn block_usize_value(fields: &BTreeMap<String, ParsedBlockValue>, key: &str) -> usize {
+    fields
+        .get(key)
+        .and_then(ParsedBlockValue::as_positive_int)
+        .unwrap_or(0)
+}
+
+fn plan_field_min_items(key: &str) -> Option<usize> {
+    governor_contract::block_field("plan", key).and_then(|field| field.min_items)
+}
+
+fn plan_field_max_items(key: &str) -> Option<usize> {
+    governor_contract::block_field("plan", key).and_then(|field| field.max_items)
+}
+
+fn parse_plan_block(text: &str) -> Option<PlanBlock> {
+    let fields = parse_block_fields(text, "plan")?;
+
+    Some(PlanBlock {
+        goal: block_text_value(&fields, "goal"),
+        steps: block_list_value(&fields, "steps"),
+        acceptance_criteria: block_list_value(&fields, "acceptance"),
+        risks: block_text_value(&fields, "risks"),
+        assumptions: block_text_value(&fields, "assumptions"),
+    })
+}
+
+fn parse_think_block(text: &str) -> Option<ThinkBlock> {
+    let fields = parse_block_fields(text, "think")?;
+
+    Some(ThinkBlock {
+        goal: block_text_value(&fields, "goal"),
+        step: block_usize_value(&fields, "step"),
+        tool: block_text_value(&fields, "tool"),
+        risk: block_text_value(&fields, "risk"),
+        doubt: block_text_value(&fields, "doubt"),
+        next: block_text_value(&fields, "next"),
+        verify: block_text_value(&fields, "verify"),
+    })
+}
+
+fn parse_reflection_block(text: &str) -> Option<ReflectionBlock> {
+    let fields = parse_block_fields(text, "reflect")?;
+
+    Some(ReflectionBlock {
+        last_outcome: block_text_value(&fields, "last_outcome"),
+        goal_delta: GoalDelta::parse(block_text_value(&fields, "goal_delta").as_str()),
+        wrong_assumption: block_text_value(&fields, "wrong_assumption"),
+        strategy_change: StrategyChange::parse(
+            block_text_value(&fields, "strategy_change").as_str(),
+        ),
+        next_minimal_action: block_text_value(&fields, "next_minimal_action"),
+    })
+}
+
+fn last_plan_from_messages(messages: &[serde_json::Value]) -> Option<PlanBlock> {
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if let Some(plan) = parse_plan_block(content) {
+            return Some(plan);
+        }
+    }
+    None
+}
+
+fn last_reflection_from_messages(messages: &[serde_json::Value]) -> Option<ReflectionBlock> {
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if let Some(r) = parse_reflection_block(content) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+fn infer_required_verification_level(
+    root_user_text: &str,
+    test_cmd: Option<&str>,
+) -> VerificationLevel {
+    let low = root_user_text.to_ascii_lowercase();
+    let verification = governor_contract::verification();
+    let looks_doc_only = text_contains_any(&low, &verification.intent_doc_terms)
+        && !text_contains_any(&low, &verification.intent_behavioral_terms);
+    if looks_doc_only {
+        return VerificationLevel::Build;
+    }
+    if test_cmd.is_some() || text_contains_any(&low, &verification.intent_behavioral_terms) {
+        return VerificationLevel::Behavioral;
+    }
+    VerificationLevel::Build
+}
+
+fn verification_level_from_plan(plan: &PlanBlock) -> Option<VerificationLevel> {
+    if plan.acceptance_criteria.is_empty() {
+        return None;
+    }
+
+    let verification = governor_contract::verification();
+
+    let mut saw_build_like = false;
+    for criterion in &plan.acceptance_criteria {
+        let low = criterion.to_ascii_lowercase();
+        if text_contains_any(&low, &verification.plan_behavioral_terms) {
+            return Some(VerificationLevel::Behavioral);
+        }
+        if text_contains_any(&low, &verification.plan_build_terms) {
+            saw_build_like = true;
+            continue;
+        }
+        return Some(VerificationLevel::Behavioral);
+    }
+
+    if saw_build_like {
+        Some(VerificationLevel::Build)
+    } else {
+        None
+    }
+}
+
+fn verification_level_for_mutation_path(path: &str) -> VerificationLevel {
+    let low = path.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return VerificationLevel::Build;
+    }
+    let verification = governor_contract::verification();
+    if text_contains_any(&low, &verification.doc_path_terms) {
+        return VerificationLevel::Build;
+    }
+
+    if verification
+        .behavioral_path_extensions
+        .iter()
+        .any(|ext| low.ends_with(ext))
+    {
+        return VerificationLevel::Behavioral;
+    }
+
+    VerificationLevel::Build
+}
+
+fn effective_verify_ok_step(
+    required: VerificationLevel,
+    last_build_verify_ok_step: Option<usize>,
+    last_behavioral_verify_ok_step: Option<usize>,
+) -> Option<usize> {
+    match required {
+        VerificationLevel::Build => last_build_verify_ok_step
+            .into_iter()
+            .chain(last_behavioral_verify_ok_step)
+            .max(),
+        VerificationLevel::Behavioral => last_behavioral_verify_ok_step,
+    }
+}
+
+fn upgrade_required_verification_from_messages(
+    messages: &[serde_json::Value],
+    base: VerificationLevel,
+) -> VerificationLevel {
+    let mut required = base;
+    let mut by_id: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role == "assistant" {
+            let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for tc in tcs {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let args = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let path = if matches!(name.as_str(), "write_file" | "patch_file" | "apply_diff") {
+                    serde_json::from_str::<serde_json::Value>(args)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("path")
+                                .and_then(|p| p.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                by_id.insert(id.to_string(), (name, path));
+            }
+            continue;
+        }
+
+        if role != "tool" {
+            continue;
+        }
+
+        let id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if id.is_empty() {
+            continue;
+        }
+        let Some((name, path)) = by_id.remove(id) else {
+            continue;
+        };
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if matches!(name.as_str(), "write_file" | "patch_file" | "apply_diff")
+            && content.contains("[hash]")
+        {
+            required = required.max(verification_level_for_mutation_path(path.as_str()));
+        }
+    }
+
+    required
+}
+
+fn last_impact_step_from_messages(messages: &[serde_json::Value]) -> Option<usize> {
+    let mut step_seq = 0usize;
+    let mut last_impact_step = None;
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role == "assistant" {
+            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if parse_impact_block(content).is_some() {
+                last_impact_step = Some(step_seq);
+            }
+            continue;
+        }
+
+        if role == "tool" {
+            step_seq = step_seq.saturating_add(1);
+        }
+    }
+
+    last_impact_step
+}
+
+fn restore_done_gate_from_messages(
+    messages: &[serde_json::Value],
+    test_cmd: Option<&str>,
+) -> (
+    usize,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+) {
+    // step_seq counts tool results (role=tool) so we can compare "mutation happened after verify"
+    // even across resumed sessions.
+    let mut step_seq: usize = 0;
+    let mut last_mutation_step: Option<usize> = None;
+    let mut last_build_verify_ok_step: Option<usize> = None;
+    let mut last_behavioral_verify_ok_step: Option<usize> = None;
+    let mut last_exec_step: Option<usize> = None;
+
+    // Map tool_call_id -> (tool_name, exec_command?)
+    let mut by_id: std::collections::HashMap<String, (String, Option<String>)> =
+        std::collections::HashMap::new();
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role == "assistant" {
+            let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for tc in tcs {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let args = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let cmd = if name == "exec" {
+                    parse_exec_command_from_args(&args)
+                } else {
+                    None
+                };
+                by_id.insert(id.to_string(), (name, cmd));
+            }
+            continue;
+        }
+
+        if role != "tool" {
+            continue;
+        }
+
+        step_seq = step_seq.saturating_add(1);
+
+        let id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if id.is_empty() {
+            continue;
+        }
+        let Some((name, cmd)) = by_id.remove(id) else {
+            continue;
+        };
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+        if name == "exec" {
+            last_exec_step = Some(step_seq);
+            let (exit_code, stdout, stderr) = parse_exec_tool_output_sections(content);
+            let Some(exit_code) = exit_code else {
+                continue;
+            };
+            let cmd = cmd.unwrap_or_default();
+            let verify_level = classify_verify_level(&cmd, test_cmd);
+            let kind = classify_exec_kind(&cmd, test_cmd);
+            if exit_code == 0 && suspicious_success_reason(&stdout, &stderr).is_none() {
+                match kind {
+                    ExecKind::Action => last_mutation_step = Some(step_seq),
+                    ExecKind::Verify => match verify_level {
+                        Some(VerificationLevel::Build) => {
+                            last_build_verify_ok_step = Some(step_seq)
+                        }
+                        Some(VerificationLevel::Behavioral) => {
+                            last_behavioral_verify_ok_step = Some(step_seq)
+                        }
+                        None => {}
+                    },
+                    ExecKind::Diagnostic => {}
+                }
+            }
+            continue;
+        }
+
+        if matches!(name.as_str(), "write_file" | "patch_file" | "apply_diff") {
+            // Successful edits always append a hash line.
+            if content.contains("[hash]") {
+                last_mutation_step = Some(step_seq);
+            }
+            // Auto-test success (if configured) also counts as verification.
+            if content.contains("PASSED (exit 0)") {
+                match configured_test_cmd_verification_level(test_cmd) {
+                    Some(VerificationLevel::Build) => last_build_verify_ok_step = Some(step_seq),
+                    Some(VerificationLevel::Behavioral) => {
+                        last_behavioral_verify_ok_step = Some(step_seq)
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    (
+        step_seq,
+        last_mutation_step,
+        last_build_verify_ok_step,
+        last_behavioral_verify_ok_step,
+        last_exec_step,
+    )
+}
+
+fn validate_plan(plan: &PlanBlock) -> Result<()> {
+    if plan.goal.trim().is_empty() {
+        return Err(anyhow!(governor_contract::plan_missing_goal_message()));
+    }
+    let min_steps = plan_field_min_items("steps").unwrap_or(2);
+    let max_steps = plan_field_max_items("steps").unwrap_or(7);
+    let min_acceptance = plan_field_min_items("acceptance").unwrap_or(1);
+    let max_acceptance = plan_field_max_items("acceptance").unwrap_or(4);
+    if plan.steps.is_empty() {
+        return Err(anyhow!(governor_contract::plan_missing_steps_message()));
+    }
+    if plan.steps.len() < min_steps {
+        return Err(anyhow!(governor_contract::plan_min_steps_message(
+            min_steps
+        )));
+    }
+    if plan.steps.len() > max_steps {
+        return Err(anyhow!(governor_contract::plan_max_steps_message(
+            max_steps
+        )));
+    }
+    if plan.acceptance_criteria.is_empty() {
+        return Err(anyhow!(governor_contract::plan_missing_acceptance_message()));
+    }
+    if plan.acceptance_criteria.len() < min_acceptance {
+        return Err(anyhow!(governor_contract::plan_min_acceptance_message(
+            min_acceptance
+        )));
+    }
+    if plan.acceptance_criteria.len() > max_acceptance {
+        return Err(anyhow!(governor_contract::plan_max_acceptance_message(
+            max_acceptance
+        )));
+    }
+    if plan.risks.trim().is_empty() {
+        return Err(anyhow!(governor_contract::plan_missing_risks_message()));
+    }
+    if plan.assumptions.trim().is_empty() {
+        return Err(anyhow!(
+            governor_contract::plan_missing_assumptions_message()
+        ));
+    }
+    if plan.steps.iter().any(|step| step.trim().is_empty()) {
+        return Err(anyhow!(governor_contract::plan_empty_step_message()));
+    }
+    if plan
+        .acceptance_criteria
+        .iter()
+        .any(|criterion| criterion.trim().is_empty())
+    {
+        return Err(anyhow!(governor_contract::plan_empty_acceptance_message()));
+    }
+    Ok(())
+}
+
+fn think_next_matches_exec_command(next: &str, command: &str) -> bool {
+    let next_sig = command_sig(next);
+    let cmd_sig = command_sig(command);
+    if next_sig.is_empty() || cmd_sig.is_empty() {
+        return false;
+    }
+    if cmd_sig.contains(&next_sig) || next_sig.contains(&cmd_sig) {
+        return true;
+    }
+
+    let next_prefix = next_sig
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cmd_prefix = cmd_sig
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    !next_prefix.is_empty() && next_prefix == cmd_prefix
+}
+
+fn validate_think(think: &ThinkBlock, plan: &PlanBlock, tc: &ToolCallData) -> Result<()> {
+    if think.goal.trim().is_empty() {
+        return Err(anyhow!(governor_contract::think_missing_goal_message()));
+    }
+    if think.step == 0 {
+        return Err(anyhow!(governor_contract::think_invalid_step_message()));
+    }
+    if think.step > plan.steps.len() {
+        return Err(anyhow!(governor_contract::think_step_out_of_range_message(
+            think.step,
+            plan.steps.len()
+        )));
+    }
+    if think.tool.trim().is_empty() {
+        return Err(anyhow!(governor_contract::think_invalid_tool_message()));
+    }
+    if think.risk.trim().is_empty() {
+        return Err(anyhow!(governor_contract::think_missing_risk_message()));
+    }
+    if think.doubt.trim().is_empty() {
+        return Err(anyhow!(governor_contract::think_missing_doubt_message()));
+    }
+    if think.next.trim().is_empty() {
+        return Err(anyhow!(governor_contract::think_missing_next_message()));
+    }
+    if think.verify.trim().is_empty() {
+        return Err(anyhow!(governor_contract::think_missing_verify_message()));
+    }
+    if think.tool != tc.name {
+        return Err(anyhow!(governor_contract::think_tool_mismatch_message(
+            &think.tool,
+            &tc.name
+        )));
+    }
+
+    if tc.name == "exec" {
+        let command = parse_exec_command_from_args(&tc.arguments)
+            .unwrap_or_else(|| tc.arguments.trim().to_string());
+        if !think_next_matches_exec_command(&think.next, &command) {
+            return Err(anyhow!(
+                governor_contract::think_exec_prefix_mismatch_message()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_reflection(
+    r: &ReflectionBlock,
+    mem: &FailureMemory,
+    file_tool_consec_failures: usize,
+) -> Result<()> {
+    if r.last_outcome.trim().is_empty() {
+        return Err(anyhow!(
+            governor_contract::reflection_missing_last_outcome_message()
+        ));
+    }
+    if r.wrong_assumption.trim().is_empty() {
+        return Err(anyhow!(
+            governor_contract::reflection_missing_wrong_assumption_message()
+        ));
+    }
+    if r.next_minimal_action.trim().is_empty() {
+        return Err(anyhow!(
+            governor_contract::reflection_missing_next_minimal_action_message()
+        ));
+    }
+    if r.goal_delta == GoalDelta::Unknown {
+        return Err(anyhow!(
+            governor_contract::reflection_invalid_goal_delta_message()
+        ));
+    }
+    if r.strategy_change == StrategyChange::Unknown {
+        return Err(anyhow!(
+            governor_contract::reflection_invalid_strategy_change_message()
+        ));
+    }
+
+    let repeated_failure = mem.same_error_repeats >= 2
+        || mem.same_command_repeats >= 3
+        || mem.same_output_repeats >= 2;
+    let repeated_failure = repeated_failure || file_tool_consec_failures >= 2;
+
+    if repeated_failure && r.strategy_change == StrategyChange::Keep {
+        return Err(anyhow!(
+            governor_contract::reflection_requires_strategy_change_message()
+        ));
+    }
+
+    if matches!(r.goal_delta, GoalDelta::Same | GoalDelta::Farther)
+        && matches!(
+            r.strategy_change,
+            StrategyChange::Keep | StrategyChange::Unknown
+        )
+    {
+        return Err(anyhow!(
+            governor_contract::reflection_non_improving_requires_change_message()
+        ));
+    }
+
+    Ok(())
+}
+
+fn build_reflection_prompt(
+    reason: &str,
+    mem: &FailureMemory,
+    state: AgentState,
+    file_tool_consec_failures: usize,
+) -> String {
+    format!(
+        "[Self Reflection Required]\n\
+Reason: {reason}\n\
+State: {:?}\n\
+Failure memory:\n\
+- consecutive_failures: {}\n\
+- same_command_repeats: {}\n\
+- same_error_repeats: {}\n\
+- same_output_repeats: {}\n\
+- file_tool_consec_failures: {}\n\
+\n\
+Before your next tool call, emit exactly ONE <reflect> block:\n\
+<reflect>\n\
+last_outcome: success|failure|partial\n\
+goal_delta: closer|same|farther\n\
+wrong_assumption: <one short sentence>\n\
+strategy_change: keep|adjust|abandon\n\
+next_minimal_action: <one short sentence>\n\
+</reflect>\n\
+\n\
+Rules:\n\
+- One line per field.\n\
+- Keep the whole block under 80 tokens.\n\
+- If the same error/command/output repeated, strategy_change cannot be `keep`.\n\
+- If file_tool_consec_failures >= 2, strategy_change cannot be `keep`.\n\
+- If goal_delta is `same` or `farther`, choose a materially different next action.\n\
+- After the <reflect> block: emit your normal <think> block (required), then call exactly one tool. Do not add prose.",
+        state,
+        mem.consecutive_failures,
+        mem.same_command_repeats,
+        mem.same_error_repeats,
+        mem.same_output_repeats,
+        file_tool_consec_failures
+    )
+}
+
+fn build_governor_state(
+    state: AgentState,
+    recovery: &RecoveryGovernor,
+    mem: &FailureMemory,
+    file_tool_consec_failures: usize,
+    last_mutation_step: Option<usize>,
+    last_verify_ok_step: Option<usize>,
+    last_reflection: Option<&ReflectionBlock>,
+) -> GovernorState {
+    let done_verify_required = last_mutation_step.unwrap_or(0) > last_verify_ok_step.unwrap_or(0);
+    let recovery_stage = if recovery.in_recovery() {
+        Some(recovery.stage_label().to_string())
+    } else {
+        None
+    };
+    let last_reflection = last_reflection.map(|r| ReflectionSummary {
+        last_outcome: if r.last_outcome.trim().is_empty() {
+            None
+        } else {
+            Some(r.last_outcome.clone())
+        },
+        goal_delta: Some(r.goal_delta.as_str().to_string()),
+        wrong_assumption: if r.wrong_assumption.trim().is_empty() {
+            None
+        } else {
+            Some(r.wrong_assumption.clone())
+        },
+        strategy_change: Some(r.strategy_change.as_str().to_string()),
+        next_minimal_action: if r.next_minimal_action.trim().is_empty() {
+            None
+        } else {
+            Some(r.next_minimal_action.clone())
+        },
+    });
+
+    GovernorState {
+        state: format!("{state:?}").to_ascii_lowercase(),
+        recovery_stage,
+
+        consecutive_failures: mem.consecutive_failures,
+        same_command_repeats: mem.same_command_repeats,
+        same_error_repeats: mem.same_error_repeats,
+        same_output_repeats: mem.same_output_repeats,
+        file_tool_consec_failures,
+
+        done_verify_required,
+        last_mutation_step,
+        last_verify_ok_step,
+
+        last_reflection,
+    }
+}
+
 fn last_tool_looks_failed(messages: &[serde_json::Value]) -> bool {
     let Some(last_tool) = messages
         .iter()
@@ -1135,11 +3030,9 @@ fn last_tool_looks_failed(messages: &[serde_json::Value]) -> bool {
 }
 
 fn is_diagnostic_tool_name(name: &str) -> bool {
-    matches!(name, "read_file" | "search_files" | "list_dir" | "glob")
-}
-
-fn is_fix_tool_name(name: &str) -> bool {
-    matches!(name, "write_file" | "patch_file" | "apply_diff")
+    governor_contract::diagnostic_tool_names()
+        .iter()
+        .any(|tool| tool == name)
 }
 
 fn is_diagnostic_command(command: &str) -> bool {
@@ -1154,6 +3047,8 @@ fn is_diagnostic_command(command: &str) -> bool {
         "dir",
         "get-location",
         "get-childitem",
+        "get-content",
+        "select-string",
         "where",
         "which",
         "get-command",
@@ -1166,6 +3061,13 @@ fn is_diagnostic_command(command: &str) -> bool {
         "git remote",
         "git branch",
         "git diff",
+        "rg",
+        "grep",
+        "cat",
+        "head",
+        "tail",
+        "sed -n",
+        "wc",
         "cargo --version",
         "rustc --version",
         "python --version",
@@ -1179,30 +3081,155 @@ fn is_diagnostic_command(command: &str) -> bool {
     pats.iter().any(|p| c.contains(p))
 }
 
-fn is_verify_command(command: &str, test_cmd: Option<&str>) -> bool {
+fn verification_examples(level: VerificationLevel) -> String {
+    let verification = governor_contract::verification();
+    let mut commands: Vec<String> = verification
+        .goal_check_runners
+        .iter()
+        .filter_map(|runner| match level {
+            VerificationLevel::Build => runner.build_command.as_ref(),
+            VerificationLevel::Behavioral => runner.test_command.as_ref(),
+        })
+        .map(|command| command.trim().to_string())
+        .filter(|command| !command.is_empty())
+        .collect();
+
+    let signatures = match level {
+        VerificationLevel::Build => &verification.build_command_signatures,
+        VerificationLevel::Behavioral => &verification.behavioral_command_signatures,
+    };
+    for command in signatures {
+        let trimmed = command.trim();
+        if trimmed.is_empty() || commands.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        commands.push(trimmed.to_string());
+        if commands.len() >= 6 {
+            break;
+        }
+    }
+
+    let quoted = commands
+        .into_iter()
+        .take(6)
+        .map(|command| format!("`{command}`"))
+        .collect::<Vec<_>>();
+    match quoted.as_slice() {
+        [] => match level {
+            VerificationLevel::Build => {
+                "`cargo check`, `cargo build`, `tsc --noemit`, `ruff check`, or `git diff --check`"
+                    .to_string()
+            }
+            VerificationLevel::Behavioral => {
+                "`cargo test`, `cargo nextest`, `pytest`, `npm test`, `go test`, or `dotnet test`"
+                    .to_string()
+            }
+        },
+        [only] => only.clone(),
+        [head @ .., tail] => format!("{} or {}", head.join(", "), tail),
+    }
+}
+
+fn verification_level_from_signature(sig: &str) -> Option<VerificationLevel> {
+    let verification = governor_contract::verification();
+    if signature_matches_any(sig, &verification.ignore_command_signatures) {
+        return None;
+    }
+    if signature_matches_any(sig, &verification.behavioral_command_signatures) {
+        return Some(VerificationLevel::Behavioral);
+    }
+
+    if signature_matches_any(sig, &verification.build_command_signatures) {
+        return Some(VerificationLevel::Build);
+    }
+
+    None
+}
+
+fn configured_test_cmd_verification_level(test_cmd: Option<&str>) -> Option<VerificationLevel> {
+    let sig = command_sig(test_cmd.unwrap_or(""));
+    if sig.is_empty() {
+        return None;
+    }
+    if signature_matches_any(
+        &sig,
+        &governor_contract::verification().ignore_command_signatures,
+    ) {
+        return None;
+    }
+    verification_level_from_signature(&sig).or(Some(VerificationLevel::Behavioral))
+}
+
+fn verification_requirement_hint(level: VerificationLevel, test_cmd: Option<&str>) -> String {
+    let preferred = test_cmd
+        .and_then(|cmd| {
+            let sig = command_sig(cmd);
+            if sig.is_empty() {
+                return None;
+            }
+            let cmd_level = configured_test_cmd_verification_level(Some(cmd))?;
+            if cmd_level.satisfies(level) {
+                Some(format!("Preferred: run `{sig}`."))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| format!("Examples: {}.", verification_examples(level)));
+    format!(
+        "run ONE real {} verification command. {preferred}",
+        level.as_str()
+    )
+}
+
+fn verification_requirement_note(
+    level: VerificationLevel,
+    test_cmd: Option<&str>,
+    plan: Option<&PlanBlock>,
+) -> String {
+    let contrast = match level {
+        VerificationLevel::Build => {
+            "Behavioral tests are welcome, but a real build/check/lint is the minimum requirement."
+        }
+        VerificationLevel::Behavioral => {
+            "Build-only checks do NOT satisfy this task; use tests or another behavioral verification."
+        }
+    };
+    let mut out = format!(
+        "[Verification Requirement]\nBefore `done`, this task requires {} verification.\n{}\n{}",
+        level.as_str(),
+        contrast,
+        verification_requirement_hint(level, test_cmd)
+    );
+    if let Some(plan) = plan {
+        if !plan.acceptance_criteria.is_empty() {
+            out.push_str("\nAcceptance criteria:\n");
+            for criterion in &plan.acceptance_criteria {
+                out.push_str(&format!("- {criterion}\n"));
+            }
+        }
+    }
+    out
+}
+
+fn classify_verify_level(command: &str, test_cmd: Option<&str>) -> Option<VerificationLevel> {
     let c = command_sig(command);
-    let pats = [
-        "cargo test",
-        "cargo build",
-        "cargo check",
-        "npm test",
-        "pnpm test",
-        "yarn test",
-        "pytest",
-        "go test",
-        "dotnet test",
-        "git status",
-    ];
-    if pats.iter().any(|p| c.contains(p)) {
-        return true;
+    if c.is_empty() {
+        return None;
+    }
+    if let Some(level) = verification_level_from_signature(&c) {
+        return Some(level);
     }
     if let Some(t) = test_cmd {
         let t_sig = command_sig(t);
         if !t_sig.is_empty() && c.contains(&t_sig) {
-            return true;
+            return configured_test_cmd_verification_level(Some(t));
         }
     }
-    false
+    None
+}
+
+fn is_verify_command(command: &str, test_cmd: Option<&str>) -> bool {
+    classify_verify_level(command, test_cmd).is_some()
 }
 
 fn classify_exec_kind(command: &str, test_cmd: Option<&str>) -> ExecKind {
@@ -1231,6 +3258,58 @@ fn normalize_for_signature(s: &str) -> String {
     out
 }
 
+fn text_contains_any(haystack: &str, terms: &[String]) -> bool {
+    terms
+        .iter()
+        .any(|term| !term.is_empty() && haystack.contains(term))
+}
+
+fn signature_matches_any(sig: &str, signatures: &[String]) -> bool {
+    signatures
+        .iter()
+        .any(|pattern| !pattern.is_empty() && sig.contains(pattern))
+}
+
+fn goal_check_max_attempts() -> usize {
+    let max_attempts = governor_contract::verification()
+        .goal_check_policy
+        .max_attempts_per_goal;
+    max_attempts.max(1)
+}
+
+fn goal_check_order() -> Vec<String> {
+    let order = governor_contract::verification()
+        .goal_check_policy
+        .goal_order
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>();
+    if order.is_empty() {
+        vec!["repo".to_string(), "tests".to_string(), "build".to_string()]
+    } else {
+        order
+    }
+}
+
+fn should_auto_run_goal_checks(command_approval_required: bool, max_iters: usize) -> bool {
+    let policy = &governor_contract::verification().goal_check_policy;
+    if !policy.run_on_stop {
+        return false;
+    }
+    if policy.require_exec_feature {
+        // TUI agentic mode always provides exec.
+    }
+    if policy.require_longrun && max_iters <= 1 {
+        return false;
+    }
+    if policy.require_command_approval_off && command_approval_required {
+        return false;
+    }
+    true
+}
+
 fn command_sig(command: &str) -> String {
     // Single line, trimmed, collapsed whitespace.
     let normalized = command.replace("\r\n", "\n");
@@ -1241,6 +3320,31 @@ fn command_sig(command: &str) -> String {
         .trim();
     let collapsed = one.split_whitespace().collect::<Vec<_>>().join(" ");
     normalize_for_signature(&collapsed)
+}
+
+fn tool_call_action_sig(tc: &ToolCallData) -> Option<String> {
+    match tc.name.as_str() {
+        "exec" => {
+            let args: serde_json::Value =
+                serde_json::from_str(&tc.arguments).unwrap_or(json!({"command": tc.arguments}));
+            let command = args["command"].as_str().unwrap_or("").trim();
+            if command.is_empty() {
+                None
+            } else {
+                Some(format!("exec:{}", command_sig(command)))
+            }
+        }
+        "read_file" | "write_file" | "patch_file" | "apply_diff" => {
+            let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+            let path = args["path"].as_str().unwrap_or("").trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some(format!("{}:{}", tc.name, normalize_for_signature(path)))
+            }
+        }
+        _ => None,
+    }
 }
 
 fn pick_interesting_error_line(stdout: &str, stderr: &str) -> String {
@@ -1389,6 +3493,27 @@ Fix: `cd` into the intended repo before `git add .`, or add the nested repo dir 
             "Rust build failed because `obstral.exe` is locked.\n\
 Fix: stop the running process (or close the TUI/serve), then rebuild.\n\
 Tip (Windows): use `scripts/run-tui.ps1` / `scripts/run-ui.ps1` which build in an isolated CARGO_TARGET_DIR and auto-kill old processes."
+                .to_string(),
+        );
+    }
+    if low.contains("could not resolve host")
+        || low.contains("couldn't resolve host")
+        || low.contains("temporary failure in name resolution")
+        || low.contains("name resolution failed")
+    {
+        if cmd_low.contains("cargo") || low.contains("crates.io") || low.contains("index.crates.io")
+        {
+            return Some(
+                "Network/DNS failure: cannot reach crates.io/index.\n\
+Action: stop retrying; this is not a code bug.\n\
+- If you are offline/sandboxed, you cannot download new crates here.\n\
+- Try `cargo ... --offline` only if deps are already cached; otherwise proceed with static edits and defer builds/tests."
+                    .to_string(),
+            );
+        }
+        return Some(
+            "Network/DNS failure: host name resolution failed.\n\
+Action: stop retrying; check connectivity and clear proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)."
                 .to_string(),
         );
     }
@@ -2168,6 +4293,198 @@ async fn run_test_cmd(cmd: &str, cwd: &str) -> String {
     }
 }
 
+fn goal_check_support_line(summary: &str, fallback: &str) -> String {
+    if summary.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        governor_contract::goal_check_supported_runners_message(summary)
+    }
+}
+
+fn error_class_name(class: &ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Environment => "environment",
+        ErrorClass::Syntax => "syntax",
+        ErrorClass::Path => "path",
+        ErrorClass::Dependency => "dependency",
+        ErrorClass::Network => "network",
+        ErrorClass::Logic => "logic",
+        ErrorClass::Unknown => "unknown",
+    }
+}
+
+fn goal_check_class_line(class: &ErrorClass) -> String {
+    match class {
+        ErrorClass::Unknown => String::new(),
+        _ => format!("class: {}\n", error_class_name(class)),
+    }
+}
+
+fn goal_check_digest_line(digest: &str) -> String {
+    let trimmed = digest.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}\n")
+    }
+}
+
+fn goal_check_runner_command(level: VerificationLevel, cwd: &str) -> Option<String> {
+    governor_contract::verification()
+        .goal_check_runners
+        .iter()
+        .find(|runner| {
+            runner
+                .detect_files_any
+                .iter()
+                .filter(|path| !path.trim().is_empty())
+                .any(|path| Path::new(cwd).join(path).exists())
+        })
+        .and_then(|runner| match level {
+            VerificationLevel::Build => runner.build_command.clone(),
+            VerificationLevel::Behavioral => runner.test_command.clone(),
+        })
+        .map(|command| command.trim().to_string())
+        .filter(|command| !command.is_empty())
+}
+
+fn goal_check_runner_summary(level: VerificationLevel) -> String {
+    governor_contract::verification()
+        .goal_check_runners
+        .iter()
+        .filter_map(|runner| {
+            let command = match level {
+                VerificationLevel::Build => runner.build_command.as_deref(),
+                VerificationLevel::Behavioral => runner.test_command.as_deref(),
+            }?
+            .trim();
+            if command.is_empty() {
+                return None;
+            }
+            let files = runner
+                .detect_files_any
+                .iter()
+                .map(|path| path.trim())
+                .filter(|path| !path.is_empty())
+                .collect::<Vec<_>>();
+            if files.is_empty() {
+                return None;
+            }
+            Some(format!("{} -> {command}", files.join("/")))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn repo_goal_missing_labels(cwd: &str) -> Vec<String> {
+    let mut missing = Vec::new();
+    for requirement in &governor_contract::verification().repo_goal_requirements {
+        let key = requirement.key.trim();
+        let label = requirement.label.trim();
+        let present = match requirement.probe.trim() {
+            "dir_exists" => requirement
+                .path
+                .as_deref()
+                .map(|path| Path::new(cwd).join(path).is_dir())
+                .unwrap_or(false),
+            "file_exists" => requirement
+                .path
+                .as_deref()
+                .map(|path| Path::new(cwd).join(path).is_file())
+                .unwrap_or(false),
+            "git_head" => run_git_cmd(cwd, &["rev-parse", "HEAD"])
+                .await
+                .map(|head| !head.trim().is_empty())
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !present {
+            missing.push(if label.is_empty() {
+                key.to_string()
+            } else {
+                label.to_string()
+            });
+        }
+    }
+    missing
+}
+
+#[derive(Debug)]
+struct GoalCheckExecResult {
+    command: String,
+    passed: bool,
+    error_class: ErrorClass,
+    digest: String,
+}
+
+async fn run_goal_check_command(
+    label: &str,
+    command: &str,
+    cwd: &str,
+    tx: &mpsc::Sender<StreamToken>,
+) -> GoalCheckExecResult {
+    let sig = command_sig(command);
+    let _ = tx
+        .send(StreamToken::Delta(format!(
+            "\n{}\n",
+            governor_contract::goal_check_exec_run_message(label, &sig)
+        )))
+        .await;
+
+    let exec_result = exec::run_command(command, Some(cwd)).await;
+    let (stdout, stderr, exit_code) = match exec_result {
+        Ok(r) => (r.stdout, r.stderr, r.exit_code),
+        Err(e) => (String::new(), e.to_string(), -1),
+    };
+    let suspicious = if exit_code == 0 {
+        suspicious_success_reason(&stdout, &stderr)
+    } else {
+        None
+    };
+    let passed = exit_code == 0 && suspicious.is_none();
+    let error_class = if passed {
+        ErrorClass::Unknown
+    } else {
+        classify_error(&stderr, &stdout)
+    };
+    let digest = if passed {
+        String::new()
+    } else if let Some(reason) = suspicious {
+        reason
+    } else {
+        let interesting = pick_interesting_error_line(&stdout, &stderr);
+        if interesting.is_empty() {
+            truncate_output_tail(&format!("{stdout}{stderr}"), 600)
+        } else {
+            interesting
+        }
+    };
+
+    let summary = if passed {
+        format!(
+            "{}\n",
+            governor_contract::goal_check_exec_ok_message(label, &sig)
+        )
+    } else {
+        format!(
+            "{}\n",
+            governor_contract::goal_check_exec_fail_message(
+                label,
+                &sig,
+                compact_one_line(&digest, 160).as_str(),
+            )
+        )
+    };
+    let _ = tx.send(StreamToken::Delta(summary)).await;
+
+    GoalCheckExecResult {
+        command: sig,
+        passed,
+        error_class,
+        digest,
+    }
+}
+
 // ── Agentic loop ──────────────────────────────────────────────────────────────
 
 /// Run the agentic loop.  Sends StreamToken events to `tx` for the TUI to display.
@@ -2182,6 +4499,7 @@ pub async fn run_agentic(
     agents_md: Option<String>,
     // Command to run after every successful file edit (e.g. "cargo test 2>&1").
     test_cmd: Option<String>,
+    command_approval_required: bool,
     approver: &dyn Approver,
 ) -> Result<AgenticEndState> {
     let messages_json: Vec<serde_json::Value> = messages_in
@@ -2203,6 +4521,7 @@ pub async fn run_agentic(
         project_context,
         agents_md,
         test_cmd,
+        command_approval_required,
         None,
         approver,
     )
@@ -2219,9 +4538,19 @@ pub async fn run_agentic_json(
     agents_md: Option<String>,
     // Command to run after every successful file edit (e.g. "cargo test 2>&1").
     test_cmd: Option<String>,
+    command_approval_required: bool,
     autosaver: Option<Arc<crate::agent_session::SessionAutoSaver>>,
     approver: &dyn Approver,
 ) -> Result<AgenticEndState> {
+    if matches!(cfg.provider, ProviderKind::Anthropic | ProviderKind::Hf) {
+        return Err(anyhow!(
+            "Coder agentic loop requires a tool-calling OpenAI-compatible Chat Completions API.\n\
+Unsupported provider for Coder: {}\n\
+Fix: use --provider openai-compatible (or --provider mistral).",
+            cfg.provider
+        ));
+    }
+
     let client = reqwest::Client::new();
     let tools = json!([
         exec_tool_def(),
@@ -2236,6 +4565,11 @@ pub async fn run_agentic_json(
     ]);
     let mut state = AgentState::Planning;
     let mut pending_system_hint: Option<String> = None;
+    let mut reflection_required: Option<String> = None;
+    let mut impact_required: Option<String> = None;
+    let mut reflection_trigger_sig: Option<String> = None;
+    let mut last_reflection: Option<ReflectionBlock> = None;
+    let mut reflection_guard: Option<ReflectionBlock> = None;
     let mut forced_tool_once = false;
     // C — token budget guardian
     let mut budget_warned = false;
@@ -2250,17 +4584,86 @@ pub async fn run_agentic_json(
         .and_then(|m| m["content"].as_str())
         .unwrap_or("")
         .to_string();
+    let root_user_text_low = root_user_text.to_ascii_lowercase();
+    let verification_contract = governor_contract::verification();
+    let wants_repo_goal =
+        text_contains_any(&root_user_text_low, &verification_contract.goal_repo_terms);
+    let wants_test_goal =
+        text_contains_any(&root_user_text_low, &verification_contract.goal_test_terms);
+    let wants_build_goal =
+        text_contains_any(&root_user_text_low, &verification_contract.goal_build_terms);
+    let mut goal_checks = GoalCheckTracker::default();
     let goal_wants_actions = wants_local_actions(&root_user_text);
+    let mut intent_required_verification =
+        infer_required_verification_level(&root_user_text, test_cmd.as_deref());
 
     // Keep messages as serde_json::Value throughout to preserve tool_call_id.
     let mut messages: Vec<serde_json::Value> = start.messages;
+    let mut active_plan =
+        last_plan_from_messages(&messages).filter(|plan| validate_plan(plan).is_ok());
+    if let Some(plan) = active_plan.as_ref() {
+        if let Some(level) = verification_level_from_plan(plan) {
+            intent_required_verification = level;
+        }
+    }
+    let mut path_required_verification =
+        upgrade_required_verification_from_messages(&messages, VerificationLevel::Build);
+    let mut required_verification = intent_required_verification.max(path_required_verification);
+    last_reflection = last_reflection_from_messages(&messages);
+    let mut working_mem = WorkingMemory::from_messages(&messages, test_cmd.as_deref());
     // Rebuild loop governor memory from the existing session so resuming runs doesn't
     // repeat the same failures from scratch.
     let mut mem = FailureMemory::from_recent_messages(&messages);
-    let mut recovery = RecoveryGovernor::restore_from_session(&mem, &messages);
+    let mut recovery =
+        RecoveryGovernor::restore_from_session(&mem, &messages, required_verification);
     if recovery.in_recovery() {
         state = AgentState::Recovery;
     }
+    // Carry the most recent declared strategy across resume, especially if we are
+    // resuming mid-recovery after a failure.
+    if recovery.in_recovery() {
+        if let Some(ref r) = last_reflection {
+            if r.strategy_change == StrategyChange::Abandon {
+                pending_system_hint = Some(format!(
+                    "Strategy previously abandoned.\n\
+Do not retry the previous approach.\n\
+Execute only the new minimal action: {}",
+                    r.next_minimal_action.as_str()
+                ));
+            }
+        }
+    }
+    // E — done gate: require verification after mutations.
+    // Rebuild done-gate tracking from the existing session so resuming runs doesn't
+    // require re-verifying unchanged work.
+    let (
+        mut step_seq,
+        mut last_mutation_step,
+        mut last_build_verify_ok_step,
+        mut last_behavioral_verify_ok_step,
+        mut last_exec_step,
+    ) = restore_done_gate_from_messages(&messages, test_cmd.as_deref());
+    let mut last_verify_ok_step = effective_verify_ok_step(
+        required_verification,
+        last_build_verify_ok_step,
+        last_behavioral_verify_ok_step,
+    );
+    let last_impact_step = last_impact_step_from_messages(&messages);
+    if last_mutation_step.unwrap_or(0) > last_impact_step.unwrap_or(0) {
+        impact_required =
+            Some("recent mutation has not been evaluated for goal impact".to_string());
+    }
+    let _ = tx
+        .send(StreamToken::GovernorState(build_governor_state(
+            state,
+            &recovery,
+            &mem,
+            file_tool_consec_failures,
+            last_mutation_step,
+            last_verify_ok_step,
+            last_reflection.as_ref(),
+        )))
+        .await;
 
     // Resolve tool_root once (absolute path) and track cwd across tool calls.
     // This prevents the classic "cd didn't persist, so git add ran in the wrong repo" failure.
@@ -2385,15 +4788,16 @@ Be concise: prefer tool calls over long explanations. Summarise intermediate res
         }
 
         // ── Progress checkpoint every 3 iterations ────────────────────────
-        // Asks the model to self-evaluate goal distance before the next command.
-        // Only fires when no higher-priority failure hint is already pending.
-        if iter > 0 && iter % 3 == 0 && pending_system_hint.is_none() {
-            pending_system_hint = Some(format!(
-                "[Progress Check — iter {iter}/{max_iters}]\n\
- Before your next command, answer in ONE line each:\n\
- 1. DONE: which steps from your <plan> are verified complete (exit_code=0)?\n\
- 2. REMAINING: which steps are left?\n\
- 3. ON_TRACK: yes/no — if no, re-evaluate your plan before proceeding."
+        // Require a reflection so the model re-evaluates goal distance and next action.
+        // Only fires when no higher-priority hint/reflection is already pending.
+        if iter > 0
+            && iter % 3 == 0
+            && pending_system_hint.is_none()
+            && reflection_required.is_none()
+        {
+            reflection_trigger_sig = None;
+            reflection_required = Some(format!(
+                "progress checkpoint iter {iter}/{max_iters} (summarize DONE/REMAINING briefly)"
             ));
         }
 
@@ -2405,7 +4809,7 @@ Be concise: prefer tool calls over long explanations. Summarise intermediate res
                 "[Final Iteration — iter {}/{}]\n\
 This is the LAST model call for this run.\n\
 - If the task is fully done AND verified: run ONE final smoke test (if needed), then call `done`.\n\
-- If the task is NOT done: call `done` with (1) verified-complete items, (2) what remains, and (3) the exact next commands/files to continue on the next run.",
+- If the task is NOT done: call `done` with (1) verified-complete items, (2) satisfied acceptance criteria, (3) remaining acceptance criteria, (4) verification evidence for completed criteria, and (5) the exact next commands/files to continue on the next run.",
                 iter + 1,
                 max_iters
             );
@@ -2434,6 +4838,54 @@ This is the LAST model call for this run.\n\
             msgs_for_call.push(json!({"role":"system","content": note}));
         }
 
+        if let Some(memory_prompt) = build_working_memory_prompt(&working_mem) {
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": memory_prompt,
+            }));
+        }
+
+        msgs_for_call.push(json!({
+            "role": "system",
+            "content": verification_requirement_note(
+                required_verification,
+                test_cmd.as_deref(),
+                active_plan.as_ref()
+            ),
+        }));
+
+        if let Some(reason) = impact_required.as_ref() {
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": build_impact_prompt(reason, active_plan.as_ref(), &working_mem),
+            }));
+        }
+
+        if let Some(reason) = reflection_required.as_ref() {
+            let mut reflection_prompt =
+                build_reflection_prompt(reason, &mem, state, file_tool_consec_failures);
+            let recent =
+                crate::agent_session::recent_reflection_summaries_from_messages(&messages, 2);
+            if !recent.is_empty() {
+                reflection_prompt.push_str("\n\n[Recent Reflections]\n");
+                for r in recent.iter().rev() {
+                    let delta = r.goal_delta.as_deref().unwrap_or("-");
+                    let strat = r.strategy_change.as_deref().unwrap_or("-");
+                    let wrong = compact_one_line(r.wrong_assumption.as_deref().unwrap_or("-"), 90);
+                    let next =
+                        compact_one_line(r.next_minimal_action.as_deref().unwrap_or("-"), 90);
+                    reflection_prompt.push_str(&format!(
+                        "- delta={delta} strategy={strat} wrong={wrong} next={next}\n"
+                    ));
+                }
+                reflection_prompt.push_str("Do not repeat the same mistake verbatim.\n");
+            }
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": reflection_prompt
+            }));
+        }
+
         let (token_tx, mut token_rx) = mpsc::channel::<StreamToken>(256);
         let cfg_clone = cfg.clone();
         let tools_clone = tools.clone();
@@ -2452,7 +4904,7 @@ This is the LAST model call for this run.\n\
         });
 
         let mut assistant_text = String::new();
-        let mut tool_call: Option<ToolCallData> = None;
+        let mut tool_calls: Vec<ToolCallData> = Vec::new();
         let mut stream_error: Option<String> = None;
 
         while let Some(token) = token_rx.recv().await {
@@ -2462,8 +4914,9 @@ This is the LAST model call for this run.\n\
                     let _ = tx.send(StreamToken::Delta(s)).await;
                 }
                 StreamToken::ToolCall(tc) => {
-                    tool_call = Some(tc);
+                    tool_calls.push(tc);
                 }
+                StreamToken::GovernorState(_) => {} // not emitted by inner stream
                 StreamToken::Done => break,
                 StreamToken::Error(e) => {
                     let _ = tx.send(StreamToken::Error(e.clone())).await;
@@ -2502,9 +4955,371 @@ This is the LAST model call for this run.\n\
             break;
         }
 
+        // ── Reflection enforcement (before any tool call) ─────────────────
+        // When reflection is required, the model MUST emit exactly one <reflect> block
+        // AND exactly one tool call in the same assistant turn.
+        if let Some(reason) = reflection_required.clone() {
+            let reflect = match parse_reflection_block(&assistant_text) {
+                Some(r) => r,
+                None => {
+                    let msg = governor_contract::reflection_missing_message(reason.as_str());
+                    let _ = tx
+                        .send(StreamToken::Delta(format!("\n[reflect] {msg}\n")))
+                        .await;
+                    pending_system_hint = Some(msg);
+                    state = AgentState::Recovery;
+                    reflection_required = Some(reason);
+                    continue;
+                }
+            };
+
+            if let Err(e) = validate_reflection(&reflect, &mem, file_tool_consec_failures) {
+                let msg =
+                    governor_contract::reflection_invalid_message(&e.to_string(), reason.as_str());
+                let _ = tx
+                    .send(StreamToken::Delta(format!("\n[reflect] {msg}\n")))
+                    .await;
+                pending_system_hint = Some(msg);
+                state = AgentState::Recovery;
+                reflection_required = Some(reason);
+                continue;
+            }
+
+            if tool_calls.len() != 1 {
+                let msg = governor_contract::reflection_one_tool_message(tool_calls.len());
+                let _ = tx
+                    .send(StreamToken::Delta(format!("\n[reflect] {msg}\n")))
+                    .await;
+                pending_system_hint = Some(msg);
+                state = AgentState::Recovery;
+                reflection_required = Some(reason);
+                continue;
+            }
+
+            let _ = tx
+                .send(StreamToken::Delta(format!(
+                    "\n[reflect] goal_delta={} strategy={} next={}\n",
+                    reflect.goal_delta.as_str(),
+                    reflect.strategy_change.as_str(),
+                    reflect.next_minimal_action.as_str()
+                )))
+                .await;
+
+            last_reflection = Some(reflect.clone());
+            reflection_guard = Some(reflect);
+            reflection_required = None;
+
+            if let Some(ref r) = last_reflection {
+                if matches!(
+                    r.strategy_change,
+                    StrategyChange::Adjust | StrategyChange::Abandon
+                ) {
+                    working_mem.set_strategy(r.next_minimal_action.as_str());
+                }
+                if r.strategy_change == StrategyChange::Abandon {
+                    pending_system_hint = Some(format!(
+                        "Strategy abandoned.\n\
+Do not retry the previous approach.\n\
+Execute only the new minimal action: {}",
+                        r.next_minimal_action.as_str()
+                    ));
+                }
+            }
+
+            let _ = tx
+                .send(StreamToken::GovernorState(build_governor_state(
+                    state,
+                    &recovery,
+                    &mem,
+                    file_tool_consec_failures,
+                    last_mutation_step,
+                    last_verify_ok_step,
+                    last_reflection.as_ref(),
+                )))
+                .await;
+        }
+
+        if let Some(reason) = impact_required.clone() {
+            let impact_plan = parse_plan_block(&assistant_text)
+                .filter(|plan| validate_plan(plan).is_ok())
+                .or_else(|| active_plan.clone());
+            let impact = match parse_impact_block(&assistant_text) {
+                Some(impact) => impact,
+                None => {
+                    let msg = governor_contract::impact_missing_message(reason.as_str());
+                    let _ = tx
+                        .send(StreamToken::Delta(format!("\n[impact] {msg}\n")))
+                        .await;
+                    pending_system_hint = Some(msg);
+                    state = AgentState::Recovery;
+                    impact_required = Some(reason);
+                    continue;
+                }
+            };
+
+            if let Err(e) = validate_impact(&impact, impact_plan.as_ref()) {
+                let msg =
+                    governor_contract::impact_invalid_message(&e.to_string(), reason.as_str());
+                let _ = tx
+                    .send(StreamToken::Delta(format!("\n[impact] {msg}\n")))
+                    .await;
+                pending_system_hint = Some(msg);
+                state = AgentState::Recovery;
+                impact_required = Some(reason);
+                continue;
+            }
+
+            if tool_calls.len() != 1 {
+                let msg = governor_contract::impact_one_tool_message(tool_calls.len());
+                let _ = tx
+                    .send(StreamToken::Delta(format!("\n[impact] {msg}\n")))
+                    .await;
+                pending_system_hint = Some(msg);
+                state = AgentState::Recovery;
+                impact_required = Some(reason);
+                continue;
+            }
+
+            let _ = tx
+                .send(StreamToken::Delta(format!(
+                    "\n[impact] changed={} progress={} gap={}\n",
+                    impact.changed.as_str(),
+                    impact.progress.as_str(),
+                    impact.remaining_gap.as_str()
+                )))
+                .await;
+
+            impact_required = None;
+        }
+
+        let parsed_plan = parse_plan_block(&assistant_text);
+        let parsed_think = parse_think_block(&assistant_text);
+        let mut validated_plan_for_turn: Option<PlanBlock> = None;
+        let mut validated_think_for_turn: Option<ThinkBlock> = None;
+
+        // Guardrail: the runtime supports only one tool call per assistant turn.
+        // (We stream tool_calls, but the executor is single-tool.)
+        if tool_calls.len() > 1 {
+            let msg = governor_contract::multiple_tool_calls_message(tool_calls.len());
+            let _ = tx
+                .send(StreamToken::Delta(format!("\n[governor] {msg}\n")))
+                .await;
+            pending_system_hint = Some(msg);
+            state = AgentState::Recovery;
+            continue;
+        }
+
+        let tool_call: Option<ToolCallData> = tool_calls.pop();
+
+        if let Some(ref tc) = tool_call {
+            let candidate_plan = match parsed_plan.as_ref() {
+                Some(plan) => {
+                    if let Err(e) = validate_plan(plan) {
+                        state = AgentState::Recovery;
+                        recovery.stage = Some(RecoveryStage::Diagnose);
+                        let block = governor_contract::invalid_plan_message(&e.to_string());
+
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                            )))
+                            .await;
+
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": format!(
+                                "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                                tc.name, tc.arguments
+                            ),
+                        }));
+                        autosave_best_effort(
+                            &autosaver,
+                            &tx,
+                            tool_root_abs.as_deref(),
+                            checkpoint.as_deref(),
+                            cur_cwd.as_deref(),
+                            &messages,
+                        )
+                        .await;
+
+                        pending_system_hint = Some(block);
+                        let _ = tx
+                            .send(StreamToken::GovernorState(build_governor_state(
+                                state,
+                                &recovery,
+                                &mem,
+                                file_tool_consec_failures,
+                                last_mutation_step,
+                                last_verify_ok_step,
+                                last_reflection.as_ref(),
+                            )))
+                            .await;
+                        continue;
+                    }
+                    plan
+                }
+                None => match active_plan.as_ref() {
+                    Some(plan) => plan,
+                    None => {
+                        state = AgentState::Recovery;
+                        recovery.stage = Some(RecoveryStage::Diagnose);
+                        let block = governor_contract::missing_plan_message();
+
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                            )))
+                            .await;
+
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": format!(
+                                "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                                tc.name, tc.arguments
+                            ),
+                        }));
+                        autosave_best_effort(
+                            &autosaver,
+                            &tx,
+                            tool_root_abs.as_deref(),
+                            checkpoint.as_deref(),
+                            cur_cwd.as_deref(),
+                            &messages,
+                        )
+                        .await;
+
+                        pending_system_hint = Some(block);
+                        let _ = tx
+                            .send(StreamToken::GovernorState(build_governor_state(
+                                state,
+                                &recovery,
+                                &mem,
+                                file_tool_consec_failures,
+                                last_mutation_step,
+                                last_verify_ok_step,
+                                last_reflection.as_ref(),
+                            )))
+                            .await;
+                        continue;
+                    }
+                },
+            };
+
+            let think = match parsed_think.as_ref() {
+                Some(think) => think,
+                None => {
+                    state = AgentState::Recovery;
+                    recovery.stage = Some(RecoveryStage::Diagnose);
+                    let block = governor_contract::missing_think_message();
+
+                    let _ = tx
+                        .send(StreamToken::Delta(format!(
+                            "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                        )))
+                        .await;
+
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": format!(
+                            "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                            tc.name, tc.arguments
+                        ),
+                    }));
+                    autosave_best_effort(
+                        &autosaver,
+                        &tx,
+                        tool_root_abs.as_deref(),
+                        checkpoint.as_deref(),
+                        cur_cwd.as_deref(),
+                        &messages,
+                    )
+                    .await;
+
+                    pending_system_hint = Some(block);
+                    let _ = tx
+                        .send(StreamToken::GovernorState(build_governor_state(
+                            state,
+                            &recovery,
+                            &mem,
+                            file_tool_consec_failures,
+                            last_mutation_step,
+                            last_verify_ok_step,
+                            last_reflection.as_ref(),
+                        )))
+                        .await;
+                    continue;
+                }
+            };
+
+            if let Err(e) = validate_think(think, candidate_plan, tc) {
+                state = AgentState::Recovery;
+                recovery.stage = Some(RecoveryStage::Diagnose);
+                let block = governor_contract::invalid_think_message(&e.to_string());
+
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                    )))
+                    .await;
+
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": format!(
+                        "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                        tc.name, tc.arguments
+                    ),
+                }));
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+
+                pending_system_hint = Some(block);
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
+
+            validated_plan_for_turn = Some(candidate_plan.clone());
+            validated_think_for_turn = Some(think.clone());
+        }
+
         // ── Append assistant turn ──────────────────────────────────────────
         if let Some(ref tc) = tool_call {
             state = AgentState::Executing;
+            if let Some(plan) = parsed_plan.clone() {
+                working_mem.sync_to_plan(&plan);
+                if let Some(level) = verification_level_from_plan(&plan) {
+                    intent_required_verification = level;
+                    required_verification =
+                        intent_required_verification.max(path_required_verification);
+                    recovery.required_verification = required_verification;
+                    last_verify_ok_step = effective_verify_ok_step(
+                        required_verification,
+                        last_build_verify_ok_step,
+                        last_behavioral_verify_ok_step,
+                    );
+                }
+                active_plan = Some(plan);
+            }
             messages.push(json!({
                 "role": "assistant",
                 "content": assistant_text,
@@ -2518,6 +5333,23 @@ This is the LAST model call for this run.\n\
                 }]
             }));
         } else {
+            if let Some(plan) = parsed_plan {
+                if validate_plan(&plan).is_ok() {
+                    working_mem.sync_to_plan(&plan);
+                    if let Some(level) = verification_level_from_plan(&plan) {
+                        intent_required_verification = level;
+                        required_verification =
+                            intent_required_verification.max(path_required_verification);
+                        recovery.required_verification = required_verification;
+                        last_verify_ok_step = effective_verify_ok_step(
+                            required_verification,
+                            last_build_verify_ok_step,
+                            last_behavioral_verify_ok_step,
+                        );
+                    }
+                    active_plan = Some(plan);
+                }
+            }
             messages.push(json!({"role": "assistant", "content": assistant_text}));
             autosave_best_effort(
                 &autosaver,
@@ -2967,6 +5799,295 @@ Fix the path/permissions, or switch to explicit tools (write_file/read_file/patc
                 }
             }
 
+            if should_auto_run_goal_checks(command_approval_required, max_iters) {
+                if let Some(goal_root) = cur_cwd.as_deref().or(tool_root_abs.as_deref()) {
+                    let mut ran_goal_checks = false;
+                    let mut goal_check_blocked = false;
+                    let max_attempts = goal_check_max_attempts();
+                    for key in goal_check_order() {
+                        let wants_goal = match key.as_str() {
+                            "repo" => wants_repo_goal,
+                            "tests" => wants_test_goal,
+                            "build" => wants_build_goal,
+                            _ => false,
+                        };
+                        if !wants_goal {
+                            continue;
+                        }
+                        let Some(status) = goal_checks.get_mut(key.as_str()) else {
+                            continue;
+                        };
+                        if status.ok || status.attempts >= max_attempts {
+                            continue;
+                        }
+                        status.attempts += 1;
+                        ran_goal_checks = true;
+                        state = AgentState::Verifying;
+
+                        match key.as_str() {
+                            "repo" => {
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "\n{}\n",
+                                        governor_contract::goal_check_repo_start_message()
+                                    )))
+                                    .await;
+                                let missing = repo_goal_missing_labels(goal_root).await;
+                                if !missing.is_empty() {
+                                    let block = governor_contract::goal_check_repo_missing_message(
+                                        missing.join(", ").as_str(),
+                                    );
+                                    messages.push(json!({"role":"user","content": block}));
+                                    autosave_best_effort(
+                                        &autosaver,
+                                        &tx,
+                                        tool_root_abs.as_deref(),
+                                        checkpoint.as_deref(),
+                                        cur_cwd.as_deref(),
+                                        &messages,
+                                    )
+                                    .await;
+                                    state = AgentState::Planning;
+                                    let _ = tx
+                                        .send(StreamToken::GovernorState(build_governor_state(
+                                            state,
+                                            &recovery,
+                                            &mem,
+                                            file_tool_consec_failures,
+                                            last_mutation_step,
+                                            last_verify_ok_step,
+                                            last_reflection.as_ref(),
+                                        )))
+                                        .await;
+                                    goal_check_blocked = true;
+                                    break;
+                                }
+                                status.ok = true;
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "{}\n",
+                                        governor_contract::goal_check_repo_ok_message()
+                                    )))
+                                    .await;
+                            }
+                            "tests" => {
+                                let Some(command) = goal_check_runner_command(
+                                    VerificationLevel::Behavioral,
+                                    goal_root,
+                                ) else {
+                                    let summary =
+                                        goal_check_runner_summary(VerificationLevel::Behavioral);
+                                    let support_line = goal_check_support_line(
+                                        summary.as_str(),
+                                        governor_contract::goal_check_tests_runner_fallback_message(
+                                        )
+                                        .as_str(),
+                                    );
+                                    let block =
+                                        governor_contract::goal_check_tests_no_runner_message(
+                                            support_line.as_str(),
+                                        );
+                                    messages.push(json!({"role":"user","content": block}));
+                                    autosave_best_effort(
+                                        &autosaver,
+                                        &tx,
+                                        tool_root_abs.as_deref(),
+                                        checkpoint.as_deref(),
+                                        cur_cwd.as_deref(),
+                                        &messages,
+                                    )
+                                    .await;
+                                    state = AgentState::Planning;
+                                    let _ = tx
+                                        .send(StreamToken::GovernorState(build_governor_state(
+                                            state,
+                                            &recovery,
+                                            &mem,
+                                            file_tool_consec_failures,
+                                            last_mutation_step,
+                                            last_verify_ok_step,
+                                            last_reflection.as_ref(),
+                                        )))
+                                        .await;
+                                    goal_check_blocked = true;
+                                    break;
+                                };
+                                let result = run_goal_check_command(
+                                    "tests",
+                                    command.as_str(),
+                                    goal_root,
+                                    &tx,
+                                )
+                                .await;
+                                if !result.passed {
+                                    let block = governor_contract::goal_check_tests_failed_message(
+                                        goal_check_class_line(&result.error_class).as_str(),
+                                        goal_check_digest_line(&result.digest).as_str(),
+                                    );
+                                    messages.push(json!({"role":"user","content": block}));
+                                    autosave_best_effort(
+                                        &autosaver,
+                                        &tx,
+                                        tool_root_abs.as_deref(),
+                                        checkpoint.as_deref(),
+                                        cur_cwd.as_deref(),
+                                        &messages,
+                                    )
+                                    .await;
+                                    state = AgentState::Recovery;
+                                    recovery.stage = Some(RecoveryStage::Fix);
+                                    let _ = tx
+                                        .send(StreamToken::GovernorState(build_governor_state(
+                                            state,
+                                            &recovery,
+                                            &mem,
+                                            file_tool_consec_failures,
+                                            last_mutation_step,
+                                            last_verify_ok_step,
+                                            last_reflection.as_ref(),
+                                        )))
+                                        .await;
+                                    goal_check_blocked = true;
+                                    break;
+                                }
+                                status.ok = true;
+                                working_mem.remember_successful_verification(&result.command);
+                                last_behavioral_verify_ok_step = Some(step_seq);
+                                last_verify_ok_step = effective_verify_ok_step(
+                                    required_verification,
+                                    last_build_verify_ok_step,
+                                    last_behavioral_verify_ok_step,
+                                );
+                                recovery.on_exec_result(
+                                    ExecKind::Verify,
+                                    Some(VerificationLevel::Behavioral),
+                                    true,
+                                );
+                            }
+                            "build" => {
+                                let Some(command) =
+                                    goal_check_runner_command(VerificationLevel::Build, goal_root)
+                                else {
+                                    let summary =
+                                        goal_check_runner_summary(VerificationLevel::Build);
+                                    let support_line = goal_check_support_line(
+                                        summary.as_str(),
+                                        governor_contract::goal_check_build_runner_fallback_message(
+                                        )
+                                        .as_str(),
+                                    );
+                                    let block =
+                                        governor_contract::goal_check_build_no_runner_message(
+                                            support_line.as_str(),
+                                        );
+                                    messages.push(json!({"role":"user","content": block}));
+                                    autosave_best_effort(
+                                        &autosaver,
+                                        &tx,
+                                        tool_root_abs.as_deref(),
+                                        checkpoint.as_deref(),
+                                        cur_cwd.as_deref(),
+                                        &messages,
+                                    )
+                                    .await;
+                                    state = AgentState::Planning;
+                                    let _ = tx
+                                        .send(StreamToken::GovernorState(build_governor_state(
+                                            state,
+                                            &recovery,
+                                            &mem,
+                                            file_tool_consec_failures,
+                                            last_mutation_step,
+                                            last_verify_ok_step,
+                                            last_reflection.as_ref(),
+                                        )))
+                                        .await;
+                                    goal_check_blocked = true;
+                                    break;
+                                };
+                                let result = run_goal_check_command(
+                                    "build",
+                                    command.as_str(),
+                                    goal_root,
+                                    &tx,
+                                )
+                                .await;
+                                if !result.passed {
+                                    let block = governor_contract::goal_check_build_failed_message(
+                                        goal_check_class_line(&result.error_class).as_str(),
+                                        goal_check_digest_line(&result.digest).as_str(),
+                                    );
+                                    messages.push(json!({"role":"user","content": block}));
+                                    autosave_best_effort(
+                                        &autosaver,
+                                        &tx,
+                                        tool_root_abs.as_deref(),
+                                        checkpoint.as_deref(),
+                                        cur_cwd.as_deref(),
+                                        &messages,
+                                    )
+                                    .await;
+                                    state = AgentState::Recovery;
+                                    recovery.stage = Some(RecoveryStage::Fix);
+                                    let _ = tx
+                                        .send(StreamToken::GovernorState(build_governor_state(
+                                            state,
+                                            &recovery,
+                                            &mem,
+                                            file_tool_consec_failures,
+                                            last_mutation_step,
+                                            last_verify_ok_step,
+                                            last_reflection.as_ref(),
+                                        )))
+                                        .await;
+                                    goal_check_blocked = true;
+                                    break;
+                                }
+                                status.ok = true;
+                                working_mem.remember_successful_verification(&result.command);
+                                last_build_verify_ok_step = Some(step_seq);
+                                last_verify_ok_step = effective_verify_ok_step(
+                                    required_verification,
+                                    last_build_verify_ok_step,
+                                    last_behavioral_verify_ok_step,
+                                );
+                                recovery.on_exec_result(
+                                    ExecKind::Verify,
+                                    Some(VerificationLevel::Build),
+                                    true,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if goal_check_blocked {
+                        continue;
+                    }
+                    if ran_goal_checks {
+                        state = AgentState::Done;
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "\n{}\n",
+                                governor_contract::goal_check_all_passed_message()
+                            )))
+                            .await;
+                        let _ = tx
+                            .send(StreamToken::GovernorState(build_governor_state(
+                                state,
+                                &recovery,
+                                &mem,
+                                file_tool_consec_failures,
+                                last_mutation_step,
+                                last_verify_ok_step,
+                                last_reflection.as_ref(),
+                            )))
+                            .await;
+                        break;
+                    }
+                }
+            }
+
             // Common failure mode: model "explains what to do" but never calls tools.
             // Try once to force a tool call so long sessions keep moving.
             if !forced_tool_once && iter + 1 < max_iters {
@@ -3000,6 +6121,17 @@ Do NOT respond with text-only instructions."
                     &messages,
                 )
                 .await;
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
                 continue;
             }
 
@@ -3015,61 +6147,246 @@ Do NOT respond with text-only instructions."
 
         // ── Execute the tool ───────────────────────────────────────────────
         let tc = tool_call.unwrap();
+        step_seq = step_seq.saturating_add(1);
+        let this_step = step_seq;
+        let step_label_for_turn = resolve_step_label(
+            validated_plan_for_turn.as_ref(),
+            validated_think_for_turn.as_ref(),
+        );
+        let next_action_for_turn = validated_think_for_turn
+            .as_ref()
+            .map(|think| think.next.as_str());
 
-        // Plan gate: require a <plan> at least once before doing any real work.
-        // The model should include <plan> in the same assistant message as its first tool call.
-        let has_plan = messages.iter().any(|m| {
-            m.get("role").and_then(|r| r.as_str()) == Some("assistant")
-                && m.get("content")
-                    .and_then(|c| c.as_str())
-                    .map(|t| t.contains("<plan>"))
-                    .unwrap_or(false)
-        });
-        if !has_plan {
-            state = AgentState::Recovery;
-            recovery.stage = Some(RecoveryStage::Diagnose);
-            let block = "[Plan Gate] Missing <plan>.\n\
-Required now: in your next assistant message, include a <plan> (goal/steps/risks/assumptions), then call ONE diagnostic tool (list_dir/search_files/glob/read_file) to start."
-                .to_string();
+        // Reflection/action alignment: if we just required a reflection due to a failure/stall,
+        // do not allow immediately repeating the same action when the reflection says
+        // `adjust`/`abandon`.
+        if let Some(ref r) = reflection_guard {
+            let needs_change = matches!(
+                r.strategy_change,
+                StrategyChange::Adjust | StrategyChange::Abandon
+            );
+            let next_sig = tool_call_action_sig(&tc);
+            if needs_change {
+                if let (Some(ref trigger), Some(ref next)) =
+                    (reflection_trigger_sig.as_ref(), next_sig.as_ref())
+                {
+                    if trigger == next {
+                        state = AgentState::Recovery;
+                        recovery.stage = Some(RecoveryStage::Diagnose);
+                        let block = format!(
+                            "Reflection/action mismatch blocked.\n\
+strategy_change: {}\n\
+trigger_action: {}\n\
+attempted_action: {}\n\
+\n\
+Required: choose a materially different next action consistent with your reflection.\n\
+Execute this minimal action instead: {}",
+                            r.strategy_change.as_str(),
+                            trigger,
+                            next,
+                            r.next_minimal_action.as_str()
+                        );
 
-            let _ = tx
-                .send(StreamToken::Delta(format!(
-                    "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
-                )))
-                .await;
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                            )))
+                            .await;
 
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": format!(
-                    "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
-                    tc.name, tc.arguments
-                ),
-            }));
-            autosave_best_effort(
-                &autosaver,
-                &tx,
-                tool_root_abs.as_deref(),
-                checkpoint.as_deref(),
-                cur_cwd.as_deref(),
-                &messages,
-            )
-            .await;
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": format!(
+                                "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                                tc.name, tc.arguments
+                            ),
+                        }));
+                        autosave_best_effort(
+                            &autosaver,
+                            &tx,
+                            tool_root_abs.as_deref(),
+                            checkpoint.as_deref(),
+                            cur_cwd.as_deref(),
+                            &messages,
+                        )
+                        .await;
 
-            pending_system_hint = Some(block);
-            continue;
+                        pending_system_hint = Some(block.clone());
+                        reflection_required = Some(
+                            "Tool call contradicted the reflection. Emit <reflect> again and change action."
+                                .to_string(),
+                        );
+                        let _ = tx
+                            .send(StreamToken::GovernorState(build_governor_state(
+                                state,
+                                &recovery,
+                                &mem,
+                                file_tool_consec_failures,
+                                last_mutation_step,
+                                last_verify_ok_step,
+                                last_reflection.as_ref(),
+                            )))
+                            .await;
+                        continue;
+                    }
+                }
+            }
+
+            // Consume the guard once the next tool call is not an immediate retry of the trigger action.
+            if !needs_change
+                || reflection_trigger_sig.is_none()
+                || next_sig
+                    .as_ref()
+                    .map(|s| reflection_trigger_sig.as_deref() != Some(s.as_str()))
+                    .unwrap_or(true)
+            {
+                reflection_guard = None;
+                reflection_trigger_sig = None;
+            }
         }
 
         // ── done tool ──────────────────────────────────────────────────────
         if tc.name.as_str() == "done" {
+            let last_mutation = last_mutation_step.unwrap_or(0);
+            let last_verify_ok = last_verify_ok_step.unwrap_or(0);
+            if last_mutation > 0 && last_verify_ok < last_mutation {
+                state = AgentState::Recovery;
+                recovery.stage = Some(RecoveryStage::Verify);
+                let block = format!(
+                    "[Done Gate] Verification required before `done`.\n\
+Last mutation step: {last_mutation}\n\
+Last verification step: {last_verify_ok}\n\
+Required now: {}",
+                    verification_requirement_hint(required_verification, test_cmd.as_deref())
+                );
+
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                    )))
+                    .await;
+
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": format!(
+                        "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                        tc.name, tc.arguments
+                    ),
+                }));
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+
+                pending_system_hint = Some(block);
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
+
             let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
             let summary = args["summary"].as_str().unwrap_or("").trim();
+            let completed_acceptance = parse_string_list_arg(&args["completed_acceptance"]);
+            let remaining_acceptance = parse_string_list_arg(&args["remaining_acceptance"]);
+            let acceptance_evidence = parse_done_acceptance_evidence(&args["acceptance_evidence"]);
             let next_steps = args["next_steps"].as_str().unwrap_or("").trim();
+            let done_plan = validated_plan_for_turn.as_ref().or(active_plan.as_ref());
+
+            let evidence_rows = match validate_done_acceptance(
+                done_plan,
+                &completed_acceptance,
+                &remaining_acceptance,
+                &acceptance_evidence,
+                &working_mem,
+            ) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    state = AgentState::Recovery;
+                    recovery.stage = Some(RecoveryStage::Verify);
+                    let block = governor_contract::done_invalid_acceptance_message(&e.to_string());
+
+                    let _ = tx
+                        .send(StreamToken::Delta(format!(
+                            "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                        )))
+                        .await;
+
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": format!(
+                            "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                            tc.name, tc.arguments
+                        ),
+                    }));
+                    autosave_best_effort(
+                        &autosaver,
+                        &tx,
+                        tool_root_abs.as_deref(),
+                        checkpoint.as_deref(),
+                        cur_cwd.as_deref(),
+                        &messages,
+                    )
+                    .await;
+
+                    pending_system_hint = Some(block);
+                    let _ = tx
+                        .send(StreamToken::GovernorState(build_governor_state(
+                            state,
+                            &recovery,
+                            &mem,
+                            file_tool_consec_failures,
+                            last_mutation_step,
+                            last_verify_ok_step,
+                            last_reflection.as_ref(),
+                        )))
+                        .await;
+                    continue;
+                }
+            };
 
             let mut final_text = String::new();
             final_text.push_str("[DONE]\n");
             if !summary.is_empty() {
                 final_text.push_str(summary);
+            }
+            final_text.push_str("\n\nAcceptance:\n");
+            let evidence_by_idx: std::collections::HashMap<usize, String> =
+                evidence_rows.into_iter().collect();
+            let done_plan = done_plan.expect("validated done plan");
+            for item in &completed_acceptance {
+                let idx = resolve_acceptance_reference(item, done_plan)
+                    .expect("completed acceptance validated");
+                final_text.push_str("- done: ");
+                final_text.push_str(acceptance_reference_label(done_plan, idx).as_str());
+                if let Some(command) = evidence_by_idx.get(&idx) {
+                    final_text.push_str(" via `");
+                    final_text.push_str(command.as_str());
+                    final_text.push('`');
+                }
+                final_text.push('\n');
+            }
+            for item in &remaining_acceptance {
+                let idx = resolve_acceptance_reference(item, done_plan)
+                    .expect("remaining acceptance validated");
+                final_text.push_str("- remaining: ");
+                final_text.push_str(acceptance_reference_label(done_plan, idx).as_str());
+                final_text.push('\n');
             }
             if !next_steps.is_empty() {
                 final_text.push_str("\n\nNext:\n");
@@ -3141,6 +6458,17 @@ Required now: in your next assistant message, include a <plan> (goal/steps/risks
             .await;
 
             pending_system_hint = Some(block);
+            let _ = tx
+                .send(StreamToken::GovernorState(build_governor_state(
+                    state,
+                    &recovery,
+                    &mem,
+                    file_tool_consec_failures,
+                    last_mutation_step,
+                    last_verify_ok_step,
+                    last_reflection.as_ref(),
+                )))
+                .await;
             continue;
         }
 
@@ -3202,8 +6530,9 @@ Required now: in your next assistant message, include a <plan> (goal/steps/risks
                                 fmt_hash(bh),
                                 fmt_hash(after_hash)
                             )),
-                            None => result
-                                .push_str(&format!("\n[hash] after={}", fmt_hash(after_hash))),
+                            None => {
+                                result.push_str(&format!("\n[hash] after={}", fmt_hash(after_hash)))
+                            }
                         }
                         file_cache.insert(cache_key, new_content);
                     }
@@ -3218,10 +6547,29 @@ Required now: in your next assistant message, include a <plan> (goal/steps/risks
             }
 
             let verified = result.contains("PASSED (exit 0)");
-            if is_error {
-                recovery.on_fix_result(false, false);
+            let verified_level = if verified {
+                configured_test_cmd_verification_level(test_cmd.as_deref())
             } else {
-                recovery.on_fix_result(true, verified);
+                None
+            };
+            if is_error {
+                recovery.on_fix_result(false, None);
+            } else {
+                last_mutation_step = Some(this_step);
+                if let Some(level) = verified_level {
+                    match level {
+                        VerificationLevel::Build => last_build_verify_ok_step = Some(this_step),
+                        VerificationLevel::Behavioral => {
+                            last_behavioral_verify_ok_step = Some(this_step)
+                        }
+                    }
+                    last_verify_ok_step = effective_verify_ok_step(
+                        required_verification,
+                        last_build_verify_ok_step,
+                        last_behavioral_verify_ok_step,
+                    );
+                }
+                recovery.on_fix_result(true, verified_level);
             }
 
             let first_line = result.lines().next().unwrap_or("").to_string();
@@ -3235,6 +6583,12 @@ Required now: in your next assistant message, include a <plan> (goal/steps/risks
                 if !rejected_by_user {
                     file_tool_consec_failures += 1;
                     pending_system_hint = Some(format!("apply_diff error: {first_line}"));
+                    if file_tool_consec_failures >= 2 {
+                        reflection_required = Some(format!(
+                            "file tool failures repeated {} times",
+                            file_tool_consec_failures
+                        ));
+                    }
                 } else {
                     pending_system_hint = Some(
                         "The user rejected the edit. Choose a safer alternative or ask again with a smaller change."
@@ -3252,10 +6606,56 @@ Required now: in your next assistant message, include a <plan> (goal/steps/risks
                 };
                 file_tool_consec_failures = 0;
                 pending_system_hint = if recovery.stage == Some(RecoveryStage::Verify) {
-                    Some("Recovery stage=verify: run ONE verification command (tests or `git status`) before continuing.".to_string())
+                    Some(format!(
+                        "Recovery stage=verify: {}",
+                        verification_requirement_hint(required_verification, test_cmd.as_deref())
+                    ))
                 } else {
                     None
                 };
+                update_working_memory_after_non_exec(
+                    &mut working_mem,
+                    "apply_diff",
+                    verified,
+                    step_label_for_turn.as_deref(),
+                    next_action_for_turn,
+                    test_cmd.as_deref(),
+                );
+                let path_level = verification_level_for_mutation_path(path.as_str());
+                if path_level > path_required_verification {
+                    path_required_verification = path_level;
+                    required_verification =
+                        intent_required_verification.max(path_required_verification);
+                    recovery.required_verification = required_verification;
+                    last_verify_ok_step = effective_verify_ok_step(
+                        required_verification,
+                        last_build_verify_ok_step,
+                        last_behavioral_verify_ok_step,
+                    );
+                    if recovery.stage == Some(RecoveryStage::Verify) {
+                        pending_system_hint = Some(format!(
+                            "Recovery stage=verify: {}",
+                            verification_requirement_hint(
+                                required_verification,
+                                test_cmd.as_deref()
+                            )
+                        ));
+                    }
+                }
+                impact_required = Some(format!(
+                    "successful mutation via apply_diff: {}",
+                    compact_one_line(path.as_str(), 80)
+                ));
+            }
+
+            if is_error {
+                reflection_required = Some(
+                    pending_system_hint
+                        .clone()
+                        .unwrap_or_else(|| "apply_diff failed".to_string()),
+                );
+                reflection_trigger_sig =
+                    Some(format!("apply_diff:{}", normalize_for_signature(&path)));
             }
 
             messages.push(json!({
@@ -3272,6 +6672,17 @@ Required now: in your next assistant message, include a <plan> (goal/steps/risks
                 &messages,
             )
             .await;
+            let _ = tx
+                .send(StreamToken::GovernorState(build_governor_state(
+                    state,
+                    &recovery,
+                    &mem,
+                    file_tool_consec_failures,
+                    last_mutation_step,
+                    last_verify_ok_step,
+                    last_reflection.as_ref(),
+                )))
+                .await;
             continue;
         }
 
@@ -3283,7 +6694,11 @@ Required now: in your next assistant message, include a <plan> (goal/steps/risks
             let max_entries = args["max_entries"].as_u64().unwrap_or(200) as usize;
             let include_hidden = args["include_hidden"].as_bool().unwrap_or(false);
 
-            let dir_label = if dir.trim().is_empty() { "." } else { dir.as_str() };
+            let dir_label = if dir.trim().is_empty() {
+                "."
+            } else {
+                dir.as_str()
+            };
             let _ = tx
                 .send(StreamToken::Delta(format!("\n\n[LIST_DIR] {dir_label}\n")))
                 .await;
@@ -3316,10 +6731,21 @@ Required now: in your next assistant message, include a <plan> (goal/steps/risks
                 pending_system_hint = if recovery.stage == Some(RecoveryStage::Fix) {
                     Some("Recovery stage=fix: apply a minimal fix now (edit files or run a corrected command).".to_string())
                 } else if recovery.stage == Some(RecoveryStage::Verify) {
-                    Some("Recovery stage=verify: run ONE verification command (tests or `git status`) before continuing.".to_string())
+                    Some(format!(
+                        "Recovery stage=verify: {}",
+                        verification_requirement_hint(required_verification, test_cmd.as_deref())
+                    ))
                 } else {
                     None
                 };
+                update_working_memory_after_non_exec(
+                    &mut working_mem,
+                    "list_dir",
+                    false,
+                    step_label_for_turn.as_deref(),
+                    next_action_for_turn,
+                    test_cmd.as_deref(),
+                );
             }
 
             messages.push(json!({
@@ -3336,6 +6762,17 @@ Required now: in your next assistant message, include a <plan> (goal/steps/risks
                 &messages,
             )
             .await;
+            let _ = tx
+                .send(StreamToken::GovernorState(build_governor_state(
+                    state,
+                    &recovery,
+                    &mem,
+                    file_tool_consec_failures,
+                    last_mutation_step,
+                    last_verify_ok_step,
+                    last_reflection.as_ref(),
+                )))
+                .await;
             continue;
         }
 
@@ -3373,10 +6810,21 @@ Required now: in your next assistant message, include a <plan> (goal/steps/risks
                 pending_system_hint = if recovery.stage == Some(RecoveryStage::Fix) {
                     Some("Recovery stage=fix: apply a minimal fix now (edit files or run a corrected command).".to_string())
                 } else if recovery.stage == Some(RecoveryStage::Verify) {
-                    Some("Recovery stage=verify: run ONE verification command (tests or `git status`) before continuing.".to_string())
+                    Some(format!(
+                        "Recovery stage=verify: {}",
+                        verification_requirement_hint(required_verification, test_cmd.as_deref())
+                    ))
                 } else {
                     None
                 };
+                update_working_memory_after_non_exec(
+                    &mut working_mem,
+                    "glob",
+                    false,
+                    step_label_for_turn.as_deref(),
+                    next_action_for_turn,
+                    test_cmd.as_deref(),
+                );
             }
 
             messages.push(json!({
@@ -3393,6 +6841,17 @@ Required now: in your next assistant message, include a <plan> (goal/steps/risks
                 &messages,
             )
             .await;
+            let _ = tx
+                .send(StreamToken::GovernorState(build_governor_state(
+                    state,
+                    &recovery,
+                    &mem,
+                    file_tool_consec_failures,
+                    last_mutation_step,
+                    last_verify_ok_step,
+                    last_reflection.as_ref(),
+                )))
+                .await;
             continue;
         }
 
@@ -3436,10 +6895,21 @@ Required now: in your next assistant message, include a <plan> (goal/steps/risks
                 pending_system_hint = if recovery.stage == Some(RecoveryStage::Fix) {
                     Some("Recovery stage=fix: apply a minimal fix now (edit files or run a corrected command).".to_string())
                 } else if recovery.stage == Some(RecoveryStage::Verify) {
-                    Some("Recovery stage=verify: run ONE verification command (tests or `git status`) before continuing.".to_string())
+                    Some(format!(
+                        "Recovery stage=verify: {}",
+                        verification_requirement_hint(required_verification, test_cmd.as_deref())
+                    ))
                 } else {
                     None
                 };
+                update_working_memory_after_non_exec(
+                    &mut working_mem,
+                    "search_files",
+                    false,
+                    step_label_for_turn.as_deref(),
+                    next_action_for_turn,
+                    test_cmd.as_deref(),
+                );
             }
 
             messages.push(json!({
@@ -3523,53 +6993,53 @@ Action required: call read_file(path) first to confirm current contents, then re
                             true,
                         )
                     } else {
-                    // Approval: show a compact before/after preview.
-                    let old = file_cache
-                        .get(&cache_key)
-                        .cloned()
-                        .or_else(|| {
-                            crate::file_tools::resolve_safe_path(&path, base)
-                                .ok()
-                                .and_then(|abs| std::fs::read_to_string(&abs).ok())
-                        })
-                        .unwrap_or_default();
-                    let preview = simple_before_after(&old, &content);
-                    let before_hash = hash_text(&old);
-                    let after_hash = hash_text(&content);
-                    let approval = approver
-                        .approve(ApprovalRequest::Edit {
-                            action: "write_file".to_string(),
-                            path: path.clone(),
-                            preview,
-                        })
-                        .await?;
-                    if approval == ApprovalOutcome::Rejected {
-                        rejected_by_user = true;
-                        (
+                        // Approval: show a compact before/after preview.
+                        let old = file_cache
+                            .get(&cache_key)
+                            .cloned()
+                            .or_else(|| {
+                                crate::file_tools::resolve_safe_path(&path, base)
+                                    .ok()
+                                    .and_then(|abs| std::fs::read_to_string(&abs).ok())
+                            })
+                            .unwrap_or_default();
+                        let preview = simple_before_after(&old, &content);
+                        let before_hash = hash_text(&old);
+                        let after_hash = hash_text(&content);
+                        let approval = approver
+                            .approve(ApprovalRequest::Edit {
+                                action: "write_file".to_string(),
+                                path: path.clone(),
+                                preview,
+                            })
+                            .await?;
+                        if approval == ApprovalOutcome::Rejected {
+                            rejected_by_user = true;
+                            (
                             format!(
                                 "REJECTED BY USER\naction: write_file\npath: {path}\n(no changes applied)"
                             ),
                             true,
                         )
-                    } else {
-                        let (mut r_text, r_err) =
-                            crate::file_tools::tool_write_file(&path, &content, base);
-                        if !r_err {
-                            file_cache.insert(cache_key.clone(), content.clone());
-                            r_text.push_str(&format!(
-                                "\n[hash] before={} after={}",
-                                fmt_hash(before_hash),
-                                fmt_hash(after_hash)
-                            ));
-                            // A — auto-test after write
-                            if let Some(ref cmd) = test_cmd {
-                                if let Some(ref root) = tool_root_abs {
-                                    r_text.push_str(&run_test_cmd(cmd, root).await);
+                        } else {
+                            let (mut r_text, r_err) =
+                                crate::file_tools::tool_write_file(&path, &content, base);
+                            if !r_err {
+                                file_cache.insert(cache_key.clone(), content.clone());
+                                r_text.push_str(&format!(
+                                    "\n[hash] before={} after={}",
+                                    fmt_hash(before_hash),
+                                    fmt_hash(after_hash)
+                                ));
+                                // A — auto-test after write
+                                if let Some(ref cmd) = test_cmd {
+                                    if let Some(ref root) = tool_root_abs {
+                                        r_text.push_str(&run_test_cmd(cmd, root).await);
+                                    }
                                 }
                             }
+                            (r_text, r_err)
                         }
-                        (r_text, r_err)
-                    }
                     }
                 }
                 _ => {
@@ -3670,18 +7140,45 @@ Action required: call read_file(path) first to confirm current contents, then re
                 if !rejected_by_user {
                     file_tool_consec_failures += 1;
                 }
+                if file_tool_consec_failures >= 2 {
+                    reflection_required = Some(format!(
+                        "file tool failures repeated {} times",
+                        file_tool_consec_failures
+                    ));
+                }
             } else {
                 file_tool_consec_failures = 0;
             }
 
             let verified = result.contains("PASSED (exit 0)");
+            let verified_level = if verified {
+                configured_test_cmd_verification_level(test_cmd.as_deref())
+            } else {
+                None
+            };
             match tc.name.as_str() {
                 "read_file" => recovery.on_diagnostic_result(!is_error),
                 "write_file" | "patch_file" => {
                     if is_error {
-                        recovery.on_fix_result(false, false);
+                        recovery.on_fix_result(false, None);
                     } else {
-                        recovery.on_fix_result(true, verified);
+                        last_mutation_step = Some(this_step);
+                        if let Some(level) = verified_level {
+                            match level {
+                                VerificationLevel::Build => {
+                                    last_build_verify_ok_step = Some(this_step)
+                                }
+                                VerificationLevel::Behavioral => {
+                                    last_behavioral_verify_ok_step = Some(this_step)
+                                }
+                            }
+                            last_verify_ok_step = effective_verify_ok_step(
+                                required_verification,
+                                last_build_verify_ok_step,
+                                last_behavioral_verify_ok_step,
+                            );
+                        }
+                        recovery.on_fix_result(true, verified_level);
                     }
                 }
                 _ => {}
@@ -3726,10 +7223,62 @@ Action required: call read_file(path) first to confirm current contents, then re
                 pending_system_hint = if recovery.stage == Some(RecoveryStage::Fix) {
                     Some("Recovery stage=fix: apply a minimal fix now (edit files or run a corrected command).".to_string())
                 } else if recovery.stage == Some(RecoveryStage::Verify) {
-                    Some("Recovery stage=verify: run ONE verification command (tests or `git status`) before continuing.".to_string())
+                    Some(format!(
+                        "Recovery stage=verify: {}",
+                        verification_requirement_hint(required_verification, test_cmd.as_deref())
+                    ))
                 } else {
                     None
                 };
+                update_working_memory_after_non_exec(
+                    &mut working_mem,
+                    tc.name.as_str(),
+                    verified,
+                    step_label_for_turn.as_deref(),
+                    next_action_for_turn,
+                    test_cmd.as_deref(),
+                );
+                if matches!(tc.name.as_str(), "write_file" | "patch_file") {
+                    let path_level = verification_level_for_mutation_path(path.as_str());
+                    if path_level > path_required_verification {
+                        path_required_verification = path_level;
+                        required_verification =
+                            intent_required_verification.max(path_required_verification);
+                        recovery.required_verification = required_verification;
+                        last_verify_ok_step = effective_verify_ok_step(
+                            required_verification,
+                            last_build_verify_ok_step,
+                            last_behavioral_verify_ok_step,
+                        );
+                        if recovery.stage == Some(RecoveryStage::Verify) {
+                            pending_system_hint = Some(format!(
+                                "Recovery stage=verify: {}",
+                                verification_requirement_hint(
+                                    required_verification,
+                                    test_cmd.as_deref()
+                                )
+                            ));
+                        }
+                    }
+                    impact_required = Some(format!(
+                        "successful mutation via {}: {}",
+                        tc.name.as_str(),
+                        compact_one_line(path.as_str(), 80)
+                    ));
+                }
+            }
+
+            if is_error || file_tool_consec_failures >= 2 {
+                reflection_required = Some(
+                    pending_system_hint
+                        .clone()
+                        .unwrap_or_else(|| "file tool failure".to_string()),
+                );
+                reflection_trigger_sig = Some(format!(
+                    "{}:{}",
+                    tc.name.as_str(),
+                    normalize_for_signature(&path)
+                ));
             }
 
             // Append tool result to conversation.
@@ -3747,6 +7296,17 @@ Action required: call read_file(path) first to confirm current contents, then re
                 &messages,
             )
             .await;
+            let _ = tx
+                .send(StreamToken::GovernorState(build_governor_state(
+                    state,
+                    &recovery,
+                    &mem,
+                    file_tool_consec_failures,
+                    last_mutation_step,
+                    last_verify_ok_step,
+                    last_reflection.as_ref(),
+                )))
+                .await;
 
             if iter + 1 == max_iters {
                 let _ = tx
@@ -3813,7 +7373,7 @@ Action required: call read_file(path) first to confirm current contents, then re
 
         if let Some(block) = should_block_git_landmines(&command, tool_root_abs.as_deref()) {
             state = AgentState::Recovery;
-            recovery.on_exec_result(ExecKind::Action, false);
+            recovery.on_exec_result(ExecKind::Action, None, false);
             let _ = tx
                 .send(StreamToken::Delta(format!(
                     "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
@@ -3844,7 +7404,93 @@ Action required: call read_file(path) first to confirm current contents, then re
 
             // Update memory so repeating the same blocked command triggers stronger hints.
             let _ = mem.on_tool_result(&command, "", &block, 1);
+            last_exec_step = Some(this_step);
             pending_system_hint = Some(block);
+            let _ = tx
+                .send(StreamToken::GovernorState(build_governor_state(
+                    state,
+                    &recovery,
+                    &mem,
+                    file_tool_consec_failures,
+                    last_mutation_step,
+                    last_verify_ok_step,
+                    last_reflection.as_ref(),
+                )))
+                .await;
+
+            if iter + 1 == max_iters {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[agent] iteration cap ({max_iters}) reached.\n"
+                    )))
+                    .await;
+            }
+            continue;
+        }
+
+        // Runtime block: prevent "same command spam" once it's already repeated.
+        // Allow repeating after a successful mutation (e.g., fix file then rerun tests).
+        let cmd_sig = command_sig(&command);
+        let repeated_cmd = mem.same_command_repeats >= 3
+            && mem.last_command_sig.as_deref() == Some(cmd_sig.as_str());
+        let mutated_since_last_exec = last_mutation_step.unwrap_or(0) > last_exec_step.unwrap_or(0);
+        if repeated_cmd && !mutated_since_last_exec {
+            state = AgentState::Recovery;
+            recovery.stage = Some(RecoveryStage::Diagnose);
+            let block = format!(
+                "Repeated identical command blocked.\n\
+same_command_repeats: {}\n\
+command_sig: {}\n\
+\n\
+Required now: change strategy (diagnose or apply a fix) before retrying.\n\
+Do NOT run the exact same command again without a material change.",
+                mem.same_command_repeats, cmd_sig
+            );
+
+            let _ = tx
+                .send(StreamToken::Delta(format!(
+                    "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                )))
+                .await;
+
+            let cwd_line = format!("cwd: {cwd_used_label}");
+            let tool_output = inject_cwd(
+                &format!("GOVERNOR BLOCKED\n\n{block}\n\ncommand:\n{command}"),
+                &cwd_line,
+                cwd_note.as_deref(),
+            );
+
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": tool_output,
+            }));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
+
+            let _ = mem.on_tool_result(&command, "", &block, 1);
+            last_exec_step = Some(this_step);
+            pending_system_hint = Some(block.clone());
+            reflection_required = Some(block);
+            reflection_trigger_sig = Some(format!("exec:{cmd_sig}"));
+            let _ = tx
+                .send(StreamToken::GovernorState(build_governor_state(
+                    state,
+                    &recovery,
+                    &mem,
+                    file_tool_consec_failures,
+                    last_mutation_step,
+                    last_verify_ok_step,
+                    last_reflection.as_ref(),
+                )))
+                .await;
 
             if iter + 1 == max_iters {
                 let _ = tx
@@ -3864,7 +7510,7 @@ Action required: call read_file(path) first to confirm current contents, then re
             .await?;
         if approval == ApprovalOutcome::Rejected {
             state = AgentState::Recovery;
-            recovery.on_exec_result(ExecKind::Action, false);
+            recovery.on_exec_result(ExecKind::Action, None, false);
             let _ = tx
                 .send(StreamToken::Delta(
                     "[RESULT][Recovery] REJECTED by user\n".to_string(),
@@ -3887,10 +7533,22 @@ Action required: call read_file(path) first to confirm current contents, then re
                 &messages,
             )
             .await;
+            last_exec_step = Some(this_step);
             pending_system_hint = Some(
                 "The user rejected the command. Choose a safer alternative or explain why it is necessary before retrying."
                     .to_string(),
             );
+            let _ = tx
+                .send(StreamToken::GovernorState(build_governor_state(
+                    state,
+                    &recovery,
+                    &mem,
+                    file_tool_consec_failures,
+                    last_mutation_step,
+                    last_verify_ok_step,
+                    last_reflection.as_ref(),
+                )))
+                .await;
 
             if iter + 1 == max_iters {
                 let _ = tx
@@ -3993,8 +7651,9 @@ This is blocked to prevent nested-repo / accidental repo-root modifications.\n\n
         messages.push(json!({
             "role": "tool",
             "tool_call_id": tc.id,
-            "content": tool_output,
+            "content": tool_output.clone(),
         }));
+        last_exec_step = Some(this_step);
         autosave_best_effort(
             &autosaver,
             &tx,
@@ -4006,7 +7665,44 @@ This is blocked to prevent nested-repo / accidental repo-root modifications.\n\n
         .await;
 
         // Update failure memory + recovery governor + possibly inject a system hint.
+        let verify_level = classify_verify_level(&command, test_cmd.as_deref());
         let exec_kind = classify_exec_kind(&command, test_cmd.as_deref());
+        if effective_exit_code == 0 && !escaped_tool_root {
+            match exec_kind {
+                ExecKind::Action => last_mutation_step = Some(this_step),
+                ExecKind::Verify => {
+                    if let Some(level) = verify_level {
+                        match level {
+                            VerificationLevel::Build => last_build_verify_ok_step = Some(this_step),
+                            VerificationLevel::Behavioral => {
+                                last_behavioral_verify_ok_step = Some(this_step)
+                            }
+                        }
+                        last_verify_ok_step = effective_verify_ok_step(
+                            required_verification,
+                            last_build_verify_ok_step,
+                            last_behavioral_verify_ok_step,
+                        );
+                    }
+                }
+                ExecKind::Diagnostic => {}
+            }
+            update_working_memory_after_exec(
+                &mut working_mem,
+                command.as_str(),
+                stdout.as_str(),
+                tool_output.as_str(),
+                exec_kind,
+                step_label_for_turn.as_deref(),
+                next_action_for_turn,
+            );
+            if exec_kind == ExecKind::Action {
+                impact_required = Some(format!(
+                    "successful mutation command: {}",
+                    compact_one_line(command.as_str(), 100)
+                ));
+            }
+        }
         let mut hint = if escaped_tool_root {
             Some(
                 "SANDBOX BREACH: Your command ended outside tool_root.\n\
@@ -4017,7 +7713,11 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
             mem.on_tool_result(&command, &stdout, &stderr, effective_exit_code)
         };
 
-        recovery.on_exec_result(exec_kind, effective_exit_code == 0 && !escaped_tool_root);
+        recovery.on_exec_result(
+            exec_kind,
+            verify_level,
+            effective_exit_code == 0 && !escaped_tool_root,
+        );
 
         if effective_exit_code == 0 && !escaped_tool_root {
             if recovery.stage == Some(RecoveryStage::Fix) {
@@ -4026,19 +7726,53 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
                         .to_string(),
                 );
             } else if recovery.stage == Some(RecoveryStage::Verify) {
-                hint = Some(
-                    "Recovery stage=verify: run ONE verification command (tests or `git status`) before continuing."
-                        .to_string(),
-                );
+                hint = Some(format!(
+                    "Recovery stage=verify: {}",
+                    verification_requirement_hint(required_verification, test_cmd.as_deref())
+                ));
             }
         }
 
+        let hint_clone_for_reflect = hint.clone();
         pending_system_hint = hint;
         state = if effective_exit_code != 0 || recovery.in_recovery() {
             AgentState::Recovery
         } else {
             AgentState::Planning
         };
+
+        if effective_exit_code != 0
+            || mem.same_error_repeats >= 2
+            || mem.same_command_repeats >= 3
+            || mem.same_output_repeats >= 2
+        {
+            let default_reason = if effective_exit_code != 0 {
+                let class_ctx = error_class_hint(&mem.last_error_class);
+                if class_ctx.is_empty() {
+                    "failure detected".to_string()
+                } else {
+                    class_ctx.to_string()
+                }
+            } else {
+                "stall detected".to_string()
+            };
+            reflection_required = Some(hint_clone_for_reflect.unwrap_or_else(|| default_reason));
+            reflection_trigger_sig = Some(format!("exec:{}", command_sig(&command)));
+        } else if reflection_guard.is_none() {
+            reflection_trigger_sig = None;
+        }
+
+        let _ = tx
+            .send(StreamToken::GovernorState(build_governor_state(
+                state,
+                &recovery,
+                &mem,
+                file_tool_consec_failures,
+                last_mutation_step,
+                last_verify_ok_step,
+                last_reflection.as_ref(),
+            )))
+            .await;
 
         // Safety: stop if we've hit the iteration cap.
         if iter + 1 == max_iters {
@@ -4154,6 +7888,494 @@ fn main() {}
     }
 
     #[test]
+    fn parses_reflection_block_fields() {
+        let text = "\
+<reflect>\n\
+last_outcome: failure\n\
+goal_delta: Further\n\
+wrong_assumption: I thought the file existed.\n\
+strategy_change: abandon\n\
+next_minimal_action: read_file src/tui/agent.rs\n\
+</reflect>\n";
+        let r = parse_reflection_block(text).expect("reflection parsed");
+        assert_eq!(r.goal_delta, GoalDelta::Farther);
+        assert_eq!(r.strategy_change, StrategyChange::Abandon);
+        assert_eq!(r.wrong_assumption, "I thought the file existed.");
+        assert_eq!(r.next_minimal_action, "read_file src/tui/agent.rs");
+    }
+
+    #[test]
+    fn parses_impact_block_fields() {
+        let text = "\
+<impact>\n\
+changed: patched src/tui/agent.rs validation\n\
+progress: step 2 moved because runtime gate exists\n\
+remaining_gap: still need to run cargo test\n\
+</impact>\n";
+        let impact = parse_impact_block(text).expect("impact parsed");
+        assert_eq!(impact.changed, "patched src/tui/agent.rs validation");
+        assert_eq!(impact.progress, "step 2 moved because runtime gate exists");
+        assert_eq!(impact.remaining_gap, "still need to run cargo test");
+    }
+
+    #[test]
+    fn validate_impact_requires_all_fields() {
+        let impact = ImpactBlock {
+            changed: "patched file".to_string(),
+            progress: "".to_string(),
+            remaining_gap: "".to_string(),
+        };
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec!["inspect".to_string(), "verify".to_string()],
+            acceptance_criteria: vec!["cargo check passes".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+        assert!(validate_impact(&impact, Some(&plan)).is_err());
+    }
+
+    #[test]
+    fn validate_impact_accepts_matching_acceptance_criterion() {
+        let impact = ImpactBlock {
+            changed: "runtime gate now blocks invalid tool calls".to_string(),
+            progress: "acceptance 2 moved because runtime gate blocks bad tool calls".to_string(),
+            remaining_gap: "still need cargo check".to_string(),
+        };
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec!["inspect".to_string(), "verify".to_string()],
+            acceptance_criteria: vec![
+                "cargo check passes".to_string(),
+                "runtime gate blocks bad tool calls".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+        assert!(validate_impact(&impact, Some(&plan)).is_ok());
+    }
+
+    #[test]
+    fn validate_impact_rejects_unknown_progress_reference() {
+        let impact = ImpactBlock {
+            changed: "updated docs".to_string(),
+            progress: "made criterion 9 move".to_string(),
+            remaining_gap: "still need review".to_string(),
+        };
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec!["inspect".to_string(), "verify".to_string()],
+            acceptance_criteria: vec!["cargo check passes".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+        assert!(validate_impact(&impact, Some(&plan)).is_err());
+    }
+
+    #[test]
+    fn validate_done_acceptance_accepts_completed_and_remaining_coverage() {
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec!["inspect".to_string(), "verify".to_string()],
+            acceptance_criteria: vec![
+                "cargo check passes".to_string(),
+                "runtime gate blocks bad tool calls".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+
+        let completed_acceptance = vec!["acceptance 1".to_string()];
+        let remaining_acceptance = vec!["runtime gate blocks bad tool calls".to_string()];
+        let acceptance_evidence = vec![DoneAcceptanceEvidence {
+            criterion: "acceptance 1".to_string(),
+            command: "cargo check".to_string(),
+        }];
+        let mut working_mem = WorkingMemory::default();
+        working_mem.remember_successful_verification("cargo check");
+
+        assert!(validate_done_acceptance(
+            Some(&plan),
+            &completed_acceptance,
+            &remaining_acceptance,
+            &acceptance_evidence,
+            &working_mem,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_done_acceptance_rejects_missing_criterion_coverage() {
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec!["inspect".to_string(), "verify".to_string()],
+            acceptance_criteria: vec![
+                "cargo check passes".to_string(),
+                "runtime gate blocks bad tool calls".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+
+        let completed_acceptance = vec!["acceptance 1".to_string()];
+        let remaining_acceptance = Vec::new();
+        let acceptance_evidence = vec![DoneAcceptanceEvidence {
+            criterion: "acceptance 1".to_string(),
+            command: "cargo check".to_string(),
+        }];
+        let mut working_mem = WorkingMemory::default();
+        working_mem.remember_successful_verification("cargo check");
+
+        assert!(validate_done_acceptance(
+            Some(&plan),
+            &completed_acceptance,
+            &remaining_acceptance,
+            &acceptance_evidence,
+            &working_mem,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_done_acceptance_rejects_unknown_reference() {
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec!["inspect".to_string(), "verify".to_string()],
+            acceptance_criteria: vec!["cargo check passes".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+
+        let completed_acceptance = vec!["acceptance 9".to_string()];
+        let remaining_acceptance = Vec::new();
+        let acceptance_evidence = vec![DoneAcceptanceEvidence {
+            criterion: "acceptance 9".to_string(),
+            command: "cargo check".to_string(),
+        }];
+        let mut working_mem = WorkingMemory::default();
+        working_mem.remember_successful_verification("cargo check");
+
+        assert!(validate_done_acceptance(
+            Some(&plan),
+            &completed_acceptance,
+            &remaining_acceptance,
+            &acceptance_evidence,
+            &working_mem,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_done_acceptance_rejects_missing_evidence_for_completed_criterion() {
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec!["inspect".to_string(), "verify".to_string()],
+            acceptance_criteria: vec!["cargo check passes".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+
+        let completed_acceptance = vec!["acceptance 1".to_string()];
+        let remaining_acceptance = Vec::new();
+        let acceptance_evidence = Vec::new();
+        let mut working_mem = WorkingMemory::default();
+        working_mem.remember_successful_verification("cargo check");
+
+        assert!(validate_done_acceptance(
+            Some(&plan),
+            &completed_acceptance,
+            &remaining_acceptance,
+            &acceptance_evidence,
+            &working_mem,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_done_acceptance_rejects_unknown_verification_command() {
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec!["inspect".to_string(), "verify".to_string()],
+            acceptance_criteria: vec!["cargo check passes".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+
+        let completed_acceptance = vec!["acceptance 1".to_string()];
+        let remaining_acceptance = Vec::new();
+        let acceptance_evidence = vec![DoneAcceptanceEvidence {
+            criterion: "acceptance 1".to_string(),
+            command: "cargo test".to_string(),
+        }];
+        let mut working_mem = WorkingMemory::default();
+        working_mem.remember_successful_verification("cargo check");
+
+        assert!(validate_done_acceptance(
+            Some(&plan),
+            &completed_acceptance,
+            &remaining_acceptance,
+            &acceptance_evidence,
+            &working_mem,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parses_plan_block_steps() {
+        let text = "\
+<plan>\n\
+goal: make tests pass\n\
+steps: 1) inspect failing test 2) patch the bug 3) run cargo test\n\
+acceptance: 1) cargo test passes 2) bug reproduction no longer fails\n\
+risks: flaky test and wrong file\n\
+assumptions: repo already builds\n\
+</plan>\n";
+        let plan = parse_plan_block(text).expect("plan parsed");
+        assert_eq!(plan.goal, "make tests pass");
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.acceptance_criteria.len(), 2);
+        assert_eq!(plan.steps[0], "inspect failing test");
+        assert_eq!(plan.steps[2], "run cargo test");
+    }
+
+    #[test]
+    fn parses_plan_block_with_colon_and_dash_numbering() {
+        let text = "\
+<plan>\n\
+goal: harden governor parsing\n\
+steps: 1: inspect parser drift 2- unify block parsing 3. run tests\n\
+acceptance_criteria: 1: parser accepts contract aliases 2- tests pass\n\
+risks: parser mismatch\n\
+assumptions: shared contract is loaded\n\
+</plan>\n";
+        let plan = parse_plan_block(text).expect("plan parsed");
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[1], "unify block parsing");
+        assert_eq!(plan.acceptance_criteria.len(), 2);
+        assert_eq!(
+            plan.acceptance_criteria[0],
+            "parser accepts contract aliases"
+        );
+    }
+
+    #[test]
+    fn validates_plan_requires_numbered_steps() {
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec!["only one step".to_string()],
+            acceptance_criteria: vec!["tests pass".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+        assert!(validate_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn validates_plan_requires_acceptance_criteria() {
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec!["inspect".to_string(), "verify".to_string()],
+            acceptance_criteria: vec![],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+        assert!(validate_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn verification_level_from_plan_uses_acceptance_criteria() {
+        let docs_plan = PlanBlock {
+            goal: "update docs".to_string(),
+            steps: vec!["edit readme".to_string(), "verify formatting".to_string()],
+            acceptance_criteria: vec![
+                "README wording is updated".to_string(),
+                "markdown renders cleanly".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "docs build exists".to_string(),
+        };
+        let code_plan = PlanBlock {
+            goal: "fix runtime bug".to_string(),
+            steps: vec![
+                "inspect".to_string(),
+                "patch".to_string(),
+                "verify".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "cargo test passes".to_string(),
+                "runtime gate blocks repeated failure".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+
+        assert_eq!(
+            verification_level_from_plan(&docs_plan),
+            Some(VerificationLevel::Build)
+        );
+        assert_eq!(
+            verification_level_from_plan(&code_plan),
+            Some(VerificationLevel::Behavioral)
+        );
+    }
+
+    #[test]
+    fn parses_think_block_fields() {
+        let text = "\
+<think>\n\
+goal: verify the fix\n\
+step: 3\n\
+tool: exec\n\
+risk: wrong test target\n\
+doubt: maybe cargo check is enough\n\
+next: cargo test\n\
+verify: exit code is zero\n\
+</think>\n";
+        let think = parse_think_block(text).expect("think parsed");
+        assert_eq!(think.step, 3);
+        assert_eq!(think.tool, "exec");
+        assert_eq!(think.next, "cargo test");
+    }
+
+    #[test]
+    fn validate_think_rejects_tool_mismatch() {
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec![
+                "inspect".to_string(),
+                "edit".to_string(),
+                "verify".to_string(),
+            ],
+            acceptance_criteria: vec!["cargo test passes".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+        let think = ThinkBlock {
+            goal: "verify".to_string(),
+            step: 3,
+            tool: "read_file".to_string(),
+            risk: "wrong target".to_string(),
+            doubt: "might need tests".to_string(),
+            next: "cargo test".to_string(),
+            verify: "exit zero".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "exec".to_string(),
+            arguments: "{\"command\":\"cargo test\"}".to_string(),
+        };
+        assert!(validate_think(&think, &plan, &tc).is_err());
+    }
+
+    #[test]
+    fn validate_think_rejects_exec_next_mismatch() {
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec![
+                "inspect".to_string(),
+                "edit".to_string(),
+                "verify".to_string(),
+            ],
+            acceptance_criteria: vec!["cargo test passes".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+        let think = ThinkBlock {
+            goal: "verify".to_string(),
+            step: 3,
+            tool: "exec".to_string(),
+            risk: "wrong target".to_string(),
+            doubt: "might hit wrong crate".to_string(),
+            next: "cargo check".to_string(),
+            verify: "exit zero".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "exec".to_string(),
+            arguments: "{\"command\":\"cargo test --lib\"}".to_string(),
+        };
+        assert!(validate_think(&think, &plan, &tc).is_err());
+    }
+
+    #[test]
+    fn validate_think_accepts_matching_exec_prefix() {
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec![
+                "inspect".to_string(),
+                "edit".to_string(),
+                "verify".to_string(),
+            ],
+            acceptance_criteria: vec!["cargo test passes".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+        let think = ThinkBlock {
+            goal: "verify".to_string(),
+            step: 3,
+            tool: "exec".to_string(),
+            risk: "wrong target".to_string(),
+            doubt: "might need workspace".to_string(),
+            next: "cargo test".to_string(),
+            verify: "exit zero".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "exec".to_string(),
+            arguments: "{\"command\":\"cargo test --lib\"}".to_string(),
+        };
+        assert!(validate_think(&think, &plan, &tc).is_ok());
+    }
+
+    #[test]
+    fn validate_reflection_rejects_missing_fields() {
+        let mem = FailureMemory::default();
+        let r = ReflectionBlock {
+            last_outcome: "failure".to_string(),
+            goal_delta: GoalDelta::Same,
+            wrong_assumption: "".to_string(),
+            strategy_change: StrategyChange::Adjust,
+            next_minimal_action: "".to_string(),
+        };
+        assert!(validate_reflection(&r, &mem, 0).is_err());
+    }
+
+    #[test]
+    fn validate_reflection_rejects_keep_on_repeated_failure() {
+        let mem = FailureMemory {
+            consecutive_failures: 2,
+            last_command_sig: None,
+            same_command_repeats: 3,
+            last_error_sig: None,
+            same_error_repeats: 2,
+            last_output_hash: None,
+            same_output_repeats: 2,
+            last_error_class: ErrorClass::Unknown,
+        };
+        let r = ReflectionBlock {
+            last_outcome: "failure".to_string(),
+            goal_delta: GoalDelta::Same,
+            wrong_assumption: "I assumed the command would work unchanged.".to_string(),
+            strategy_change: StrategyChange::Keep,
+            next_minimal_action: "try again".to_string(),
+        };
+        assert!(validate_reflection(&r, &mem, 0).is_err());
+    }
+
+    #[test]
+    fn validate_reflection_rejects_keep_on_file_tool_repeats() {
+        let mem = FailureMemory::default();
+        let r = ReflectionBlock {
+            last_outcome: "failure".to_string(),
+            goal_delta: GoalDelta::Closer,
+            wrong_assumption: "I assumed the patch would apply cleanly.".to_string(),
+            strategy_change: StrategyChange::Keep,
+            next_minimal_action: "retry patch_file with same args".to_string(),
+        };
+        assert!(validate_reflection(&r, &mem, 2).is_err());
+    }
+
+    #[test]
     fn rebuilds_failure_memory_from_session_messages() {
         let messages = vec![
             json!({"role":"system","content":"sys"}),
@@ -4168,5 +8390,197 @@ fn main() {}
         assert_eq!(mem.consecutive_failures, 2);
         assert_eq!(mem.same_command_repeats, 2);
         assert_eq!(mem.same_error_repeats, 2);
+    }
+
+    #[test]
+    fn classify_exec_kind_treats_git_status_as_diagnostic() {
+        assert_eq!(classify_exec_kind("git status", None), ExecKind::Diagnostic);
+        assert_eq!(classify_exec_kind("cargo check", None), ExecKind::Verify);
+    }
+
+    #[test]
+    fn classify_verify_level_distinguishes_build_and_behavioral() {
+        assert_eq!(
+            classify_verify_level("cargo check", None),
+            Some(VerificationLevel::Build)
+        );
+        assert_eq!(
+            classify_verify_level("cargo test --lib", None),
+            Some(VerificationLevel::Behavioral)
+        );
+        assert_eq!(
+            classify_verify_level("npm run lint", None),
+            Some(VerificationLevel::Build)
+        );
+        assert_eq!(
+            classify_verify_level("python -m pytest -q", None),
+            Some(VerificationLevel::Behavioral)
+        );
+        assert_eq!(classify_verify_level("git status", None), None);
+    }
+
+    #[test]
+    fn effective_verify_ok_step_requires_behavioral_when_requested() {
+        assert_eq!(
+            effective_verify_ok_step(VerificationLevel::Build, Some(3), Some(5)),
+            Some(5)
+        );
+        assert_eq!(
+            effective_verify_ok_step(VerificationLevel::Behavioral, Some(3), Some(5)),
+            Some(5)
+        );
+        assert_eq!(
+            effective_verify_ok_step(VerificationLevel::Behavioral, Some(3), None),
+            None
+        );
+    }
+
+    #[test]
+    fn infer_required_verification_level_keeps_docs_build_only() {
+        assert_eq!(
+            infer_required_verification_level("Update README wording and docs only", None),
+            VerificationLevel::Build
+        );
+        assert_eq!(
+            infer_required_verification_level("Fix runtime bug in agent loop", None),
+            VerificationLevel::Behavioral
+        );
+    }
+
+    #[test]
+    fn goal_check_policy_respects_command_approval() {
+        assert!(should_auto_run_goal_checks(false, DEFAULT_MAX_ITERS));
+        assert!(!should_auto_run_goal_checks(true, DEFAULT_MAX_ITERS));
+    }
+
+    #[test]
+    fn goal_check_runner_command_uses_shared_catalog() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            td.path().join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.1.0'\n",
+        )
+        .expect("write cargo");
+        let cmd = goal_check_runner_command(
+            VerificationLevel::Behavioral,
+            td.path().to_string_lossy().as_ref(),
+        )
+        .expect("runner command");
+        assert_eq!(cmd, "cargo test -q");
+    }
+
+    #[test]
+    fn repo_goal_missing_labels_follow_shared_requirements() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(td.path().join(".git")).expect("mkdir .git");
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let missing = rt.block_on(repo_goal_missing_labels(
+            td.path().to_string_lossy().as_ref(),
+        ));
+        assert!(missing.contains(&"HEAD (commit)".to_string()));
+        assert!(missing.contains(&"README.md".to_string()));
+        assert!(!missing.contains(&".git".to_string()));
+    }
+
+    #[test]
+    fn verification_examples_include_shared_goal_check_runners() {
+        let build = verification_examples(VerificationLevel::Build);
+        let behavioral = verification_examples(VerificationLevel::Behavioral);
+
+        assert!(build.contains("cargo build -q"));
+        assert!(behavioral.contains("python -m pytest -q"));
+    }
+
+    #[test]
+    fn restore_done_gate_does_not_count_git_status_as_verification() {
+        let messages = vec![
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"exec","arguments":"{\"command\":\"touch foo.txt\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"call_1","content":"OK (exit_code: 0)\nstdout:\n"}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"call_2","type":"function","function":{"name":"exec","arguments":"{\"command\":\"git status\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"call_2","content":"OK (exit_code: 0)\nstdout:\nOn branch main\n"}),
+        ];
+
+        let (_, last_mutation_step, _last_build_verify_ok_step, last_behavioral_verify_ok_step, _) =
+            restore_done_gate_from_messages(&messages, None);
+
+        assert_eq!(last_mutation_step, Some(1));
+        assert_eq!(last_behavioral_verify_ok_step, None);
+    }
+
+    #[test]
+    fn upgrade_required_verification_from_messages_detects_code_mutation() {
+        let messages = vec![
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"patch_file","arguments":"{\"path\":\"src/tui/agent.rs\",\"search\":\"a\",\"replace\":\"b\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"call_1","content":"OK\n[hash] before=1 after=2"}),
+        ];
+
+        assert_eq!(
+            upgrade_required_verification_from_messages(&messages, VerificationLevel::Build),
+            VerificationLevel::Behavioral
+        );
+    }
+
+    #[test]
+    fn working_memory_rebuilds_from_messages() {
+        let messages = vec![
+            json!({
+                "role":"assistant",
+                "content":"<plan>\ngoal: ship fix\nsteps: 1) inspect files 2) edit agent 3) verify build\nacceptance: 1) cargo check passes 2) runtime gate blocks bad tool calls\nrisks: wrong file, wrong command\nassumptions: cargo works\n</plan>\n<think>\ngoal: inspect file\nstep: 1\ntool: read_file\nrisk: wrong path\ndoubt: maybe wrong target\nnext: read src/tui/agent.rs\nverify: file opens\n</think>",
+                "tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/tui/agent.rs\"}"}}]
+            }),
+            json!({"role":"tool","tool_call_id":"call_1","content":"[src/tui/agent.rs] (10 lines, 100 bytes)\nfn main() {}\n"}),
+            json!({
+                "role":"assistant",
+                "content":"<think>\ngoal: verify build\nstep: 3\ntool: exec\nrisk: wrong target\ndoubt: maybe workspace differs\nnext: cargo check\nverify: exit code is zero\n</think>",
+                "tool_calls":[{"id":"call_2","type":"function","function":{"name":"exec","arguments":"{\"command\":\"cargo check\"}"}}]
+            }),
+            json!({"role":"tool","tool_call_id":"call_2","content":"OK (exit_code: 0)\ncwd: /repo\nstdout:\nFinished dev [unoptimized] target(s) in 0.10s\n"}),
+            json!({"role":"assistant","content":"<reflect>\nlast_outcome: partial\ngoal_delta: closer\nwrong_assumption: cargo test was necessary first\nstrategy_change: adjust\nnext_minimal_action: run targeted tests\n</reflect>"}),
+        ];
+
+        let mem = WorkingMemory::from_messages(&messages, None);
+        assert!(mem.facts.iter().any(|fact| fact.contains("cwd: /repo")));
+        assert!(mem
+            .completed_steps
+            .iter()
+            .any(|step| step == "inspect files"));
+        assert!(mem
+            .completed_steps
+            .iter()
+            .any(|step| step == "verify build"));
+        assert!(mem
+            .successful_verifications
+            .iter()
+            .any(|cmd| cmd == "cargo check"));
+        assert_eq!(mem.chosen_strategy.as_deref(), Some("run targeted tests"));
+    }
+
+    #[test]
+    fn working_memory_sync_to_plan_drops_stale_steps() {
+        let mut mem = WorkingMemory::default();
+        mem.remember_completed_step("inspect files");
+        mem.remember_completed_step("verify build");
+
+        let plan = PlanBlock {
+            goal: "ship fix".to_string(),
+            steps: vec!["verify build".to_string(), "ship".to_string()],
+            acceptance_criteria: vec!["cargo check passes".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "tests exist".to_string(),
+        };
+
+        mem.sync_to_plan(&plan);
+        assert_eq!(mem.completed_steps, vec!["verify build".to_string()]);
+    }
+
+    #[test]
+    fn last_impact_step_tracks_post_mutation_assessment() {
+        let messages = vec![
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"a.txt\",\"content\":\"x\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"call_1","content":"OK\n[hash] before=0 after=1"}),
+            json!({"role":"assistant","content":"<impact>\nchanged: wrote a.txt\nprogress: step 2 moved\nremaining_gap: run cargo check\n</impact>\n"}),
+        ];
+
+        assert_eq!(last_impact_step_from_messages(&messages), Some(1));
     }
 }

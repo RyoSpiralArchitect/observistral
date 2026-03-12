@@ -275,6 +275,7 @@ fn sanitize_shellish_command(cmd: &str) -> String {
     s
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn split_args_simple(s: &str) -> Vec<String> {
     // Minimal tokeniser good enough for short command snippets.
     // Supports single and double quotes. In double quotes, \" and \\ are handled.
@@ -326,6 +327,7 @@ fn split_args_simple(s: &str) -> Vec<String> {
     out
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn ps_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -911,9 +913,37 @@ async fn build_command(cmd_str: &str) -> Result<Command> {
         c.args(["-NoProfile", "-NonInteractive", "-Command", &wrapped]);
         Ok(c)
     } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", cmd_str]);
-        Ok(c)
+        fn path_has_executable(name: &str) -> bool {
+            let Some(path) = std::env::var_os("PATH") else {
+                return false;
+            };
+            for dir in std::env::split_paths(&path) {
+                if dir.as_os_str().is_empty() {
+                    continue;
+                }
+                let cand = dir.join(name);
+                if std::fs::metadata(&cand).is_ok_and(|m| m.is_file()) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        // Prefer bash when available: many LLM-produced scripts use bashisms
+        // (`[[ ... ]]`, `set -euo pipefail`, etc.) which break under dash/POSIX sh.
+        //
+        // Avoid sourcing user profile/rc files: they can `cd` outside tool_root or
+        // print banners that pollute tool output. The parent process environment
+        // already reflects the user's PATH when started from a terminal.
+        if path_has_executable("bash") {
+            let mut c = Command::new("bash");
+            c.args(["--noprofile", "--norc", "-c", cmd_str]);
+            Ok(c)
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", cmd_str]);
+            Ok(c)
+        }
     }
 }
 

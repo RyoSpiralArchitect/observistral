@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -6,10 +7,38 @@ use tokio::sync::mpsc;
 use crate::config::{ProviderKind, RunConfig};
 use crate::types::ChatMessage;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReflectionSummary {
+    pub last_outcome: Option<String>,
+    pub goal_delta: Option<String>,
+    pub wrong_assumption: Option<String>,
+    pub strategy_change: Option<String>,
+    pub next_minimal_action: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernorState {
+    pub state: String,
+    pub recovery_stage: Option<String>,
+
+    pub consecutive_failures: usize,
+    pub same_command_repeats: usize,
+    pub same_error_repeats: usize,
+    pub same_output_repeats: usize,
+    pub file_tool_consec_failures: usize,
+
+    pub done_verify_required: bool,
+    pub last_mutation_step: Option<usize>,
+    pub last_verify_ok_step: Option<usize>,
+
+    pub last_reflection: Option<ReflectionSummary>,
+}
+
 #[derive(Debug, Clone)]
 pub enum StreamToken {
     Delta(String),
     ToolCall(ToolCallData),
+    GovernorState(GovernorState),
     Done,
     Error(String),
     /// Git checkpoint hash created at session start (for rollback).
@@ -192,10 +221,12 @@ pub async fn stream_openai_compat_json(
     const MAX_CONNECT_RETRIES: usize = 3;
 
     for url in stream_chat_urls_for_base_url(&cfg.base_url) {
-        let connect_ctx = format!(
-            "failed to connect to {url}\n\
-             If behind a proxy, set: $env:HTTPS_PROXY=\"http://host:port\""
-        );
+        let proxy_hint = if cfg!(target_os = "windows") {
+            r#"If behind a proxy, set: $env:HTTPS_PROXY="http://host:port""#
+        } else {
+            r#"If behind a proxy, set: export HTTPS_PROXY="http://host:port""#
+        };
+        let connect_ctx = format!("failed to connect to {url}\n{proxy_hint}");
 
         let mut payload_try = payload.clone();
         let mut attempt: usize = 0;

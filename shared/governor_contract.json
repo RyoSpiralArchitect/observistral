@@ -1,0 +1,602 @@
+{
+  "tool_names": [
+    "exec",
+    "read_file",
+    "write_file",
+    "patch_file",
+    "apply_diff",
+    "search_files",
+    "list_dir",
+    "glob",
+    "done"
+  ],
+  "diagnostic_tools": [
+    "list_dir",
+    "search_files",
+    "glob",
+    "read_file"
+  ],
+  "plan": {
+    "title": "Planning Protocol — emit before the first real tool call and whenever the plan changes",
+    "tag": "plan",
+    "fields": [
+      {
+        "key": "goal",
+        "hint": "<one sentence: what the finished task looks like when done>",
+        "kind": "string",
+        "required": true
+      },
+      {
+        "key": "steps",
+        "hint": "1) ... 2) ... 3) ... (3-7 concrete, ordered steps)",
+        "kind": "list",
+        "required": true,
+        "min_items": 2,
+        "max_items": 7
+      },
+      {
+        "key": "acceptance",
+        "hint": "1) ... 2) ... (1-4 concrete done-checks)",
+        "kind": "list",
+        "required": true,
+        "aliases": [
+          "acceptance_criteria"
+        ],
+        "min_items": 1,
+        "max_items": 4
+      },
+      {
+        "key": "risks",
+        "hint": "<the 2 most likely failure modes for this specific task>",
+        "kind": "string",
+        "required": true
+      },
+      {
+        "key": "assumptions",
+        "hint": "<what you are taking as given>",
+        "kind": "string",
+        "required": true
+      }
+    ],
+    "rules": []
+  },
+  "think": {
+    "title": "Reasoning Protocol — emit before EVERY tool call",
+    "tag": "think",
+    "fields": [
+      {
+        "key": "goal",
+        "hint": "<≤12 words: what must succeed right now>",
+        "kind": "string",
+        "required": true
+      },
+      {
+        "key": "step",
+        "hint": "<which plan step number this tool call belongs to>",
+        "kind": "positive_int",
+        "required": true,
+        "min_value": 1
+      },
+      {
+        "key": "tool",
+        "hint": "<exec|read_file|write_file|patch_file|apply_diff|search_files|list_dir|glob|done>",
+        "kind": "tool_name",
+        "required": true,
+        "allowed_values_from": "tool_names",
+        "value_aliases": {
+          "read": "read_file",
+          "write": "write_file",
+          "patch": "patch_file",
+          "diff": "apply_diff",
+          "search": "search_files",
+          "list": "list_dir",
+          "finish": "done"
+        }
+      },
+      {
+        "key": "risk",
+        "hint": "<≤12 words: most likely failure mode>",
+        "kind": "string",
+        "required": true
+      },
+      {
+        "key": "doubt",
+        "hint": "<≤12 words: one reason this approach could be wrong>",
+        "kind": "string",
+        "required": true
+      },
+      {
+        "key": "next",
+        "hint": "<≤12 words: exact next action; for exec, use the command prefix>",
+        "kind": "string",
+        "required": true
+      },
+      {
+        "key": "verify",
+        "hint": "<≤12 words: how to confirm this step succeeded>",
+        "kind": "string",
+        "required": true
+      }
+    ],
+    "rules": [
+      "Keep each field under 15 words."
+    ]
+  },
+  "reflect": {
+    "title": "Self Reflection Protocol — emit only when the system explicitly requires it",
+    "tag": "reflect",
+    "fields": [
+      {
+        "key": "last_outcome",
+        "hint": "success|failure|partial",
+        "kind": "enum",
+        "required": true,
+        "allowed_values": [
+          "success",
+          "failure",
+          "partial"
+        ]
+      },
+      {
+        "key": "goal_delta",
+        "hint": "closer|same|farther",
+        "kind": "enum",
+        "required": true,
+        "allowed_values": [
+          "closer",
+          "same",
+          "farther"
+        ],
+        "value_aliases": {
+          "further": "farther"
+        }
+      },
+      {
+        "key": "wrong_assumption",
+        "hint": "<one short sentence>",
+        "kind": "string",
+        "required": true
+      },
+      {
+        "key": "strategy_change",
+        "hint": "keep|adjust|abandon",
+        "kind": "enum",
+        "required": true,
+        "allowed_values": [
+          "keep",
+          "adjust",
+          "abandon"
+        ]
+      },
+      {
+        "key": "next_minimal_action",
+        "hint": "<one short sentence>",
+        "kind": "string",
+        "required": true
+      }
+    ],
+    "rules": [
+      "After the <reflect> block, call exactly one tool."
+    ]
+  },
+  "impact": {
+    "title": "Post-Mutation Impact Check — emit only when the system explicitly requires it",
+    "tag": "impact",
+    "fields": [
+      {
+        "key": "changed",
+        "hint": "<one short sentence>",
+        "kind": "string",
+        "required": true
+      },
+      {
+        "key": "progress",
+        "hint": "<which plan step or acceptance criterion moved>",
+        "kind": "string",
+        "required": true
+      },
+      {
+        "key": "remaining_gap",
+        "hint": "<one short sentence>",
+        "kind": "string",
+        "required": true
+      }
+    ],
+    "rules": [
+      "Mention the actual mutation effect, not intent.",
+      "`progress` must name a real step or acceptance criterion.",
+      "After the <impact> block, call exactly one tool."
+    ]
+  },
+  "done": {
+    "required_args": [
+      "summary",
+      "completed_acceptance",
+      "remaining_acceptance",
+      "acceptance_evidence"
+    ],
+    "acceptance_evidence_fields": [
+      "criterion",
+      "command"
+    ],
+    "rules": [
+      "Use done only after real verification succeeds.",
+      "Each completed acceptance criterion must cite a successful verification command."
+    ]
+  },
+  "verification": {
+    "intent_doc_terms": [
+      "readme",
+      "documentation",
+      "docs",
+      "comment",
+      "comments",
+      "typo",
+      "spelling",
+      "translate",
+      "translation",
+      "markdown",
+      "changelog",
+      "ドキュメント",
+      "コメント",
+      "誤字",
+      "翻訳"
+    ],
+    "intent_behavioral_terms": [
+      "fix",
+      "bug",
+      "implement",
+      "feature",
+      "behavior",
+      "logic",
+      "test",
+      "runtime",
+      "agent",
+      "coder",
+      "observer",
+      "parser",
+      "loop",
+      "gate",
+      "acceptance",
+      "修正",
+      "バグ",
+      "実装",
+      "機能",
+      "挙動",
+      "ロジック",
+      "テスト",
+      "強化",
+      "改善",
+      "検証",
+      "コーダー",
+      "エージェント"
+    ],
+    "goal_test_terms": [
+      "test",
+      "tests",
+      "unit test",
+      "unittest",
+      "pytest",
+      "jest",
+      "mocha",
+      "go test",
+      "cargo test",
+      "npm test",
+      "e2e",
+      "smoke",
+      "テスト",
+      "単体テスト",
+      "総合テスト"
+    ],
+    "goal_build_terms": [
+      "build",
+      "compile",
+      "release",
+      "bundle",
+      "cargo build",
+      "cargo check",
+      "npm run build",
+      "pnpm build",
+      "yarn build",
+      "ビルド",
+      "コンパイル"
+    ],
+    "goal_repo_terms": [
+      "repo",
+      "repository",
+      "git",
+      "scaffold",
+      "bootstrap",
+      "init",
+      "setup",
+      "create repo",
+      "create repository",
+      "リポ",
+      "リポジトリ",
+      "雛形",
+      "ひな形",
+      "プロジェクト",
+      "git init"
+    ],
+    "goal_check_runners": [
+      {
+        "detect_files_any": [
+          "Cargo.toml"
+        ],
+        "test_command": "cargo test -q",
+        "build_command": "cargo build -q"
+      },
+      {
+        "detect_files_any": [
+          "package.json"
+        ],
+        "test_command": "npm test --silent",
+        "build_command": "npm run build --silent"
+      },
+      {
+        "detect_files_any": [
+          "pyproject.toml",
+          "requirements.txt"
+        ],
+        "test_command": "python -m pytest -q",
+        "build_command": "python -m compileall -q ."
+      }
+    ],
+    "repo_goal_requirements": [
+      {
+        "key": "in_repo",
+        "label": ".git",
+        "probe": "dir_exists",
+        "path": ".git"
+      },
+      {
+        "key": "head",
+        "label": "HEAD (commit)",
+        "probe": "git_head"
+      },
+      {
+        "key": "readme",
+        "label": "README.md",
+        "probe": "file_exists",
+        "path": "README.md"
+      }
+    ],
+    "goal_check_policy": {
+      "run_on_stop": true,
+      "require_longrun": true,
+      "require_exec_feature": true,
+      "require_command_approval_off": true,
+      "max_attempts_per_goal": 3,
+      "goal_order": [
+        "repo",
+        "tests",
+        "build"
+      ]
+    },
+    "plan_build_terms": [
+      "build",
+      "compile",
+      "check",
+      "lint",
+      "format",
+      "fmt",
+      "readme",
+      "docs",
+      "documentation",
+      "comment",
+      "typo",
+      "translation",
+      "markdown",
+      "renders",
+      "render",
+      "ドキュメント",
+      "コメント",
+      "誤字",
+      "翻訳"
+    ],
+    "plan_behavioral_terms": [
+      "test",
+      "tests",
+      "runtime",
+      "behavior",
+      "behaviour",
+      "works",
+      "work correctly",
+      "user can",
+      "click",
+      "responds",
+      "response",
+      "output",
+      "parses",
+      "loads",
+      "saves",
+      "passes",
+      "fixes the bug",
+      "regression",
+      "executes",
+      "実行",
+      "挙動",
+      "動く",
+      "通る",
+      "テスト",
+      "バグ"
+    ],
+    "doc_path_terms": [
+      "readme",
+      ".md",
+      ".txt",
+      ".rst",
+      ".adoc",
+      "changelog",
+      "docs/"
+    ],
+    "behavioral_path_extensions": [
+      ".rs",
+      ".py",
+      ".js",
+      ".jsx",
+      ".ts",
+      ".tsx",
+      ".go",
+      ".cs",
+      ".java",
+      ".c",
+      ".cc",
+      ".cpp",
+      ".h",
+      ".hpp",
+      ".swift",
+      ".kt",
+      ".rb",
+      ".php",
+      ".html",
+      ".css",
+      ".scss",
+      ".sh",
+      ".ps1"
+    ],
+    "ignore_command_signatures": [
+      "git status"
+    ],
+    "build_command_signatures": [
+      "cargo build",
+      "cargo check",
+      "cargo clippy",
+      "cargo fmt --check",
+      "npm run build",
+      "npm run lint",
+      "pnpm build",
+      "pnpm lint",
+      "yarn build",
+      "yarn lint",
+      "ruff check",
+      "mypy",
+      "eslint",
+      "tsc",
+      "go build",
+      "dotnet build",
+      "git diff --check"
+    ],
+    "behavioral_command_signatures": [
+      "cargo test",
+      "cargo nextest",
+      "npm test",
+      "npm run test",
+      "pnpm test",
+      "pnpm run test",
+      "yarn test",
+      "yarn run test",
+      "pytest",
+      "python -m pytest",
+      "go test",
+      "dotnet test",
+      "mvn test",
+      "gradle test",
+      "gradlew test",
+      "ctest",
+      "make test",
+      "vitest",
+      "jest",
+      "bun test",
+      "swift test",
+      "xcodebuild test",
+      "phpunit",
+      "composer test",
+      "deno test"
+    ]
+  },
+  "prompt_layout": {
+    "block_order": [
+      "plan",
+      "think",
+      "impact",
+      "reflect"
+    ],
+    "done_title": "Done Protocol",
+    "done_args_template": "done must include {done_args}.",
+    "error_title": "Error Protocol",
+    "error_rules": [
+      "If exit_code ≠ 0: STOP immediately.",
+      "  1. Quote the exact error line.",
+      "  2. State root cause in one sentence.",
+      "  3. Fix with one corrected command.",
+      "If the SAME approach fails 3 consecutive times: STOP, explain why,",
+      "  and propose a completely different strategy. Never repeat a failing command."
+    ]
+  },
+  "messages": {
+    "multiple_tool_calls": "Multiple tool calls detected ({count}). Only ONE tool call per turn is supported.\nFix: call exactly one tool in your next assistant message.",
+    "plan_invalid": "[Plan Gate] Invalid <plan>: {error}\nRequired now: emit a valid <plan> with {plan_fields}, then emit <think>, then call ONE tool.",
+    "plan_missing": "[Plan Gate] Missing valid <plan>.\nRequired now: in your next assistant message, include a valid <plan> ({plan_fields}), then emit <think>, then call ONE diagnostic tool ({diagnostic_tools}) to start.",
+    "plan_missing_goal": "plan missing goal",
+    "plan_missing_steps": "plan missing steps",
+    "plan_min_steps": "plan must include at least {min_steps} numbered steps in `steps:`",
+    "plan_max_steps": "plan has too many steps (max {max_steps})",
+    "plan_missing_acceptance": "plan must include acceptance criteria",
+    "plan_min_acceptance": "plan must include at least {min_acceptance} acceptance criterion in `acceptance:`",
+    "plan_max_acceptance": "plan has too many acceptance criteria (max {max_acceptance})",
+    "plan_missing_risks": "plan missing risks",
+    "plan_missing_assumptions": "plan missing assumptions",
+    "plan_empty_step": "plan contains an empty step",
+    "plan_empty_acceptance": "plan contains an empty acceptance criterion",
+    "think_missing": "[Think Gate] Missing <think>.\nRequired now: emit a valid <think> with {think_fields} immediately before your tool call.",
+    "think_invalid": "[Think Gate] Invalid <think>: {error}\nRequired now: emit a valid <think> whose step exists in the current <plan> and whose tool matches the actual tool call.",
+    "think_missing_goal": "think missing goal",
+    "think_invalid_step": "think missing/invalid step",
+    "think_requires_plan": "think requires a valid current plan",
+    "think_step_out_of_range": "think.step={step} is outside the current plan ({plan_steps} steps)",
+    "think_invalid_tool": "think missing/invalid tool",
+    "think_missing_risk": "think missing risk",
+    "think_missing_doubt": "think missing doubt",
+    "think_missing_next": "think missing next",
+    "think_missing_verify": "think missing verify",
+    "think_tool_mismatch": "think.tool={think_tool} does not match actual tool={actual_tool}",
+    "think_exec_prefix_mismatch": "think.next does not align with exec command (expected command prefix match)",
+    "reflection_missing": "Reflection required but missing.\nReason: {reason}\nEmit <reflect>...</reflect> before the next tool call.",
+    "reflection_invalid": "Invalid self-reflection: {error}\nReason: {reason}\nEmit a valid <reflect> block before the next tool call.",
+    "reflection_one_tool": "Reflection gate: expected exactly ONE tool call after <reflect>, got {count}.\nFix: emit ONE <reflect> block, then call exactly ONE tool.",
+    "reflection_stop": "Reflection required but no tool call followed.\nReason: {reason}\nEmit <reflect>...</reflect> and then call exactly one tool.",
+    "reflection_missing_last_outcome": "reflection missing last_outcome",
+    "reflection_missing_wrong_assumption": "reflection missing wrong_assumption",
+    "reflection_missing_next_minimal_action": "reflection missing next_minimal_action",
+    "reflection_invalid_goal_delta": "reflection missing/invalid goal_delta",
+    "reflection_invalid_strategy_change": "reflection missing/invalid strategy_change",
+    "reflection_requires_strategy_change": "reflection says keep, but repeated failure/stall requires strategy change",
+    "reflection_non_improving_requires_change": "goal_delta is not improving, so strategy_change cannot be keep",
+    "impact_missing": "Impact check required but missing.\nReason: {reason}\nEmit <impact>...</impact> before the next tool call.",
+    "impact_invalid": "Invalid impact check: {error}\nReason: {reason}\nEmit a valid <impact> block before the next tool call.",
+    "impact_one_tool": "Impact gate: expected exactly ONE tool call after <impact>, got {count}.\nFix: emit ONE <impact> block, then call exactly ONE tool.",
+    "impact_stop": "Impact check required but no tool call followed.\nReason: {reason}\nEmit <impact>...</impact> and then call exactly one tool.",
+    "impact_missing_changed": "impact missing changed",
+    "impact_missing_progress": "impact missing progress",
+    "impact_missing_remaining_gap": "impact missing remaining_gap",
+    "impact_requires_plan": "impact requires a valid current plan",
+    "impact_invalid_progress_reference": "impact.progress must reference a real current plan step or acceptance criterion",
+    "done_invalid_acceptance": "[Done Gate] Invalid acceptance summary: {error}\nRequired now: call `done` with `completed_acceptance`, `remaining_acceptance`, and `acceptance_evidence` that cover every current plan acceptance criterion and cite known-good verification commands.",
+    "done_requires_plan": "done requires a valid current plan",
+    "done_missing_criteria": "done must cite the current plan acceptance criteria",
+    "done_completed_invalid_reference": "done.completed_acceptance must reference a real current acceptance criterion",
+    "done_remaining_invalid_reference": "done.remaining_acceptance must reference a real current acceptance criterion",
+    "done_duplicate_criteria": "done acceptance criteria contain duplicates across completed/remaining",
+    "done_incomplete_coverage": "done acceptance coverage must account for every current plan acceptance criterion",
+    "done_evidence_incomplete": "done.acceptance_evidence must cover every completed acceptance criterion exactly once",
+    "done_evidence_invalid_reference": "done.acceptance_evidence criterion must reference a real current acceptance criterion",
+    "done_evidence_only_completed": "done.acceptance_evidence may cite only completed acceptance criteria",
+    "done_evidence_duplicate_criteria": "done.acceptance_evidence contains duplicate criterion entries",
+    "done_evidence_unknown_command": "done.acceptance_evidence command must match a known successful verification command",
+    "goal_check_repo_start": "[goal_check:repo] checking {requirements}",
+    "goal_check_repo_ok": "[goal_check:repo] OK",
+    "goal_check_exec_run": "[goal_check:{label}] run `{command}`",
+    "goal_check_exec_ok": "[goal_check:{label}] OK `{command}`",
+    "goal_check_exec_fail": "[goal_check:{label}] FAIL `{command}`\n{digest_line}",
+    "goal_check_all_passed": "[goal_check] all requested stop checks passed",
+    "goal_check_supported_runners": "Supported runners: {summary}.",
+    "goal_check_tests_runner_fallback": "If tests are required, configure a supported test runner and re-run.",
+    "goal_check_build_runner_fallback": "If build is required, add build instructions/scripts for this repo and run them.",
+    "goal_check_repo_missing": "[goal_check]\nThe task is NOT complete yet.\nMissing: {missing}\nFix it by using exec/write_file. Do NOT stop until the goals are satisfied.",
+    "goal_check_tests_no_runner": "[goal_check]\nTests were requested, but no test runner was detected in the current directory.\n{supported_runners_line}\nOtherwise, explicitly explain why tests are not applicable and then stop.",
+    "goal_check_tests_failed": "[goal_check]\nTests are failing (or suspicious output indicates failure).\n{class_line}{digest_line}Fix the failures and re-run the tests. Do NOT stop until tests pass.",
+    "goal_check_build_no_runner": "[goal_check]\nA build step was requested, but no known build runner was detected in the current directory.\n{supported_runners_line}\nOtherwise, explicitly explain why build is not applicable and then stop.",
+    "goal_check_build_failed": "[goal_check]\nBuild is failing (or suspicious output indicates failure).\n{class_line}{digest_line}Fix the build failures and re-run. Do NOT stop until build passes."
+  }
+}

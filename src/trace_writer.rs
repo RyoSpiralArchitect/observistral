@@ -34,7 +34,6 @@ pub fn safe_mkdir(path: &Path) -> Result<()> {
 /// - each call writes one JSON object per line
 /// - best used for tool calls, checkpoints, governor events, and errors
 pub struct TraceWriter {
-    path: PathBuf,
     started_at_ms: u128,
     w: Mutex<BufWriter<std::fs::File>>,
 }
@@ -48,14 +47,9 @@ impl TraceWriter {
             .open(&path)
             .with_context(|| format!("failed to open trace file: {}", path.display()))?;
         Ok(Self {
-            path,
             started_at_ms: now_ms(),
             w: Mutex::new(BufWriter::new(f)),
         })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     pub fn event(&self, event: &str, payload: serde_json::Value) -> Result<()> {

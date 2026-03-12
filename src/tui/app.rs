@@ -2,6 +2,7 @@ use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 
 use crate::config::RunConfig;
+use crate::streaming::GovernorState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -174,6 +175,8 @@ pub struct App {
     /// How many agentic tool-call iterations have been completed so far
     /// for the current Coder task (reset to 0 on each new send).
     pub coder_iter: u32,
+    /// Latest governor status snapshot from the agentic loop.
+    pub coder_governor: Option<GovernorState>,
 
     /// Running task handles used for Ctrl+K cancellation.
     pub coder_task: Option<JoinHandle<()>>,
@@ -243,6 +246,7 @@ impl App {
             quit: false,
             tick_count: 0,
             coder_iter: 0,
+            coder_governor: None,
             coder_task: None,
             observer_task: None,
             chat_task: None,

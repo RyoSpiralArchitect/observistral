@@ -12,7 +12,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::PartialConfig;
+use crate::config::{PartialConfig, ProviderKind};
 use crate::modes::Mode;
 
 #[derive(clap::Args, Debug, Clone)]
@@ -20,6 +20,32 @@ pub struct TuiArgs {
     /// Model to use for the Observer pane (defaults to same as Coder).
     #[arg(long)]
     pub observer_model: Option<String>,
+
+    /// Provider to use for the Observer pane (defaults to same as Coder).
+    #[arg(long, value_enum)]
+    pub observer_provider: Option<ProviderKind>,
+
+    /// Provider base URL for the Observer pane. When omitted and the provider differs
+    /// from the Coder, the provider default is used (not OBS_BASE_URL).
+    #[arg(long)]
+    pub observer_base_url: Option<String>,
+
+    /// API key for the Observer pane (prefer env vars over CLI flags).
+    #[arg(long)]
+    pub observer_api_key: Option<String>,
+
+    /// Provider to use for the Chat pane (defaults to same as Coder).
+    #[arg(long, value_enum)]
+    pub chat_provider: Option<ProviderKind>,
+
+    /// Provider base URL for the Chat pane. When omitted and the provider differs
+    /// from the Coder, the provider default is used (not OBS_BASE_URL).
+    #[arg(long)]
+    pub chat_base_url: Option<String>,
+
+    /// API key for the Chat pane (prefer env vars over CLI flags).
+    #[arg(long)]
+    pub chat_api_key: Option<String>,
 
     /// UI / response language hint (ja/en/fr).
     #[arg(long, default_value = "ja")]
@@ -62,10 +88,55 @@ pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
         .resolve()
         .context("failed to resolve coder config")?;
 
+    // Coder is the agentic tool loop; it requires an OpenAI-compatible Chat Completions API
+    // with tool calling. Anthropic and HF (local subprocess) are supported for Chat/Observer only.
+    if matches!(
+        coder_cfg.provider,
+        ProviderKind::Anthropic | ProviderKind::Hf
+    ) {
+        anyhow::bail!(
+            "TUI Coder requires a tool-calling provider: openai-compatible or mistral.\n\
+You selected: {}\n\
+Fix: pass `--provider openai-compatible` (or `--provider mistral`).\n\
+Tip: you can still use Anthropic/HF for other panes via `--observer-provider` / `--chat-provider`.",
+            coder_cfg.provider
+        );
+    }
+
     // Chat uses Chat mode (no tools) and should default to chat_model (not code_model).
     let chat_cfg = {
         let mut chat_partial = partial_cfg.clone();
         chat_partial.mode = Some(Mode::Chat);
+        if let Some(p) = args.chat_provider.clone() {
+            chat_partial.provider = Some(p.clone());
+
+            // If the Chat provider differs from the Coder, do not inherit global base_url/model/api_key
+            // (they are almost always wrong across provider families). Prefer provider defaults/env.
+            if p != coder_cfg.provider {
+                chat_partial.base_url = args.chat_base_url.clone().or_else(|| Some(String::new()));
+                chat_partial.api_key = args.chat_api_key.clone();
+
+                // If the user did not explicitly set --chat-model, default to the provider model.
+                if chat_partial.chat_model.is_none() {
+                    chat_partial.model = Some(String::new());
+                    chat_partial.chat_model = Some(String::new());
+                }
+            } else {
+                if args.chat_base_url.is_some() {
+                    chat_partial.base_url = args.chat_base_url.clone();
+                }
+                if args.chat_api_key.is_some() {
+                    chat_partial.api_key = args.chat_api_key.clone();
+                }
+            }
+        } else {
+            if args.chat_base_url.is_some() {
+                chat_partial.base_url = args.chat_base_url.clone();
+            }
+            if args.chat_api_key.is_some() {
+                chat_partial.api_key = args.chat_api_key.clone();
+            }
+        }
         chat_partial
             .resolve()
             .context("failed to resolve chat config")?
@@ -74,13 +145,48 @@ pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
     // For the Observer we allow a different model via --observer-model.
     let observer_cfg = {
         let mut obs_partial = partial_cfg.clone();
+        obs_partial.mode = Some(crate::modes::Mode::Observer);
+
+        if let Some(p) = args.observer_provider.clone() {
+            obs_partial.provider = Some(p.clone());
+
+            if p != coder_cfg.provider {
+                obs_partial.base_url = args
+                    .observer_base_url
+                    .clone()
+                    .or_else(|| Some(String::new()));
+                obs_partial.api_key = args.observer_api_key.clone();
+
+                // Default to provider model unless explicitly overridden by --observer-model.
+                if args.observer_model.is_none() {
+                    obs_partial.model = Some(String::new());
+                    obs_partial.chat_model = Some(String::new());
+                    obs_partial.code_model = Some(String::new());
+                }
+            } else {
+                if args.observer_base_url.is_some() {
+                    obs_partial.base_url = args.observer_base_url.clone();
+                }
+                if args.observer_api_key.is_some() {
+                    obs_partial.api_key = args.observer_api_key.clone();
+                }
+            }
+        } else {
+            if args.observer_base_url.is_some() {
+                obs_partial.base_url = args.observer_base_url.clone();
+            }
+            if args.observer_api_key.is_some() {
+                obs_partial.api_key = args.observer_api_key.clone();
+            }
+        }
+
         if let Some(obs_model) = &args.observer_model {
             obs_partial.model = Some(obs_model.clone());
-            obs_partial.chat_model = None;
-            obs_partial.code_model = None;
+            // Block env overrides and force chat_model/code_model to follow base model.
+            obs_partial.chat_model = Some(String::new());
+            obs_partial.code_model = Some(String::new());
         }
         // Observer always uses Observer mode.
-        obs_partial.mode = Some(crate::modes::Mode::Observer);
         obs_partial
             .resolve()
             .context("failed to resolve observer config")?

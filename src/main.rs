@@ -4,9 +4,11 @@ mod chatbot;
 mod config;
 mod exec;
 mod file_tools;
+mod governor_contract;
 mod lang_detect;
 mod loop_detect;
 mod modes;
+mod observer;
 mod pending_commands;
 mod pending_edits;
 mod personas;
@@ -338,7 +340,12 @@ fn run_list(what: ListWhat) {
         }
         ListWhat::Personas => {
             for p in personas::supported_personas() {
-                println!("{p}");
+                let label = personas::resolve_persona(p).map(|d| d.label).unwrap_or("");
+                if label.trim().is_empty() {
+                    println!("{p}");
+                } else {
+                    println!("{p}\t{label}");
+                }
             }
         }
     }
@@ -1143,6 +1150,7 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
                 project_context_for_task,
                 agents_md_for_task,
                 test_cmd_for_task,
+                command_approval,
                 autosaver_for_task,
                 approver_for_task.as_ref(),
             )
@@ -1170,6 +1178,11 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
                                         "arguments": tc.arguments,
                                     }),
                                 );
+                            }
+                        }
+                        streaming::StreamToken::GovernorState(s) => {
+                            if let Some(ref tw) = trace {
+                                let _ = tw.event("governor_state", json!(s));
                             }
                         }
                         streaming::StreamToken::Checkpoint(hash) => {
@@ -1234,6 +1247,8 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
         cur_cwd = end_state.cur_cwd;
         checkpoint = checkpoint.or(end_state.checkpoint);
         if let Some(ref tw) = trace {
+            let last_reflection =
+                crate::agent_session::last_reflection_summary_from_messages(&messages_json);
             let _ = tw.event(
                 "round_end",
                 json!({
@@ -1241,6 +1256,7 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
                     "messages_len": messages_json.len(),
                     "checkpoint": checkpoint.as_deref(),
                     "cur_cwd": cur_cwd.as_deref(),
+                    "last_reflection": last_reflection,
                 }),
             );
         }

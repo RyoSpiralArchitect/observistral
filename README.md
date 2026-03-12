@@ -133,19 +133,33 @@ The Coder isn't limited to shell commands. It has five purpose-built tools:
 
 ### The Coder Doubts Itself
 
-Before every tool call, the Coder fills out a 5-line scratchpad:
+Before the first real tool call, the Coder emits a `<plan>` with explicit acceptance criteria. Before every tool call, it emits a structured `<think>` block:
+
+```
+<plan>
+goal:        what “done” means
+steps:       1) ... 2) ... 3) ...
+acceptance:  1) concrete done-check 2) concrete done-check
+risks:       most likely failure modes
+assumptions: what is being assumed
+</plan>
+```
 
 ```
 <think>
 goal:   what must succeed right now
+step:   which plan step this belongs to
+tool:   exec|read_file|write_file|patch_file|apply_diff|search_files|list_dir|glob|done
 risk:   most likely failure mode
 doubt:  one reason this approach could be wrong   ← the unusual field
-next:   exact command or operation
+next:   exact next action / command prefix
 verify: how to confirm it worked
 </think>
 ```
 
-The `doubt:` field forces the model to surface one self-criticism before acting. ~50 tokens. It prevents the failure mode where the model is confidently wrong.
+The runtime now validates `step` and `tool` against the current plan and actual tool call in both TUI and Web GUI. The `acceptance:` criteria also feed the verification requirement, so docs-only plans can stop at build/check/lint while behavior-changing plans are pushed to real tests. The `doubt:` field forces the model to surface one self-criticism before acting.
+
+The scratchpad/governor protocol itself is now sourced from one shared contract file: `shared/governor_contract.json`. TUI reads it directly, and the Web GUI fetches the same contract from `/api/governor_contract` while also bootstrapping the same fallback contract from `/assets/governor_contract.js` before `app.js` runs. That shared contract now also drives block field mapping, field aliases, enum normalization, `done` schema requirements, shared `Done/Error Protocol` prompt sections, detailed `plan` / `think` / `reflect` / `impact` / `done` validator errors, gate/validator error messages, the verification heuristics themselves (intent terms, acceptance terms, path classes, and verification command signatures), the `goal_check` runner catalog used for test/build probes, the repo-goal probe requirements (`.git`, `HEAD`, `README.md`), the `goal_check` retry messages pushed back into the loop, the `goal_check` execution log/status lines shown in TUI/Web, and the `goal_check` execution policy itself (auto-run conditions, retry cap, probe order), which reduces prompt drift.
 
 ### State-Machine Loop (Planning → Executing → Verifying → Recovery)
 
@@ -156,13 +170,24 @@ Most "agent loops" are just a max-iteration timer. OBSTRAL routes the Coder thro
 - `verifying` — run `goal_check` probes before declaring done
 - `recovery`  — stuck detection triggers diagnostics + strategy shift
 
+`git status` is diagnostics only. Completion verification must be a real test/build/check/lint command or your configured test command.
+
+Verification is now acceptance-aware: docs-only work can stop after a real build/check/lint, but code/behavior changes are pushed to behavioral verification (`cargo test`, `pytest`, `npm test`, etc.) before `done`.
+
 This makes long runs converge instead of drifting into README-polish loops.
 
 OBSTRAL also injects a compact `[Recent runs]` memory (commands + `write_file` / `patch_file` / `apply_diff`) so the Coder doesn't forget what it just did and repeat itself.
 
+It also rebuilds a compact `[Working Memory]` from session messages: confirmed facts, completed steps, and known-good verification commands. That gives resumed runs positive memory, not just failure memory.
+
+After every successful mutation, the Coder is also forced to emit a short `<impact>` block before the next tool call, stating what changed and which acceptance criterion actually moved. The runtime now checks that `progress:` points to a real current plan step or acceptance criterion.
+The TUI and Web GUI now both enforce the same `reflect` / `impact` runtime gates, so failed or stalled runs must self-correct explicitly before the next tool call.
+
+The final `done` call is also acceptance-aware now: it must explicitly report which current plan acceptance criteria are already satisfied, which ones remain, and which successful verification command proved each completed criterion. Runtime validation checks that the coverage is complete and that every cited command is real.
+
 ### Goal Verification on Stop (No False "Done")
 
-When the model returns `finish_reason=stop` without tool calls, OBSTRAL can automatically run lightweight checks (repo init, tests, build) and push a `[goal_check]` message back into the loop if anything is missing or failing.
+When the model returns `finish_reason=stop` without tool calls, OBSTRAL can automatically run lightweight checks (repo init, tests, build) and push a `[goal_check]` message back into the loop if anything is missing or failing. That stop-path now uses the same shared policy and shared goal-check log format in both TUI and Web GUI.
 
 ### @file References: Skip the Read Turn
 
@@ -203,23 +228,32 @@ score: 74  rationale: auth is solid, tests cover happy path only
 
 ### Progress Checkpoints
 
-At iterations 3, 6, and 9, the Coder pauses for self-evaluation:
+At iterations 3, 6, and 9, the Coder pauses for a forced self-reflection **before the next tool call**:
 
 ```
-1. DONE: which plan steps are verified complete (exit_code=0)?
-2. REMAINING: what's left?
-3. ON_TRACK: yes/no — if no, re-evaluate before the next command.
+<reflect>
+last_outcome: success|failure|partial
+goal_delta: closer|same|farther
+wrong_assumption: <one short sentence>
+strategy_change: keep|adjust|abandon
+next_minimal_action: <one short sentence>
+</reflect>
 ```
 
 This is the difference between an agent that keeps circling and one that knows when it's lost.
 
-### Windows-First (Really)
+### Cross-platform (Windows / macOS / Linux)
 
-Most AI coding tools are designed on Mac, tested on Linux, and "should work" on Windows.
+OBSTRAL runs on Windows, macOS, and Linux.
 
-OBSTRAL was built on Windows. It handles:
+It was originally built on Windows (so the annoying Windows edge cases are first-class), but the core runtime is OS-agnostic and the repo ships both PowerShell and bash entrypoints:
+
+- Windows: `scripts/*.ps1` (`run-ui.ps1`, `run-tui.ps1`, …)
+- macOS / Linux: `scripts/*.sh` (`run-ui.sh`, `run-tui.sh`, …)
+
+Windows-specific hardening (still useful even if you mainly develop on macOS/Linux):
 - WDAC-blocked binaries → Python Lite fallback server (pure stdlib)
-- Automatic PowerShell syntax translation (bash → PS)
+- Automatic PowerShell syntax translation (bash → PS) for mixed transcripts
 - Corporate proxy environments
 - `sh.exe` Win32 error 5 on interactive git prompts
 
@@ -268,19 +302,57 @@ Every field is intentional. `quote` pins the exact offending line to the card. `
 
 ## Quickstart
 
+### 0) Set your API key (TUI/CLI)
+
+- OpenAI-compatible: `OPENAI_API_KEY` or `OBS_API_KEY`
+- Mistral: `MISTRAL_API_KEY` (or `OBS_API_KEY`)
+- Anthropic (Chat/Observer only): `ANTHROPIC_API_KEY`
+
+```powershell
+$env:OPENAI_API_KEY = "..."
+# or: $env:MISTRAL_API_KEY = "..."
+```
+
+```bash
+export OPENAI_API_KEY="..."
+# or: export MISTRAL_API_KEY="..."
+```
+
+Web UI: paste keys in Settings (stored in your browser and sent only to your local server).
+
 **Web UI (recommended)**
 ```powershell
+# Windows (PowerShell)
 .\scripts\run-ui.ps1
 # → http://127.0.0.1:18080/
 ```
 
+```bash
+# macOS / Linux (bash)
+bash ./scripts/run-ui.sh
+# → http://127.0.0.1:18080/
+```
+
+In the Web UI: open Settings → choose Provider/Model/Base URL → paste API key → set `toolRoot` to your project path.
+
 **TUI (terminal)**
 ```powershell
+# Windows (PowerShell)
 .\scripts\run-tui.ps1
 ```
 
+```bash
+# macOS / Linux (bash)
+bash ./scripts/run-tui.sh
+```
+
 **Headless Coder (CLI)**
-```powershell
+Install `obstral` (optional):
+- Windows (PowerShell): `.\scripts\install.ps1`
+- macOS / Linux (bash): `bash ./scripts/install.sh`
+
+Then run:
+```bash
 # (optional) generate .obstral.md template (stack + test_cmd)
 obstral init -C .
 
@@ -307,11 +379,18 @@ obstral review -C .
 
 # review changes since a checkpoint (hash printed by `obstral agent`)
 obstral review -C . --base <checkpoint_hash>
- ```
+```
 
 **Python Lite (WDAC / no Rust binary)**
 ```powershell
+# Windows
 python .\scripts\serve_lite.py
+# → http://127.0.0.1:18080/
+```
+
+```bash
+# macOS / Linux
+python3 ./scripts/serve_lite.py
 # → http://127.0.0.1:18080/
 ```
 
@@ -368,9 +447,21 @@ Session JSON may contain code and tool outputs — treat it as sensitive.
 
 ### Providers
 
-OBSTRAL speaks OpenAI-compatible APIs. It also supports Mistral, Anthropic, Gemini, and local HF models via a `ChatProvider` trait.
+OBSTRAL supports these providers today:
 
-Set a different model per role: fast model for Coder iteration, powerful model for Observer analysis. Common gotchas: `401` (bad key), `429` (rate limit), `max_tokens` vs `max_completion_tokens` mismatch.
+| Provider | `--provider` | Default `base_url` | Key env var(s) | Tool-calling Coder |
+|---|---|---|---|---|
+| OpenAI-compatible | `openai-compatible` | `https://api.openai.com/v1` | `OBS_API_KEY` or `OPENAI_API_KEY` | ✅ |
+| Mistral | `mistral` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` (or `OBS_API_KEY`) | ✅ |
+| Anthropic | `anthropic` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY` | ❌ (Chat/Observer only) |
+| HF local (subprocess) | `hf` | `http://localhost` | *(none)* | ❌ (Chat/Observer only) |
+
+Notes:
+- The Coder agent loop (`obstral agent`, TUI Coder, Web agentic mode) requires an OpenAI-compatible **Chat Completions** API with tool calling (`tools` / `tool_calls`) → use `openai-compatible` or `mistral`.
+- `openai-compatible` means the OpenAI Chat Completions API (`/v1/chat/completions`) with Bearer auth. Point `--base-url` / `OBS_BASE_URL` at your endpoint (include the trailing `/v1`).
+- You can list built-ins with `obstral list providers` / `obstral list modes` / `obstral list personas`.
+
+Set a different model per role: fast model for Coder iteration, powerful model for Observer analysis. In the TUI you can also split providers per pane (Coder still must be `openai-compatible`/`mistral`): `obstral tui --observer-provider anthropic --observer-model claude-3-5-sonnet-latest`. Common gotchas: `401` (bad key), `429` (rate limit), `max_tokens` vs `max_completion_tokens` mismatch.
 
 ### Chat Personas
 
@@ -397,8 +488,10 @@ In the Web UI, Chat has two optional helpers:
 | Command | Effect |
 |---|---|
 | `/model <name>` | Switch model mid-session |
+| `/provider <name>` | Switch provider mid-session (or show current) |
+| `/base_url <url>` | Switch base_url mid-session (or show; use `default` to reset) |
 | `/persona <key>` | Switch Coder persona |
-| `/temp <0.0–1.0>` | Adjust temperature |
+| `/temp <0.0–2.0>` | Adjust temperature |
 | `/root <path>` | Change tool_root for subsequent sends |
 | `/lang ja\|en\|fr` | Switch UI + prompt language |
 | `/find <query>` | Filter messages in the current pane |

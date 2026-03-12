@@ -639,6 +639,7 @@
       messages: [],
       tasks: [],
       coderMem: { cmdStats: [] },
+      observerMem: { proposal_counts: {} },
     };
   }
 
@@ -706,6 +707,28 @@
 
     if (ct.includes("application/json")) return resp.json();
     return resp.text();
+  }
+
+  let governorContractCache = null;
+  let governorContractPromise = null;
+  async function getGovernorContract() {
+    if (governorContractCache) return governorContractCache;
+    if (!governorContractPromise) {
+      governorContractPromise = fetch("/api/governor_contract")
+        .then(async (resp) => {
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          return resp.json();
+        })
+        .then((json) => {
+          governorContractCache = json || null;
+          return governorContractCache;
+        })
+        .catch(() => {
+          governorContractCache = DEFAULT_GOVERNOR_CONTRACT;
+          return governorContractCache;
+        });
+    }
+    return governorContractPromise;
   }
 
   function parseSseFrame(frameText) {
@@ -1041,9 +1064,1243 @@
 
   // ── UI Render helpers ─────────────────────────────────────────────────────────
 
-  // Renders message content with <think>…</think> blocks dimmed separately.
+  function normalizeScratchEntry(s) {
+    return String(s || "").trim().replace(/\s+/g, " ").toLowerCase();
+  }
+
+  function extractTagBlock(text, tag) {
+    const re = new RegExp(`<${tag}>\\s*([\\s\\S]*?)\\s*<\\/${tag}>`, "i");
+    const m = re.exec(String(text || ""));
+    return m && m[1] ? String(m[1]).trim() : "";
+  }
+
+  function parseTagFields(body) {
+    const out = [];
+    let currentKey = "";
+    let currentValue = "";
+    const lines = String(body || "").replace(/\r\n/g, "\n").split("\n");
+    for (const raw of lines) {
+      const line = String(raw || "");
+      const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/.exec(line);
+      if (m) {
+        if (currentKey) out.push([currentKey, currentValue.trim()]);
+        currentKey = String(m[1] || "").trim().toLowerCase();
+        currentValue = String(m[2] || "").trim();
+        continue;
+      }
+      if (currentKey && line.trim()) {
+        currentValue += (currentValue ? " " : "") + line.trim();
+      }
+    }
+    if (currentKey) out.push([currentKey, currentValue.trim()]);
+    return out;
+  }
+
+  function parsePlanItems(s) {
+    const text = String(s || "").replace(/\r\n/g, "\n").trim();
+    if (!text) return [];
+    const numbered = [];
+    const re = /(?:^|\s)\d+[).:-]\s*([\s\S]*?)(?=(?:\s+\d+[).:-]\s)|$)/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const item = String(m[1] || "").trim().replace(/\s+/g, " ");
+      if (item) numbered.push(item);
+    }
+    if (numbered.length) return numbered;
+    return text
+      .split(/\n|;/)
+      .map((part) => String(part || "").trim().replace(/\s+/g, " "))
+      .filter((part) => part && part !== "-");
+  }
+
+  const EMERGENCY_GOVERNOR_CONTRACT = Object.freeze({
+    tool_names: [],
+    diagnostic_tools: [],
+    plan: { tag: "plan", fields: [], rules: [] },
+    think: { tag: "think", fields: [], rules: [] },
+    reflect: { tag: "reflect", fields: [], rules: [] },
+    impact: { tag: "impact", fields: [], rules: [] },
+    done: {
+      required_args: ["summary", "completed_acceptance", "remaining_acceptance", "acceptance_evidence"],
+      acceptance_evidence_fields: ["criterion", "command"],
+      rules: [],
+    },
+    prompt_layout: {
+      block_order: ["plan", "think", "impact", "reflect"],
+      done_title: "Done Protocol",
+      done_args_template: "done must include {done_args}.",
+      error_title: "Error Protocol",
+      error_rules: [
+        "If exit_code ≠ 0: STOP immediately.",
+        "  1. Quote the exact error line.",
+        "  2. State root cause in one sentence.",
+        "  3. Fix with one corrected command.",
+        "If the SAME approach fails 3 consecutive times: STOP, explain why,",
+        "  and propose a completely different strategy. Never repeat a failing command.",
+      ],
+    },
+    verification: {
+      goal_test_terms: [],
+      goal_build_terms: [],
+      goal_repo_terms: [],
+      goal_check_runners: [],
+      repo_goal_requirements: [],
+      goal_check_policy: {
+        run_on_stop: false,
+        require_longrun: false,
+        require_exec_feature: false,
+        require_command_approval_off: false,
+        max_attempts_per_goal: 0,
+        goal_order: [],
+      },
+      ignore_command_signatures: [],
+      build_command_signatures: [],
+      behavioral_command_signatures: [],
+    },
+    messages: {},
+  });
+
+  const DEFAULT_GOVERNOR_CONTRACT = (() => {
+    const embedded = typeof window !== "undefined"
+      ? window.__OBSTRAL_GOVERNOR_CONTRACT_FALLBACK__
+      : null;
+    return embedded && typeof embedded === "object"
+      ? embedded
+      : EMERGENCY_GOVERNOR_CONTRACT;
+  })();
+
+  function contractToolNames(contract) {
+    const items = contract && Array.isArray(contract.tool_names) ? contract.tool_names : [];
+    return items.length ? items : DEFAULT_GOVERNOR_CONTRACT.tool_names;
+  }
+
+  function contractDiagnosticTools(contract) {
+    const items = contract && Array.isArray(contract.diagnostic_tools) ? contract.diagnostic_tools : [];
+    return items.length ? items : DEFAULT_GOVERNOR_CONTRACT.diagnostic_tools;
+  }
+
+  function contractBlock(contract, tag) {
+    if (!tag) return null;
+    const source = contract && typeof contract === "object" ? contract : null;
+    if (source && source[tag] && source[tag].tag === tag) return source[tag];
+    return DEFAULT_GOVERNOR_CONTRACT[tag] || null;
+  }
+
+  function contractVerification(contract) {
+    const source = contract && typeof contract === "object" && contract.verification && typeof contract.verification === "object"
+      ? contract.verification
+      : null;
+    if (source) return source;
+    return DEFAULT_GOVERNOR_CONTRACT.verification || EMERGENCY_GOVERNOR_CONTRACT.verification;
+  }
+
+  function verificationTerms(contract, key) {
+    const verification = contractVerification(contract);
+    const items = verification && Array.isArray(verification[key]) ? verification[key] : [];
+    if (items.length) return items;
+    const fallback = DEFAULT_GOVERNOR_CONTRACT.verification;
+    return fallback && Array.isArray(fallback[key]) ? fallback[key] : [];
+  }
+
+  function textMatchesVerificationTerms(text, terms) {
+    const haystack = normalizeScratchEntry(text);
+    if (!haystack) return false;
+    return (Array.isArray(terms) ? terms : []).some((term) => {
+      const candidate = normalizeScratchEntry(term);
+      return candidate && haystack.includes(candidate);
+    });
+  }
+
+  function signatureMatchesVerificationTerms(sig, terms) {
+    if (!sig) return false;
+    return (Array.isArray(terms) ? terms : []).some((term) => {
+      const candidate = normalizeScratchEntry(term);
+      return candidate && sig.includes(candidate);
+    });
+  }
+
+  function verificationLevelForCommand(command, contract) {
+    const sig = normalizeScratchEntry(command);
+    if (!sig) return "";
+    if (signatureMatchesVerificationTerms(sig, verificationTerms(contract, "ignore_command_signatures"))) return "";
+    if (signatureMatchesVerificationTerms(sig, verificationTerms(contract, "behavioral_command_signatures"))) return "behavioral";
+    if (signatureMatchesVerificationTerms(sig, verificationTerms(contract, "build_command_signatures"))) return "build";
+    return "";
+  }
+
+  function goalCheckRunners(contract) {
+    const verification = contractVerification(contract);
+    const items = verification && Array.isArray(verification.goal_check_runners) ? verification.goal_check_runners : [];
+    if (items.length) return items;
+    const fallback = DEFAULT_GOVERNOR_CONTRACT.verification;
+    return fallback && Array.isArray(fallback.goal_check_runners) ? fallback.goal_check_runners : [];
+  }
+
+  function psSingleQuote(value) {
+    return `'${String(value || "").replace(/'/g, "''")}'`;
+  }
+
+  function shSingleQuote(value) {
+    return `'${String(value || "").replace(/'/g, "'\"'\"'")}'`;
+  }
+
+  function goalCheckCondition(runner, isWindows) {
+    const files = Array.isArray(runner && runner.detect_files_any)
+      ? runner.detect_files_any.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    if (!files.length) return "";
+    return isWindows
+      ? files.map((file) => `(Test-Path -LiteralPath ${psSingleQuote(file)})`).join(" -or ")
+      : files.map((file) => `[ -f ${shSingleQuote(file)} ]`).join(" || ");
+  }
+
+  function goalCheckCommand(contract, kind, isWindows) {
+    const commandKey = kind === "build" ? "build_command" : "test_command";
+    const noRunner = kind === "build" ? "NO_BUILD_RUNNER" : "NO_TEST_RUNNER";
+    const branches = goalCheckRunners(contract)
+      .map((runner) => {
+        const condition = goalCheckCondition(runner, isWindows);
+        const command = String(runner && runner[commandKey] || "").trim();
+        return condition && command ? { condition, command } : null;
+      })
+      .filter(Boolean);
+    if (!branches.length) {
+      return isWindows ? `Write-Output ${psSingleQuote(noRunner)}` : `echo ${noRunner}`;
+    }
+    if (isWindows) {
+      return branches
+        .map((branch, idx) => `${idx === 0 ? "if" : "elseif"} (${branch.condition}) { ${branch.command} }`)
+        .concat([`else { Write-Output ${psSingleQuote(noRunner)} }`])
+        .join(" ");
+    }
+    return branches
+      .map((branch, idx) => `${idx === 0 ? "if" : "elif"} ${branch.condition}; then ${branch.command};`)
+      .concat([`else echo ${noRunner}; fi`])
+      .join(" ");
+  }
+
+  function goalCheckRunnerSummary(contract, kind) {
+    const commandKey = kind === "build" ? "build_command" : "test_command";
+    return goalCheckRunners(contract)
+      .map((runner) => {
+        const files = Array.isArray(runner && runner.detect_files_any)
+          ? runner.detect_files_any.map((item) => String(item || "").trim()).filter(Boolean)
+          : [];
+        const command = String(runner && runner[commandKey] || "").trim();
+        if (!files.length || !command) return "";
+        return `${files.join("/")} -> ${command}`;
+      })
+      .filter(Boolean)
+      .join(", ");
+  }
+
+  function repoGoalRequirements(contract) {
+    const verification = contractVerification(contract);
+    const items = verification && Array.isArray(verification.repo_goal_requirements) ? verification.repo_goal_requirements : [];
+    if (items.length) return items;
+    const fallback = DEFAULT_GOVERNOR_CONTRACT.verification;
+    return fallback && Array.isArray(fallback.repo_goal_requirements) ? fallback.repo_goal_requirements : [];
+  }
+
+  function goalCheckPolicy(contract) {
+    const verification = contractVerification(contract);
+    const policy = verification && verification.goal_check_policy && typeof verification.goal_check_policy === "object"
+      ? verification.goal_check_policy
+      : null;
+    if (policy) return policy;
+    const fallback = DEFAULT_GOVERNOR_CONTRACT.verification;
+    return fallback && fallback.goal_check_policy && typeof fallback.goal_check_policy === "object"
+      ? fallback.goal_check_policy
+      : {};
+  }
+
+  function goalCheckMaxAttempts(contract) {
+    const n = Number(goalCheckPolicy(contract).max_attempts_per_goal);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 3;
+  }
+
+  function goalCheckOrder(contract) {
+    const order = goalCheckPolicy(contract).goal_order;
+    const items = Array.isArray(order) ? order.map((item) => String(item || "").trim()).filter(Boolean) : [];
+    return items.length ? items : ["repo", "tests", "build"];
+  }
+
+  function shouldAutoRunGoalChecks(contract, status, longrun, requireCommandApproval) {
+    const policy = goalCheckPolicy(contract);
+    if (policy.run_on_stop === false) return false;
+    if (policy.require_exec_feature !== false) {
+      const canExec = !!(status && status.features && status.features.exec);
+      if (!canExec) return false;
+    }
+    if (policy.require_longrun !== false && !longrun) return false;
+    if (policy.require_command_approval_off !== false && requireCommandApproval) return false;
+    return true;
+  }
+
+  function escapeRegExp(value) {
+    return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function repoGoalProbeCommand(contract, isWindows) {
+    const requirements = repoGoalRequirements(contract);
+    const commands = requirements
+      .map((requirement) => {
+        const key = String(requirement && requirement.key || "").trim();
+        const probe = String(requirement && requirement.probe || "").trim();
+        const path = String(requirement && requirement.path || "").trim();
+        if (!key || !probe) return "";
+        if (probe === "dir_exists" && path) {
+          return isWindows
+            ? `Write-Output (${psSingleQuote(key)} + '=' + (Test-Path -LiteralPath ${psSingleQuote(path)}))`
+            : `${key}=0; [ -d ${shSingleQuote(path)} ] && ${key}=1; echo ${key}=$${key}`;
+        }
+        if (probe === "file_exists" && path) {
+          return isWindows
+            ? `Write-Output (${psSingleQuote(key)} + '=' + (Test-Path -LiteralPath ${psSingleQuote(path)}))`
+            : `${key}=0; [ -f ${shSingleQuote(path)} ] && ${key}=1; echo ${key}=$${key}`;
+        }
+        if (probe === "git_head") {
+          return isWindows
+            ? `$obstral_${key} = ''; try { $obstral_${key} = (git rev-parse HEAD 2>$null).Trim() } catch { $obstral_${key} = '' }; Write-Output (${psSingleQuote(key)} + '=' + $obstral_${key})`
+            : `echo ${key}=$(git rev-parse HEAD 2>/dev/null || true)`;
+        }
+        return "";
+      })
+      .filter(Boolean);
+    return commands.join("; ");
+  }
+
+  function repoGoalMissingLabels(contract, stdoutRaw) {
+    return repoGoalRequirements(contract)
+      .filter((requirement) => {
+        const key = String(requirement && requirement.key || "").trim();
+        const probe = String(requirement && requirement.probe || "").trim();
+        if (!key || !probe) return false;
+        const re = new RegExp(`^${escapeRegExp(key)}=(.*)$`, "im");
+        const match = re.exec(String(stdoutRaw || ""));
+        const value = match ? String(match[1] || "").trim() : "";
+        if (probe === "dir_exists" || probe === "file_exists") return !/^(true|1)$/i.test(value);
+        if (probe === "git_head") return !value;
+        return false;
+      })
+      .map((requirement) => String(requirement && requirement.label || requirement && requirement.key || "").trim())
+      .filter(Boolean);
+  }
+
+  function contractFieldSpec(contract, tag, rawKey) {
+    const block = contractBlock(contract, tag);
+    const fields = block && Array.isArray(block.fields) ? block.fields : [];
+    const want = normalizeScratchEntry(rawKey);
+    if (!want) return null;
+    return fields.find((field) => {
+      const key = normalizeScratchEntry(field && field.key);
+      if (key && key === want) return true;
+      const aliases = field && Array.isArray(field.aliases) ? field.aliases : [];
+      return aliases.some((alias) => normalizeScratchEntry(alias) === want);
+    }) || null;
+  }
+
+  function contractFieldKeys(contract, tag) {
+    const block = contractBlock(contract, tag);
+    const fields = block && Array.isArray(block.fields) ? block.fields : [];
+    const keys = fields
+      .map((field) => String(field && field.key ? field.key : "").trim())
+      .filter(Boolean);
+    return keys.join("/");
+  }
+
+  function contractFieldAllowedValues(contract, tag, rawKey) {
+    const field = contractFieldSpec(contract, tag, rawKey);
+    if (!field) return [];
+    if (field.allowed_values_from === "tool_names") return contractToolNames(contract);
+    return Array.isArray(field.allowed_values) ? field.allowed_values.map((item) => String(item || "").trim()).filter(Boolean) : [];
+  }
+
+  function canonicalFieldValue(contract, tag, rawKey, value) {
+    const field = contractFieldSpec(contract, tag, rawKey);
+    if (!field) return "";
+    const normalized = String(value || "").trim().toLowerCase().replace(/\s+/g, "_");
+    if (!normalized) return "";
+    const aliases = field && field.value_aliases && typeof field.value_aliases === "object" ? field.value_aliases : {};
+    if (aliases[normalized]) return String(aliases[normalized]);
+    const allowed = contractFieldAllowedValues(contract, tag, rawKey);
+    return allowed.includes(normalized) ? normalized : "";
+  }
+
+  function parseBlockFields(contract, text, tag) {
+    const body = extractTagBlock(text, tag);
+    if (!body) return null;
+    const out = {};
+    for (const [rawKey, value] of parseTagFields(body)) {
+      const field = contractFieldSpec(contract, tag, rawKey);
+      if (!field || !field.key) continue;
+      const key = String(field.key);
+      const kind = String(field.kind || "string");
+      if (kind === "list") out[key] = parsePlanItems(value);
+      else if (kind === "positive_int") out[key] = parseFirstPositiveInt(value);
+      else if (kind === "tool_name" || kind === "enum") out[key] = canonicalFieldValue(contract, tag, key, value);
+      else out[key] = value;
+    }
+    return out;
+  }
+
+  function fieldValueMissing(field, value) {
+    const kind = String(field && field.kind ? field.kind : "string");
+    if (kind === "list") return !Array.isArray(value) || !value.length;
+    if (kind === "positive_int") return !Number.isFinite(Number(value)) || Number(value) < Math.max(1, Number(field && field.min_value) || 1);
+    return !String(value || "").trim();
+  }
+
+  function parsePlanBlock(text, contract) {
+    const values = parseBlockFields(contract, text, "plan");
+    if (!values) return null;
+    return {
+      goal: String(values.goal || ""),
+      steps: Array.isArray(values.steps) ? values.steps : [],
+      acceptanceCriteria: Array.isArray(values.acceptance) ? values.acceptance : [],
+      risks: String(values.risks || ""),
+      assumptions: String(values.assumptions || ""),
+    };
+  }
+
+  function canonicalToolName(s, contract) {
+    return canonicalFieldValue(contract, "think", "tool", s);
+  }
+
+  function parseThinkBlock(text, contract) {
+    const values = parseBlockFields(contract, text, "think");
+    if (!values) return null;
+    return {
+      goal: String(values.goal || ""),
+      step: Number(values.step) || 0,
+      tool: String(values.tool || ""),
+      risk: String(values.risk || ""),
+      doubt: String(values.doubt || ""),
+      next: String(values.next || ""),
+      verify: String(values.verify || ""),
+    };
+  }
+
+  function validatePlanBlock(contract, plan) {
+    if (!plan) return planMissingGoalMessage(contract);
+    const goalField = contractFieldSpec(contract, "plan", "goal");
+    if (goalField && fieldValueMissing(goalField, plan.goal)) return planMissingGoalMessage(contract);
+    const stepsField = contractFieldSpec(contract, "plan", "steps");
+    if (stepsField && fieldValueMissing(stepsField, plan.steps)) return planMissingStepsMessage(contract);
+    const acceptanceField = contractFieldSpec(contract, "plan", "acceptance");
+    if (acceptanceField && fieldValueMissing(acceptanceField, plan.acceptanceCriteria)) return planMissingAcceptanceMessage(contract);
+    const stepCount = Array.isArray(plan.steps) ? plan.steps.length : 0;
+    if (stepsField && Number(stepsField.min_items) > 0 && stepCount < Number(stepsField.min_items)) {
+      return planMinStepsMessage(contract, Number(stepsField.min_items));
+    }
+    if (stepsField && Number(stepsField.max_items) > 0 && stepCount > Number(stepsField.max_items)) {
+      return planMaxStepsMessage(contract, Number(stepsField.max_items));
+    }
+    const acceptanceCount = Array.isArray(plan.acceptanceCriteria) ? plan.acceptanceCriteria.length : 0;
+    if (acceptanceField && Number(acceptanceField.min_items) > 0 && acceptanceCount < Number(acceptanceField.min_items)) {
+      return planMinAcceptanceMessage(contract, Number(acceptanceField.min_items));
+    }
+    if (acceptanceField && Number(acceptanceField.max_items) > 0 && acceptanceCount > Number(acceptanceField.max_items)) {
+      return planMaxAcceptanceMessage(contract, Number(acceptanceField.max_items));
+    }
+    if (!String(plan.risks || "").trim()) return planMissingRisksMessage(contract);
+    if (!String(plan.assumptions || "").trim()) return planMissingAssumptionsMessage(contract);
+    if (Array.isArray(plan.steps) && plan.steps.some((step) => !String(step || "").trim())) {
+      return planEmptyStepMessage(contract);
+    }
+    if (Array.isArray(plan.acceptanceCriteria) && plan.acceptanceCriteria.some((criterion) => !String(criterion || "").trim())) {
+      return planEmptyAcceptanceMessage(contract);
+    }
+    return "";
+  }
+
+  function thinkCommandSig(s) {
+    return normalizeScratchEntry(String(s || "").replace(/[`"'“”]/g, ""));
+  }
+
+  function thinkNextMatchesExecCommand(next, command) {
+    const nextSig = thinkCommandSig(next);
+    const cmdSig = thinkCommandSig(command);
+    if (!nextSig || !cmdSig) return false;
+    if (cmdSig.includes(nextSig) || nextSig.includes(cmdSig)) return true;
+
+    const nextPrefix = nextSig.split(/\s+/).slice(0, 2).join(" ");
+    const cmdPrefix = cmdSig.split(/\s+/).slice(0, 2).join(" ");
+    return !!nextPrefix && nextPrefix === cmdPrefix;
+  }
+
+  function validateThinkBlock(contract, think, plan, toolName, toolArgs) {
+    if (!think) return thinkMissingGoalMessage(contract);
+    const goalField = contractFieldSpec(contract, "think", "goal");
+    if (goalField && fieldValueMissing(goalField, think.goal)) return thinkMissingGoalMessage(contract);
+    const stepField = contractFieldSpec(contract, "think", "step");
+    if (stepField && fieldValueMissing(stepField, think.step)) return thinkInvalidStepMessage(contract);
+    if (!plan || !Array.isArray(plan.steps)) return thinkRequiresPlanMessage(contract);
+    if (Number(think.step) > plan.steps.length) {
+      return thinkStepOutOfRangeMessage(contract, Number(think.step), plan.steps.length);
+    }
+    if (fieldValueMissing(contractFieldSpec(contract, "think", "tool"), think.tool)) return thinkInvalidToolMessage(contract);
+    if (fieldValueMissing(contractFieldSpec(contract, "think", "risk"), think.risk)) return thinkMissingRiskMessage(contract);
+    if (fieldValueMissing(contractFieldSpec(contract, "think", "doubt"), think.doubt)) return thinkMissingDoubtMessage(contract);
+    if (fieldValueMissing(contractFieldSpec(contract, "think", "next"), think.next)) return thinkMissingNextMessage(contract);
+    if (fieldValueMissing(contractFieldSpec(contract, "think", "verify"), think.verify)) return thinkMissingVerifyMessage(contract);
+    if (String(think.tool) !== String(toolName || "")) {
+      return thinkToolMismatchMessage(contract, String(think.tool), String(toolName || ""));
+    }
+    if (String(toolName || "") === "exec") {
+      let command = "";
+      try {
+        const args = JSON.parse(String(toolArgs || "{}"));
+        command = String(args.command || "").trim();
+      } catch (_) {
+        command = String(toolArgs || "").trim();
+      }
+      if (!thinkNextMatchesExecCommand(think.next, command)) {
+        return thinkExecPrefixMismatchMessage(contract);
+      }
+    }
+    return "";
+  }
+
+  function parseStringListArg(value) {
+    if (Array.isArray(value)) {
+      return value
+        .map((item) => String(item || "").trim().replace(/\s+/g, " "))
+        .filter(Boolean);
+    }
+    if (typeof value === "string") return parsePlanItems(value);
+    return [];
+  }
+
+  function doneRequiredArgs(contract) {
+    const done = contract && contract.done && typeof contract.done === "object" ? contract.done : DEFAULT_GOVERNOR_CONTRACT.done;
+    const items = Array.isArray(done.required_args) ? done.required_args : [];
+    return items.length ? items : DEFAULT_GOVERNOR_CONTRACT.done.required_args;
+  }
+
+  function doneEvidenceFields(contract) {
+    const done = contract && contract.done && typeof contract.done === "object" ? contract.done : DEFAULT_GOVERNOR_CONTRACT.done;
+    const items = Array.isArray(done.acceptance_evidence_fields) ? done.acceptance_evidence_fields : [];
+    return items.length ? items : DEFAULT_GOVERNOR_CONTRACT.done.acceptance_evidence_fields;
+  }
+
+  function parseDoneAcceptanceEvidence(value, contract) {
+    if (!Array.isArray(value)) return [];
+    const [criterionKey, commandKey] = doneEvidenceFields(contract);
+    return value
+      .map((item) => {
+        const obj = item && typeof item === "object" ? item : null;
+        const criterion = obj ? String(obj[criterionKey] || "").trim().replace(/\s+/g, " ") : "";
+        const command = obj ? String(obj[commandKey] || "").trim().replace(/\s+/g, " ") : "";
+        return criterion && command ? { criterion, command } : null;
+      })
+      .filter(Boolean);
+  }
+
+  function resolveAcceptanceReference(reference, plan) {
+    const ref = normalizeScratchEntry(reference);
+    if (!ref || !plan || !Array.isArray(plan.acceptanceCriteria)) return -1;
+    if (/(acceptance|criterion|criteria)/.test(ref)) {
+      const num = parseInt((String(reference || "").match(/\d+/) || [])[0] || "", 10);
+      if (Number.isFinite(num) && num >= 1 && num <= plan.acceptanceCriteria.length) return num - 1;
+    }
+    return plan.acceptanceCriteria.findIndex((criterion) => {
+      const want = normalizeScratchEntry(criterion);
+      return want && (ref.includes(want) || want.includes(ref));
+    });
+  }
+
+  function acceptanceReferenceLabel(plan, idx) {
+    const criterion = plan && plan.acceptanceCriteria && plan.acceptanceCriteria[idx]
+      ? String(plan.acceptanceCriteria[idx])
+      : "-";
+    return `acceptance ${idx + 1}: ${criterion}`;
+  }
+
+  function resolveKnownVerificationCommand(command, knownCommands) {
+    const want = normalizeScratchEntry(command);
+    if (!want) return "";
+    for (const candidate of Array.isArray(knownCommands) ? knownCommands : []) {
+      const sig = normalizeScratchEntry(candidate);
+      if (sig && (sig === want || sig.includes(want) || want.includes(sig))) return String(candidate);
+    }
+    return "";
+  }
+
+  function validateDoneAcceptance(contract, plan, completedAcceptance, remainingAcceptance, acceptanceEvidence, knownCommands) {
+    if (!plan) return { error: doneRequiresPlanMessage(contract) };
+    if (!completedAcceptance.length && !remainingAcceptance.length) {
+      return { error: doneMissingCriteriaMessage(contract) };
+    }
+    const covered = new Set();
+    const completed = new Set();
+    for (const entry of completedAcceptance) {
+      const idx = resolveAcceptanceReference(entry, plan);
+      if (idx < 0) return { error: doneCompletedInvalidReferenceMessage(contract) };
+      if (covered.has(idx)) return { error: doneDuplicateCriteriaMessage(contract) };
+      covered.add(idx);
+      completed.add(idx);
+    }
+    for (const entry of remainingAcceptance) {
+      const idx = resolveAcceptanceReference(entry, plan);
+      if (idx < 0) return { error: doneRemainingInvalidReferenceMessage(contract) };
+      if (covered.has(idx)) return { error: doneDuplicateCriteriaMessage(contract) };
+      covered.add(idx);
+    }
+    if (covered.size !== plan.acceptanceCriteria.length) {
+      return { error: doneIncompleteCoverageMessage(contract) };
+    }
+    if (acceptanceEvidence.length !== completed.size) {
+      return { error: doneEvidenceIncompleteMessage(contract) };
+    }
+    const evidenceByIdx = new Map();
+    for (const item of acceptanceEvidence) {
+      const idx = resolveAcceptanceReference(item.criterion, plan);
+      if (idx < 0) return { error: doneEvidenceInvalidReferenceMessage(contract) };
+      if (!completed.has(idx)) return { error: doneEvidenceOnlyCompletedMessage(contract) };
+      if (evidenceByIdx.has(idx)) return { error: doneEvidenceDuplicateCriteriaMessage(contract) };
+      const known = resolveKnownVerificationCommand(item.command, knownCommands);
+      if (!known) return { error: doneEvidenceUnknownCommandMessage(contract) };
+      evidenceByIdx.set(idx, known);
+    }
+    return { evidenceByIdx };
+  }
+
+  function diagnosticToolHint(contract) {
+    return contractDiagnosticTools(contract).join("/");
+  }
+
+  function toolNamesCsv(contract) {
+    return contractToolNames(contract).join(", ");
+  }
+
+  const EMERGENCY_CONTRACT_MESSAGES = Object.freeze({
+    multiple_tool_calls: "Multiple tool calls detected ({count}). Only ONE tool call per turn is supported.\nFix: call exactly one tool in your next assistant message.",
+    plan_invalid: "[Plan Gate] Invalid <plan>: {error}\nRequired now: emit a valid <plan> with {plan_fields}, then emit <think>, then call ONE tool.",
+    plan_missing: "[Plan Gate] Missing valid <plan>.\nRequired now: in your next assistant message, include a valid <plan> ({plan_fields}), then emit <think>, then call ONE diagnostic tool ({diagnostic_tools}) to start.",
+    think_missing: "[Think Gate] Missing <think>.\nRequired now: emit a valid <think> with {think_fields} immediately before your tool call.",
+    think_invalid: "[Think Gate] Invalid <think>: {error}\nRequired now: emit a valid <think> whose step exists in the current <plan> and whose tool matches the actual tool call.",
+    reflection_missing: "Reflection required but missing.\nReason: {reason}\nEmit <reflect>...</reflect> before the next tool call.",
+    reflection_invalid: "Invalid self-reflection: {error}\nReason: {reason}\nEmit a valid <reflect> block before the next tool call.",
+    reflection_one_tool: "Reflection gate: expected exactly ONE tool call after <reflect>, got {count}.\nFix: emit ONE <reflect> block, then call exactly ONE tool.",
+    reflection_stop: "Reflection required but no tool call followed.\nReason: {reason}\nEmit <reflect>...</reflect> and then call exactly one tool.",
+    impact_missing: "Impact check required but missing.\nReason: {reason}\nEmit <impact>...</impact> before the next tool call.",
+    impact_invalid: "Invalid impact check: {error}\nReason: {reason}\nEmit a valid <impact> block before the next tool call.",
+    impact_one_tool: "Impact gate: expected exactly ONE tool call after <impact>, got {count}.\nFix: emit ONE <impact> block, then call exactly ONE tool.",
+    impact_stop: "Impact check required but no tool call followed.\nReason: {reason}\nEmit <impact>...</impact> and then call exactly one tool.",
+    done_invalid_acceptance: "[Done Gate] Invalid acceptance summary: {error}\nRequired now: call `done` with `completed_acceptance`, `remaining_acceptance`, and `acceptance_evidence` that cover every current plan acceptance criterion and cite known-good verification commands.",
+    goal_check_repo_start: "[goal_check:repo] checking {requirements}",
+    goal_check_repo_ok: "[goal_check:repo] OK",
+    goal_check_exec_run: "[goal_check:{label}] run `{command}`",
+    goal_check_exec_ok: "[goal_check:{label}] OK `{command}`",
+    goal_check_exec_fail: "[goal_check:{label}] FAIL `{command}`\n{digest_line}",
+    goal_check_all_passed: "[goal_check] all requested stop checks passed",
+    goal_check_supported_runners: "Supported runners: {summary}.",
+    goal_check_tests_runner_fallback: "If tests are required, configure a supported test runner and re-run.",
+    goal_check_build_runner_fallback: "If build is required, add build instructions/scripts for this repo and run them.",
+    goal_check_repo_missing: "[goal_check]\nThe task is NOT complete yet.\nMissing: {missing}\nFix it by using exec/write_file. Do NOT stop until the goals are satisfied.",
+    goal_check_tests_no_runner: "[goal_check]\nTests were requested, but no test runner was detected in the current directory.\n{supported_runners_line}\nOtherwise, explicitly explain why tests are not applicable and then stop.",
+    goal_check_tests_failed: "[goal_check]\nTests are failing (or suspicious output indicates failure).\n{class_line}{digest_line}Fix the failures and re-run the tests. Do NOT stop until tests pass.",
+    goal_check_build_no_runner: "[goal_check]\nA build step was requested, but no known build runner was detected in the current directory.\n{supported_runners_line}\nOtherwise, explicitly explain why build is not applicable and then stop.",
+    goal_check_build_failed: "[goal_check]\nBuild is failing (or suspicious output indicates failure).\n{class_line}{digest_line}Fix the build failures and re-run. Do NOT stop until build passes.",
+  });
+
+  function emergencyContractMessage(key, replacements) {
+    switch (String(key || "")) {
+      case "plan_min_steps":
+        return `plan must include at least ${replacements && replacements.min_steps ? replacements.min_steps : "?"} numbered steps in \`steps:\``;
+      case "plan_max_steps":
+        return `plan has too many steps (max ${replacements && replacements.max_steps ? replacements.max_steps : "?"})`;
+      case "plan_min_acceptance":
+        return `plan must include at least ${replacements && replacements.min_acceptance ? replacements.min_acceptance : "?"} acceptance criterion in \`acceptance:\``;
+      case "plan_max_acceptance":
+        return `plan has too many acceptance criteria (max ${replacements && replacements.max_acceptance ? replacements.max_acceptance : "?"})`;
+      case "think_step_out_of_range":
+        return `think.step=${replacements && replacements.step ? replacements.step : "?"} is outside the current plan (${replacements && replacements.plan_steps ? replacements.plan_steps : "?"} steps)`;
+      case "think_tool_mismatch":
+        return `think.tool=${replacements && replacements.think_tool ? replacements.think_tool : "?"} does not match actual tool=${replacements && replacements.actual_tool ? replacements.actual_tool : "?"}`;
+      default:
+        return String(key || "governor_message_missing").replaceAll("_", " ");
+    }
+  }
+
+  function contractMessage(contract, key, replacements) {
+    const messages = contract && contract.messages && typeof contract.messages === "object"
+      ? contract.messages
+      : (DEFAULT_GOVERNOR_CONTRACT && DEFAULT_GOVERNOR_CONTRACT.messages && typeof DEFAULT_GOVERNOR_CONTRACT.messages === "object"
+        ? DEFAULT_GOVERNOR_CONTRACT.messages
+        : null);
+    let out = String(
+      messages && messages[key]
+        ? messages[key]
+        : (EMERGENCY_CONTRACT_MESSAGES[key] || emergencyContractMessage(key, replacements))
+    );
+    const entries = replacements && typeof replacements === "object" ? Object.entries(replacements) : [];
+    for (const [name, value] of entries) {
+      out = out.replaceAll(`{${name}}`, String(value == null ? "" : value));
+    }
+    return out;
+  }
+
+  function goalCheckSupportLine(summary, fallback) {
+    return summary
+      ? contractMessage(governorContract, "goal_check_supported_runners", { summary })
+      : fallback;
+  }
+
+  function goalCheckClassLine(errClass) {
+    return errClass ? `class: ${errClass}\n` : "";
+  }
+
+  function goalCheckDigestLine(digest) {
+    return digest ? `${String(digest).trim()}\n` : "";
+  }
+
+  function goalCheckRepoRequirementsSummary(contract) {
+    const requirements = contract && contract.verification && Array.isArray(contract.verification.repo_goal_requirements)
+      ? contract.verification.repo_goal_requirements
+      : [];
+    const labels = requirements
+      .map((requirement) => {
+        const label = String(requirement && requirement.label ? requirement.label : "").trim();
+        if (label) return label;
+        return String(requirement && requirement.key ? requirement.key : "").trim();
+      })
+      .filter(Boolean);
+    return labels.length ? labels.join(" / ") : ".git / HEAD / README.md";
+  }
+
+  function goalCheckRepoStartMessage(contract) {
+    return contractMessage(contract, "goal_check_repo_start", {
+      requirements: goalCheckRepoRequirementsSummary(contract),
+    });
+  }
+
+  function goalCheckRepoOkMessage(contract) {
+    return contractMessage(contract, "goal_check_repo_ok");
+  }
+
+  function goalCheckExecRunMessage(contract, label, command) {
+    return contractMessage(contract, "goal_check_exec_run", {
+      label: String(label || "").trim(),
+      command: String(command || "").trim(),
+    });
+  }
+
+  function goalCheckExecOkMessage(contract, label, command) {
+    return contractMessage(contract, "goal_check_exec_ok", {
+      label: String(label || "").trim(),
+      command: String(command || "").trim(),
+    });
+  }
+
+  function goalCheckExecFailMessage(contract, label, command, digestLine) {
+    return contractMessage(contract, "goal_check_exec_fail", {
+      label: String(label || "").trim(),
+      command: String(command || "").trim(),
+      digest_line: String(digestLine || "").trim(),
+    });
+  }
+
+  function goalCheckAllPassedMessage(contract) {
+    return contractMessage(contract, "goal_check_all_passed");
+  }
+
+  function goalCheckRepoMissingMessage(contract, missing) {
+    return contractMessage(contract, "goal_check_repo_missing", {
+      missing: Array.isArray(missing) ? missing.join(", ") : String(missing || ""),
+    });
+  }
+
+  function goalCheckTestsNoRunnerMessage(contract, summary) {
+    return contractMessage(contract, "goal_check_tests_no_runner", {
+      supported_runners_line: goalCheckSupportLine(
+        summary,
+        contractMessage(contract, "goal_check_tests_runner_fallback"),
+      ),
+    });
+  }
+
+  function goalCheckTestsFailedMessage(contract, errClass, digest) {
+    return contractMessage(contract, "goal_check_tests_failed", {
+      class_line: goalCheckClassLine(errClass),
+      digest_line: goalCheckDigestLine(digest),
+    });
+  }
+
+  function goalCheckBuildNoRunnerMessage(contract, summary) {
+    return contractMessage(contract, "goal_check_build_no_runner", {
+      supported_runners_line: goalCheckSupportLine(
+        summary,
+        contractMessage(contract, "goal_check_build_runner_fallback"),
+      ),
+    });
+  }
+
+  function goalCheckBuildFailedMessage(contract, errClass, digest) {
+    return contractMessage(contract, "goal_check_build_failed", {
+      class_line: goalCheckClassLine(errClass),
+      digest_line: goalCheckDigestLine(digest),
+    });
+  }
+
+  function renderGovernorPromptBlock(block) {
+    if (!block || !block.tag || !Array.isArray(block.fields)) return "";
+    const lines = [`[${String(block.title || "").trim()}]`, `<${block.tag}>`];
+    for (const field of block.fields) {
+      if (!field || !field.key) continue;
+      lines.push(`${field.key}: ${field.hint || ""}`.trimEnd());
+    }
+    lines.push(`</${block.tag}>`);
+    if (Array.isArray(block.rules)) {
+      for (const rule of block.rules) {
+        if (String(rule || "").trim()) lines.push(String(rule).trim());
+      }
+    }
+    return lines.join("\n");
+  }
+
+  function promptLayout(contract) {
+    const layout = contract && contract.prompt_layout && typeof contract.prompt_layout === "object"
+      ? contract.prompt_layout
+      : DEFAULT_GOVERNOR_CONTRACT.prompt_layout;
+    return layout && typeof layout === "object" ? layout : EMERGENCY_GOVERNOR_CONTRACT.prompt_layout;
+  }
+
+  function buildSystemReasoning(contract) {
+    const layout = promptLayout(contract);
+    const doneRules = contract && contract.done && Array.isArray(contract.done.rules)
+      ? contract.done.rules.filter((rule) => String(rule || "").trim()).map((rule) => String(rule).trim())
+      : [
+          "Use done only after real verification succeeds.",
+          "Each completed acceptance criterion must cite a successful verification command.",
+        ];
+    const doneArgs = doneRequiredArgs(contract).join(", ");
+    const doneLine = String(layout && layout.done_args_template ? layout.done_args_template : "done must include {done_args}.")
+      .replaceAll("{done_args}", doneArgs);
+    const parts = [];
+    const order = layout && Array.isArray(layout.block_order) ? layout.block_order : ["plan", "think", "impact", "reflect"];
+    order.forEach((tag) => {
+      const rendered = renderGovernorPromptBlock(contractBlock(contract, tag));
+      if (rendered) parts.push(rendered);
+    });
+    parts.push([
+      `[${String(layout && layout.done_title ? layout.done_title : "Done Protocol")}]`,
+      ...doneRules,
+      doneLine,
+    ].filter(Boolean).join("\n"));
+    const errorRules = layout && Array.isArray(layout.error_rules)
+      ? layout.error_rules.filter((rule) => String(rule || "").trim()).map((rule) => String(rule).trim())
+      : EMERGENCY_GOVERNOR_CONTRACT.prompt_layout.error_rules;
+    parts.push([
+      `[${String(layout && layout.error_title ? layout.error_title : "Error Protocol")}]`,
+      ...errorRules,
+    ].filter(Boolean).join("\n"));
+    return ["", ...parts].join("\n\n");
+  }
+
+  function multipleToolCallsMessage(contract, count) {
+    return contractMessage(contract, "multiple_tool_calls", { count });
+  }
+
+  function invalidPlanMessage(contract, error) {
+    return contractMessage(contract, "plan_invalid", {
+      error,
+      plan_fields: contractFieldKeys(contract, "plan"),
+    });
+  }
+
+  function planMissingGoalMessage(contract) {
+    return contractMessage(contract, "plan_missing_goal");
+  }
+
+  function planMissingStepsMessage(contract) {
+    return contractMessage(contract, "plan_missing_steps");
+  }
+
+  function planMinStepsMessage(contract, minSteps) {
+    return contractMessage(contract, "plan_min_steps", { min_steps: minSteps });
+  }
+
+  function planMaxStepsMessage(contract, maxSteps) {
+    return contractMessage(contract, "plan_max_steps", { max_steps: maxSteps });
+  }
+
+  function planMissingAcceptanceMessage(contract) {
+    return contractMessage(contract, "plan_missing_acceptance");
+  }
+
+  function planMinAcceptanceMessage(contract, minAcceptance) {
+    return contractMessage(contract, "plan_min_acceptance", { min_acceptance: minAcceptance });
+  }
+
+  function planMaxAcceptanceMessage(contract, maxAcceptance) {
+    return contractMessage(contract, "plan_max_acceptance", { max_acceptance: maxAcceptance });
+  }
+
+  function planMissingRisksMessage(contract) {
+    return contractMessage(contract, "plan_missing_risks");
+  }
+
+  function planMissingAssumptionsMessage(contract) {
+    return contractMessage(contract, "plan_missing_assumptions");
+  }
+
+  function planEmptyStepMessage(contract) {
+    return contractMessage(contract, "plan_empty_step");
+  }
+
+  function planEmptyAcceptanceMessage(contract) {
+    return contractMessage(contract, "plan_empty_acceptance");
+  }
+
+  function missingPlanMessage(contract) {
+    return contractMessage(contract, "plan_missing", {
+      plan_fields: contractFieldKeys(contract, "plan"),
+      diagnostic_tools: diagnosticToolHint(contract),
+    });
+  }
+
+  function missingThinkMessage(contract) {
+    return contractMessage(contract, "think_missing", {
+      think_fields: contractFieldKeys(contract, "think"),
+    });
+  }
+
+  function invalidThinkMessage(contract, error) {
+    return contractMessage(contract, "think_invalid", { error });
+  }
+
+  function thinkMissingGoalMessage(contract) {
+    return contractMessage(contract, "think_missing_goal");
+  }
+
+  function thinkInvalidStepMessage(contract) {
+    return contractMessage(contract, "think_invalid_step");
+  }
+
+  function thinkRequiresPlanMessage(contract) {
+    return contractMessage(contract, "think_requires_plan");
+  }
+
+  function thinkStepOutOfRangeMessage(contract, step, planSteps) {
+    return contractMessage(contract, "think_step_out_of_range", { step, plan_steps: planSteps });
+  }
+
+  function thinkInvalidToolMessage(contract) {
+    return contractMessage(contract, "think_invalid_tool");
+  }
+
+  function thinkMissingRiskMessage(contract) {
+    return contractMessage(contract, "think_missing_risk");
+  }
+
+  function thinkMissingDoubtMessage(contract) {
+    return contractMessage(contract, "think_missing_doubt");
+  }
+
+  function thinkMissingNextMessage(contract) {
+    return contractMessage(contract, "think_missing_next");
+  }
+
+  function thinkMissingVerifyMessage(contract) {
+    return contractMessage(contract, "think_missing_verify");
+  }
+
+  function thinkToolMismatchMessage(contract, thinkTool, actualTool) {
+    return contractMessage(contract, "think_tool_mismatch", {
+      think_tool: thinkTool,
+      actual_tool: actualTool,
+    });
+  }
+
+  function thinkExecPrefixMismatchMessage(contract) {
+    return contractMessage(contract, "think_exec_prefix_mismatch");
+  }
+
+  function reflectionMissingMessage(contract, reason) {
+    return contractMessage(contract, "reflection_missing", { reason });
+  }
+
+  function reflectionInvalidMessage(contract, error, reason) {
+    return contractMessage(contract, "reflection_invalid", { error, reason });
+  }
+
+  function reflectionOneToolMessage(contract, count) {
+    return contractMessage(contract, "reflection_one_tool", { count });
+  }
+
+  function reflectionStopMessage(contract, reason) {
+    return contractMessage(contract, "reflection_stop", { reason });
+  }
+
+  function reflectionMissingLastOutcomeMessage(contract) {
+    return contractMessage(contract, "reflection_missing_last_outcome");
+  }
+
+  function reflectionMissingWrongAssumptionMessage(contract) {
+    return contractMessage(contract, "reflection_missing_wrong_assumption");
+  }
+
+  function reflectionMissingNextMinimalActionMessage(contract) {
+    return contractMessage(contract, "reflection_missing_next_minimal_action");
+  }
+
+  function reflectionInvalidGoalDeltaMessage(contract) {
+    return contractMessage(contract, "reflection_invalid_goal_delta");
+  }
+
+  function reflectionInvalidStrategyChangeMessage(contract) {
+    return contractMessage(contract, "reflection_invalid_strategy_change");
+  }
+
+  function reflectionRequiresStrategyChangeMessage(contract) {
+    return contractMessage(contract, "reflection_requires_strategy_change");
+  }
+
+  function reflectionNonImprovingRequiresChangeMessage(contract) {
+    return contractMessage(contract, "reflection_non_improving_requires_change");
+  }
+
+  function impactMissingMessage(contract, reason) {
+    return contractMessage(contract, "impact_missing", { reason });
+  }
+
+  function impactInvalidMessage(contract, error, reason) {
+    return contractMessage(contract, "impact_invalid", { error, reason });
+  }
+
+  function impactOneToolMessage(contract, count) {
+    return contractMessage(contract, "impact_one_tool", { count });
+  }
+
+  function impactStopMessage(contract, reason) {
+    return contractMessage(contract, "impact_stop", { reason });
+  }
+
+  function impactMissingChangedMessage(contract) {
+    return contractMessage(contract, "impact_missing_changed");
+  }
+
+  function impactMissingProgressMessage(contract) {
+    return contractMessage(contract, "impact_missing_progress");
+  }
+
+  function impactMissingRemainingGapMessage(contract) {
+    return contractMessage(contract, "impact_missing_remaining_gap");
+  }
+
+  function impactRequiresPlanMessage(contract) {
+    return contractMessage(contract, "impact_requires_plan");
+  }
+
+  function impactInvalidProgressReferenceMessage(contract) {
+    return contractMessage(contract, "impact_invalid_progress_reference");
+  }
+
+  function doneInvalidAcceptanceMessage(contract, error) {
+    return contractMessage(contract, "done_invalid_acceptance", { error });
+  }
+
+  function doneRequiresPlanMessage(contract) {
+    return contractMessage(contract, "done_requires_plan");
+  }
+
+  function doneMissingCriteriaMessage(contract) {
+    return contractMessage(contract, "done_missing_criteria");
+  }
+
+  function doneCompletedInvalidReferenceMessage(contract) {
+    return contractMessage(contract, "done_completed_invalid_reference");
+  }
+
+  function doneRemainingInvalidReferenceMessage(contract) {
+    return contractMessage(contract, "done_remaining_invalid_reference");
+  }
+
+  function doneDuplicateCriteriaMessage(contract) {
+    return contractMessage(contract, "done_duplicate_criteria");
+  }
+
+  function doneIncompleteCoverageMessage(contract) {
+    return contractMessage(contract, "done_incomplete_coverage");
+  }
+
+  function doneEvidenceIncompleteMessage(contract) {
+    return contractMessage(contract, "done_evidence_incomplete");
+  }
+
+  function doneEvidenceInvalidReferenceMessage(contract) {
+    return contractMessage(contract, "done_evidence_invalid_reference");
+  }
+
+  function doneEvidenceOnlyCompletedMessage(contract) {
+    return contractMessage(contract, "done_evidence_only_completed");
+  }
+
+  function doneEvidenceDuplicateCriteriaMessage(contract) {
+    return contractMessage(contract, "done_evidence_duplicate_criteria");
+  }
+
+  function doneEvidenceUnknownCommandMessage(contract) {
+    return contractMessage(contract, "done_evidence_unknown_command");
+  }
+
+  function parseFirstPositiveInt(s) {
+    const m = String(s || "").match(/\d+/);
+    const n = m ? parseInt(m[0], 10) : 0;
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
+  function parseReflectionBlock(text, contract) {
+    const values = parseBlockFields(contract, text, "reflect");
+    if (!values) return null;
+    return {
+      lastOutcome: String(values.last_outcome || ""),
+      goalDelta: String(values.goal_delta || ""),
+      wrongAssumption: String(values.wrong_assumption || ""),
+      strategyChange: String(values.strategy_change || ""),
+      nextMinimalAction: String(values.next_minimal_action || ""),
+    };
+  }
+
+  function validateReflectionBlock(contract, reflect, governor, fileToolConsecutiveFailures) {
+    if (!reflect) return reflectionMissingLastOutcomeMessage(contract);
+    if (fieldValueMissing(contractFieldSpec(contract, "reflect", "last_outcome"), reflect.lastOutcome)) return reflectionMissingLastOutcomeMessage(contract);
+    if (fieldValueMissing(contractFieldSpec(contract, "reflect", "goal_delta"), reflect.goalDelta)) return reflectionInvalidGoalDeltaMessage(contract);
+    if (fieldValueMissing(contractFieldSpec(contract, "reflect", "wrong_assumption"), reflect.wrongAssumption)) return reflectionMissingWrongAssumptionMessage(contract);
+    if (fieldValueMissing(contractFieldSpec(contract, "reflect", "strategy_change"), reflect.strategyChange)) return reflectionInvalidStrategyChangeMessage(contract);
+    if (fieldValueMissing(contractFieldSpec(contract, "reflect", "next_minimal_action"), reflect.nextMinimalAction)) return reflectionMissingNextMinimalActionMessage(contract);
+    const repeatedFailure =
+      (Number(governor.sameErrRepeats) || 0) >= 2
+      || (Number(governor.sameCmdRepeats) || 0) >= 3
+      || (Number(governor.sameOutRepeats) || 0) >= 2
+      || Number(fileToolConsecutiveFailures || 0) >= 2;
+    if (repeatedFailure && reflect.strategyChange === "keep") {
+      return reflectionRequiresStrategyChangeMessage(contract);
+    }
+    if ((reflect.goalDelta === "same" || reflect.goalDelta === "farther")
+      && (reflect.strategyChange === "keep" || reflect.strategyChange === "unknown")) {
+      return reflectionNonImprovingRequiresChangeMessage(contract);
+    }
+    return "";
+  }
+
+  function buildReflectionPrompt(reason, agentState, governor, fileToolConsecutiveFailures) {
+    return [
+      "[Self Reflection Required]",
+      `Reason: ${reason}`,
+      `State: ${agentState}`,
+      "Failure memory:",
+      `- consecutive_failures: ${Number(governor.consecutiveFailures) || 0}`,
+      `- same_command_repeats: ${Number(governor.sameCmdRepeats) || 0}`,
+      `- same_error_repeats: ${Number(governor.sameErrRepeats) || 0}`,
+      `- same_output_repeats: ${Number(governor.sameOutRepeats) || 0}`,
+      `- file_tool_consecutive_failures: ${Number(fileToolConsecutiveFailures) || 0}`,
+      "",
+      "Before your next tool call, emit exactly:",
+      "<reflect>",
+      "last_outcome: success|failure|partial",
+      "goal_delta: closer|same|farther",
+      "wrong_assumption: <one short sentence>",
+      "strategy_change: keep|adjust|abandon",
+      "next_minimal_action: <one short sentence>",
+      "</reflect>",
+      "",
+      "Rules:",
+      "- One line per field.",
+      "- Keep the whole block under 80 tokens.",
+      "- If the same error/command/output repeated, strategy_change cannot be `keep`.",
+      "- If file_tool_consecutive_failures >= 2, strategy_change cannot be `keep`.",
+      "- If goal_delta is `same` or `farther`, choose a materially different next action.",
+      "- After the <reflect> block, call exactly one tool.",
+    ].join("\n");
+  }
+
+  function parseImpactBlock(text, contract) {
+    const values = parseBlockFields(contract, text, "impact");
+    if (!values) return null;
+    return {
+      changed: String(values.changed || ""),
+      progress: String(values.progress || ""),
+      remainingGap: String(values.remaining_gap || ""),
+    };
+  }
+
+  function impactProgressMatchesEntry(progress, entry) {
+    const progressSig = normalizeScratchEntry(progress);
+    const entrySig = normalizeScratchEntry(entry);
+    if (!progressSig || !entrySig) return false;
+    return progressSig.includes(entrySig) || entrySig.includes(progressSig);
+  }
+
+  function impactProgressMatchesPlan(progress, plan) {
+    const progressSig = normalizeScratchEntry(progress);
+    if (!progressSig || !plan) return false;
+
+    if (progressSig.includes("step")) {
+      const n = parseFirstPositiveInt(progress);
+      if (n && Array.isArray(plan.steps) && n <= plan.steps.length) return true;
+    }
+
+    if ((progressSig.includes("acceptance") || progressSig.includes("criterion") || progressSig.includes("criteria"))
+      && resolveAcceptanceReference(progress, plan) >= 0) {
+      return true;
+    }
+
+    return (Array.isArray(plan.steps) && plan.steps.some((step) => impactProgressMatchesEntry(progress, step)))
+      || (Array.isArray(plan.acceptanceCriteria) && plan.acceptanceCriteria.some((criterion) => impactProgressMatchesEntry(progress, criterion)));
+  }
+
+  function validateImpactBlock(contract, impact, plan) {
+    if (!impact) return impactMissingChangedMessage(contract);
+    if (fieldValueMissing(contractFieldSpec(contract, "impact", "changed"), impact.changed)) return impactMissingChangedMessage(contract);
+    if (fieldValueMissing(contractFieldSpec(contract, "impact", "progress"), impact.progress)) return impactMissingProgressMessage(contract);
+    if (fieldValueMissing(contractFieldSpec(contract, "impact", "remaining_gap"), impact.remainingGap)) return impactMissingRemainingGapMessage(contract);
+    if (!plan) return impactRequiresPlanMessage(contract);
+    if (!impactProgressMatchesPlan(impact.progress, plan)) {
+      return impactInvalidProgressReferenceMessage(contract);
+    }
+    return "";
+  }
+
+  function buildImpactPrompt(reason, plan) {
+    const lines = [
+      "[Impact Check Required]",
+      `Reason: ${reason}`,
+      `Current goal: ${plan && plan.goal ? plan.goal : "-"}`,
+      "",
+      "Before your next tool call, emit exactly:",
+      "<impact>",
+      "changed: <one short sentence>",
+      "progress: <which plan step or acceptance criterion moved>",
+      "remaining_gap: <one short sentence>",
+      "</impact>",
+      "",
+      "Rules:",
+      "- Keep the whole block under 60 tokens.",
+      "- Mention the actual mutation effect, not intent.",
+      "- `progress` must name a real step or acceptance criterion.",
+      "- After the <impact> block, call exactly one tool.",
+    ];
+    if (plan && Array.isArray(plan.steps) && plan.steps.length) {
+      lines.push("", "[Plan Steps]");
+      plan.steps.forEach((step, idx) => lines.push(`- step ${idx + 1}: ${step}`));
+    }
+    if (plan && Array.isArray(plan.acceptanceCriteria) && plan.acceptanceCriteria.length) {
+      lines.push("", "[Acceptance Criteria]");
+      plan.acceptanceCriteria.forEach((criterion, idx) => lines.push(`- acceptance ${idx + 1}: ${criterion}`));
+    }
+    return lines.join("\n");
+  }
+
+  function isVerificationCommand(command, contract) {
+    return Boolean(verificationLevelForCommand(command, contract));
+  }
+
+  // Renders message content with <think>…</think>, <reflect>…</reflect>, and <impact>…</impact> blocks dimmed separately.
   function renderWithThink(text, execRes, onRun, onOpen) {
-    const re = /<think>([\s\S]*?)<\/think>/gi;
+    const re = /<(think|reflect|impact)>([\s\S]*?)<\/\1>/gi;
     const parts = [];
     let last = 0;
     let k = 0;
@@ -1052,7 +2309,13 @@
       if (m.index > last) {
         parts.push(...parseMarkdown(text.slice(last, m.index), execRes, onRun, onOpen));
       }
-      parts.push(e("div", { key: "think" + k++, className: "think-block" }, m[1].trim()));
+      const tag = String(m[1] || "").toLowerCase();
+      const body = String(m[2] || "").trim();
+      parts.push(e(
+        "div",
+        { key: tag + k++, className: tag === "reflect" ? "reflect-block" : (tag === "impact" ? "impact-block" : "think-block") },
+        body,
+      ));
       last = m.index + m[0].length;
     }
     if (last < text.length) {
@@ -1289,6 +2552,20 @@
               }))
               .slice(0, 60);
             return { cmdStats };
+          })(),
+          observerMem: (() => {
+            const m = t.observerMem && typeof t.observerMem === "object" ? t.observerMem : null;
+            const pc0 = (m && m.proposal_counts && typeof m.proposal_counts === "object") ? m.proposal_counts : {};
+            const proposal_counts = {};
+            const keys = Object.keys(pc0 || {});
+            for (let i = 0; i < keys.length && i < 80; i++) {
+              const k = String(keys[i] || "").slice(0, 120);
+              if (!k) continue;
+              const v0 = pc0[keys[i]];
+              const v = typeof v0 === "number" ? v0 : Number(v0) || 0;
+              if (v > 0) proposal_counts[k] = Math.max(1, Math.min(99, Math.round(v)));
+            }
+            return { proposal_counts };
           })(),
         }));
       if (!threads.length) threads = [makeThread("Thread 1")];
@@ -2395,9 +3672,6 @@
       const TRUNC_STDOUT = 2000;
       const TRUNC_STDERR = 800;
       const KEEP_TOOL_TURNS = longrun ? 6 : 3;
-      const WANTS_REPO_GOAL = /(?:\brepo\b|\brepository\b|\bgit\b|scaffold|bootstrap|init|setup|create\s+(?:a\s+)?repo|create\s+(?:a\s+)?repository|リポ|リポジトリ|雛形|ひな形|プロジェクト|git\s+init)/i.test(String(text || ""));
-      const WANTS_TEST_GOAL = /(?:\btests?\b|unit\s*tests?|unittest|pytest|jest|mocha|go\s+test|cargo\s+test|npm\s+test|e2e|smoke|テスト|単体テスト|総合テスト)/i.test(String(text || ""));
-      const WANTS_BUILD_GOAL = /(?:\bbuild\b|\bcompile\b|\brelease\b|bundle|cargo\s+(?:build|check)|npm\s+run\s+build|pnpm\s+build|yarn\s+build|ビルド|コンパイル)/i.test(String(text || ""));
       let goalChecks = {
         repo: { attempts: 0, ok: false },
         tests: { attempts: 0, ok: false },
@@ -2892,6 +4166,26 @@
       // Lightweight state machine: the system prompt sees the current state so the model can route its behavior.
       // This is intentionally small (planning/executing/verifying/recovery/done) to keep it robust across models.
       let agentState = "planning";
+      let activePlan = null;
+      const knownGoodVerificationCommands = [];
+      let fileToolConsecutiveFailures = 0;
+      let reflectionRequired = "";
+      let impactRequired = "";
+      const rememberKnownVerificationCommand = (command) => {
+        const value = String(command || "").trim().replace(/\s+/g, " ");
+        const sig = normalizeScratchEntry(value);
+        if (!sig) return;
+        const idx = knownGoodVerificationCommands.findIndex((item) => normalizeScratchEntry(item) === sig);
+        if (idx >= 0) knownGoodVerificationCommands.splice(idx, 1);
+        knownGoodVerificationCommands.push(value);
+        while (knownGoodVerificationCommands.length > 6) knownGoodVerificationCommands.shift();
+      };
+      const requireReflection = (reason) => {
+        reflectionRequired = String(reason || "failure or stall detected").trim();
+      };
+      const requireImpact = (reason) => {
+        impactRequired = String(reason || "successful mutation requires impact check").trim();
+      };
 
       // Short-term memory: keep a compact summary of recent tool actions so the model can avoid repeats.
       const recentRuns = [];
@@ -3006,14 +4300,19 @@
         return "";
       };
 
+      const governorContract = await getGovernorContract();
+      const sharedToolNames = toolNamesCsv(governorContract);
+      const WANTS_REPO_GOAL = textMatchesVerificationTerms(text, verificationTerms(governorContract, "goal_repo_terms"));
+      const WANTS_TEST_GOAL = textMatchesVerificationTerms(text, verificationTerms(governorContract, "goal_test_terms"));
+      const WANTS_BUILD_GOAL = textMatchesVerificationTerms(text, verificationTerms(governorContract, "goal_build_terms"));
       const isWindows = isWindowsHost();
       const SYSTEM_BASE = isWindows ? [
         "You are an autonomous coding agent with DIRECT access to the user's Windows machine.",
         `Working directory (tool_root): ${cwdLabelNow()}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "0. NEVER create a git repo inside another git repo. If you see 'embedded git repository' warnings, STOP and relocate to a clean directory under tool_root.",
-        "1. ALWAYS use tools to act. Available tools: read_file, list_dir, search_files, glob, patch_file, apply_diff, write_file, exec. NEVER just show code.", 
-        "   PRIORITY: 1) read_file  2) list_dir  3) search_files/glob  4) patch_file/apply_diff  5) write_file  6) exec", 
+        `1. ALWAYS use tools to act. Available tools: ${sharedToolNames}. NEVER just show code.`, 
+        "   PRIORITY: 1) read_file  2) list_dir  3) search_files/glob  4) patch_file/apply_diff  5) write_file  6) exec  7) done", 
         "   Use read_file before editing. Use patch_file/apply_diff for edits. Use list_dir/search_files/glob to discover structure quickly.", 
         "   Fallback (if tool calls are not supported): output ONE ```powershell``` code block containing ONLY commands (no `$ ` or `PS>` prompts).",
         "2. Use PowerShell syntax ONLY (cmd.exe is NOT used):",
@@ -3025,14 +4324,14 @@
         "   - NEVER use mkdir -p, touch, cat >, or any Unix syntax.",
         "3. Execute ALL steps immediately via tools. Do NOT ask for permission or confirmation.", 
         "4. After each exec call, read the output and continue until the task is 100% complete.",
-        "5. End with a brief summary listing every file created/modified and any remaining steps.",
+        "5. When the task is complete, call done with summary + acceptance coverage + verification evidence.",
       ].join("\n") : [
         "You are an autonomous coding agent with DIRECT access to the user's local machine.",
         `Working directory (tool_root): ${cwdLabelNow()}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "0. NEVER create a git repo inside another git repo. If you see 'embedded git repository' warnings, STOP and relocate to a clean directory under tool_root.",
-        "1. ALWAYS use tools to act. Available tools: read_file, list_dir, search_files, glob, patch_file, apply_diff, write_file, exec. NEVER just show code.", 
-        "   PRIORITY: 1) read_file  2) list_dir  3) search_files/glob  4) patch_file/apply_diff  5) write_file  6) exec", 
+        `1. ALWAYS use tools to act. Available tools: ${sharedToolNames}. NEVER just show code.`, 
+        "   PRIORITY: 1) read_file  2) list_dir  3) search_files/glob  4) patch_file/apply_diff  5) write_file  6) exec  7) done", 
         "   Use read_file before editing. Use patch_file/apply_diff for edits. Use list_dir/search_files/glob to discover structure quickly.", 
         "   Fallback (if tool calls are not supported): output ONE ```bash``` code block containing ONLY commands (no `$ ` prompts).",
         "2. Use Unix shell commands:",
@@ -3042,37 +4341,10 @@
         "   - Git: git init, git add ., git commit -m 'init'",
         "3. Execute ALL steps immediately via tools. Do NOT ask for permission or confirmation.", 
         "4. After each exec call, read the output and continue until the task is 100% complete.",
-        "5. End with a brief summary listing every file created/modified and any remaining steps.",
+        "5. When the task is complete, call done with summary + acceptance coverage + verification evidence.",
       ].join("\n");
 
-      const SYSTEM_REASONING = [
-        "",
-        "[Planning Protocol — emit ONCE before your very first exec call]",
-        "<plan>",
-        "goal: <one sentence: what the finished task looks like when done>",
-        "steps: 1) ... 2) ... 3) ... (3-7 concrete, ordered steps)",
-        "risks: <the 2 most likely failure modes for this specific task>",
-        "assumptions: <what you are taking as given>",
-        "</plan>",
-        "",
-        "[Reasoning Protocol — emit before EVERY exec call]",
-        "<think>",
-        "goal: <≤12 words: what must succeed right now>",
-        "risk: <≤12 words: most likely failure mode>",
-        "doubt: <≤12 words: one reason this could be wrong>",
-        "next: <≤12 words: exact command or step>",
-        "verify: <≤12 words: how to confirm this step succeeded>",
-        "</think>",
-        "This 5-line check (~50 tokens) prevents wrong-direction errors that cost 300+ tokens to recover.",
-        "",
-        "[Error Protocol]",
-        "If exit_code ≠ 0: STOP immediately.",
-        "  1. Quote the exact error line.",
-        "  2. State root cause in one sentence.",
-        "  3. Fix with one corrected command.",
-        "If the SAME approach fails 3 consecutive times: STOP, explain why,",
-        "  and propose a completely different strategy. Never repeat a failing command.",
-      ].join("\n");
+      const SYSTEM_REASONING = buildSystemReasoning(governorContract);
 
       const SYSTEM_BASE_TEXT = SYSTEM_BASE + SYSTEM_REASONING;
 
@@ -3207,6 +4479,45 @@
         },
       };
 
+      const [criterionField, commandField] = doneEvidenceFields(governorContract);
+      const doneTool = {
+        type: "function",
+        function: {
+          name: "done",
+          description: "Finish the task. Use only after real verification succeeds, and cite acceptance coverage plus verification evidence.",
+          parameters: {
+            type: "object",
+            properties: {
+              summary: { type: "string", description: "Brief summary of what changed and where it lives." },
+              completed_acceptance: {
+                type: "array",
+                items: { type: "string" },
+                description: "Acceptance criteria already satisfied."
+              },
+              remaining_acceptance: {
+                type: "array",
+                items: { type: "string" },
+                description: "Acceptance criteria still remaining."
+              },
+              acceptance_evidence: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    [criterionField]: { type: "string" },
+                    [commandField]: { type: "string" },
+                  },
+                  required: doneEvidenceFields(governorContract),
+                },
+                description: "For each completed criterion, the verification command that already succeeded."
+              },
+              next_steps: { type: "string", description: "Exact follow-up commands or remaining work." },
+            },
+            required: doneRequiredArgs(governorContract),
+          },
+        },
+      };
+
       const messages = [
         { role: "system", content: SYSTEM_BASE_TEXT },
         ...history,
@@ -3223,21 +4534,28 @@
       // On finish_reason=stop, run lightweight checks to ensure the deliverable exists (repo init, tests/build pass, etc).
       // This prevents "looks done" replies that are missing key artifacts.
       const canAutoExec = () => {
-        const canExec = !!(status && status.features && status.features.exec);
-        return canExec && longrun && !config.requireCommandApproval;
+        return shouldAutoRunGoalChecks(governorContract, status, longrun, config.requireCommandApproval);
       };
       const goalPending = (k) => {
         const st = goalChecks && goalChecks[k] ? goalChecks[k] : null;
         if (!st) return false;
         const attempts = Number(st.attempts) || 0;
-        return !st.ok && attempts < 3;
+        return !st.ok && attempts < goalCheckMaxAttempts(governorContract);
       };
-      const runGoalExec = async (label, commandToRun) => {
+      const runGoalExec = async (label, commandToRun, options) => {
+        const cfg = options && typeof options === "object" ? options : {};
+        const emitSummary = cfg.emitSummary !== false;
         const win = isWindowsHost();
         const fenceLang = win ? "powershell" : "bash";
         const prompt = win ? "PS> " : "$ ";
         const shown = String(commandToRun || "").split("\n").map((l, i) => (i === 0 ? prompt : "    ") + l).join("\n");
-        display += (display ? "\n\n" : "") + "```" + fenceLang + "\n" + shown;
+        const commandShown = commandSig(commandToRun);
+        if (emitSummary) {
+          display += (display ? "\n\n" : "") + goalCheckExecRunMessage(governorContract, label, commandShown) + "\n";
+        } else if (display) {
+          display += "\n\n";
+        }
+        display += "```" + fenceLang + "\n" + shown;
         flush("\n```");
 
         const cwdUsed = cwdNow();
@@ -3247,22 +4565,31 @@
         const breach = sandboxBreachReason(parsed.pwd);
         maybeUpdateWorkdirFromPwd(parsed.pwd);
 
-        const stdoutRaw = String(parsed.stdout || "");
-        const stderrRaw = String(execRes.stderr || "");
-        const stdout = truncToolTail(stdoutRaw, TRUNC_STDOUT);
-        const stderr = truncToolTail(stderrRaw, TRUNC_STDERR);
-        const exitCode = execRes.exit_code;
-        const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdoutRaw, stderrRaw) : "";
-        const failed = exitCode !== 0 || !!suspicious || !!breach;
-        const errClass = failed ? classifyErrorClass(stderrRaw, stdoutRaw) : "";
-        const digest = failed ? extractErrorDigest(stdoutRaw, stderrRaw) : "";
-        const errLine = failed ? (firstDigestLine(digest) || errorLineSig(stdout, stderr) || "") : "";
-        pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: exitCode, ok: !failed, cls: errClass, err: errLine, note: label });
+	        const stdoutRaw = String(parsed.stdout || "");
+	        const stderrRaw = String(execRes.stderr || "");
+	        const stdout = truncToolTail(stdoutRaw, TRUNC_STDOUT);
+	        const stderr = truncToolTail(stderrRaw, TRUNC_STDERR);
+	        const exitCode = execRes.exit_code;
+	        const durationMs = Math.max(0, Math.round(Number(execRes.duration_ms) || 0));
+	        const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdoutRaw, stderrRaw) : "";
+	        const failed = exitCode !== 0 || !!suspicious || !!breach;
+	        const errClass = failed ? classifyErrorClass(stderrRaw, stdoutRaw) : "";
+	        const digest = failed ? extractErrorDigest(stdoutRaw, stderrRaw) : "";
+	        const errLine = failed ? (firstDigestLine(digest) || errorLineSig(stdout, stderr) || "") : "";
+	        pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: exitCode, ok: !failed, cls: errClass, err: errLine, note: label });
 
-        if (stdout) display += "\n" + stdout;
-        if (stderr) display += "\nstderr: " + stderr;
-        display += "\n```\nexit: " + exitCode;
-        flush();
+	        if (stdout) display += "\n" + stdout;
+	        if (stderr) display += "\nstderr: " + stderr;
+	        display += "\n```\nexit: " + exitCode + "\nduration_ms: " + durationMs;
+          if (emitSummary) {
+            const digestLine = failed ? clip(firstDigestLine(digest) || String(digest || "").trim(), 160) : "";
+            display += "\n" + (
+              failed
+                ? goalCheckExecFailMessage(governorContract, label, commandShown, digestLine)
+                : goalCheckExecOkMessage(governorContract, label, commandShown)
+            );
+          }
+	        flush();
 
         return { label, exitCode, failed, breach, suspicious, stdoutRaw, stderrRaw, stdout, stderr, errClass, digest };
       };
@@ -3271,25 +4598,14 @@
         goalChecks.repo.attempts = (Number(goalChecks.repo.attempts) || 0) + 1;
 
         const win = isWindowsHost();
-        const probeCmd = win
-          ? [
-              "$inRepo = Test-Path -LiteralPath '.git'",
-              "$head = ''",
-              "try { $head = (git rev-parse HEAD 2>$null).Trim() } catch { $head = '' }",
-              "$readme = Test-Path -LiteralPath 'README.md'",
-              "Write-Output ('in_repo=' + $inRepo)",
-              "Write-Output ('head=' + $head)",
-              "Write-Output ('readme=' + $readme)",
-            ].join('; ')
-          : [
-              "in_repo=0; [ -d .git ] && in_repo=1; echo in_repo=$in_repo",
-              "head=$(git rev-parse HEAD 2>/dev/null || true); echo head=$head",
-              "readme=0; [ -f README.md ] && readme=1; echo readme=$readme",
-            ].join('; ');
+        const probeCmd = repoGoalProbeCommand(governorContract, win);
+        if (!String(probeCmd || "").trim()) return false;
 
         let res;
         try {
-          res = await runGoalExec("goal_repo", probeCmd);
+          display += (display ? "\n\n" : "") + goalCheckRepoStartMessage(governorContract);
+          flush();
+          res = await runGoalExec("repo", probeCmd, { emitSummary: false });
         } catch (e2) {
           return false;
         }
@@ -3308,32 +4624,19 @@
           return true;
         }
 
-        const stdoutRaw = String(res.stdoutRaw || "");
-        const missing = [];
-        const inRepo = /in_repo=(true|1)/i.test(stdoutRaw);
-        const head = (() => {
-          const m = stdoutRaw.match(/^head=(.*)$/im);
-          return m ? String(m[1] || "").trim() : "";
-        })();
-        const readme = /readme=(true|1)/i.test(stdoutRaw);
-        if (!inRepo) missing.push(".git");
-        if (!head) missing.push("HEAD (commit)");
-        if (!readme) missing.push("README.md");
+        const missing = repoGoalMissingLabels(governorContract, res.stdoutRaw);
 
         if (missing.length) {
           messages.push({
             role: "user",
-            content: [
-              "[goal_check]",
-              "The task is NOT complete yet.",
-              "Missing: " + missing.join(", "),
-              "Fix it by using exec/write_file. Do NOT stop until the goals are satisfied.",
-            ].join("\n"),
+            content: goalCheckRepoMissingMessage(governorContract, missing),
           });
           return true;
         }
 
         goalChecks.repo.ok = true;
+        display += "\n" + goalCheckRepoOkMessage(governorContract);
+        flush();
         return false;
       };
       const goalCheckTests = async () => {
@@ -3341,33 +4644,17 @@
         goalChecks.tests.attempts = (Number(goalChecks.tests.attempts) || 0) + 1;
 
         const win = isWindowsHost();
-        const testCmd = win
-          ? [
-              "if (Test-Path -LiteralPath 'Cargo.toml') { cargo test -q }",
-              "elseif (Test-Path -LiteralPath 'package.json') { npm test --silent }",
-              "elseif ((Test-Path -LiteralPath 'pyproject.toml') -or (Test-Path -LiteralPath 'requirements.txt')) { python -m pytest -q }",
-              "else { Write-Output 'NO_TEST_RUNNER' }",
-            ].join(' ')
-          : [
-              "if [ -f Cargo.toml ]; then cargo test -q;",
-              "elif [ -f package.json ]; then npm test --silent;",
-              "elif [ -f pyproject.toml ] || [ -f requirements.txt ]; then python -m pytest -q;",
-              "else echo NO_TEST_RUNNER; fi",
-            ].join(' ');
+        const testCmd = goalCheckCommand(governorContract, "test", win);
 
         let res;
-        try { res = await runGoalExec("goal_tests", testCmd); } catch (_) { return false; }
+        try { res = await runGoalExec("tests", testCmd); } catch (_) { return false; }
 
         const out0 = String(res.stdoutRaw || "");
         if (out0.includes("NO_TEST_RUNNER")) {
+          const summary = goalCheckRunnerSummary(governorContract, "test");
           messages.push({
             role: "user",
-            content: [
-              "[goal_check]",
-              "Tests were requested, but no test runner was detected in the current directory.",
-              "If tests are required, set up a runner (Cargo.toml -> cargo test, package.json -> npm test, pyproject.toml -> pytest) and re-run.",
-              "Otherwise, explicitly explain why tests are not applicable and then stop.",
-            ].join("\n"),
+            content: goalCheckTestsNoRunnerMessage(governorContract, summary),
           });
           return true;
         }
@@ -3375,13 +4662,11 @@
         if (res.failed) {
           messages.push({
             role: "user",
-            content: [
-              "[goal_check]",
-              "Tests are failing (or suspicious output indicates failure).",
-              res.errClass ? ("class: " + res.errClass) : "",
-              res.digest || "",
-              "Fix the failures and re-run the tests. Do NOT stop until tests pass.",
-            ].filter(Boolean).join("\n"),
+            content: goalCheckTestsFailedMessage(
+              governorContract,
+              res.errClass,
+              res.digest,
+            ),
           });
           agentState = "recovery";
           return true;
@@ -3395,33 +4680,17 @@
         goalChecks.build.attempts = (Number(goalChecks.build.attempts) || 0) + 1;
 
         const win = isWindowsHost();
-        const buildCmd = win
-          ? [
-              "if (Test-Path -LiteralPath 'Cargo.toml') { cargo build -q }",
-              "elseif (Test-Path -LiteralPath 'package.json') { npm run build --silent }",
-              "elseif ((Test-Path -LiteralPath 'pyproject.toml') -or (Test-Path -LiteralPath 'requirements.txt')) { python -m compileall -q . }",
-              "else { Write-Output 'NO_BUILD_RUNNER' }",
-            ].join(' ')
-          : [
-              "if [ -f Cargo.toml ]; then cargo build -q;",
-              "elif [ -f package.json ]; then npm run build --silent;",
-              "elif [ -f pyproject.toml ] || [ -f requirements.txt ]; then python -m compileall -q .;",
-              "else echo NO_BUILD_RUNNER; fi",
-            ].join(' ');
+        const buildCmd = goalCheckCommand(governorContract, "build", win);
 
         let res;
-        try { res = await runGoalExec("goal_build", buildCmd); } catch (_) { return false; }
+        try { res = await runGoalExec("build", buildCmd); } catch (_) { return false; }
 
         const out0 = String(res.stdoutRaw || "");
         if (out0.includes("NO_BUILD_RUNNER")) {
+          const summary = goalCheckRunnerSummary(governorContract, "build");
           messages.push({
             role: "user",
-            content: [
-              "[goal_check]",
-              "A build step was requested, but no known build runner was detected in the current directory.",
-              "If build is required: add build instructions/scripts for this repo and run them.",
-              "Otherwise, explicitly explain why build is not applicable and then stop.",
-            ].join("\n"),
+            content: goalCheckBuildNoRunnerMessage(governorContract, summary),
           });
           return true;
         }
@@ -3429,13 +4698,11 @@
         if (res.failed) {
           messages.push({
             role: "user",
-            content: [
-              "[goal_check]",
-              "Build is failing (or suspicious output indicates failure).",
-              res.errClass ? ("class: " + res.errClass) : "",
-              res.digest || "",
-              "Fix the build failures and re-run. Do NOT stop until build passes.",
-            ].filter(Boolean).join("\n"),
+            content: goalCheckBuildFailedMessage(
+              governorContract,
+              res.errClass,
+              res.digest,
+            ),
           });
           agentState = "recovery";
           return true;
@@ -3447,10 +4714,23 @@
       const runGoalChecksOnStop = async () => {
         if (!canAutoExec()) return false;
         agentState = "verifying";
-        // Run checks in order; stop at the first unmet goal (so the model can fix it).
-        if (await goalCheckRepo()) return true;
-        if (await goalCheckTests()) return true;
-        if (await goalCheckBuild()) return true;
+        const handlers = {
+          repo: goalCheckRepo,
+          tests: goalCheckTests,
+          build: goalCheckBuild,
+        };
+        let ranAny = false;
+        for (const key of goalCheckOrder(governorContract)) {
+          if (!goalPending(key)) continue;
+          const handler = handlers[key];
+          if (!handler) continue;
+          ranAny = true;
+          if (await handler()) return true;
+        }
+        if (ranAny) {
+          display += (display ? "\n\n" : "") + goalCheckAllPassedMessage(governorContract);
+          flush();
+        }
         return false;
       };
 
@@ -3563,13 +4843,14 @@
               const breach = sandboxBreachReason(parsed.pwd);
               maybeUpdateWorkdirFromPwd(parsed.pwd);
 
-              const out = truncToolTail(String(parsed.stdout || ""), TRUNC_STDOUT);
-              const err = truncToolTail(String(execRes.stderr || ""), TRUNC_STDERR);
+	              const out = truncToolTail(String(parsed.stdout || ""), TRUNC_STDOUT);
+	              const err = truncToolTail(String(execRes.stderr || ""), TRUNC_STDERR);
+	              const durationMs = Math.max(0, Math.round(Number(execRes.duration_ms) || 0));
 
-              if (out) display += "\n" + out;
-              if (err) display += "\nstderr: " + err;
-              display += "\n```\nexit: " + execRes.exit_code;
-              flush();
+	              if (out) display += "\n" + out;
+	              if (err) display += "\nstderr: " + err;
+	              display += "\n```\nexit: " + execRes.exit_code + "\nduration_ms: " + durationMs;
+	              flush();
 
               messages.push({
                 role: "user",
@@ -3606,6 +4887,27 @@
         }
         const sysExtras = [];
         sysExtras.push(`[Agent state]\nstate: ${agentState}`);
+        if (reflectionRequired) {
+          sysExtras.push(buildReflectionPrompt(
+            reflectionRequired,
+            agentState,
+            governor,
+            fileToolConsecutiveFailures,
+          ));
+        }
+        if (impactRequired) {
+          sysExtras.push(buildImpactPrompt(impactRequired, activePlan));
+        }
+        if (activePlan && Array.isArray(activePlan.acceptanceCriteria) && activePlan.acceptanceCriteria.length) {
+          const planLines = ["[Current acceptance criteria]"];
+          activePlan.acceptanceCriteria.forEach((criterion, idx) => {
+            planLines.push(`- acceptance ${idx + 1}: ${criterion}`);
+          });
+          sysExtras.push(planLines.join("\n"));
+        }
+        if (knownGoodVerificationCommands.length) {
+          sysExtras.push(["[Known-good verification commands]", ...knownGoodVerificationCommands.map((cmd) => `- ${cmd}`)].join("\n"));
+        }
         const recentTxt = formatRecentRuns();
         if (recentTxt) sysExtras.push(recentTxt);
         if (govHint) sysExtras.push("[Governor]\n" + govHint);
@@ -3621,7 +4923,7 @@
           if (display) display += "\n\n";
            streamResult = await streamChatTools({
              messages,
-            tools: [execTool, writeFileTool, readFileTool, patchFileTool, applyDiffTool, searchFilesTool, listDirTool, globTool], 
+            tools: [execTool, writeFileTool, readFileTool, patchFileTool, applyDiffTool, searchFilesTool, listDirTool, globTool, doneTool], 
              model: String(reqCfg.codeModel || reqCfg.model || ""),
              base_url: String(reqCfg.baseUrl || ""),
              api_key: resolvedKey || undefined,
@@ -3644,46 +4946,217 @@
         }
 
         const { text: asstText, finishReason, toolCalls: asstToolCalls } = streamResult;
+        const parsedPlanForTurn = parsePlanBlock(asstText, governorContract);
+        const planValidationError = parsedPlanForTurn ? validatePlanBlock(governorContract, parsedPlanForTurn) : "";
+        const parsedThinkForTurn = parseThinkBlock(asstText, governorContract);
+        if (parsedPlanForTurn && !planValidationError) activePlan = parsedPlanForTurn;
 
         // Append assistant turn to conversation history (OpenAI format).
         const asstMsg = { role: "assistant", content: asstText || null };
         if (asstToolCalls.length > 0) asstMsg.tool_calls = asstToolCalls; 
         messages.push(asstMsg); 
+
+        const blockCurrentToolCalls = (block) => {
+          agentState = "recovery";
+          governor.pendingHint = block;
+          display += (display ? "\n\n" : "") + "[GOVERNOR BLOCK]\n" + block;
+          flush();
+          for (const tc of asstToolCalls) {
+            const toolName = tc && tc.function && tc.function.name ? String(tc.function.name) : "";
+            const toolArgs = tc && tc.function && tc.function.arguments ? String(tc.function.arguments) : "";
+            messages.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: "GOVERNOR BLOCKED\n\n" + block + "\n\ntool:\n" + toolName + "\narguments:\n" + toolArgs,
+            });
+          }
+        };
+
+        const blockWithoutToolCalls = (block) => {
+          agentState = "recovery";
+          governor.pendingHint = block;
+          display += (display ? "\n\n" : "") + "[GOVERNOR BLOCK]\n" + block;
+          flush();
+        };
  
         if (finishReason === "tool_calls" && asstToolCalls.length > 0) { 
-          // Plan gate: require a <plan> at least once before doing any real work. 
-          // The model should include <plan> in the same assistant message as its first tool call. 
-          const hasPlan = messages.some((m) => ( 
-            m 
-            && m.role === "assistant" 
-            && typeof m.content === "string" 
-            && m.content.indexOf("<plan>") !== -1 
-          )); 
-          if (!hasPlan) { 
-            const block = "[Plan Gate] Missing <plan>.\n" 
-              + "Required now: in your next assistant message, include a <plan> (goal/steps/risks/assumptions), " 
-              + "then call ONE diagnostic tool (list_dir/search_files/glob/read_file) to start."; 
-            agentState = "recovery"; 
-            governor.pendingHint = block; 
-            display += (display ? "\n\n" : "") + "[GOVERNOR BLOCK]\n" + block; 
-            flush(); 
-            for (const tc of asstToolCalls) { 
-              const toolName = tc && tc.function && tc.function.name ? String(tc.function.name) : ""; 
-              const toolArgs = tc && tc.function && tc.function.arguments ? String(tc.function.arguments) : ""; 
-              messages.push({ 
-                role: "tool", 
-                tool_call_id: tc.id, 
-                content: "GOVERNOR BLOCKED\n\n" + block + "\n\ntool:\n" + toolName + "\narguments:\n" + toolArgs, 
-              }); 
-            } 
+          if (parsedPlanForTurn && planValidationError) {
+            const block = invalidPlanMessage(governorContract, planValidationError);
+            blockCurrentToolCalls(block);
+            continue;
+          }
+          if (!activePlan) { 
+            const block = missingPlanMessage(governorContract);
+            blockCurrentToolCalls(block);
             continue; 
-          } 
+          }
+
+          if (asstToolCalls.length > 1) {
+            const block = multipleToolCallsMessage(governorContract, asstToolCalls.length);
+            blockCurrentToolCalls(block);
+            continue;
+          }
+
+          if (reflectionRequired) {
+            const reflect = parseReflectionBlock(asstText, governorContract);
+            if (!reflect) {
+              const block = reflectionMissingMessage(governorContract, reflectionRequired);
+              blockCurrentToolCalls(block);
+              continue;
+            }
+            const reflectError = validateReflectionBlock(
+              governorContract,
+              reflect,
+              governor,
+              fileToolConsecutiveFailures,
+            );
+            if (reflectError) {
+              const block = reflectionInvalidMessage(
+                governorContract,
+                reflectError,
+                reflectionRequired,
+              );
+              blockCurrentToolCalls(block);
+              continue;
+            }
+            if (asstToolCalls.length !== 1) {
+              const block = reflectionOneToolMessage(governorContract, asstToolCalls.length);
+              blockCurrentToolCalls(block);
+              continue;
+            }
+            display += (display ? "\n\n" : "") + `[reflect] goal_delta=${reflect.goalDelta} strategy=${reflect.strategyChange} next=${reflect.nextMinimalAction}`;
+            flush();
+            reflectionRequired = "";
+            if (reflect.strategyChange === "abandon") {
+              governor.pendingHint = [
+                "Strategy abandoned.",
+                "Do not retry the previous approach.",
+                "Execute only the new minimal action: " + reflect.nextMinimalAction,
+              ].join("\n");
+            }
+          }
+
+          if (impactRequired) {
+            const impact = parseImpactBlock(asstText, governorContract);
+            if (!impact) {
+              const block = impactMissingMessage(governorContract, impactRequired);
+              blockCurrentToolCalls(block);
+              continue;
+            }
+            const impactError = validateImpactBlock(governorContract, impact, activePlan);
+            if (impactError) {
+              const block = impactInvalidMessage(
+                governorContract,
+                impactError,
+                impactRequired,
+              );
+              blockCurrentToolCalls(block);
+              continue;
+            }
+            if (asstToolCalls.length !== 1) {
+              const block = impactOneToolMessage(governorContract, asstToolCalls.length);
+              blockCurrentToolCalls(block);
+              continue;
+            }
+            display += (display ? "\n\n" : "") + `[impact] changed=${impact.changed} progress=${impact.progress} gap=${impact.remainingGap}`;
+            flush();
+            impactRequired = "";
+          }
+
+          const candidatePlan = parsedPlanForTurn && !planValidationError ? parsedPlanForTurn : activePlan;
+          const actualToolCall = asstToolCalls[0];
+          const actualToolName = actualToolCall && actualToolCall.function ? String(actualToolCall.function.name || "").trim() : "";
+          const actualToolArgs = actualToolCall && actualToolCall.function ? String(actualToolCall.function.arguments || "") : "";
+
+          if (!parsedThinkForTurn) {
+            const block = missingThinkMessage(governorContract);
+            blockCurrentToolCalls(block);
+            continue;
+          }
+
+          const thinkError = validateThinkBlock(
+            governorContract,
+            parsedThinkForTurn,
+            candidatePlan,
+            actualToolName,
+            actualToolArgs,
+          );
+          if (thinkError) {
+            const block = invalidThinkMessage(governorContract, thinkError);
+            blockCurrentToolCalls(block);
+            continue;
+          }
  
+          let doneNow = false;
           for (const tc of asstToolCalls) { 
             if (ac.signal.aborted) break; 
             if (tc.type !== "function" || !tc.function || !tc.function.name) continue; 
  
             const toolName = String(tc.function.name || "").trim();
+
+            if (toolName === "done") {
+              let args;
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+              const summary = String(args.summary || "").trim();
+              const completedAcceptance = parseStringListArg(args.completed_acceptance);
+              const remainingAcceptance = parseStringListArg(args.remaining_acceptance);
+              const acceptanceEvidence = parseDoneAcceptanceEvidence(args.acceptance_evidence, governorContract);
+              const nextSteps = String(args.next_steps || "").trim();
+
+              if (asstToolCalls.length !== 1) {
+                const toolResult = "GOVERNOR BLOCKED\n\ndone must be the only tool call in its turn.";
+                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                display += (display ? "\n\n" : "") + "[GOVERNOR BLOCK]\n" + toolResult;
+                flush();
+                agentState = "recovery";
+                governor.pendingHint = toolResult;
+                break;
+              }
+
+              const validation = validateDoneAcceptance(
+                governorContract,
+                activePlan,
+                completedAcceptance,
+                remainingAcceptance,
+                acceptanceEvidence,
+                knownGoodVerificationCommands,
+              );
+              if (validation && validation.error) {
+                const toolResult = doneInvalidAcceptanceMessage(governorContract, validation.error);
+                messages.push({ role: "tool", tool_call_id: tc.id, content: "GOVERNOR BLOCKED\n\n" + toolResult });
+                display += (display ? "\n\n" : "") + "[GOVERNOR BLOCK]\n" + toolResult;
+                flush();
+                agentState = "recovery";
+                governor.pendingHint = toolResult;
+                break;
+              }
+
+              const evidenceByIdx = validation && validation.evidenceByIdx ? validation.evidenceByIdx : new Map();
+              const lines = ["[DONE]"];
+              if (summary) lines.push(summary);
+              lines.push("", "Acceptance:");
+              for (const entry of completedAcceptance) {
+                const idx = resolveAcceptanceReference(entry, activePlan);
+                const label = idx >= 0 ? acceptanceReferenceLabel(activePlan, idx) : entry;
+                const known = idx >= 0 ? evidenceByIdx.get(idx) : "";
+                lines.push(known ? `- done: ${label} via \`${known}\`` : `- done: ${label}`);
+              }
+              for (const entry of remainingAcceptance) {
+                const idx = resolveAcceptanceReference(entry, activePlan);
+                const label = idx >= 0 ? acceptanceReferenceLabel(activePlan, idx) : entry;
+                lines.push(`- remaining: ${label}`);
+              }
+              if (nextSteps) lines.push("", "Next:", nextSteps);
+
+              const finalText = lines.join("\n").trim();
+              messages.push({ role: "tool", tool_call_id: tc.id, content: "OK: done" });
+              messages.push({ role: "assistant", content: finalText });
+              display += (display ? "\n\n" : "") + finalText;
+              flush();
+              agentState = "done";
+              doneNow = true;
+              break;
+            }
 
             if (toolName === "exec") {
               agentState = "executing";
@@ -3707,6 +5180,7 @@
                   toolResult = `error: blocked repeated failing command (${repeatBlock}). You MUST choose a different command/strategy.`;
                   pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: -1, ok: false, cls: "blocked", err: clip(repeatBlock, 120) });
                   agentState = "recovery";
+                  requireReflection(repeatBlock || "repeated failing command blocked");
                   display += `\n(blocked: ${repeatBlock})\n\`\`\`\nexit: -1`;
                   flush();
                   messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
@@ -3716,6 +5190,7 @@
                   toolResult = `error: blocked dangerous command (${danger}). Ask the user to run it manually if truly intended.`;
                   pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: -1, ok: false, cls: "blocked", err: clip(danger, 120) });
                   agentState = "recovery";
+                  requireReflection(danger || "dangerous command blocked");
                   display += `\n(blocked: ${danger})\n\`\`\`\nexit: -1`;
                   flush();
                   messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
@@ -3749,6 +5224,7 @@
                     pushRecentRun({ kind: "exec", cmd: commandSig(commandToRun), exit: -1, ok: false, cls: "rejected", err: "rejected by user" });
                     display += "\n(rejected)\n```\nexit: -1";
                     flush();
+                    requireReflection("command rejected by user");
                     messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
                     continue;
                   }
@@ -3760,13 +5236,14 @@
                 const parsed = stripPwdMarker(execRes.stdout);
                 const breach = sandboxBreachReason(parsed.pwd);
                 maybeUpdateWorkdirFromPwd(parsed.pwd);
-                const stdoutRaw = String(parsed.stdout || "");
-                const stderrRaw = String(execRes.stderr || "");
-                const stdout = truncToolTail(stdoutRaw, TRUNC_STDOUT);
-                const stderr = truncToolTail(stderrRaw, TRUNC_STDERR);
-                const exitCode = execRes.exit_code;
-                const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdoutRaw, stderrRaw) : "";
-                const failed = exitCode !== 0 || !!suspicious || !!breach;
+	                const stdoutRaw = String(parsed.stdout || "");
+	                const stderrRaw = String(execRes.stderr || "");
+	                const stdout = truncToolTail(stdoutRaw, TRUNC_STDOUT);
+	                const stderr = truncToolTail(stderrRaw, TRUNC_STDERR);
+	                const exitCode = execRes.exit_code;
+	                const durationMs = Math.max(0, Math.round(Number(execRes.duration_ms) || 0));
+	                const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdoutRaw, stderrRaw) : "";
+	                const failed = exitCode !== 0 || !!suspicious || !!breach;
                 noteCmd(k, failed, errorLineSig(stdout, stderr));
                 const hintGit = failed ? gitRepoHint(stderrRaw) : "";
                 const hintGov = failed ? deriveGovernorHint(stderrRaw, stdoutRaw) : "";
@@ -3827,6 +5304,7 @@
                     // Sandbox breaches are always critical: force a correction immediately.
                     governor.pendingHint = hintSandbox;
                   }
+                  requireReflection(governor.pendingHint || stuckReason || errLine || "failure or stall detected");
                 } else {
                   governor.consecutiveFailures = 0;
                   governor.lastCmdSig = "";
@@ -3836,16 +5314,21 @@
                   governor.lastOutHash = 0n;
                   governor.sameOutRepeats = 0;
                   governor.pendingDiag = "";
+                  if (isVerificationCommand(commandToRun, governorContract)) {
+                    rememberKnownVerificationCommand(commandToRun);
+                  }
                 }
 
-                toolResult = failed
-                  ? `${prefixText}FAILED (exit_code: ${exitCode}).\n${cwdLine}\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}\n⚠ The command failed. Diagnose the error above and call exec again with the fix. Do NOT continue to the next step until this succeeds.`
-                  : `OK (exit_code: 0)\n${cwdLine}\nstdout: ${stdout || "(empty)"}`;
+	                toolResult = failed
+	                  ? `${prefixText}FAILED (exit_code: ${exitCode}).\nduration_ms: ${durationMs}\n${cwdLine}\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}\n⚠ The command failed. Diagnose the error above and call exec again with the fix. Do NOT continue to the next step until this succeeds.`
+	                  : `OK (exit_code: 0)\nduration_ms: ${durationMs}\n${cwdLine}\nstdout: ${stdout || "(empty)"}`;
 
-                if (stdout) display += "\n" + stdout;
-                if (stderr) display += "\nstderr: " + stderr;
-                display += "\n```\nexit: " + exitCode;
-              } catch (execErr) {
+	                if (stdout) display += "\n" + stdout;
+	                if (stderr) display += "\nstderr: " + stderr;
+	                if (breach) display += "\nSANDBOX_BREACH: " + breach;
+	                if (suspicious) display += "\nSUSPICIOUS_SUCCESS: " + suspicious;
+	                display += "\n```\nexit: " + exitCode + "\nduration_ms: " + durationMs;
+	              } catch (execErr) {
                 noteCmd(k, true, normalizeForSig(execErr.message || ""));
                 toolResult = `error: ${execErr.message}`;
                 display += "\nerror: " + execErr.message + "\n```";
@@ -3879,12 +5362,24 @@
                 if (unsafePath) {
                   toolResult = "error: unsafe path (must be relative, no '..', no drive letters)";
                   pushRecentRun({ kind: "write_file", status: "FAIL", ok: false, path: path0 || "(missing)", note: "unsafe path" });
+                  fileToolConsecutiveFailures += 1;
+                  requireReflection(
+                    fileToolConsecutiveFailures >= 2
+                      ? `file tool failures repeated ${fileToolConsecutiveFailures} times`
+                      : "write_file failed: unsafe path"
+                  );
                   messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
                   continue;
                 }
                 if (!content) {
                   toolResult = "error: write_file content is empty";
                   pushRecentRun({ kind: "write_file", status: "FAIL", ok: false, path: path0 || "(missing)", note: "empty content" });
+                  fileToolConsecutiveFailures += 1;
+                  requireReflection(
+                    fileToolConsecutiveFailures >= 2
+                      ? `file tool failures repeated ${fileToolConsecutiveFailures} times`
+                      : "write_file failed: empty content"
+                  );
                   messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
                   continue;
                 }
@@ -3906,6 +5401,12 @@
                     messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });  
                     agentState = "recovery";  
                     governor.pendingHint = toolResult; 
+                    fileToolConsecutiveFailures += 1;
+                    requireReflection(
+                      fileToolConsecutiveFailures >= 2
+                        ? `file tool failures repeated ${fileToolConsecutiveFailures} times`
+                        : "write_file blocked before overwrite"
+                    );
                     continue; 
                   } 
                 } catch (_) { 
@@ -3932,11 +5433,19 @@
                 const wr = await postJson("/api/write_file", { path: fullPath, content }, ac.signal); 
                 toolResult = `OK write_file\nbytes_written: ${wr && wr.bytes_written != null ? wr.bytes_written : content.length}`; 
                 fileReadSet.add(fullPath); 
+                fileToolConsecutiveFailures = 0;
+                requireImpact(`write_file succeeded: ${path0 || fullPath}`);
                 pushRecentRun({ kind: "write_file", status: "OK", path: path0 || fullPath, note: `bytes=${wr && wr.bytes_written != null ? wr.bytes_written : content.length}` }); 
                 messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult }); 
               } catch (e2) { 
                 toolResult = `error: ${prettyErr(e2)}`; 
                 pushRecentRun({ kind: "write_file", status: "FAIL", ok: false, path: path0 || "(missing)", note: clip(prettyErr(e2), 120) });
+                fileToolConsecutiveFailures += 1;
+                requireReflection(
+                  fileToolConsecutiveFailures >= 2
+                    ? `file tool failures repeated ${fileToolConsecutiveFailures} times`
+                    : firstDigestLine(toolResult) || "write_file failed"
+                );
                 messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               }
               flush();
@@ -4006,9 +5515,17 @@
                 const res = await postJson("/api/patch_file", { path: fullPath, search, replace }, ac.signal); 
                 const raw = res && res.message ? res.message : "OK: patched"; 
                 toolResult = rewriteToolPath(raw, fullPath, path0); 
+                fileToolConsecutiveFailures = 0;
+                requireImpact(`patch_file succeeded: ${path0}`);
                 pushRecentRun({ kind: "patch_file", status: "OK", path: path0, note: firstDigestLine(toolResult) || "" }); 
               } catch (e2) { 
                 toolResult = `ERROR patching '${path0}': ${prettyErr(e2)}`; 
+                fileToolConsecutiveFailures += 1;
+                requireReflection(
+                  fileToolConsecutiveFailures >= 2
+                    ? `file tool failures repeated ${fileToolConsecutiveFailures} times`
+                    : firstDigestLine(toolResult) || "patch_file failed"
+                );
                 pushRecentRun({ kind: "patch_file", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) }); 
               } 
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
@@ -4023,7 +5540,8 @@
               const dir0raw = String(args.dir || ""); 
               const dir0 = (dir0raw === "." || dir0raw === "./") ? "" : dir0raw; 
               const ci = !!args.case_insensitive; 
-              display += (display ? "\n\n" : "") + `🔍 search_files: ${pattern}`; 
+              const shown = dir0 ? dir0 : "."; 
+              display += (display ? "\n\n" : "") + `🔍 search_files: ${pattern} (dir=${shown})`; 
               flush(); 
               let toolResult; 
               try { 
@@ -4043,7 +5561,9 @@
               try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
               const path0 = String(args.path || "").trim();
               const diff = String(args.diff || "");
-              display += (display ? "\n\n" : "") + `⟁ apply_diff: ${path0}`; 
+              const diffChars = diff.length;
+              const hunks = (diff.match(/^@@/gm) || []).length;
+              display += (display ? "\n\n" : "") + `⟁ apply_diff: ${path0} (${diffChars} chars, ${hunks} hunks)`; 
               flush(); 
               let toolResult; 
               try { 
@@ -4051,9 +5571,17 @@
                 const res = await postJson("/api/apply_diff", { path: fullPath, diff }, ac.signal); 
                 const raw = res && res.message ? res.message : "OK: diff applied"; 
                 toolResult = rewriteToolPath(raw, fullPath, path0); 
+                fileToolConsecutiveFailures = 0;
+                requireImpact(`apply_diff succeeded: ${path0}`);
                 pushRecentRun({ kind: "apply_diff", status: "OK", path: path0, note: firstDigestLine(toolResult) || "" }); 
               } catch (e2) { 
                 toolResult = `ERROR applying diff to '${path0}': ${prettyErr(e2)}`; 
+                fileToolConsecutiveFailures += 1;
+                requireReflection(
+                  fileToolConsecutiveFailures >= 2
+                    ? `file tool failures repeated ${fileToolConsecutiveFailures} times`
+                    : firstDigestLine(toolResult) || "apply_diff failed"
+                );
                 pushRecentRun({ kind: "apply_diff", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) }); 
               } 
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
@@ -4067,7 +5595,8 @@
               const pattern = String(args.pattern || "").trim(); 
               const dir0raw = String(args.dir || ""); 
               const dir0 = (dir0raw === "." || dir0raw === "./") ? "" : dir0raw; 
-              display += (display ? "\n\n" : "") + `❖ glob: ${pattern}`; 
+              const shown = dir0 ? dir0 : "."; 
+              display += (display ? "\n\n" : "") + `❖ glob: ${pattern} (dir=${shown})`; 
               flush(); 
               let toolResult; 
               try { 
@@ -4085,9 +5614,20 @@
             // Unknown tool — ignore, but keep the model informed.
             messages.push({ role: "tool", tool_call_id: tc.id, content: `error: unknown tool: ${toolName}` });
           }
+          if (doneNow) break;
           if (awaitingApproval) break;
         } else {
           // finish_reason === "stop" — if the model didn't produce tool calls, try implied scripts.
+          if (reflectionRequired) {
+            const block = reflectionStopMessage(governorContract, reflectionRequired);
+            blockWithoutToolCalls(block);
+            continue;
+          }
+          if (impactRequired) {
+            const block = impactStopMessage(governorContract, impactRequired);
+            blockWithoutToolCalls(block);
+            continue;
+          }
           const implied = extractImpliedExecScripts(asstText);
           if (!implied.length) {
             // Goal delta check: the model may "stop" even though the deliverable isn't actually complete.
@@ -4181,13 +5721,14 @@
               const parsed = stripPwdMarker(execRes.stdout);
               const breach = sandboxBreachReason(parsed.pwd);
               maybeUpdateWorkdirFromPwd(parsed.pwd);
-              const stdoutRaw = String(parsed.stdout || "");
-              const stderrRaw = String(execRes.stderr || "");
-              const stdout = truncToolTail(stdoutRaw, TRUNC_STDOUT);
-              const stderr = truncToolTail(stderrRaw, TRUNC_STDERR);
-              const exitCode = execRes.exit_code;
-              const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdoutRaw, stderrRaw) : "";
-              const failed = exitCode !== 0 || !!suspicious || !!breach;
+	              const stdoutRaw = String(parsed.stdout || "");
+	              const stderrRaw = String(execRes.stderr || "");
+	              const stdout = truncToolTail(stdoutRaw, TRUNC_STDOUT);
+	              const stderr = truncToolTail(stderrRaw, TRUNC_STDERR);
+	              const exitCode = execRes.exit_code;
+	              const durationMs = Math.max(0, Math.round(Number(execRes.duration_ms) || 0));
+	              const suspicious = (exitCode === 0) ? suspiciousSuccessReason(stdoutRaw, stderrRaw) : "";
+	              const failed = exitCode !== 0 || !!suspicious || !!breach;
               noteCmd(k, failed, errorLineSig(stdout, stderr));
               const hintGit = failed ? gitRepoHint(stderrRaw) : "";
               const hintGov = failed ? deriveGovernorHint(stderrRaw, stdoutRaw) : "";
@@ -4256,16 +5797,19 @@
                 governor.lastOutHash = 0n;
                 governor.sameOutRepeats = 0;
                 governor.pendingDiag = "";
+                if (isVerificationCommand(commandToRun, governorContract)) {
+                  rememberKnownVerificationCommand(commandToRun);
+                }
               }
 
-              resultText = failed
-                ? `${prefixText}FAILED (exit_code: ${exitCode}).\n${cwdLine}\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}`
-                : `OK (exit_code: 0)\n${cwdLine}\nstdout: ${stdout || "(empty)"}`;
+	              resultText = failed
+	                ? `${prefixText}FAILED (exit_code: ${exitCode}).\nduration_ms: ${durationMs}\n${cwdLine}\nstderr: ${stderr || "(empty)"}\nstdout: ${stdout || "(empty)"}${hint ? ("\n\n" + hint) : ""}`
+	                : `OK (exit_code: 0)\nduration_ms: ${durationMs}\n${cwdLine}\nstdout: ${stdout || "(empty)"}`;
 
-              if (stdout) display += "\n" + stdout;
-              if (stderr) display += "\nstderr: " + stderr;
-              display += "\n```\nexit: " + exitCode;
-              flush();
+	              if (stdout) display += "\n" + stdout;
+	              if (stderr) display += "\nstderr: " + stderr;
+	              display += "\n```\nexit: " + exitCode + "\nduration_ms: " + durationMs;
+	              flush();
 
               const nextInstr = failed
                 ? "⚠ The command failed. Diagnose the error above and output a FIX command as ONE code block. Do NOT continue to the next step until this succeeds."
@@ -4586,6 +6130,83 @@
         setSendingCoder(false);
         abortCoderRef.current = null;
         refreshPendingEdits();
+      }
+    };
+
+    const runObserverEngine = async () => {
+      if (sendingObserver) return;
+      if (!activeThread) return;
+
+      const supported = !!(status && status.features && status.features.observer_engine);
+      if (!supported) {
+        showToast(lang === "fr" ? "Observer engine non disponible sur ce serveur." : lang === "en" ? "Observer engine not available on this server." : "このサーバではObserver engineが使えません。", "info");
+        return;
+      }
+
+      const threadId = activeThread.id;
+      const coderMsgs = paneMessages("coder").filter((m) => m && !m.streaming);
+      if (!coderMsgs.length) {
+        showToast(lang === "fr" ? "Aucune activité du Coder à analyser." : lang === "en" ? "No Coder activity to analyze." : "分析できるCoderの履歴がありません。", "info");
+        return;
+      }
+
+      const recent = coderMsgs.slice(-10);
+      const transcript = recent
+        .map((m) => {
+          const who = m.role === "user" ? "User" : "Coder";
+          return `${who}:\n${String(m.content || "").trimEnd()}`;
+        })
+        .join("\n\n")
+        .trim();
+
+      if (!transcript) {
+        showToast(lang === "fr" ? "Transcript vide." : lang === "en" ? "Empty transcript." : "Transcriptが空です。", "info");
+        return;
+      }
+
+      const userText =
+        lang === "fr"
+          ? "[ENGINE] Analyse déterministe des actions récentes du Coder."
+          : lang === "en"
+            ? "[ENGINE] Deterministic analysis of the Coder's recent actions."
+            : "[ENGINE] Coderの直近行動をdeterministicに解析。";
+
+      const userMsg = { id: uid(), pane: "observer", role: "user", content: userText, ts: Date.now() };
+      const asstId = uid();
+      const asstMsg = { id: asstId, pane: "observer", role: "assistant", content: "", ts: Date.now(), streaming: true };
+
+      setThreadState((s) => ({
+        ...s,
+        threads: s.threads.map((t) =>
+          t.id === threadId ? { ...t, updatedAt: Date.now(), messages: [...(t.messages || []), userMsg, asstMsg] } : t
+        ),
+      }));
+      setSendingObserver(true);
+      requestAnimationFrame(() => scrollBottom(observerBodyRef));
+
+      const ac = new AbortController();
+      abortObserverRef.current = ac;
+      try {
+        const mem0 = (activeThread && activeThread.observerMem && typeof activeThread.observerMem === "object") ? activeThread.observerMem : { proposal_counts: {} };
+        const resp = await postJson("/api/observer_engine", { transcript, memory: mem0 }, ac.signal);
+        const formatted = resp && resp.formatted ? String(resp.formatted || "") : "";
+        const mem1 = (resp && resp.memory && typeof resp.memory === "object") ? resp.memory : mem0;
+
+        setThreadState((s) => ({
+          ...s,
+          threads: s.threads.map((t) => {
+            if (t.id !== threadId) return t;
+            const msgs = (t.messages || []).map((m) => (m.id === asstId ? { ...m, content: formatted || "…", streaming: false } : m));
+            return { ...t, updatedAt: Date.now(), observerMem: mem1, messages: msgs };
+          }),
+        }));
+        requestAnimationFrame(() => scrollBottom(observerBodyRef));
+      } catch (err) {
+        const msg = prettyErr(err);
+        setMsg(threadId, asstId, `[${tr(lang, "error")}] ${msg}`, observerBodyRef);
+      } finally {
+        setSendingObserver(false);
+        abortObserverRef.current = null;
       }
     };
 
@@ -6899,6 +8520,14 @@
                     observerFind
                       ? e("button", { className: "btn btn-icon", type: "button", title: tr(lang, "clear"), onClick: () => setObserverFind("") }, "✕")
                       : null,
+                    e("button", {
+                      className: "btn btn-icon",
+                      type: "button",
+                      title: lang === "fr" ? "Lancer l'Observer engine" : lang === "en" ? "Run Observer engine" : "Observer engineを実行",
+                      disabled: sendingObserver || coderMsgs.length === 0,
+                      onClick: () => runObserverEngine(),
+                      style: { marginLeft: 6 },
+                    }, "⚙"),
                     observerFind
                       ? e("span", { className: "msg-ts", style: { marginLeft: 6 } }, `${observerMsgsView.length}/${observerMsgs.length}`)
                       : null
@@ -6920,14 +8549,24 @@
                       ? e("div", { className: "pane-empty pane-empty-obs" },
                           e("div", { className: "pane-empty-icon" }, "👁"),
                           e("p", { className: "pane-empty-hint" }, tr(lang, "observerHint")),
-                          !config.autoObserve && coderMsgs.length > 0 && e("button", {
-                            className: "btn btn-accent obs-quick-trigger",
-                            onClick: () => sendObserver(lang === "en"
-                              ? "Please review the Coder's latest output."
-                              : lang === "fr"
-                                ? "Veuillez examiner la dernière sortie du Coder."
-                                : "Coderの最新の出力をレビューしてください。"),
-                          }, lang === "en" ? "▶ Observe now" : lang === "fr" ? "▶ Observer" : "▶ 今すぐ観察")
+                          !config.autoObserve && coderMsgs.length > 0 && e("div", {
+                            style: { display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center" },
+                          },
+                            e("button", {
+                              className: "btn btn-accent obs-quick-trigger",
+                              disabled: sendingObserver,
+                              onClick: () => sendObserver(lang === "en"
+                                ? "Please review the Coder's latest output."
+                                : lang === "fr"
+                                  ? "Veuillez examiner la dernière sortie du Coder."
+                                  : "Coderの最新の出力をレビューしてください。"),
+                            }, lang === "en" ? "▶ Observe (LLM)" : lang === "fr" ? "▶ Observer (LLM)" : "▶ LLMで観察"),
+                            e("button", {
+                              className: "btn obs-quick-trigger",
+                              disabled: sendingObserver,
+                              onClick: () => runObserverEngine(),
+                            }, lang === "en" ? "⚙ Observe (engine)" : lang === "fr" ? "⚙ Observer (engine)" : "⚙ エンジン観察")
+                          )
                         )
                       : observerMsgsView.length === 0
                         ? e("div", { className: "pane-empty" },

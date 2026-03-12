@@ -683,7 +683,12 @@ pub fn tool_list_dir(
 
     let rd = match std::fs::read_dir(&dir_path) {
         Ok(r) => r,
-        Err(e) => return (format!("ERROR: cannot read dir '{}': {e}", dir_path.display()), true),
+        Err(e) => {
+            return (
+                format!("ERROR: cannot read dir '{}': {e}", dir_path.display()),
+                true,
+            )
+        }
     };
 
     let mut dirs: Vec<String> = Vec::new();
@@ -691,7 +696,11 @@ pub fn tool_list_dir(
 
     for entry in rd.flatten() {
         let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
         if name.is_empty() {
             continue;
         }

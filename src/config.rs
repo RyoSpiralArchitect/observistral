@@ -42,6 +42,14 @@ impl std::fmt::Display for ProviderKind {
     }
 }
 
+impl std::str::FromStr for ProviderKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        parse_provider(s).ok_or_else(|| format!("unsupported provider: {s}"))
+    }
+}
+
 pub fn supported_providers() -> Vec<&'static str> {
     vec!["openai-compatible", "mistral", "anthropic", "hf"]
 }

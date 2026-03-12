@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
@@ -98,6 +98,10 @@ async fn serve_asset(stream: &mut TcpStream, req_path: &str) -> Result<()> {
     }
 
     let ctype = asset_content_type(rel);
+    if rel == "governor_contract.js" {
+        let js = crate::governor_contract::browser_fallback_script();
+        return write_response(stream, 200, "OK", ctype, js.as_bytes()).await;
+    }
     if let Some(bytes) = read_dev_asset(rel) {
         return write_response(stream, 200, "OK", ctype, &bytes).await;
     }
@@ -384,6 +388,7 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/chat_tools_stream") => {
             api_chat_tools_stream(&mut stream, state, &req.body).await
         }
+        ("POST", "/api/observer_engine") => api_observer_engine(&mut stream, &req.body).await,
         ("GET", "/api/pending_edits") => api_pending_edits(&mut stream, state).await,
         ("POST", "/api/queue_edit") => api_queue_edit(&mut stream, state, &req.body).await,
         ("POST", "/api/approve_edit") => api_approve_edit(&mut stream, state, &req.body).await,
@@ -396,21 +401,22 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/reject_command") => api_reject_command(&mut stream, state, &req.body).await,
         ("GET", "/api/meta_prompts") => api_meta_prompts_get(&mut stream, state).await,
         ("POST", "/api/meta_prompts") => api_meta_prompts_post(&mut stream, state, &req.body).await,
-        ("POST", "/api/write_file") => api_write_file(&mut stream, state, &req.body).await, 
-        ("POST", "/api/read_file") => api_read_file(&mut stream, state, &req.body).await, 
-        ("POST", "/api/patch_file") => api_patch_file(&mut stream, state, &req.body).await, 
-        ("POST", "/api/search_files") => { 
-            api_search_files_endpoint(&mut stream, state, &req.body).await 
-        } 
-        ("POST", "/api/list_dir") => api_list_dir(&mut stream, state, &req.body).await, 
-        ("POST", "/api/glob_files") => api_glob_files(&mut stream, state, &req.body).await, 
-        ("POST", "/api/apply_diff") => api_apply_diff(&mut stream, state, &req.body).await, 
-        ("POST", "/api/stat_path") => api_stat_path(&mut stream, state, &req.body).await, 
-        ("POST", "/api/rollback") => api_rollback(&mut stream, state, &req.body).await, 
-        ("GET", p) if p.starts_with("/api/project/scan") => api_project_scan(&mut stream, p).await, 
-        _ => { 
-            write_text( 
-                &mut stream, 
+        ("POST", "/api/write_file") => api_write_file(&mut stream, state, &req.body).await,
+        ("POST", "/api/read_file") => api_read_file(&mut stream, state, &req.body).await,
+        ("POST", "/api/patch_file") => api_patch_file(&mut stream, state, &req.body).await,
+        ("POST", "/api/search_files") => {
+            api_search_files_endpoint(&mut stream, state, &req.body).await
+        }
+        ("POST", "/api/list_dir") => api_list_dir(&mut stream, state, &req.body).await,
+        ("POST", "/api/glob_files") => api_glob_files(&mut stream, state, &req.body).await,
+        ("POST", "/api/apply_diff") => api_apply_diff(&mut stream, state, &req.body).await,
+        ("POST", "/api/stat_path") => api_stat_path(&mut stream, state, &req.body).await,
+        ("POST", "/api/rollback") => api_rollback(&mut stream, state, &req.body).await,
+        ("GET", "/api/governor_contract") => api_governor_contract(&mut stream).await,
+        ("GET", p) if p.starts_with("/api/project/scan") => api_project_scan(&mut stream, p).await,
+        _ => {
+            write_text(
+                &mut stream,
                 404,
                 "Not Found",
                 "text/plain; charset=utf-8",
@@ -772,6 +778,69 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
         )
         .await
     }
+}
+
+async fn api_observer_engine(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        messages: Option<Vec<serde_json::Value>>,
+        transcript: Option<String>,
+        memory: Option<crate::observer::memory::CritiqueMemory>,
+    }
+
+    #[derive(Serialize)]
+    struct Resp {
+        critique: crate::observer::Critique,
+        formatted: String,
+        memory: crate::observer::memory::CritiqueMemory,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
+        }
+    };
+
+    let mut mem = req.memory.unwrap_or_default();
+
+    let critique = if let Some(messages) = req.messages {
+        crate::observer::engine::run_observer(&messages, Some(&mut mem))
+    } else if let Some(transcript) = req.transcript {
+        crate::observer::engine::run_observer_from_transcript(&transcript, Some(&mut mem))
+    } else {
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "missing required field: messages or transcript".to_string(),
+            },
+        )
+        .await;
+    };
+
+    let formatted = crate::observer::engine::format_critique_as_observer_blocks(&critique);
+
+    write_json(
+        stream,
+        200,
+        "OK",
+        &Resp {
+            critique,
+            formatted,
+            memory: mem,
+        },
+    )
+    .await
 }
 
 async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
@@ -1281,6 +1350,7 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
         stdout: String,
         stderr: String,
         exit_code: i32,
+        duration_ms: u64,
     }
 
     let req: Req = match serde_json::from_slice(body) {
@@ -1358,17 +1428,21 @@ async fn api_exec(stream: &mut TcpStream, body: &[u8]) -> Result<()> {
     // - dangerous command blocklist
     // - poison proxy env scrubbing
     // - Windows output decoding (CP932 fallback)
+    let start = Instant::now();
     let r = crate::exec::run_command(&req.command, req.cwd.as_deref()).await;
+    let duration_ms: u64 = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let out = match r {
         Ok(r) => Res {
             stdout: r.stdout,
             stderr: r.stderr,
             exit_code: r.exit_code,
+            duration_ms,
         },
         Err(e) => Res {
             stdout: String::new(),
             stderr: format!("spawn failed: {e:#}"),
             exit_code: -1,
+            duration_ms,
         },
     };
     write_json(stream, 200, "OK", &out).await
@@ -1381,6 +1455,10 @@ async fn api_pending_commands(stream: &mut TcpStream, state: AppState) -> Result
     }
     let pending = state.pending_commands.list().await;
     write_json(stream, 200, "OK", &Res { pending }).await
+}
+
+async fn api_governor_contract(stream: &mut TcpStream) -> Result<()> {
+    write_json(stream, 200, "OK", crate::governor_contract::contract()).await
 }
 
 async fn api_queue_command(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
@@ -2132,59 +2210,59 @@ async fn api_search_files_endpoint(
     if is_err {
         return write_json(stream, 400, "Bad Request", &ApiError { error: output }).await;
     }
-    write_json(stream, 200, "OK", &Res { ok: true, output }).await 
-} 
+    write_json(stream, 200, "OK", &Res { ok: true, output }).await
+}
 
-async fn api_list_dir(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> { 
-    #[derive(Deserialize)] 
-    struct Req { 
-        #[serde(default)] 
-        dir: String, 
-        #[serde(default)] 
-        max_entries: usize, 
-        #[serde(default)] 
-        include_hidden: bool, 
-    } 
- 
-    #[derive(Serialize)] 
-    struct Res { 
-        ok: bool, 
-        output: String, 
-    } 
- 
-    let req: Req = match serde_json::from_slice(body) { 
-        Ok(r) => r, 
-        Err(e) => { 
-            return write_json( 
-                stream, 
-                400, 
-                "Bad Request", 
-                &ApiError { 
-                    error: e.to_string(), 
-                }, 
-            ) 
-            .await 
-        } 
-    }; 
- 
-    let base = state.workspace_root.to_string_lossy().into_owned(); 
-    let (output, is_err) = crate::file_tools::tool_list_dir( 
-        &req.dir, 
-        req.max_entries, 
-        req.include_hidden, 
-        Some(&base), 
-    ); 
-    if is_err { 
-        return write_json(stream, 400, "Bad Request", &ApiError { error: output }).await; 
-    } 
-    write_json(stream, 200, "OK", &Res { ok: true, output }).await 
-} 
- 
-async fn api_glob_files(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> { 
-    #[derive(Deserialize)] 
-    struct Req { 
-        pattern: String, 
-        #[serde(default)] 
+async fn api_list_dir(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        #[serde(default)]
+        dir: String,
+        #[serde(default)]
+        max_entries: usize,
+        #[serde(default)]
+        include_hidden: bool,
+    }
+
+    #[derive(Serialize)]
+    struct Res {
+        ok: bool,
+        output: String,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
+    };
+
+    let base = state.workspace_root.to_string_lossy().into_owned();
+    let (output, is_err) = crate::file_tools::tool_list_dir(
+        &req.dir,
+        req.max_entries,
+        req.include_hidden,
+        Some(&base),
+    );
+    if is_err {
+        return write_json(stream, 400, "Bad Request", &ApiError { error: output }).await;
+    }
+    write_json(stream, 200, "OK", &Res { ok: true, output }).await
+}
+
+async fn api_glob_files(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        pattern: String,
+        #[serde(default)]
         dir: String,
     }
     #[derive(Serialize)]
@@ -2250,120 +2328,126 @@ async fn api_apply_diff(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
         stream,
         200,
         "OK",
-        &Res { 
-            ok: true, 
-            message: msg, 
-        }, 
-    ) 
-    .await 
-} 
- 
-async fn api_stat_path(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> { 
-    #[derive(Deserialize)] 
-    struct Req { 
-        path: String, 
-    } 
-    #[derive(Serialize)] 
-    struct Res { 
-        ok: bool, 
-        exists: bool, 
-        is_file: bool, 
-        is_dir: bool, 
-        bytes: u64, 
-    } 
- 
-    let req: Req = match serde_json::from_slice(body) { 
-        Ok(r) => r, 
-        Err(e) => { 
-            return write_json( 
-                stream, 
-                400, 
-                "Bad Request", 
-                &ApiError { 
-                    error: e.to_string(), 
-                }, 
-            ) 
-            .await 
-        } 
-    }; 
- 
-    let rel_path = req.path.trim(); 
-    if rel_path.is_empty() { 
-        return write_json( 
-            stream, 
-            400, 
-            "Bad Request", 
-            &ApiError { 
-                error: "path is required".into(), 
-            }, 
-        ) 
-        .await; 
-    } 
-    let rel = Path::new(rel_path); 
-    // Local path safety (keep consistent with pending store). 
-    if rel.is_absolute() 
-        || rel.components().any(|c| { 
-            matches!( 
-                c, 
-                Component::ParentDir | Component::RootDir | Component::Prefix(_) 
-            ) 
-        }) 
-    { 
-        return write_json( 
-            stream, 
-            400, 
-            "Bad Request", 
-            &ApiError { 
-                error: format!("unsafe path: {rel_path}"), 
-            }, 
-        ) 
-        .await; 
-    } 
- 
-    let abs = state.workspace_root.join(rel); 
-    match std::fs::metadata(&abs) { 
-        Ok(md) => write_json( 
-            stream, 
-            200, 
-            "OK", 
-            &Res { 
-                ok: true, 
-                exists: true, 
-                is_file: md.is_file(), 
-                is_dir: md.is_dir(), 
-                bytes: md.len(), 
-            }, 
-        ) 
-        .await, 
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => write_json( 
-            stream, 
-            200, 
-            "OK", 
-            &Res { 
-                ok: true, 
-                exists: false, 
-                is_file: false, 
-                is_dir: false, 
-                bytes: 0, 
-            }, 
-        ) 
-        .await, 
-        Err(e) => write_json( 
-            stream, 
-            400, 
-            "Bad Request", 
-            &ApiError { 
-                error: format!("stat failed: {e}"), 
-            }, 
-        ) 
-        .await, 
-    } 
-} 
+        &Res {
+            ok: true,
+            message: msg,
+        },
+    )
+    .await
+}
 
-async fn api_rollback(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> { 
-    #[derive(Deserialize)] 
-    struct Req { 
-        #[serde(default)] 
+async fn api_stat_path(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        path: String,
+    }
+    #[derive(Serialize)]
+    struct Res {
+        ok: bool,
+        exists: bool,
+        is_file: bool,
+        is_dir: bool,
+        bytes: u64,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
+    };
+
+    let rel_path = req.path.trim();
+    if rel_path.is_empty() {
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "path is required".into(),
+            },
+        )
+        .await;
+    }
+    let rel = Path::new(rel_path);
+    // Local path safety (keep consistent with pending store).
+    if rel.is_absolute()
+        || rel.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: format!("unsafe path: {rel_path}"),
+            },
+        )
+        .await;
+    }
+
+    let abs = state.workspace_root.join(rel);
+    match std::fs::metadata(&abs) {
+        Ok(md) => {
+            write_json(
+                stream,
+                200,
+                "OK",
+                &Res {
+                    ok: true,
+                    exists: true,
+                    is_file: md.is_file(),
+                    is_dir: md.is_dir(),
+                    bytes: md.len(),
+                },
+            )
+            .await
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_json(
+                stream,
+                200,
+                "OK",
+                &Res {
+                    ok: true,
+                    exists: false,
+                    is_file: false,
+                    is_dir: false,
+                    bytes: 0,
+                },
+            )
+            .await
+        }
+        Err(e) => {
+            write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: format!("stat failed: {e}"),
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn api_rollback(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        #[serde(default)]
         checkpoint: String,
         // Back-compat: older UI versions used `{hash: "..."}`
         #[serde(default)]
@@ -2558,6 +2642,7 @@ async fn api_status(stream: &mut TcpStream, state: AppState) -> Result<()> {
             pending_edits: true,
             pending_commands: true,
             chat_tools: true,
+            observer_engine: true,
             meta_prompts: true,
             open_file: true,
         },
@@ -3020,6 +3105,7 @@ struct ApiFeatures {
     pending_edits: bool,
     pending_commands: bool,
     chat_tools: bool,
+    observer_engine: bool,
     meta_prompts: bool,
     open_file: bool,
 }

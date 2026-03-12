@@ -1067,8 +1067,10 @@ body.looping .bubble.assistant {
 }
 .dot.streaming { animation: dotPulse 1.1s ease-in-out infinite; }
 
-/* --- think block --- */
-.think-block {
+/* --- think/reflect/impact blocks --- */
+.think-block,
+.reflect-block,
+.impact-block {
   margin: 6px 0;
   padding: 8px 10px;
   border-radius: 10px;
@@ -1662,7 +1664,9 @@ kbd {
 .reader-body code {
   font-size: 12.5px;
 }
-.reader-body .think-block {
+.reader-body .think-block,
+.reader-body .reflect-block,
+.reader-body .impact-block {
   opacity: 0.86;
 }
 

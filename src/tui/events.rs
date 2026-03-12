@@ -18,13 +18,75 @@ use super::app::{App, Focus, Message, RightTab, Role, Task, TaskPhase, TaskTarge
 // ── Clipboard ─────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
-fn copy_to_clipboard(text: &str) {
+fn copy_to_clipboard(text: &str) -> bool {
     use clipboard_win::{formats, set_clipboard};
-    let _ = set_clipboard(formats::Unicode, text);
+    set_clipboard(formats::Unicode, text).is_ok()
 }
 
-#[cfg(not(target_os = "windows"))]
-fn copy_to_clipboard(_text: &str) {}
+#[cfg(target_os = "macos")]
+fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() else {
+        return false;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.wait();
+        return false;
+    };
+    if stdin.write_all(text.as_bytes()).is_err() {
+        let _ = child.wait();
+        return false;
+    }
+    matches!(child.wait(), Ok(status) if status.success())
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn try_pipe(cmd: &str, args: &[&str], input: &str) -> bool {
+        let Ok(mut child) = Command::new(cmd).args(args).stdin(Stdio::piped()).spawn() else {
+            return false;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.wait();
+            return false;
+        };
+        if stdin.write_all(input.as_bytes()).is_err() {
+            let _ = child.wait();
+            return false;
+        }
+        matches!(child.wait(), Ok(status) if status.success())
+    }
+
+    try_pipe("wl-copy", &[], text)
+        || try_pipe("xclip", &["-selection", "clipboard"], text)
+        || try_pipe("xsel", &["--clipboard", "--input"], text)
+}
+
+async fn fake_stream_text(tx: &mpsc::Sender<StreamToken>, text: &str) {
+    const CHUNK_CHARS: usize = 32;
+    let mut buf = String::new();
+    let mut n = 0usize;
+
+    for ch in text.chars() {
+        buf.push(ch);
+        n += 1;
+        if n >= CHUNK_CHARS {
+            let out = std::mem::take(&mut buf);
+            n = 0;
+            let _ = tx.send(StreamToken::Delta(out)).await;
+        }
+    }
+
+    if !buf.is_empty() {
+        let _ = tx.send(StreamToken::Delta(buf)).await;
+    }
+    let _ = tx.send(StreamToken::Done).await;
+}
 
 // ── Slash command handler ─────────────────────────────────────────────────────
 
@@ -58,6 +120,174 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
     }
 
     match cmd_lc.as_str() {
+        "/provider" => {
+            use crate::config::{supported_providers, PartialConfig, ProviderKind, RunConfig};
+
+            fn partial_from_run_config(cfg: &RunConfig) -> PartialConfig {
+                PartialConfig {
+                    vibe: matches!(cfg.mode, crate::modes::Mode::Vibe),
+                    provider: Some(cfg.provider.clone()),
+                    model: Some(cfg.model.clone()),
+                    chat_model: Some(cfg.chat_model.clone()),
+                    code_model: Some(cfg.code_model.clone()),
+                    api_key: cfg.api_key.clone(),
+                    base_url: Some(cfg.base_url.clone()),
+                    mode: Some(cfg.mode.clone()),
+                    persona: Some(cfg.persona.clone()),
+                    temperature: Some(cfg.temperature),
+                    max_tokens: Some(cfg.max_tokens),
+                    timeout_seconds: Some(cfg.timeout_seconds),
+                    hf_device: Some(cfg.hf_device.clone()),
+                    hf_local_only: Some(cfg.hf_local_only),
+                }
+            }
+
+            fn resolve_with_provider(
+                cfg: &RunConfig,
+                provider: ProviderKind,
+            ) -> anyhow::Result<RunConfig> {
+                let mut partial = partial_from_run_config(cfg);
+                partial.provider = Some(provider);
+                // Reset cross-provider fields to safe defaults + env keys.
+                partial.api_key = None;
+                partial.base_url = Some(String::new());
+                partial.model = Some(String::new());
+                partial.chat_model = Some(String::new());
+                partial.code_model = Some(String::new());
+                partial.resolve()
+            }
+
+            let cur = match pane {
+                PaneId::Coder => &app.coder_cfg,
+                PaneId::Observer => &app.observer_cfg,
+                PaneId::Chat => &app.chat_cfg,
+            };
+
+            if arg.is_empty() {
+                push!(format!(
+                    "provider: {}  base_url: {}  model: {}",
+                    cur.provider, cur.base_url, cur.model
+                ));
+                return true;
+            }
+
+            let p = match arg.trim().parse::<ProviderKind>() {
+                Ok(p) => p,
+                Err(_) => {
+                    let values = supported_providers().join("|");
+                    push!(format!("usage: /provider <{values}>"));
+                    return true;
+                }
+            };
+
+            if pane == PaneId::Coder && matches!(p, ProviderKind::Anthropic | ProviderKind::Hf) {
+                push!(
+                    "Coder requires a tool-calling provider: openai-compatible or mistral. (Use Chat/Observer for anthropic/hf.)"
+                        .to_string()
+                );
+                return true;
+            }
+
+            let cur_clone = cur.clone();
+            match resolve_with_provider(&cur_clone, p.clone()) {
+                Ok(new_cfg) => {
+                    match pane {
+                        PaneId::Coder => app.coder_cfg = new_cfg,
+                        PaneId::Observer => app.observer_cfg = new_cfg,
+                        PaneId::Chat => app.chat_cfg = new_cfg,
+                    }
+                    push!(format!("{:?} provider <- {p}", pane));
+                }
+                Err(e) => push!(format!("error: {e}")),
+            }
+        }
+        "/base_url" | "/baseurl" => {
+            use crate::config::{PartialConfig, RunConfig};
+
+            fn partial_from_run_config(cfg: &RunConfig) -> PartialConfig {
+                PartialConfig {
+                    vibe: matches!(cfg.mode, crate::modes::Mode::Vibe),
+                    provider: Some(cfg.provider.clone()),
+                    model: Some(cfg.model.clone()),
+                    chat_model: Some(cfg.chat_model.clone()),
+                    code_model: Some(cfg.code_model.clone()),
+                    api_key: cfg.api_key.clone(),
+                    base_url: Some(cfg.base_url.clone()),
+                    mode: Some(cfg.mode.clone()),
+                    persona: Some(cfg.persona.clone()),
+                    temperature: Some(cfg.temperature),
+                    max_tokens: Some(cfg.max_tokens),
+                    timeout_seconds: Some(cfg.timeout_seconds),
+                    hf_device: Some(cfg.hf_device.clone()),
+                    hf_local_only: Some(cfg.hf_local_only),
+                }
+            }
+
+            fn resolve_with_base_url(cfg: &RunConfig, base_url: &str) -> anyhow::Result<RunConfig> {
+                let mut partial = partial_from_run_config(cfg);
+                partial.base_url = Some(base_url.to_string());
+                partial.resolve()
+            }
+
+            let cur = match pane {
+                PaneId::Coder => &app.coder_cfg,
+                PaneId::Observer => &app.observer_cfg,
+                PaneId::Chat => &app.chat_cfg,
+            };
+
+            if arg.is_empty() {
+                push!(format!("base_url: {}", cur.base_url));
+                return true;
+            }
+
+            let base = arg.trim();
+            let base_url = if base.eq_ignore_ascii_case("default") {
+                String::new()
+            } else {
+                let parsed = match reqwest::Url::parse(base) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        push!(format!("error: invalid URL: {e}"));
+                        return true;
+                    }
+                };
+                match parsed.scheme() {
+                    "http" | "https" => {}
+                    other => {
+                        push!(format!(
+                            "error: unsupported scheme: {other} (expected http/https)"
+                        ));
+                        return true;
+                    }
+                }
+                if parsed.host_str().is_none() {
+                    push!("error: base_url missing host".to_string());
+                    return true;
+                }
+                base.trim_end_matches('/').to_string()
+            };
+
+            let cur_clone = cur.clone();
+            match resolve_with_base_url(&cur_clone, &base_url) {
+                Ok(new_cfg) => {
+                    match pane {
+                        PaneId::Coder => app.coder_cfg = new_cfg,
+                        PaneId::Observer => app.observer_cfg = new_cfg,
+                        PaneId::Chat => app.chat_cfg = new_cfg,
+                    }
+                    push!(format!(
+                        "{:?} base_url <- {}",
+                        pane,
+                        if base_url.is_empty() {
+                            "(default)"
+                        } else {
+                            &base_url
+                        }
+                    ));
+                }
+                Err(e) => push!(format!("error: {e}")),
+            }
+        }
         "/model" => {
             if arg.is_empty() {
                 let m = match pane {
@@ -316,6 +546,8 @@ test_cmd: {test_cmd}
         }
         "/help" | "/?" => {
             push!("/model <name>       set model\n\
+/provider <name>    set provider (or show)\n\
+/base_url <url>     set base_url (or show; use `default` to reset)\n\
 /persona <name>     set persona\n\
 /temp <0.0-2.0>     set temperature\n\
 /lang <ja|en|fr>    set language\n\
@@ -547,9 +779,15 @@ async fn handle_key(
                     .map(|m| m.content.clone())
             };
             if let Some(text) = content {
-                copy_to_clipboard(&text);
-                app.focused_pane_mut()
-                    .push_tool("✓ クリップボードにコピー".to_string());
+                if copy_to_clipboard(&text) {
+                    app.focused_pane_mut()
+                        .push_tool("✓ クリップボードにコピー".to_string());
+                } else {
+                    app.focused_pane_mut().push_tool(
+                        "✗ クリップボードにコピー失敗（macOS: pbcopy / Linux: wl-copy|xclip|xsel）"
+                            .to_string(),
+                    );
+                }
             }
         }
 
@@ -704,6 +942,9 @@ fn handle_coder_token(token: StreamToken, app: &mut App) {
         StreamToken::ToolCall(_) => {
             app.coder_iter = app.coder_iter.saturating_add(1);
         }
+        StreamToken::GovernorState(s) => {
+            app.coder_governor = Some(s);
+        }
         StreamToken::Done => {
             app.coder.finish_stream();
         }
@@ -725,7 +966,7 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
         StreamToken::Delta(s) => {
             app.observer.push_delta(&s);
         }
-        StreamToken::ToolCall(_) | StreamToken::Checkpoint(_) => {}
+        StreamToken::ToolCall(_) | StreamToken::Checkpoint(_) | StreamToken::GovernorState(_) => {}
         StreamToken::Done => {
             app.observer.finish_stream();
             // A — auto-fix pipeline: queue the review text for Coder on next Tick.
@@ -824,7 +1065,7 @@ fn handle_chat_token(token: StreamToken, app: &mut App) {
         StreamToken::Delta(s) => {
             app.chat.push_delta(&s);
         }
-        StreamToken::ToolCall(_) | StreamToken::Checkpoint(_) => {}
+        StreamToken::ToolCall(_) | StreamToken::Checkpoint(_) | StreamToken::GovernorState(_) => {}
         StreamToken::Done => {
             app.chat.finish_stream();
         }
@@ -992,6 +1233,7 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
             project_context,
             agents_md,
             test_cmd,
+            false,
             &approver,
         )
         .await
@@ -1230,6 +1472,22 @@ async fn send_observer_message(
 
         let result = match cfg.provider {
             ProviderKind::Anthropic => stream_anthropic(&client, &cfg, &messages, tx.clone()).await,
+            ProviderKind::Hf => {
+                let provider = providers::build_provider(client.clone(), &cfg);
+                let req = ChatRequest {
+                    messages: messages.clone(),
+                    temperature: Some(cfg.temperature),
+                    max_tokens: Some(cfg.max_tokens),
+                    metadata: None,
+                };
+                match provider.chat(&req).await {
+                    Ok(resp) => {
+                        fake_stream_text(&tx, &resp.content).await;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             _ => stream_openai_compat(&client, &cfg, &messages, None, tx.clone()).await,
         };
         if let Err(e) = result {
@@ -1420,6 +1678,22 @@ async fn send_chat_message(
         let client = reqwest::Client::new();
         let result = match cfg.provider {
             ProviderKind::Anthropic => stream_anthropic(&client, &cfg, &messages, tx.clone()).await,
+            ProviderKind::Hf => {
+                let provider = providers::build_provider(client.clone(), &cfg);
+                let req = ChatRequest {
+                    messages: messages.clone(),
+                    temperature: Some(cfg.temperature),
+                    max_tokens: Some(cfg.max_tokens),
+                    metadata: None,
+                };
+                match provider.chat(&req).await {
+                    Ok(resp) => {
+                        fake_stream_text(&tx, &resp.content).await;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             _ => stream_openai_compat(&client, &cfg, &messages, None, tx.clone()).await,
         };
         if let Err(e) = result {
@@ -1575,8 +1849,8 @@ async fn dispatch_selected_task(
         return;
     };
     let msg = format!(
-        "[TASK]\nphase: {:?}\npriority: {}\ntitle: {}\n\n{}",
-        t.phase, t.priority, t.title, t.body
+        "[TASK]\nid: {}\nphase: {:?}\npriority: {}\ntitle: {}\n\n{}",
+        t.id, t.phase, t.priority, t.title, t.body
     );
     match t.target {
         TaskTarget::Coder => send_coder_with_text(app, coder_tx, msg).await,
@@ -1823,6 +2097,22 @@ async fn maybe_observer_loop_retry(app: &mut App, observer_tx: &mpsc::Sender<Str
         let client = reqwest::Client::new();
         let result = match cfg.provider {
             ProviderKind::Anthropic => stream_anthropic(&client, &cfg, &messages, tx.clone()).await,
+            ProviderKind::Hf => {
+                let provider = providers::build_provider(client.clone(), &cfg);
+                let req = ChatRequest {
+                    messages: messages.clone(),
+                    temperature: Some(cfg.temperature),
+                    max_tokens: Some(cfg.max_tokens),
+                    metadata: None,
+                };
+                match provider.chat(&req).await {
+                    Ok(resp) => {
+                        fake_stream_text(&tx, &resp.content).await;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             _ => stream_openai_compat(&client, &cfg, &messages, None, tx.clone()).await,
         };
         if let Err(e) = result {
