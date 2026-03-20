@@ -111,6 +111,34 @@ async fn emit_repo_map_fallback_telemetry(
     .await;
 }
 
+fn push_blocked_tool_exchange(
+    messages: &mut Vec<serde_json::Value>,
+    assistant_text: &str,
+    tc: &ToolCallData,
+    block: &str,
+) {
+    messages.push(json!({
+        "role": "assistant",
+        "content": assistant_text,
+        "tool_calls": [{
+            "id": tc.id,
+            "type": "function",
+            "function": {
+                "name": tc.name,
+                "arguments": tc.arguments
+            }
+        }]
+    }));
+    messages.push(json!({
+        "role": "tool",
+        "tool_call_id": tc.id,
+        "content": format!(
+            "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+            tc.name, tc.arguments
+        ),
+    }));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepoMapHintStrength {
     Strong,
@@ -6269,14 +6297,12 @@ Execute only the new minimal action: {}",
                             )))
                             .await;
 
-                        messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": format!(
-                                "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
-                                tc.name, tc.arguments
-                            ),
-                        }));
+                        push_blocked_tool_exchange(
+                            &mut messages,
+                            &assistant_text_clean,
+                            tc,
+                            &block,
+                        );
                         autosave_best_effort(
                             &autosaver,
                             &tx,
@@ -6316,14 +6342,12 @@ Execute only the new minimal action: {}",
                             )))
                             .await;
 
-                        messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": format!(
-                                "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
-                                tc.name, tc.arguments
-                            ),
-                        }));
+                        push_blocked_tool_exchange(
+                            &mut messages,
+                            &assistant_text_clean,
+                            tc,
+                            &block,
+                        );
                         autosave_best_effort(
                             &autosaver,
                             &tx,
@@ -6364,14 +6388,12 @@ Execute only the new minimal action: {}",
                         )))
                         .await;
 
-                    messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": format!(
-                            "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
-                            tc.name, tc.arguments
-                        ),
-                    }));
+                    push_blocked_tool_exchange(
+                        &mut messages,
+                        &assistant_text_clean,
+                        tc,
+                        &block,
+                    );
                     autosave_best_effort(
                         &autosaver,
                         &tx,
@@ -6409,14 +6431,12 @@ Execute only the new minimal action: {}",
                     )))
                     .await;
 
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": format!(
-                        "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
-                        tc.name, tc.arguments
-                    ),
-                }));
+                push_blocked_tool_exchange(
+                    &mut messages,
+                    &assistant_text_clean,
+                    tc,
+                    &block,
+                );
                 autosave_best_effort(
                     &autosaver,
                     &tx,
