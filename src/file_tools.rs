@@ -333,6 +333,87 @@ fn skip_extension(ext: &str) -> bool {
     )
 }
 
+fn finalize_search_output(pattern: &str, results: &[String], truncated: bool, note: Option<&str>) -> String {
+    let count = results.len();
+    let cap_note = if truncated {
+        format!(" (first {MAX_SEARCH_RESULTS} shown — more may exist)")
+    } else {
+        String::new()
+    };
+    let header = format!(
+        "[search_files: '{}' — {} match(es){}]\n",
+        pattern, count, cap_note
+    );
+    let body = results.join("\n");
+    let out = if body.chars().count() > MAX_SEARCH_OUT_CHARS {
+        let trunc: String = body.chars().take(MAX_SEARCH_OUT_CHARS).collect();
+        format!("{header}{trunc}\n[…output truncated]")
+    } else {
+        format!("{header}{body}")
+    };
+    match note {
+        Some(note) if !note.is_empty() => format!("{out}\n[note] {note}"),
+        _ => out,
+    }
+}
+
+fn search_single_file(
+    pattern: &str,
+    file_path: &Path,
+    case_insensitive: bool,
+    display_path: &str,
+) -> (String, bool) {
+    let content = match std::fs::read_to_string(file_path) {
+        Ok(c) => c,
+        Err(e) => return (format!("ERROR reading '{}': {e}", file_path.display()), true),
+    };
+
+    let needle = if case_insensitive {
+        pattern.to_ascii_lowercase()
+    } else {
+        pattern.to_string()
+    };
+
+    let mut results: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    for (ln, line) in content.lines().enumerate() {
+        let cmp = if case_insensitive {
+            line.to_ascii_lowercase()
+        } else {
+            line.to_string()
+        };
+        if cmp.contains(&needle) {
+            let display: String = line.trim_end().chars().take(MAX_LINE_DISPLAY).collect();
+            results.push(format!("{}:{}: {}", display_path, ln + 1, display));
+            if results.len() >= MAX_SEARCH_RESULTS {
+                truncated = true;
+                break;
+            }
+        }
+    }
+
+    if results.is_empty() {
+        return (
+            format!(
+                "[search_files] No matches for '{}' in file '{}'\n[note] dir resolved to a file, so the search was scoped to that file",
+                pattern, display_path
+            ),
+            false,
+        );
+    }
+
+    (
+        finalize_search_output(
+            pattern,
+            &results,
+            truncated,
+            Some("dir resolved to a file, so the search was scoped to that file"),
+        ),
+        false,
+    )
+}
+
 /// Recursive file search (literal, no regex dependency).
 /// Returns "relative/path:line_no: content" for each matching line.
 pub fn tool_search_files(
@@ -355,6 +436,17 @@ pub fn tool_search_files(
             Err(e) => return (format!("ERROR: {e}"), true),
         }
     };
+
+    if search_root.is_file() {
+        let display_path = match base {
+            Some(root) => search_root
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| search_root.display().to_string()),
+            None => search_root.display().to_string(),
+        };
+        return search_single_file(pattern, &search_root, case_insensitive, &display_path);
+    }
 
     if !search_root.is_dir() {
         return (
@@ -445,26 +537,7 @@ pub fn tool_search_files(
         );
     }
 
-    let count = results.len();
-    let cap_note = if truncated {
-        format!(" (first {MAX_SEARCH_RESULTS} shown — more may exist)")
-    } else {
-        String::new()
-    };
-    let header = format!(
-        "[search_files: '{}' — {} match(es){}]\n",
-        pattern, count, cap_note
-    );
-    let body = results.join("\n");
-
-    let out = if body.chars().count() > MAX_SEARCH_OUT_CHARS {
-        let trunc: String = body.chars().take(MAX_SEARCH_OUT_CHARS).collect();
-        format!("{header}{trunc}\n[…output truncated]")
-    } else {
-        format!("{header}{body}")
-    };
-
-    (out, false)
+    (finalize_search_output(pattern, &results, truncated, None), false)
 }
 
 // ── apply_diff ────────────────────────────────────────────────────────────────
@@ -1030,6 +1103,30 @@ mod tests {
         assert!(!err, "{r}");
         assert!(r.contains("d a/"), "{r}");
         assert!(r.contains("f b.txt"), "{r}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_files_accepts_file_scope_when_dir_is_file() {
+        let dir = std::env::temp_dir().join("obstral_test_search_file_scope");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("src"));
+        let _ = std::fs::write(
+            dir.join("src").join("events.rs"),
+            "alpha\nmatch cmd_lc.as_str()\nomega\n",
+        );
+        let base = dir.to_string_lossy().into_owned();
+
+        let (r, err) = tool_search_files(
+            "match cmd_lc.as_str()",
+            "src/events.rs",
+            false,
+            Some(&base),
+        );
+        assert!(!err, "{r}");
+        assert!(r.contains("src/events.rs:2:"), "{r}");
+        assert!(r.contains("scoped to that file"), "{r}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
