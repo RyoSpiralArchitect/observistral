@@ -3364,6 +3364,97 @@ fn parse_think_block(text: &str) -> Option<ThinkBlock> {
     })
 }
 
+fn json_string_field(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<String> {
+    match obj.get(key) {
+        Some(serde_json::Value::String(s)) => Some(s.trim().to_string()),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        Some(serde_json::Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn json_list_field(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Vec<String> {
+    obj.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| match item {
+                    serde_json::Value::String(s) => Some(compact_one_line(s.trim(), 120)),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    serde_json::Value::Bool(b) => Some(b.to_string()),
+                    _ => None,
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn pseudo_tool_call_to_block_text(tc: &ToolCallData) -> Option<String> {
+    let args: serde_json::Value = serde_json::from_str(&tc.arguments).ok()?;
+    let obj = args.as_object()?;
+
+    match tc.name.as_str() {
+        "plan" => {
+            let goal = json_string_field(obj, "goal")?;
+            let steps = json_list_field(obj, "steps");
+            let acceptance = json_list_field(obj, "acceptance");
+            let risks = json_string_field(obj, "risks").unwrap_or_default();
+            let assumptions = json_string_field(obj, "assumptions").unwrap_or_default();
+            let steps_line = steps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("{} ) {}", i + 1, s))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace(" )", ")");
+            let acceptance_line = acceptance
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("{} ) {}", i + 1, s))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace(" )", ")");
+            Some(format!(
+                "<plan>\n\
+goal: {goal}\n\
+steps: {steps_line}\n\
+acceptance: {acceptance_line}\n\
+risks: {risks}\n\
+assumptions: {assumptions}\n\
+</plan>\n"
+            ))
+        }
+        "think" => {
+            let goal = json_string_field(obj, "goal")?;
+            let step = json_string_field(obj, "step").unwrap_or_default();
+            let tool = json_string_field(obj, "tool").unwrap_or_default();
+            let risk = json_string_field(obj, "risk").unwrap_or_default();
+            let doubt = json_string_field(obj, "doubt").unwrap_or_default();
+            let next = json_string_field(obj, "next").unwrap_or_default();
+            let verify = json_string_field(obj, "verify").unwrap_or_default();
+            Some(format!(
+                "<think>\n\
+goal: {goal}\n\
+step: {step}\n\
+tool: {tool}\n\
+risk: {risk}\n\
+doubt: {doubt}\n\
+next: {next}\n\
+verify: {verify}\n\
+</think>\n"
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn parse_reflection_block(text: &str) -> Option<ReflectionBlock> {
     let fields = parse_block_fields(text, "reflect")?;
 
@@ -3386,6 +3477,19 @@ fn last_plan_from_messages(messages: &[serde_json::Value]) -> Option<PlanBlock> 
         let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
         if let Some(plan) = parse_plan_block(content) {
             return Some(plan);
+        }
+    }
+    None
+}
+
+fn last_think_from_messages(messages: &[serde_json::Value]) -> Option<ThinkBlock> {
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if let Some(think) = parse_think_block(content) {
+            return Some(think);
         }
     }
     None
@@ -6027,6 +6131,16 @@ This is the LAST model call for this run.\n\
                     let _ = tx.send(StreamToken::Delta(s)).await;
                 }
                 StreamToken::ToolCall(tc) => {
+                    if matches!(cfg.provider, ProviderKind::Mistral) {
+                        if let Some(block_text) = pseudo_tool_call_to_block_text(&tc) {
+                            if !assistant_text.trim().is_empty() {
+                                assistant_text.push_str("\n\n");
+                            }
+                            assistant_text.push_str(&block_text);
+                            let _ = tx.send(StreamToken::Delta(block_text)).await;
+                            continue;
+                        }
+                    }
                     tool_calls.push(tc);
                 }
                 StreamToken::GovernorState(_) => {} // not emitted by inner stream
@@ -6213,6 +6327,11 @@ Execute only the new minimal action: {}",
             .to_string();
         let parsed_plan = parse_plan_block(&assistant_text);
         let parsed_think = parse_think_block(&assistant_text);
+        let compat_last_think = if matches!(cfg.provider, ProviderKind::Mistral) {
+            last_think_from_messages(&messages)
+        } else {
+            None
+        };
         let mut validated_plan_for_turn: Option<PlanBlock> = None;
         let mut validated_think_for_turn: Option<ThinkBlock> = None;
 
@@ -6375,7 +6494,7 @@ Execute only the new minimal action: {}",
                 },
             };
 
-            let think = match parsed_think.as_ref() {
+            let think = match parsed_think.as_ref().or(compat_last_think.as_ref()) {
                 Some(think) => think,
                 None => {
                     state = AgentState::Recovery;
@@ -6660,7 +6779,7 @@ Execute only the new minimal action: {}",
                 continue;
             }
 
-            if let Some(plan) = parsed_plan {
+            if let Some(ref plan) = parsed_plan {
                 if validate_plan(&plan).is_ok() {
                     adopt_valid_plan(
                         &plan,
@@ -6688,6 +6807,44 @@ Execute only the new minimal action: {}",
                 &messages,
             )
             .await;
+
+            if matches!(cfg.provider, ProviderKind::Mistral)
+                && (parsed_plan.as_ref().filter(|plan| validate_plan(plan).is_ok()).is_some()
+                    || parsed_think.is_some())
+                && iter + 1 < max_iters
+            {
+                state = AgentState::Recovery;
+                let note = if parsed_think.is_some() {
+                    "\
+[Mistral compatibility]\n\
+Your think block was recorded.\n\
+Next assistant turn: call ONE real tool that matches the recorded think.tool."
+                } else {
+                    "\
+[Mistral compatibility]\n\
+Your plan block was recorded.\n\
+Next assistant turn: emit a <think> block and call ONE real tool."
+                };
+                pending_system_hint = Some(note.to_string());
+                let _ = tx
+                    .send(StreamToken::Delta(
+                        "\n[compat] recorded structured block; continuing to real tool call\n"
+                            .to_string(),
+                    ))
+                    .await;
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
 
             // Model didn't call tools. If the user asked for local actions, try implied scripts
             // (PowerShell/bash code fences) as a fallback so non-tool-calling models can still act.
@@ -9697,6 +9854,51 @@ verify: exit code is zero\n\
         assert_eq!(think.step, 3);
         assert_eq!(think.tool, "exec");
         assert_eq!(think.next, "cargo test");
+    }
+
+    #[test]
+    fn pseudo_plan_tool_call_converts_to_plan_block_text() {
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "plan".to_string(),
+            arguments: serde_json::json!({
+                "goal": "locate handler",
+                "steps": ["search code", "read file", "verify"],
+                "acceptance": ["path identified", "handler confirmed"],
+                "risks": "wrong file",
+                "assumptions": "code is local"
+            })
+            .to_string(),
+        };
+
+        let text = pseudo_tool_call_to_block_text(&tc).expect("block text");
+        let plan = parse_plan_block(&text).expect("plan parsed");
+        assert_eq!(plan.goal, "locate handler");
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.acceptance_criteria.len(), 2);
+    }
+
+    #[test]
+    fn pseudo_think_tool_call_converts_to_think_block_text() {
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "think".to_string(),
+            arguments: serde_json::json!({
+                "goal": "inspect the source",
+                "step": "2",
+                "tool": "read_file",
+                "risk": "wrong path",
+                "doubt": "maybe router is elsewhere",
+                "next": "read src/tui/events.rs",
+                "verify": "command returns file contents"
+            })
+            .to_string(),
+        };
+
+        let text = pseudo_tool_call_to_block_text(&tc).expect("block text");
+        let think = parse_think_block(&text).expect("think parsed");
+        assert_eq!(think.step, 2);
+        assert_eq!(think.tool, "read_file");
     }
 
     #[test]
