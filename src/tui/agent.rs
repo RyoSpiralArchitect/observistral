@@ -3396,11 +3396,10 @@ fn json_list_field(
         .unwrap_or_default()
 }
 
-fn pseudo_tool_call_to_block_text(tc: &ToolCallData) -> Option<String> {
-    let args: serde_json::Value = serde_json::from_str(&tc.arguments).ok()?;
+fn pseudo_block_text_from_named_args(name: &str, args: &serde_json::Value) -> Option<String> {
     let obj = args.as_object()?;
 
-    match tc.name.as_str() {
+    match name.trim_matches(|c| c == '<' || c == '>') {
         "plan" => {
             let goal = json_string_field(obj, "goal")?;
             let steps = json_list_field(obj, "steps");
@@ -3453,6 +3452,61 @@ verify: {verify}\n\
         }
         _ => None,
     }
+}
+
+fn pseudo_tool_call_to_block_text(tc: &ToolCallData) -> Option<String> {
+    let args: serde_json::Value = serde_json::from_str(&tc.arguments).ok()?;
+    pseudo_block_text_from_named_args(&tc.name, &args)
+}
+
+fn split_concatenated_json_values(raw: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let de = serde_json::Deserializer::from_str(raw).into_iter::<serde_json::Value>();
+    for value in de {
+        match value {
+            Ok(v) => out.push(v),
+            Err(_) => return Vec::new(),
+        }
+    }
+    out
+}
+
+fn normalize_mistral_tool_call(tc: &ToolCallData) -> (Vec<String>, Option<ToolCallData>) {
+    if let Some(block) = pseudo_tool_call_to_block_text(tc) {
+        return (vec![block], None);
+    }
+
+    let mut prelude = Vec::new();
+    let values = split_concatenated_json_values(&tc.arguments);
+    if values.len() > 1 {
+        for value in values.iter().take(values.len().saturating_sub(1)) {
+            if let Some(block) = pseudo_block_text_from_named_args("plan", value)
+                .or_else(|| pseudo_block_text_from_named_args("think", value))
+            {
+                prelude.push(block);
+            }
+        }
+
+        if let Some(last) = values.last() {
+            return (
+                prelude,
+                Some(ToolCallData {
+                    id: tc.id.clone(),
+                    name: tc.name.trim_matches(|c| c == '<' || c == '>').to_string(),
+                    arguments: last.to_string(),
+                }),
+            );
+        }
+    }
+
+    (
+        prelude,
+        Some(ToolCallData {
+            id: tc.id.clone(),
+            name: tc.name.trim_matches(|c| c == '<' || c == '>').to_string(),
+            arguments: tc.arguments.clone(),
+        }),
+    )
 }
 
 fn parse_reflection_block(text: &str) -> Option<ReflectionBlock> {
@@ -6132,14 +6186,19 @@ This is the LAST model call for this run.\n\
                 }
                 StreamToken::ToolCall(tc) => {
                     if matches!(cfg.provider, ProviderKind::Mistral) {
-                        if let Some(block_text) = pseudo_tool_call_to_block_text(&tc) {
+                        let (blocks, normalized) = normalize_mistral_tool_call(&tc);
+                        for block_text in blocks {
                             if !assistant_text.trim().is_empty() {
                                 assistant_text.push_str("\n\n");
                             }
                             assistant_text.push_str(&block_text);
                             let _ = tx.send(StreamToken::Delta(block_text)).await;
+                        }
+                        if let Some(tc) = normalized {
+                            tool_calls.push(tc);
                             continue;
                         }
+                        continue;
                     }
                     tool_calls.push(tc);
                 }
@@ -9899,6 +9958,32 @@ verify: exit code is zero\n\
         let think = parse_think_block(&text).expect("think parsed");
         assert_eq!(think.step, 2);
         assert_eq!(think.tool, "read_file");
+    }
+
+    #[test]
+    fn normalize_mistral_tool_call_extracts_sidecar_plan_from_arguments() {
+        let plan = serde_json::json!({
+            "goal": "locate handler",
+            "steps": ["search code", "read file", "verify"],
+            "acceptance": ["path identified"],
+            "risks": "wrong file",
+            "assumptions": "repo is local"
+        })
+        .to_string();
+        let args = serde_json::json!({"pattern":"/realize","dir":"src"}).to_string();
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "search_files".to_string(),
+            arguments: format!("{plan}{args}"),
+        };
+
+        let (blocks, normalized) = normalize_mistral_tool_call(&tc);
+        assert_eq!(blocks.len(), 1);
+        let plan_block = parse_plan_block(&blocks[0]).expect("plan parsed");
+        assert_eq!(plan_block.goal, "locate handler");
+        let normalized = normalized.expect("real tool preserved");
+        assert_eq!(normalized.name, "search_files");
+        assert_eq!(normalized.arguments, serde_json::json!({"pattern":"/realize","dir":"src"}).to_string());
     }
 
     #[test]
