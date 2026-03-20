@@ -3404,8 +3404,12 @@ fn pseudo_block_text_from_named_args(name: &str, args: &serde_json::Value) -> Op
             let goal = json_string_field(obj, "goal")?;
             let steps = json_list_field(obj, "steps");
             let acceptance = json_list_field(obj, "acceptance");
-            let risks = json_string_field(obj, "risks").unwrap_or_default();
-            let assumptions = json_string_field(obj, "assumptions").unwrap_or_default();
+            let risks = json_string_field(obj, "risks")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown risks; inspect carefully before editing".to_string());
+            let assumptions = json_string_field(obj, "assumptions")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "current repo scan reflects the active workspace".to_string());
             let steps_line = steps
                 .iter()
                 .enumerate()
@@ -3434,10 +3438,16 @@ assumptions: {assumptions}\n\
             let goal = json_string_field(obj, "goal")?;
             let step = json_string_field(obj, "step").unwrap_or_default();
             let tool = json_string_field(obj, "tool").unwrap_or_default();
-            let risk = json_string_field(obj, "risk").unwrap_or_default();
-            let doubt = json_string_field(obj, "doubt").unwrap_or_default();
+            let risk = json_string_field(obj, "risk")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "wrong file or target".to_string());
+            let doubt = json_string_field(obj, "doubt")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "may need a broader check".to_string());
             let next = json_string_field(obj, "next").unwrap_or_default();
-            let verify = json_string_field(obj, "verify").unwrap_or_default();
+            let verify = json_string_field(obj, "verify")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "confirm the result matches the request".to_string());
             Some(format!(
                 "<think>\n\
 goal: {goal}\n\
@@ -4018,6 +4028,56 @@ fn validate_think(think: &ThinkBlock, plan: &PlanBlock, tc: &ToolCallData) -> Re
     }
 
     Ok(())
+}
+
+fn compat_synthetic_think(tc: &ToolCallData, plan: &PlanBlock) -> ThinkBlock {
+    let next = match tc.name.as_str() {
+        "exec" => parse_exec_command_from_args(&tc.arguments)
+            .unwrap_or_else(|| "run the command".to_string()),
+        "read_file" => serde_json::from_str::<serde_json::Value>(&tc.arguments)
+            .ok()
+            .and_then(|v| {
+                v.get("path")
+                    .and_then(|x| x.as_str())
+                    .map(|path| format!("read {path}"))
+            })
+            .unwrap_or_else(|| "read the target file".to_string()),
+        "search_files" => serde_json::from_str::<serde_json::Value>(&tc.arguments)
+            .ok()
+            .and_then(|v| {
+                let pattern = v.get("pattern").and_then(|x| x.as_str()).unwrap_or("pattern");
+                let dir = v.get("dir").and_then(|x| x.as_str()).unwrap_or(".");
+                Some(format!("search {pattern} in {dir}"))
+            })
+            .unwrap_or_else(|| "search the codebase".to_string()),
+        "list_dir" => serde_json::from_str::<serde_json::Value>(&tc.arguments)
+            .ok()
+            .and_then(|v| {
+                v.get("dir")
+                    .and_then(|x| x.as_str())
+                    .map(|dir| format!("list {dir}"))
+            })
+            .unwrap_or_else(|| "list the directory".to_string()),
+        "glob" => serde_json::from_str::<serde_json::Value>(&tc.arguments)
+            .ok()
+            .and_then(|v| {
+                let pattern = v.get("pattern").and_then(|x| x.as_str()).unwrap_or("*");
+                let dir = v.get("dir").and_then(|x| x.as_str()).unwrap_or(".");
+                Some(format!("glob {pattern} in {dir}"))
+            })
+            .unwrap_or_else(|| "glob for candidate files".to_string()),
+        _ => format!("run {}", tc.name),
+    };
+
+    ThinkBlock {
+        goal: compact_one_line(plan.goal.as_str(), 120),
+        step: 1,
+        tool: tc.name.clone(),
+        risk: "wrong target or overly broad action".to_string(),
+        doubt: "may need one narrower follow-up".to_string(),
+        next,
+        verify: "confirm the tool output matches the request".to_string(),
+    }
 }
 
 fn validate_reflection(
@@ -6553,7 +6613,17 @@ Execute only the new minimal action: {}",
                 },
             };
 
-            let think = match parsed_think.as_ref().or(compat_last_think.as_ref()) {
+            let compat_synth_think = if matches!(cfg.provider, ProviderKind::Mistral) {
+                Some(compat_synthetic_think(tc, candidate_plan))
+            } else {
+                None
+            };
+
+            let think = match parsed_think
+                .as_ref()
+                .or(compat_last_think.as_ref())
+                .or(compat_synth_think.as_ref())
+            {
                 Some(think) => think,
                 None => {
                     state = AgentState::Recovery;
@@ -6597,6 +6667,19 @@ Execute only the new minimal action: {}",
                     continue;
                 }
             };
+
+            if parsed_think.is_none()
+                && compat_last_think.is_none()
+                && compat_synth_think.is_some()
+                && matches!(cfg.provider, ProviderKind::Mistral)
+            {
+                let _ = tx
+                    .send(StreamToken::Delta(
+                        "\n[compat] synthesized think block for Mistral tool turn\n"
+                            .to_string(),
+                    ))
+                    .await;
+            }
 
             if let Err(e) = validate_think(think, candidate_plan, tc) {
                 state = AgentState::Recovery;
