@@ -1555,7 +1555,8 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
     } = args;
 
     let cwd = std::env::current_dir().context("failed to get current directory")?;
-    let base_root = normalize_tool_root(tool_root).unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+    let base_root =
+        normalize_tool_root(tool_root).unwrap_or_else(|| cwd.to_string_lossy().into_owned());
     let base_root_path = std::path::PathBuf::from(&base_root);
     let spec_path = resolve_eval_path(spec, &cwd);
     let spec_data = crate::runtime_eval::load_spec(&spec_path)?;
@@ -1570,8 +1571,12 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
                 .as_secs()
         )),
     };
-    std::fs::create_dir_all(&out_dir)
-        .with_context(|| format!("failed to create runtime eval out dir: {}", out_dir.display()))?;
+    std::fs::create_dir_all(&out_dir).with_context(|| {
+        format!(
+            "failed to create runtime eval out dir: {}",
+            out_dir.display()
+        )
+    })?;
     let report_path = report_out
         .map(|p| resolve_eval_path(p, &base_root_path))
         .unwrap_or_else(|| out_dir.join("report.json"));
@@ -1614,8 +1619,9 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
             idx + 1,
             crate::runtime_eval::sanitize_case_id(&case.id)
         ));
-        std::fs::create_dir_all(&case_dir)
-            .with_context(|| format!("failed to create case artifact dir: {}", case_dir.display()))?;
+        std::fs::create_dir_all(&case_dir).with_context(|| {
+            format!("failed to create case artifact dir: {}", case_dir.display())
+        })?;
         let trace_path = case_dir.join("trace.jsonl");
         let session_path = case_dir.join("session.json");
         let json_path = case_dir.join("final.json");
@@ -1629,12 +1635,7 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
         let case_max_iters = case.max_iters.or(spec_data.defaults.max_iters);
         let case_autofix = case.autofix.or(spec_data.defaults.autofix);
 
-        eprintln!(
-            "[eval] case {}/{}: {}",
-            idx + 1,
-            selected.len(),
-            case.id
-        );
+        eprintln!("[eval] case {}/{}: {}", idx + 1, selected.len(), case.id);
 
         let started = std::time::Instant::now();
         let run_result = run_agent_with_behavior(

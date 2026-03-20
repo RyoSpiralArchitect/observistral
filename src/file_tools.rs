@@ -333,7 +333,12 @@ fn skip_extension(ext: &str) -> bool {
     )
 }
 
-fn finalize_search_output(pattern: &str, results: &[String], truncated: bool, note: Option<&str>) -> String {
+fn finalize_search_output(
+    pattern: &str,
+    results: &[String],
+    truncated: bool,
+    note: Option<&str>,
+) -> String {
     let count = results.len();
     let cap_note = if truncated {
         format!(" (first {MAX_SEARCH_RESULTS} shown — more may exist)")
@@ -365,7 +370,12 @@ fn search_single_file(
 ) -> (String, bool) {
     let content = match std::fs::read_to_string(file_path) {
         Ok(c) => c,
-        Err(e) => return (format!("ERROR reading '{}': {e}", file_path.display()), true),
+        Err(e) => {
+            return (
+                format!("ERROR reading '{}': {e}", file_path.display()),
+                true,
+            )
+        }
     };
 
     let needle = if case_insensitive {
@@ -537,7 +547,10 @@ pub fn tool_search_files(
         );
     }
 
-    (finalize_search_output(pattern, &results, truncated, None), false)
+    (
+        finalize_search_output(pattern, &results, truncated, None),
+        false,
+    )
 }
 
 // ── apply_diff ────────────────────────────────────────────────────────────────
@@ -1118,12 +1131,8 @@ mod tests {
         );
         let base = dir.to_string_lossy().into_owned();
 
-        let (r, err) = tool_search_files(
-            "match cmd_lc.as_str()",
-            "src/events.rs",
-            false,
-            Some(&base),
-        );
+        let (r, err) =
+            tool_search_files("match cmd_lc.as_str()", "src/events.rs", false, Some(&base));
         assert!(!err, "{r}");
         assert!(r.contains("src/events.rs:2:"), "{r}");
         assert!(r.contains("scoped to that file"), "{r}");

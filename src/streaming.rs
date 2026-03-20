@@ -195,7 +195,11 @@ fn normalize_mistral_messages(messages: &[serde_json::Value]) -> Vec<serde_json:
 
     for msg in messages {
         let role = msg.get("role").and_then(|x| x.as_str()).unwrap_or("");
-        let content = msg.get("content").and_then(|x| x.as_str()).unwrap_or("").trim();
+        let content = msg
+            .get("content")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim();
         let has_tool_calls = msg
             .get("tool_calls")
             .and_then(|x| x.as_array())
@@ -398,7 +402,7 @@ pub async fn stream_openai_compat_json(
         r
     } else if want_completions {
         let url = format!("{}/completions", cfg.base_url.trim_end_matches('/'));
-    let prompt = prompt_from_json_messages(&prepared_messages);
+        let prompt = prompt_from_json_messages(&prepared_messages);
         let mut comp_payload = json!({
             "model": cfg.model,
             "prompt": prompt,

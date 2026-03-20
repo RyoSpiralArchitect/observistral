@@ -184,8 +184,12 @@ pub fn load_spec(path: &Path) -> Result<RuntimeEvalSpec> {
 
 pub fn save_report(path: &Path, report: &RuntimeEvalReport) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create runtime eval report dir: {}", parent.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create runtime eval report dir: {}",
+            parent.display()
+        )
+    })?;
     let text =
         serde_json::to_string_pretty(report).context("failed to serialize runtime eval report")?;
     std::fs::write(path, text)
@@ -248,21 +252,26 @@ pub fn summarize_cases(cases: &[RuntimeEvalCaseReport]) -> RuntimeEvalSummary {
     let passed = cases.iter().filter(|c| c.ok).count();
     let failed = total.saturating_sub(passed);
     let avg_duration_ms = avg(cases.iter().map(|c| c.duration_ms as f64).collect());
-    let avg_tool_calls = avg(cases.iter().map(|c| c.metrics.tool_call_count as f64).collect());
-    let avg_iterations = avg(cases.iter().map(|c| c.metrics.iteration_count as f64).collect());
-    let avg_messages = avg(cases.iter().map(|c| c.metrics.messages_len as f64).collect());
-    let avg_repo_map_fallbacks = avg(
-        cases
-            .iter()
-            .map(|c| c.metrics.repo_map_fallback_count as f64)
-            .collect(),
-    );
-    let avg_recovery_enters = avg(
-        cases
-            .iter()
-            .map(|c| c.metrics.recovery_enter_count as f64)
-            .collect(),
-    );
+    let avg_tool_calls = avg(cases
+        .iter()
+        .map(|c| c.metrics.tool_call_count as f64)
+        .collect());
+    let avg_iterations = avg(cases
+        .iter()
+        .map(|c| c.metrics.iteration_count as f64)
+        .collect());
+    let avg_messages = avg(cases
+        .iter()
+        .map(|c| c.metrics.messages_len as f64)
+        .collect());
+    let avg_repo_map_fallbacks = avg(cases
+        .iter()
+        .map(|c| c.metrics.repo_map_fallback_count as f64)
+        .collect());
+    let avg_recovery_enters = avg(cases
+        .iter()
+        .map(|c| c.metrics.recovery_enter_count as f64)
+        .collect());
     let mut passed_ids = Vec::new();
     let mut failed_ids = Vec::new();
     for case in cases {
@@ -322,14 +331,21 @@ fn load_trace_lines(path: &Path) -> Result<Vec<TraceLine>> {
             continue;
         }
         let trace: TraceLine = serde_json::from_str(line).with_context(|| {
-            format!("failed to parse trace line {} from {}", idx + 1, path.display())
+            format!(
+                "failed to parse trace line {} from {}",
+                idx + 1,
+                path.display()
+            )
         })?;
         out.push(trace);
     }
     Ok(out)
 }
 
-fn collect_metrics(trace_lines: &[TraceLine], artifacts: &RuntimeEvalArtifacts) -> Result<RuntimeEvalMetrics> {
+fn collect_metrics(
+    trace_lines: &[TraceLine],
+    artifacts: &RuntimeEvalArtifacts,
+) -> Result<RuntimeEvalMetrics> {
     let mut metrics = RuntimeEvalMetrics::default();
     let mut tool_names = BTreeSet::new();
     let mut agent_end_ok = None;
@@ -342,7 +358,10 @@ fn collect_metrics(trace_lines: &[TraceLine], artifacts: &RuntimeEvalArtifacts) 
                 metrics.tool_call_count += 1;
                 if let Some(name) = line.data.get("name").and_then(|v| v.as_str()) {
                     tool_names.insert(name.to_string());
-                    *metrics.tool_call_histogram.entry(name.to_string()).or_insert(0) += 1;
+                    *metrics
+                        .tool_call_histogram
+                        .entry(name.to_string())
+                        .or_insert(0) += 1;
                 }
             }
             "error" => metrics.error_count += 1,
@@ -412,18 +431,17 @@ fn collect_metrics(trace_lines: &[TraceLine], artifacts: &RuntimeEvalArtifacts) 
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as usize,
                 );
-                metrics.max_file_tool_consec_failures = metrics
-                    .max_file_tool_consec_failures
-                    .max(
-                        line.data
-                            .get("file_tool_consec_failures")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize,
-                    );
+                metrics.max_file_tool_consec_failures = metrics.max_file_tool_consec_failures.max(
+                    line.data
+                        .get("file_tool_consec_failures")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize,
+                );
             }
             "realize_state" => {
                 metrics.realize_events += 1;
-                metrics.realize_mean_drift_last = line.data.get("mean_drift").and_then(|v| v.as_f64());
+                metrics.realize_mean_drift_last =
+                    line.data.get("mean_drift").and_then(|v| v.as_f64());
                 metrics.realize_mean_latency_last = line
                     .data
                     .get("mean_realize_latency")

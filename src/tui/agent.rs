@@ -3066,6 +3066,37 @@ struct DoneAcceptanceEvidence {
     command: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ObservationSearchEvidence {
+    command: String,
+    pattern: String,
+    hit_count: usize,
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ObservationReadEvidence {
+    command: String,
+    path: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ObservationEvidence {
+    searches: Vec<ObservationSearchEvidence>,
+    reads: Vec<ObservationReadEvidence>,
+}
+
+#[derive(Debug, Clone)]
+struct CriterionEvidenceScore {
+    idx: usize,
+    total: f32,
+    search_specificity: f32,
+    read_confirm: f32,
+    repo_prior: f32,
+    best_path: Option<String>,
+    suggested_commands: Vec<String>,
+}
+
 fn parse_done_acceptance_evidence(value: &serde_json::Value) -> Vec<DoneAcceptanceEvidence> {
     let serde_json::Value::Array(items) = value else {
         return Vec::new();
@@ -3092,12 +3123,392 @@ fn parse_done_acceptance_evidence(value: &serde_json::Value) -> Vec<DoneAcceptan
         .collect()
 }
 
-fn parse_leading_ordinal(reference: &str) -> Option<usize> {
-    let trimmed = reference.trim_start();
-    let digits_len = trimmed
+fn keyword_tokens(s: &str) -> std::collections::BTreeSet<String> {
+    s.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| part.len() >= 3)
+        .collect()
+}
+
+fn token_overlap_score(
+    a: &std::collections::BTreeSet<String>,
+    b: &std::collections::BTreeSet<String>,
+) -> f32 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let overlap = a.intersection(b).count() as f32;
+    let denom = a.len().min(b.len()).max(1) as f32;
+    (overlap / denom).clamp(0.0, 1.0)
+}
+
+fn is_read_only_observation_task(root_user_text: &str, plan: Option<&PlanBlock>) -> bool {
+    let low = root_user_text.to_ascii_lowercase();
+    let observe_terms = [
+        "locate",
+        "find",
+        "where",
+        "inspect",
+        "read-only",
+        "read only",
+        "read the file",
+        "do not edit",
+        "don't edit",
+        "no edit",
+        "no edits",
+        "without editing",
+    ];
+    let mutate_terms = [
+        "edit",
+        "patch",
+        "modify",
+        "write",
+        "create",
+        "implement",
+        "fix",
+        "build",
+        "test",
+        "compile",
+        "refactor",
+    ];
+    if !observe_terms.iter().any(|term| low.contains(term)) {
+        return false;
+    }
+    if mutate_terms
+        .iter()
+        .any(|term| low.contains(term) && !low.contains("do not edit"))
+    {
+        return false;
+    }
+
+    if let Some(plan) = plan {
+        let steps_low = plan
+            .steps
+            .iter()
+            .map(|step| step.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if steps_low.iter().any(|step| {
+            [
+                "write", "patch", "apply", "edit", "fix", "build", "test", "compile",
+            ]
+            .iter()
+            .any(|term| step.contains(term))
+        }) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn parse_search_hit_count(content: &str) -> usize {
+    let first = content.lines().next().unwrap_or("");
+    let Some(idx) = first.find("—") else {
+        return 0;
+    };
+    let tail = first[idx + "—".len()..].trim();
+    let digits = tail
         .chars()
         .take_while(|ch| ch.is_ascii_digit())
-        .count();
+        .collect::<String>();
+    digits.parse::<usize>().ok().unwrap_or(0)
+}
+
+fn parse_search_result_paths(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('[') {
+            continue;
+        }
+        let Some((path, _rest)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let path = compact_one_line(path.trim(), 160);
+        if !path.is_empty() {
+            remember_recent_unique(&mut out, path.as_str(), 8, 160);
+        }
+    }
+    out
+}
+
+fn parse_read_file_result_path(content: &str) -> Option<String> {
+    let first = content.lines().next().unwrap_or("").trim();
+    let inner = first.strip_prefix('[')?.split(']').next()?.trim();
+    let path = compact_one_line(inner, 160);
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+fn collect_observation_evidence(messages: &[serde_json::Value]) -> ObservationEvidence {
+    #[derive(Debug, Clone)]
+    enum PendingObservation {
+        Search(ObservationSearchEvidence),
+        Read(ObservationReadEvidence),
+    }
+
+    let mut pending: std::collections::HashMap<String, PendingObservation> =
+        std::collections::HashMap::new();
+    let mut evidence = ObservationEvidence::default();
+
+    for msg in messages {
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if role == "assistant" {
+            let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for tc in tool_calls {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let args = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let parsed = serde_json::from_str::<serde_json::Value>(args).ok();
+                match name {
+                    "search_files" => {
+                        let command =
+                            canonicalize_tool_call_command(name, args).unwrap_or_default();
+                        let pattern = parsed
+                            .as_ref()
+                            .and_then(|v| v.get("pattern"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        pending.insert(
+                            id.to_string(),
+                            PendingObservation::Search(ObservationSearchEvidence {
+                                command,
+                                pattern,
+                                hit_count: 0,
+                                paths: Vec::new(),
+                            }),
+                        );
+                    }
+                    "read_file" => {
+                        let command =
+                            canonicalize_tool_call_command(name, args).unwrap_or_default();
+                        let path = parsed
+                            .as_ref()
+                            .and_then(|v| v.get("path"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        pending.insert(
+                            id.to_string(),
+                            PendingObservation::Read(ObservationReadEvidence { command, path }),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        if role != "tool" {
+            continue;
+        }
+
+        let tool_call_id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if tool_call_id.is_empty() {
+            continue;
+        }
+        let Some(pending_obs) = pending.remove(tool_call_id) else {
+            continue;
+        };
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if !non_exec_tool_succeeded(content) {
+            continue;
+        }
+
+        match pending_obs {
+            PendingObservation::Search(mut search) => {
+                search.hit_count = parse_search_hit_count(content);
+                search.paths = parse_search_result_paths(content);
+                evidence.searches.push(search);
+            }
+            PendingObservation::Read(mut read) => {
+                if read.path.trim().is_empty() {
+                    if let Some(parsed_path) = parse_read_file_result_path(content) {
+                        read.path = parsed_path;
+                    }
+                }
+                if !read.path.trim().is_empty() {
+                    evidence.reads.push(read);
+                }
+            }
+        }
+    }
+
+    evidence
+}
+
+fn search_hit_specificity(hit_count: usize) -> f32 {
+    match hit_count {
+        0 => 0.0,
+        1 => 1.0,
+        2..=3 => 0.85,
+        4..=10 => 0.6,
+        _ => 0.35,
+    }
+}
+
+fn path_prior_score(path: &str, root_user_text: &str, plan_goal: &str, criterion: &str) -> f32 {
+    let mut task_tokens = keyword_tokens(root_user_text);
+    task_tokens.extend(keyword_tokens(plan_goal));
+    task_tokens.extend(keyword_tokens(criterion));
+    let path_tokens = keyword_tokens(path);
+    let mut score = token_overlap_score(&path_tokens, &task_tokens);
+    if task_tokens.contains("tui") && path_tokens.contains("tui") {
+        score = (score + 0.35).clamp(0.0, 1.0);
+    }
+    if task_tokens.contains("realize") && path_tokens.contains("events") {
+        score = (score + 0.15).clamp(0.0, 1.0);
+    }
+    score
+}
+
+fn build_read_only_evidence_scores(
+    root_user_text: &str,
+    plan: &PlanBlock,
+    evidence: &ObservationEvidence,
+) -> Vec<CriterionEvidenceScore> {
+    let mut path_votes: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for search in &evidence.searches {
+        for path in &search.paths {
+            *path_votes.entry(path.clone()).or_insert(0) += 1;
+        }
+    }
+    for read in &evidence.reads {
+        *path_votes.entry(read.path.clone()).or_insert(0) += 2;
+    }
+    let global_best_path = path_votes
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+        .map(|(path, _)| path);
+
+    plan.acceptance_criteria
+        .iter()
+        .enumerate()
+        .map(|(idx, criterion)| {
+            let criterion_tokens = keyword_tokens(criterion);
+
+            let best_search = evidence
+                .searches
+                .iter()
+                .map(|search| {
+                    let pattern_tokens = keyword_tokens(&search.pattern);
+                    let mut relevance = token_overlap_score(&criterion_tokens, &pattern_tokens);
+                    let path_relevance = search
+                        .paths
+                        .iter()
+                        .map(|path| path_prior_score(path, root_user_text, &plan.goal, criterion))
+                        .fold(0.0f32, f32::max);
+                    if relevance == 0.0 && search.hit_count > 0 {
+                        relevance = 0.45;
+                    }
+                    let specificity = search_hit_specificity(search.hit_count)
+                        * (0.5 + 0.5 * relevance.max(path_relevance));
+                    (specificity.clamp(0.0, 1.0), search)
+                })
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut suggested_commands = Vec::new();
+            let search_specificity = if let Some((score, search)) = best_search {
+                remember_recent_unique(&mut suggested_commands, &search.command, 3, 200);
+                score
+            } else {
+                0.0
+            };
+
+            let best_path = evidence
+                .reads
+                .iter()
+                .map(|read| read.path.clone())
+                .find(|path| {
+                    global_best_path
+                        .as_ref()
+                        .map(|best| best == path)
+                        .unwrap_or(false)
+                })
+                .or_else(|| global_best_path.clone())
+                .or_else(|| evidence.reads.first().map(|read| read.path.clone()));
+
+            let read_confirm = evidence
+                .reads
+                .iter()
+                .map(|read| {
+                    let path_score =
+                        path_prior_score(&read.path, root_user_text, &plan.goal, criterion);
+                    let mut score = if criterion.to_ascii_lowercase().contains("read")
+                        || criterion.to_ascii_lowercase().contains("verify")
+                        || criterion.to_ascii_lowercase().contains("context")
+                        || criterion.to_ascii_lowercase().contains("handler")
+                    {
+                        0.75 + 0.25 * path_score
+                    } else {
+                        0.55 + 0.45 * path_score
+                    };
+                    if global_best_path.as_deref() == Some(read.path.as_str()) {
+                        score = (score + 0.15).clamp(0.0, 1.0);
+                    }
+                    (score.clamp(0.0, 1.0), read)
+                })
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(score, read)| {
+                    remember_recent_unique(&mut suggested_commands, &read.command, 3, 200);
+                    score
+                })
+                .unwrap_or(0.0);
+
+            let repo_prior = best_path
+                .as_deref()
+                .map(|path| path_prior_score(path, root_user_text, &plan.goal, criterion))
+                .unwrap_or(0.0);
+
+            let total = (search_specificity * 0.30 + read_confirm * 0.50 + repo_prior * 0.20)
+                .clamp(0.0, 1.0);
+
+            CriterionEvidenceScore {
+                idx,
+                total,
+                search_specificity,
+                read_confirm,
+                repo_prior,
+                best_path,
+                suggested_commands,
+            }
+        })
+        .collect()
+}
+
+fn parse_leading_ordinal(reference: &str) -> Option<usize> {
+    let trimmed = reference.trim_start();
+    let digits_len = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
     if digits_len == 0 {
         return None;
     }
@@ -3160,7 +3571,11 @@ fn collect_successful_observation_commands(messages: &[serde_json::Value]) -> Ve
     let mut commands = Vec::new();
 
     for msg in messages {
-        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if role == "assistant" {
             let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
                 continue;
@@ -3333,7 +3748,21 @@ fn validate_done_acceptance(
     Ok(evidence_rows)
 }
 
-fn build_done_acceptance_recovery_hint(error_text: &str, known_commands: &[String]) -> String {
+fn evidence_score_label(score: f32) -> &'static str {
+    if score >= 0.85 {
+        "strong"
+    } else if score >= 0.60 {
+        "medium"
+    } else {
+        "weak"
+    }
+}
+
+fn build_done_acceptance_recovery_hint(
+    error_text: &str,
+    known_commands: &[String],
+    read_only_scores: &[CriterionEvidenceScore],
+) -> String {
     let mut lines = Vec::new();
     let low = error_text.to_ascii_lowercase();
 
@@ -3360,6 +3789,43 @@ fn build_done_acceptance_recovery_hint(error_text: &str, known_commands: &[Strin
         for command in known_commands.iter().rev().take(6) {
             lines.push(format!("- {}", compact_one_line(command, 200)));
         }
+    }
+
+    if !read_only_scores.is_empty() {
+        lines.push(
+            "Read-only evidence scores (use these to choose completed vs remaining):".to_string(),
+        );
+        for score in read_only_scores {
+            let mut detail = format!(
+                "- acceptance {}: {:.2} {} (search={:.2}, read={:.2}, repo={:.2})",
+                score.idx + 1,
+                score.total,
+                evidence_score_label(score.total),
+                score.search_specificity,
+                score.read_confirm,
+                score.repo_prior
+            );
+            if let Some(path) = score.best_path.as_deref() {
+                detail.push_str(&format!(" path={path}"));
+            }
+            lines.push(detail);
+            if !score.suggested_commands.is_empty() {
+                lines.push(format!(
+                    "  cite: {}",
+                    score
+                        .suggested_commands
+                        .iter()
+                        .take(2)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                ));
+            }
+        }
+        lines.push(
+            "Rule: for read-only tasks, criteria with strong scores are good completed candidates; medium scores usually need one more confirming read/search; weak scores should stay remaining."
+                .to_string(),
+        );
     }
 
     if lines.is_empty() {
@@ -3663,10 +4129,7 @@ fn json_string_field(
     }
 }
 
-fn json_list_field(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Vec<String> {
+fn json_list_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Vec<String> {
     obj.get(key)
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -4332,7 +4795,10 @@ fn compat_synthetic_think(tc: &ToolCallData, plan: &PlanBlock) -> ThinkBlock {
         "search_files" => serde_json::from_str::<serde_json::Value>(&tc.arguments)
             .ok()
             .and_then(|v| {
-                let pattern = v.get("pattern").and_then(|x| x.as_str()).unwrap_or("pattern");
+                let pattern = v
+                    .get("pattern")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("pattern");
                 let dir = v.get("dir").and_then(|x| x.as_str()).unwrap_or(".");
                 Some(format!("search {pattern} in {dir}"))
             })
@@ -6923,12 +7389,7 @@ Execute only the new minimal action: {}",
                         )))
                         .await;
 
-                    push_blocked_tool_exchange(
-                        &mut messages,
-                        &assistant_text_clean,
-                        tc,
-                        &block,
-                    );
+                    push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
                     autosave_best_effort(
                         &autosaver,
                         &tx,
@@ -6962,8 +7423,7 @@ Execute only the new minimal action: {}",
             {
                 let _ = tx
                     .send(StreamToken::Delta(
-                        "\n[compat] synthesized think block for Mistral tool turn\n"
-                            .to_string(),
+                        "\n[compat] synthesized think block for Mistral tool turn\n".to_string(),
                     ))
                     .await;
             }
@@ -6979,12 +7439,7 @@ Execute only the new minimal action: {}",
                     )))
                     .await;
 
-                push_blocked_tool_exchange(
-                    &mut messages,
-                    &assistant_text_clean,
-                    tc,
-                    &block,
-                );
+                push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
                 autosave_best_effort(
                     &autosaver,
                     &tx,
@@ -7238,7 +7693,10 @@ Execute only the new minimal action: {}",
             .await;
 
             if matches!(cfg.provider, ProviderKind::Mistral)
-                && (parsed_plan.as_ref().filter(|plan| validate_plan(plan).is_ok()).is_some()
+                && (parsed_plan
+                    .as_ref()
+                    .filter(|plan| validate_plan(plan).is_ok())
+                    .is_some()
                     || parsed_think.is_some())
                 && iter + 1 < max_iters
             {
@@ -8221,6 +8679,23 @@ Required now: {}",
             let done_plan = validated_plan_for_turn.as_ref().or(active_plan.as_ref());
             let known_acceptance_commands =
                 collect_known_acceptance_commands(&messages, &working_mem);
+            let read_only_scores = if done_plan
+                .filter(|plan| is_read_only_observation_task(&root_user_text, Some(plan)))
+                .is_some()
+            {
+                done_plan
+                    .map(|plan| {
+                        let observation_evidence = collect_observation_evidence(&messages);
+                        build_read_only_evidence_scores(
+                            &root_user_text,
+                            plan,
+                            &observation_evidence,
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
             let evidence_rows = match validate_done_acceptance(
                 done_plan,
@@ -8236,6 +8711,7 @@ Required now: {}",
                     let hint = build_done_acceptance_recovery_hint(
                         &e.to_string(),
                         &known_acceptance_commands,
+                        &read_only_scores,
                     );
                     let block = format!(
                         "{}{}",
@@ -10186,10 +10662,7 @@ remaining_gap: still need to run cargo test\n\
             assumptions: "repo indexed".to_string(),
         };
 
-        let completed_acceptance = vec![
-            "acceptance 1".to_string(),
-            "acceptance 2".to_string(),
-        ];
+        let completed_acceptance = vec!["acceptance 1".to_string(), "acceptance 2".to_string()];
         let remaining_acceptance = Vec::new();
         let acceptance_evidence = vec![
             DoneAcceptanceEvidence {
@@ -10246,6 +10719,53 @@ remaining_gap: still need to run cargo test\n\
             ),
             Some(1)
         );
+    }
+
+    #[test]
+    fn build_read_only_evidence_scores_prefers_search_plus_read_confirmation() {
+        let plan = PlanBlock {
+            goal: "Locate the /realize slash command handler in the TUI".to_string(),
+            steps: vec![
+                "inspect src".to_string(),
+                "search for /realize".to_string(),
+                "read the matching file".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path containing the `/realize` slash command handler is identified."
+                    .to_string(),
+                "The handler logic is confirmed to be part of the TUI component.".to_string(),
+                "The location is verified by reading the file and confirming the context."
+                    .to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+        let evidence = ObservationEvidence {
+            searches: vec![ObservationSearchEvidence {
+                command: "search_files(dir=src, pattern=/realize)".to_string(),
+                pattern: "/realize".to_string(),
+                hit_count: 1,
+                paths: vec!["src/tui/events.rs".to_string()],
+            }],
+            reads: vec![ObservationReadEvidence {
+                command: "read_file(path=src/tui/events.rs)".to_string(),
+                path: "src/tui/events.rs".to_string(),
+            }],
+        };
+
+        let scores = build_read_only_evidence_scores(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            &plan,
+            &evidence,
+        );
+
+        assert_eq!(scores.len(), 3);
+        assert!(scores[0].total >= 0.80);
+        assert!(scores[1].read_confirm >= 0.80);
+        assert!(scores[2]
+            .suggested_commands
+            .iter()
+            .any(|cmd| cmd.contains("read_file")));
     }
 
     #[test]
@@ -10433,7 +10953,10 @@ verify: exit code is zero\n\
         assert_eq!(plan_block.goal, "locate handler");
         let normalized = normalized.expect("real tool preserved");
         assert_eq!(normalized.name, "search_files");
-        assert_eq!(normalized.arguments, serde_json::json!({"pattern":"/realize","dir":"src"}).to_string());
+        assert_eq!(
+            normalized.arguments,
+            serde_json::json!({"pattern":"/realize","dir":"src"}).to_string()
+        );
     }
 
     #[test]
