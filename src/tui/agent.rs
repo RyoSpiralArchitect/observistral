@@ -3092,10 +3092,42 @@ fn parse_done_acceptance_evidence(value: &serde_json::Value) -> Vec<DoneAcceptan
         .collect()
 }
 
+fn parse_leading_ordinal(reference: &str) -> Option<usize> {
+    let trimmed = reference.trim_start();
+    let digits_len = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count();
+    if digits_len == 0 {
+        return None;
+    }
+    let digits = &trimmed[..digits_len];
+    let rest = trimmed[digits_len..].trim_start();
+    let Some(number) = digits.parse::<usize>().ok() else {
+        return None;
+    };
+    if rest.is_empty()
+        || rest.starts_with(')')
+        || rest.starts_with('.')
+        || rest.starts_with(':')
+        || rest.starts_with('-')
+    {
+        Some(number)
+    } else {
+        None
+    }
+}
+
 fn resolve_acceptance_reference(reference: &str, plan: &PlanBlock) -> Option<usize> {
     let reference_sig = normalize_memory_entry(reference);
     if reference_sig.is_empty() {
         return None;
+    }
+
+    if let Some(n) = parse_leading_ordinal(reference) {
+        if n <= plan.acceptance_criteria.len() {
+            return Some(n - 1);
+        }
     }
 
     if reference_sig.contains("acceptance")
@@ -10184,6 +10216,36 @@ remaining_gap: still need to run cargo test\n\
             &known_commands,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn resolve_acceptance_reference_accepts_leading_numbered_text() {
+        let plan = PlanBlock {
+            goal: "locate handler".to_string(),
+            steps: vec!["inspect".to_string()],
+            acceptance_criteria: vec![
+                "The exact file path containing the `/realize` slash command handler is identified."
+                    .to_string(),
+                "The handler logic is confirmed to be part of the TUI component.".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+
+        assert_eq!(
+            resolve_acceptance_reference(
+                "1) The exact file path containing the `/realize` slash command handler is identified (`src/tui/events.rs`).",
+                &plan
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            resolve_acceptance_reference(
+                "2) The handler logic is confirmed to be part of the TUI component (within `tui/events.rs`).",
+                &plan
+            ),
+            Some(1)
+        );
     }
 
     #[test]
