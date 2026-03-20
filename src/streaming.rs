@@ -34,11 +34,32 @@ pub struct GovernorState {
     pub last_reflection: Option<ReflectionSummary>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealizeState {
+    pub pending: bool,
+    pub age_turns: usize,
+    pub window_end: usize,
+    pub latest_drift: Option<f64>,
+    pub mean_drift: f64,
+    pub mean_realize_latency: f64,
+    pub missing: usize,
+    pub early_leakage: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryEvent {
+    pub event: String,
+    #[serde(default)]
+    pub data: serde_json::Value,
+}
+
 #[derive(Debug, Clone)]
 pub enum StreamToken {
     Delta(String),
     ToolCall(ToolCallData),
     GovernorState(GovernorState),
+    RealizeState(RealizeState),
+    Telemetry(TelemetryEvent),
     Done,
     Error(String),
     /// Git checkpoint hash created at session start (for rollback).

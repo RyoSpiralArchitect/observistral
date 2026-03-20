@@ -401,6 +401,15 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/reject_command") => api_reject_command(&mut stream, state, &req.body).await,
         ("GET", "/api/meta_prompts") => api_meta_prompts_get(&mut stream, state).await,
         ("POST", "/api/meta_prompts") => api_meta_prompts_post(&mut stream, state, &req.body).await,
+        ("POST", "/api/meta_diagnose/list") => {
+            api_meta_diagnose_list(&mut stream, state, &req.body).await
+        }
+        ("POST", "/api/meta_diagnose/read") => {
+            api_meta_diagnose_read(&mut stream, state, &req.body).await
+        }
+        ("POST", "/api/meta_diagnose/save") => {
+            api_meta_diagnose_save(&mut stream, state, &req.body).await
+        }
         ("POST", "/api/write_file") => api_write_file(&mut stream, state, &req.body).await,
         ("POST", "/api/read_file") => api_read_file(&mut stream, state, &req.body).await,
         ("POST", "/api/patch_file") => api_patch_file(&mut stream, state, &req.body).await,
@@ -429,7 +438,10 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::is_localhost_origin;
+    use super::{
+        compact_meta_diagnose_timestamp, is_localhost_origin, is_safe_meta_artifact_name,
+        meta_artifact_slug,
+    };
 
     #[test]
     fn localhost_origin_parsing_is_strict() {
@@ -443,6 +455,36 @@ mod tests {
         assert!(!is_localhost_origin("http://127.0.0.1.evil.com"));
         assert!(!is_localhost_origin("null"));
         assert!(!is_localhost_origin(""));
+    }
+
+    #[test]
+    fn compact_meta_diagnose_timestamp_formats_filename_stamp() {
+        assert_eq!(
+            compact_meta_diagnose_timestamp("2026-03-12T01:23:45.678Z").as_deref(),
+            Some("20260312T012345Z")
+        );
+        assert_eq!(
+            compact_meta_diagnose_timestamp("2026-03-12T01:23:45Z").as_deref(),
+            Some("20260312T012345Z")
+        );
+        assert!(compact_meta_diagnose_timestamp("bad").is_none());
+    }
+
+    #[test]
+    fn meta_artifact_slug_sanitizes_filename_components() {
+        assert_eq!(meta_artifact_slug("pj-25/abeam", "thread"), "pj-25-abeam");
+        assert_eq!(meta_artifact_slug("msg:abc?.json", "msg"), "msg-abc-json");
+        assert_eq!(meta_artifact_slug("", "msg"), "msg");
+    }
+
+    #[test]
+    fn meta_artifact_name_rejects_path_traversal() {
+        assert!(is_safe_meta_artifact_name(
+            "20260312T012345Z__thread-a__msg-b.json"
+        ));
+        assert!(!is_safe_meta_artifact_name("../secret.json"));
+        assert!(!is_safe_meta_artifact_name("nested/file.json"));
+        assert!(!is_safe_meta_artifact_name("/abs.json"));
     }
 }
 
@@ -1974,6 +2016,502 @@ async fn api_meta_prompts_post(stream: &mut TcpStream, state: AppState, body: &[
         &Res {
             ok: true,
             approval_id,
+        },
+    )
+    .await
+}
+
+fn resolve_api_root_path(workspace_root: &Path, root: Option<&str>) -> Result<PathBuf> {
+    let raw = root.unwrap_or(".").trim();
+    let raw = if raw.is_empty() { "." } else { raw };
+    crate::exec::validate_cwd(raw)?;
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(workspace_root.join(path))
+    }
+}
+
+fn compact_meta_diagnose_timestamp(ts: &str) -> Option<String> {
+    let digits: String = ts.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 14 {
+        return None;
+    }
+    Some(format!("{}T{}Z", &digits[..8], &digits[8..14]))
+}
+
+fn meta_artifact_slug(value: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in value.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            prev_dash = false;
+            Some(ch.to_ascii_lowercase())
+        } else if ch == '-' || ch == '_' {
+            prev_dash = false;
+            Some(ch)
+        } else if prev_dash {
+            None
+        } else {
+            prev_dash = true;
+            Some('-')
+        };
+        if let Some(ch) = mapped {
+            out.push(ch);
+        }
+    }
+    let trimmed = out.trim_matches('-').trim_matches('_');
+    let base = if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed
+    };
+    base.chars().take(64).collect()
+}
+
+fn meta_diagnose_rel_dir() -> &'static str {
+    ".obstral/meta-diagnose"
+}
+
+fn is_safe_meta_artifact_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return false;
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return false;
+    }
+    if !trimmed.ends_with(".json") {
+        return false;
+    }
+    let mut comps = path.components();
+    matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+}
+
+async fn api_meta_diagnose_list(
+    stream: &mut TcpStream,
+    state: AppState,
+    body: &[u8],
+) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        root: Option<String>,
+        limit: Option<usize>,
+    }
+    #[derive(Serialize)]
+    struct Res {
+        ok: bool,
+        path: String,
+        items: Vec<serde_json::Value>,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
+        }
+    };
+
+    let root = match resolve_api_root_path(&state.workspace_root, req.root.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: format!("invalid root: {e}"),
+                },
+            )
+            .await;
+        }
+    };
+    let index_path = root.join(meta_diagnose_rel_dir()).join("index.jsonl");
+    let limit = req.limit.unwrap_or(120).clamp(1, 500);
+    let Ok(text) = std::fs::read_to_string(&index_path) else {
+        return write_json(
+            stream,
+            200,
+            "OK",
+            &Res {
+                ok: true,
+                path: index_path.to_string_lossy().into_owned(),
+                items: Vec::new(),
+            },
+        )
+        .await;
+    };
+
+    let mut items: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let mut value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+            let name = value
+                .get("path")
+                .and_then(|v| v.as_str())
+                .and_then(|p| Path::new(p).file_name().and_then(|x| x.to_str()))
+                .unwrap_or("")
+                .to_string();
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("name".into(), serde_json::Value::String(name));
+            }
+            Some(value)
+        })
+        .collect();
+    items.reverse();
+    items.truncate(limit);
+
+    write_json(
+        stream,
+        200,
+        "OK",
+        &Res {
+            ok: true,
+            path: index_path.to_string_lossy().into_owned(),
+            items,
+        },
+    )
+    .await
+}
+
+async fn api_meta_diagnose_read(
+    stream: &mut TcpStream,
+    state: AppState,
+    body: &[u8],
+) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        root: Option<String>,
+        name: String,
+    }
+    #[derive(Serialize)]
+    struct Res {
+        ok: bool,
+        path: String,
+        artifact: serde_json::Value,
+        raw: String,
+        parse_ok: bool,
+        parse_error: Option<String>,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
+        }
+    };
+
+    if !is_safe_meta_artifact_name(&req.name) {
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "invalid artifact name".into(),
+            },
+        )
+        .await;
+    }
+
+    let root = match resolve_api_root_path(&state.workspace_root, req.root.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: format!("invalid root: {e}"),
+                },
+            )
+            .await;
+        }
+    };
+    let path = root.join(meta_diagnose_rel_dir()).join(req.name.trim());
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: format!("failed to read artifact: {e}"),
+                },
+            )
+            .await;
+        }
+    };
+    let (artifact, parse_ok, parse_error) = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(v) => (v, true, None),
+        Err(e) => (
+            serde_json::json!({}),
+            false,
+            Some(format!("invalid artifact json: {e}")),
+        ),
+    };
+
+    write_json(
+        stream,
+        200,
+        "OK",
+        &Res {
+            ok: true,
+            path: path.to_string_lossy().into_owned(),
+            artifact,
+            raw,
+            parse_ok,
+            parse_error,
+        },
+    )
+    .await
+}
+
+async fn api_meta_diagnose_save(
+    stream: &mut TcpStream,
+    state: AppState,
+    body: &[u8],
+) -> Result<()> {
+    use serde_json::json;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Deserialize)]
+    struct Req {
+        root: Option<String>,
+        artifact: serde_json::Value,
+    }
+    #[derive(Serialize)]
+    struct Res {
+        ok: bool,
+        path: String,
+        index_path: String,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
+        }
+    };
+
+    if !req.artifact.is_object() {
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "artifact must be a JSON object".into(),
+            },
+        )
+        .await;
+    }
+
+    let root = match resolve_api_root_path(&state.workspace_root, req.root.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: format!("invalid root: {e}"),
+                },
+            )
+            .await;
+        }
+    };
+
+    let ts = req
+        .artifact
+        .get("ts")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let stamp = compact_meta_diagnose_timestamp(&ts).unwrap_or_else(|| {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        format!("unix{secs}")
+    });
+    let thread_id = req
+        .artifact
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let target_message_id = req
+        .artifact
+        .get("target_message_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let thread_slug = meta_artifact_slug(&thread_id, "thread");
+    let message_slug = meta_artifact_slug(&target_message_id, "msg");
+    let dir = root.join(meta_diagnose_rel_dir());
+    let artifact_base = dir.join(format!(
+        "{stamp}__thread-{thread_slug}__msg-{message_slug}.json"
+    ));
+    let artifact_path = if artifact_base.exists() {
+        let stem = artifact_base
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("meta-diagnose");
+        let ext = artifact_base
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("json");
+        let mut candidate = artifact_base.clone();
+        for idx in 1..1000u32 {
+            let next = dir.join(format!("{stem}__{idx:02}.{ext}"));
+            if !next.exists() {
+                candidate = next;
+                break;
+            }
+        }
+        candidate
+    } else {
+        artifact_base
+    };
+    if let Err(e) = crate::trace_writer::safe_mkdir(&artifact_path) {
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: format!("failed to create artifact dir: {e}"),
+            },
+        )
+        .await;
+    }
+
+    let artifact_text = match serde_json::to_string_pretty(&req.artifact) {
+        Ok(s) => s,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: format!("failed to serialize artifact: {e}"),
+                },
+            )
+            .await;
+        }
+    };
+    if let Err(e) = std::fs::write(&artifact_path, artifact_text.as_bytes()) {
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: format!("failed to write artifact: {e}"),
+            },
+        )
+        .await;
+    }
+
+    let index_path = dir.join("index.jsonl");
+    if let Err(e) = crate::trace_writer::safe_mkdir(&index_path) {
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: format!("failed to create index dir: {e}"),
+            },
+        )
+        .await;
+    }
+    let mut index = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&index_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: format!("failed to open index: {e}"),
+                },
+            )
+            .await;
+        }
+    };
+    let index_line = json!({
+        "ts": ts,
+        "thread_id": thread_id,
+        "target_message_id": target_message_id,
+        "path": artifact_path.to_string_lossy(),
+        "parse_ok": req.artifact.get("parse_ok").cloned().unwrap_or(serde_json::Value::Null),
+        "parse_error": req.artifact.get("parse_error").cloned().unwrap_or(serde_json::Value::Null),
+        "provider": req.artifact.get("provider").cloned().unwrap_or(serde_json::Value::Null),
+        "model": req.artifact.get("model").cloned().unwrap_or(serde_json::Value::Null),
+        "primary_failure": req
+            .artifact
+            .get("diagnosis")
+            .and_then(|v| v.get("primary_failure"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    });
+    let index_text = format!("{index_line}\n");
+    if let Err(e) = index.write_all(index_text.as_bytes()) {
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: format!("failed to append index: {e}"),
+            },
+        )
+        .await;
+    }
+
+    write_json(
+        stream,
+        200,
+        "OK",
+        &Res {
+            ok: true,
+            path: artifact_path.to_string_lossy().into_owned(),
+            index_path: index_path.to_string_lossy().into_owned(),
         },
     )
     .await

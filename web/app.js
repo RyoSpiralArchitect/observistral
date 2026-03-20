@@ -134,6 +134,30 @@
       focusCoder: "Focus coder",
       focusObserver: "Focus observer",
       splitHint: "Drag to resize. Double-click to reset.",
+      metaDiagnose: "Meta diagnose",
+      metaBadge: "META",
+      whyFail: "Why did this fail?",
+      metaDiagnoseRunning: "Running meta diagnosis…",
+      metaDiagnoseMissingTarget: "No failed message found to diagnose.",
+      metaDiagnoseBadTarget: "Target message not found.",
+      metaDiagnoseJsonRetry: "Meta diagnosis returned invalid JSON. Retrying once…",
+      metaDiagnoseSaved: "Meta diagnosis saved",
+      metaDiagnoseSaveFailed: "Failed to save meta diagnosis",
+      metaViewer: "Meta",
+      metaViewerRefresh: "Refresh",
+      metaViewerParseOkOnly: "parse_ok only",
+      metaViewerThreadFilter: "Filter thread",
+      metaViewerEmpty: "No saved meta diagnoses.",
+      metaViewerSelect: "Select a meta diagnosis.",
+      metaViewerLoadFailed: "Failed to load meta diagnoses",
+      metaViewerReadFailed: "Failed to load artifact",
+      metaViewerOpenJson: "Open artifact JSON",
+      metaViewerRerun: "Re-run diagnosis",
+      metaViewerRerunSavedPacket: "Live target missing. Re-running from saved packet…",
+      metaViewerSummary: "summary",
+      metaViewerCauses: "causes",
+      metaViewerExperiments: "experiments",
+      metaViewerRawResponse: "raw_response",
     },
     ja: {
       threads: "スレッド",
@@ -247,6 +271,30 @@
       pendingCommands: "保留中のコマンド",
       approve: "承認",
       reject: "却下",
+      metaDiagnose: "メタ診断",
+      metaBadge: "META",
+      whyFail: "Why did this fail?",
+      metaDiagnoseRunning: "メタ診断を実行中…",
+      metaDiagnoseMissingTarget: "診断対象の失敗メッセージが見つかりません。",
+      metaDiagnoseBadTarget: "対象メッセージが見つかりません。",
+      metaDiagnoseJsonRetry: "メタ診断が不正なJSONを返したため、1回だけ再試行します…",
+      metaDiagnoseSaved: "メタ診断を保存しました",
+      metaDiagnoseSaveFailed: "メタ診断の保存に失敗しました",
+      metaViewer: "Meta",
+      metaViewerRefresh: "更新",
+      metaViewerParseOkOnly: "parse_ok のみ",
+      metaViewerThreadFilter: "thread で絞り込み",
+      metaViewerEmpty: "保存済みメタ診断はまだありません。",
+      metaViewerSelect: "メタ診断を選択してください。",
+      metaViewerLoadFailed: "メタ診断一覧の読み込みに失敗しました",
+      metaViewerReadFailed: "artifact の読み込みに失敗しました",
+      metaViewerOpenJson: "artifact JSON を開く",
+      metaViewerRerun: "再診断",
+      metaViewerRerunSavedPacket: "live の対象が無いため、保存済み packet から再診断します…",
+      metaViewerSummary: "summary",
+      metaViewerCauses: "causes",
+      metaViewerExperiments: "experiments",
+      metaViewerRawResponse: "raw_response",
     },
     fr: {
       threads: "Fils",
@@ -360,6 +408,30 @@
       focusCoder: "Agrandir Coder",
       focusObserver: "Agrandir Observer",
       splitHint: "Glissez pour redimensionner. Double-cliquez pour réinitialiser.",
+      metaDiagnose: "Meta diagnose",
+      metaBadge: "META",
+      whyFail: "Pourquoi cet échec ?",
+      metaDiagnoseRunning: "Diagnostic méta en cours…",
+      metaDiagnoseMissingTarget: "Aucun message d'échec à diagnostiquer.",
+      metaDiagnoseBadTarget: "Message cible introuvable.",
+      metaDiagnoseJsonRetry: "Le diagnostic méta a renvoyé un JSON invalide. Nouvelle tentative unique…",
+      metaDiagnoseSaved: "Diagnostic méta enregistré",
+      metaDiagnoseSaveFailed: "Échec de l'enregistrement du diagnostic méta",
+      metaViewer: "Meta",
+      metaViewerRefresh: "Actualiser",
+      metaViewerParseOkOnly: "parse_ok seulement",
+      metaViewerThreadFilter: "Filtrer thread",
+      metaViewerEmpty: "Aucun diagnostic méta enregistré.",
+      metaViewerSelect: "Sélectionnez un diagnostic méta.",
+      metaViewerLoadFailed: "Échec du chargement des diagnostics méta",
+      metaViewerReadFailed: "Échec du chargement de l'artifact",
+      metaViewerOpenJson: "Ouvrir l'artifact JSON",
+      metaViewerRerun: "Relancer le diagnostic",
+      metaViewerRerunSavedPacket: "Cible live introuvable. Relance depuis le packet sauvegardé…",
+      metaViewerSummary: "summary",
+      metaViewerCauses: "causes",
+      metaViewerExperiments: "experiments",
+      metaViewerRawResponse: "raw_response",
     },
   };
 
@@ -2393,6 +2465,99 @@
     return word === "core" || word === "feature" || word === "polish" ? word : null;
   }
 
+  const META_DIAGNOSE_KIND = "meta_diagnose";
+  const META_FIX_LAYERS = Object.freeze([
+    "guideline",
+    "instruction",
+    "skill",
+    "harness",
+    "tool",
+    "index",
+    "schema_ci",
+    "repo_code",
+    "no_change",
+  ]);
+
+  function extractJsonObjectText(text) {
+    const raw = String(text || "").trim();
+    if (!raw) return "";
+    if (raw.startsWith("{") && raw.endsWith("}")) return raw;
+    const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fence && fence[1]) {
+      const body = String(fence[1] || "").trim();
+      if (body.startsWith("{") && body.endsWith("}")) return body;
+    }
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start >= 0 && end > start) return raw.slice(start, end + 1).trim();
+    return "";
+  }
+
+  function normalizeMetaFixLayer(value) {
+    const raw = String(value || "").trim().toLowerCase();
+    if (!raw) return "no_change";
+    if (META_FIX_LAYERS.includes(raw)) return raw;
+    if (raw === "guidelines") return "guideline";
+    if (raw === "repo" || raw === "repo_bug") return "repo_code";
+    if (raw === "schema" || raw === "ci") return "schema_ci";
+    return "no_change";
+  }
+
+  function normalizeMetaDiagnosis(parsed) {
+    if (!parsed || typeof parsed !== "object") return null;
+    const causes = Array.isArray(parsed.causes) ? parsed.causes.slice(0, 3) : [];
+    const experiments = Array.isArray(parsed.recommended_experiments)
+      ? parsed.recommended_experiments.slice(0, 4)
+      : [];
+    const doNotChange = Array.isArray(parsed.do_not_change)
+      ? parsed.do_not_change.slice(0, 6).map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    return {
+      summary: String(parsed.summary || "").trim(),
+      primary_failure: String(parsed.primary_failure || "").trim(),
+      causes: causes.map((cause) => ({
+        label: String(cause && cause.label || "").trim(),
+        why: String(cause && cause.why || "").trim(),
+        evidence: Array.isArray(cause && cause.evidence)
+          ? cause.evidence.slice(0, 5).map((item) => String(item || "").trim()).filter(Boolean)
+          : [],
+        fix_layer: normalizeMetaFixLayer(cause && cause.fix_layer),
+        minimal_patch: String(cause && cause.minimal_patch || "").trim(),
+        confidence: Math.max(0, Math.min(1, Number(cause && cause.confidence) || 0)),
+      })).filter((cause) => cause.label || cause.why || cause.minimal_patch),
+      recommended_experiments: experiments.map((item) => ({
+        change: String(item && item.change || "").trim(),
+        verify: String(item && item.verify || "").trim(),
+        expected_signal: String(item && item.expected_signal || "").trim(),
+      })).filter((item) => item.change || item.verify || item.expected_signal),
+      do_not_change: doNotChange,
+    };
+  }
+
+  function parseMetaDiagnosisResult(text) {
+    const raw = String(text || "").trim();
+    const jsonText = extractJsonObjectText(raw);
+    if (!jsonText) {
+      return { diagnosis: null, parseError: "no_json_object_found" };
+    }
+    let parsed = null;
+    try {
+      parsed = JSON.parse(jsonText);
+    } catch (err) {
+      const msg = err && err.message ? String(err.message) : "json_parse_failed";
+      return { diagnosis: null, parseError: `invalid_json: ${msg}` };
+    }
+    const diagnosis = normalizeMetaDiagnosis(parsed);
+    if (!diagnosis) {
+      return { diagnosis: null, parseError: "json_did_not_match_meta_diagnosis_schema" };
+    }
+    return { diagnosis, parseError: null };
+  }
+
+  function parseMetaDiagnosis(text) {
+    return parseMetaDiagnosisResult(text).diagnosis;
+  }
+
   // ╔══════════════════════════════════════════════════════════╗
   // ║  SECTION: App Shell (React state + event handlers)       ║
   // ╚══════════════════════════════════════════════════════════╝
@@ -2489,7 +2654,16 @@
     const [pendingCommands, setPendingCommands] = useState([]);
     const [pendingBusy, setPendingBusy] = useState(false);
     const [metaBusy, setMetaBusy] = useState(false);
-    const [observerSubTab, setObserverSubTab] = useState("analysis"); // "analysis" | "chat"
+    const [observerSubTab, setObserverSubTab] = useState("analysis"); // "analysis" | "chat" | "meta"
+    const [metaArtifacts, setMetaArtifacts] = useState([]);
+    const [metaArtifactsLoading, setMetaArtifactsLoading] = useState(false);
+    const [metaArtifactsError, setMetaArtifactsError] = useState("");
+    const [metaArtifactThreadFilter, setMetaArtifactThreadFilter] = useState("");
+    const [metaArtifactParseOnly, setMetaArtifactParseOnly] = useState(false);
+    const [metaArtifactRoot, setMetaArtifactRoot] = useState("");
+    const [metaArtifactSelectedName, setMetaArtifactSelectedName] = useState("");
+    const [metaArtifactDetail, setMetaArtifactDetail] = useState(null);
+    const [metaArtifactDetailLoading, setMetaArtifactDetailLoading] = useState(false);
     const [chatInput, setChatInput] = useState("");
     const [sendingChat, setSendingChat] = useState(false);
     const [proposalModal, setProposalModal] = useState(null);
@@ -2522,6 +2696,8 @@
                   content: typeof m.content === "string" ? m.content : String(m.content || ""),
                   ts: typeof m.ts === "number" ? m.ts : Date.now(),
                   streaming: !!m.streaming,
+                  metaKind: typeof m.metaKind === "string" ? m.metaKind : "",
+                  metaTargetId: typeof m.metaTargetId === "string" ? m.metaTargetId : "",
                 }))
             : [],
           tasks: Array.isArray(t.tasks)
@@ -2907,6 +3083,11 @@
         .catch(() => {});
     };
 
+    useEffect(() => {
+      if (observerSubTab !== "meta") return;
+      refreshMetaArtifacts(true).catch(() => {});
+    }, [observerSubTab, activeThread && activeThread.id, config.toolRoot]);
+
     const resolvePendingEdit = async (id, approve) => {
       const eid = String(id || "").trim();
       if (!eid || pendingBusy) return;
@@ -3243,6 +3424,262 @@
       } catch (_) {}
     };
 
+    const metaLayerClass = (layer) => "meta-layer-" + normalizeMetaFixLayer(layer);
+
+    const renderMetaDiagnosisCard = (diag) => {
+      if (!diag) return null;
+      const causes = Array.isArray(diag.causes) ? diag.causes : [];
+      const experiments = Array.isArray(diag.recommended_experiments) ? diag.recommended_experiments : [];
+      const unchanged = Array.isArray(diag.do_not_change) ? diag.do_not_change : [];
+      return e(
+        "div",
+        { className: "meta-diag-card" },
+        e(
+          "div",
+          { className: "meta-diag-head" },
+          e("span", { className: "pill meta-pill" }, tr(lang, "metaBadge")),
+          diag.primary_failure ? e("span", { className: "meta-primary" }, diag.primary_failure) : null
+        ),
+        diag.summary ? e("div", { className: "meta-summary" }, diag.summary) : null,
+        causes.length
+          ? e(
+              "div",
+              { className: "meta-section" },
+              causes.map((cause, idx) =>
+                e(
+                  "div",
+                  { key: `cause-${idx}`, className: "meta-cause" },
+                  e(
+                    "div",
+                    { className: "meta-cause-head" },
+                    e("strong", null, cause.label || `cause_${idx + 1}`),
+                    e("span", { className: `meta-layer ${metaLayerClass(cause.fix_layer)}` }, cause.fix_layer || "no_change"),
+                    e("span", { className: "meta-confidence" }, `${Math.round((Number(cause.confidence) || 0) * 100)}%`)
+                  ),
+                  cause.why ? e("div", { className: "meta-cause-why" }, cause.why) : null,
+                  cause.evidence && cause.evidence.length
+                    ? e(
+                        "ul",
+                        { className: "meta-list" },
+                        cause.evidence.map((item, evidenceIdx) => e("li", { key: `e-${idx}-${evidenceIdx}` }, item))
+                      )
+                    : null,
+                  cause.minimal_patch ? e("div", { className: "meta-patch" }, cause.minimal_patch) : null
+                )
+              )
+            )
+          : null,
+        experiments.length
+          ? e(
+              "div",
+              { className: "meta-section" },
+              e("div", { className: "meta-label" }, "experiments"),
+              experiments.map((item, idx) =>
+                e(
+                  "div",
+                  { key: `exp-${idx}`, className: "meta-experiment" },
+                  item.change ? e("div", null, `change: ${item.change}`) : null,
+                  item.verify ? e("div", null, `verify: ${item.verify}`) : null,
+                  item.expected_signal ? e("div", null, `signal: ${item.expected_signal}`) : null
+                )
+              )
+            )
+          : null,
+        unchanged.length
+          ? e(
+              "div",
+              { className: "meta-section" },
+              e("div", { className: "meta-label" }, "do_not_change"),
+              e(
+                "ul",
+                { className: "meta-list" },
+                unchanged.map((item, idx) => e("li", { key: `nc-${idx}` }, item))
+              )
+            )
+          : null
+      );
+    };
+
+    const renderMetaViewer = () => {
+      const needle = String(metaArtifactThreadFilter || "").trim().toLowerCase();
+      const items = metaArtifacts.filter((item) => {
+        if (!item || typeof item !== "object") return false;
+        if (metaArtifactParseOnly && !item.parse_ok) return false;
+        if (!needle) return true;
+        const hay = [item.thread_id, item.target_message_id, item.primary_failure, item.name]
+          .map((x) => String(x || "").toLowerCase())
+          .join("\n");
+        return hay.includes(needle);
+      });
+      const failureCounts = Array.from(
+        items.reduce((map, item) => {
+          const key = String(item && item.primary_failure || "").trim();
+          if (!key) return map;
+          map.set(key, (map.get(key) || 0) + 1);
+          return map;
+        }, new Map())
+      )
+        .sort((a, b) => {
+          if (b[1] !== a[1]) return b[1] - a[1];
+          return String(a[0]).localeCompare(String(b[0]));
+        })
+        .slice(0, 6);
+      const detail = metaArtifactDetail;
+      const artifact = detail && detail.artifact && typeof detail.artifact === "object" ? detail.artifact : null;
+      const diagnosis = artifact && artifact.diagnosis ? normalizeMetaDiagnosis(artifact.diagnosis) : null;
+      const rawResponse = artifact ? String(artifact.raw_response || detail && detail.raw || "").trim() : String(detail && detail.raw || "").trim();
+      const completedTs = artifact && artifact.ts ? Date.parse(String(artifact.ts)) : NaN;
+      return e(
+        "div",
+        { className: "meta-viewer" },
+        e(
+          "div",
+          { className: "meta-viewer-toolbar" },
+          e("button", {
+            className: "btn btn-icon",
+            type: "button",
+            disabled: metaArtifactsLoading || metaArtifactDetailLoading,
+            onClick: () => refreshMetaArtifacts(true),
+          }, tr(lang, "metaViewerRefresh")),
+          e("input", {
+            className: "input",
+            value: metaArtifactThreadFilter,
+            placeholder: tr(lang, "metaViewerThreadFilter"),
+            onChange: (ev) => setMetaArtifactThreadFilter(ev.target.value),
+            style: { flex: 1, minWidth: 120 },
+          }),
+          e("label", { className: "meta-viewer-toggle" },
+            e("input", {
+              type: "checkbox",
+              checked: metaArtifactParseOnly,
+              onChange: (ev) => setMetaArtifactParseOnly(!!ev.target.checked),
+            }),
+            e("span", null, tr(lang, "metaViewerParseOkOnly"))
+          )
+        ),
+        e(
+          "div",
+          { className: "meta-viewer-root" },
+          metaArtifactRoot || "."
+        ),
+        failureCounts.length
+          ? e(
+              "div",
+              { className: "meta-viewer-counts" },
+              e("span", { className: "meta-label" }, "primary_failure"),
+              failureCounts.map(([label, count]) =>
+                e("span", { key: label, className: "meta-viewer-count-chip" }, `${label} ×${count}`)
+              )
+            )
+          : null,
+        e(
+          "div",
+          { className: "meta-viewer-grid" },
+          e(
+            "div",
+            { className: "meta-viewer-list" },
+            metaArtifactsLoading
+              ? e("div", { className: "pane-empty" }, e("p", { className: "pane-empty-hint" }, tr(lang, "loading")))
+              : metaArtifactsError
+                ? e("div", { className: "pane-empty" }, e("p", { className: "pane-empty-hint" }, metaArtifactsError))
+                : items.length === 0
+                  ? e("div", { className: "pane-empty" }, e("p", { className: "pane-empty-hint" }, tr(lang, "metaViewerEmpty")))
+                  : items.map((item, idx) => {
+                      const name = String(item && item.name || "");
+                      const active = name && name === metaArtifactSelectedName;
+                      const parseOk = !!(item && item.parse_ok);
+                      return e(
+                        "button",
+                        {
+                          key: name || `meta-item-${idx}`,
+                          type: "button",
+                          className: "meta-viewer-item" + (active ? " active" : ""),
+                          onClick: () => loadMetaArtifactDetail(metaArtifactRoot || currentMetaArtifactRoot(), name),
+                        },
+                        e(
+                          "div",
+                          { className: "meta-viewer-item-head" },
+                          e("span", { className: "meta-viewer-item-title" }, String(item && item.primary_failure || name || "meta")),
+                          e("span", { className: "meta-viewer-item-status" + (parseOk ? " ok" : " bad") }, parseOk ? "parse_ok" : "parse_fail")
+                        ),
+                        e("div", { className: "meta-viewer-item-sub" }, String(item && item.thread_id || "")),
+                        e("div", { className: "meta-viewer-item-sub" }, String(item && item.target_message_id || "")),
+                        e("div", { className: "meta-viewer-item-sub mono" }, String(item && item.ts || ""))
+                      );
+                    })
+          ),
+          e(
+            "div",
+            { className: "meta-viewer-detail" },
+            metaArtifactDetailLoading
+              ? e("div", { className: "pane-empty" }, e("p", { className: "pane-empty-hint" }, tr(lang, "loading")))
+              : !detail
+                ? e("div", { className: "pane-empty" }, e("p", { className: "pane-empty-hint" }, tr(lang, "metaViewerSelect")))
+                : e(React.Fragment, null,
+                    e(
+                      "div",
+                      { className: "meta-viewer-detail-head" },
+                      e("div", { className: "meta-viewer-detail-title" }, String(detail.name || "meta artifact")),
+                      e("div", { className: "meta-viewer-detail-actions" },
+                        e("span", { className: "meta-viewer-item-status" + (detail.parse_ok ? " ok" : " bad") }, detail.parse_ok ? "parse_ok" : "parse_fail"),
+                        e("button", {
+                          className: "btn btn-icon",
+                          type: "button",
+                          disabled: metaBusy || sendingObserver,
+                          onClick: () => rerunMetaDiagnoseFromArtifact(detail),
+                        }, tr(lang, "metaViewerRerun")),
+                        e("button", {
+                          className: "btn btn-icon",
+                          type: "button",
+                          onClick: () => setReaderModal({
+                            title: String(detail.name || tr(lang, "metaViewer")),
+                            ts: Number.isFinite(completedTs) ? completedTs : Date.now(),
+                            content: "```json\n" + String(detail.raw || JSON.stringify(detail.artifact || {}, null, 2)) + "\n```",
+                          }),
+                        }, tr(lang, "metaViewerOpenJson"))
+                      )
+                    ),
+                    e(
+                      "div",
+                      { className: "meta-viewer-kv" },
+                      e("span", null, `thread: ${String(artifact && artifact.thread_id || "")}`),
+                      e("span", null, `target: ${String(artifact && artifact.target_message_id || "")}`),
+                      e("span", null, `provider: ${String(artifact && artifact.provider || "")}`),
+                      e("span", null, `model: ${String(artifact && artifact.model || "")}`)
+                    ),
+                    diagnosis
+                      ? e(
+                          "div",
+                          { className: "meta-viewer-section" },
+                          e("div", { className: "meta-label" }, tr(lang, "metaViewerSummary")),
+                          renderMetaDiagnosisCard(diagnosis)
+                        )
+                      : null,
+                    !diagnosis && detail.parse_error
+                      ? e("div", { className: "meta-viewer-parse-error" }, String(detail.parse_error))
+                      : null,
+                    artifact && artifact.packet && artifact.packet.actual_outcome
+                      ? e(
+                          "details",
+                          { className: "ctx-details" },
+                          e("summary", { className: "ctx-summary" }, "packet.actual_outcome"),
+                          e("pre", { className: "ctx-pre" }, String(artifact.packet.actual_outcome || ""))
+                        )
+                      : null,
+                    rawResponse
+                      ? e(
+                          "details",
+                          { className: "ctx-details" },
+                          e("summary", { className: "ctx-summary" }, tr(lang, "metaViewerRawResponse")),
+                          e("pre", { className: "ctx-pre meta-viewer-raw" }, rawResponse)
+                        )
+                      : null
+                  )
+          )
+        )
+      );
+    };
+
     const renderMessage = (m) => {
       const canExec = !!(status && status.features && status.features.exec);
       const canOpen = !!(status && status.features && status.features.open_file);
@@ -3260,12 +3697,16 @@
       const isExpanded = expandedMsgs.has(m.id);
       const isCollapsed = isLong && !isExpanded;
       const choices = (!m.streaming && m.role === "assistant" && m.pane !== "observer") ? extractChoices(s) : [];
+      const metaDiagnosis = (!m.streaming && pane === "observer" && isMetaDiagnoseMessage(m) && m.role === "assistant")
+        ? parseMetaDiagnosis(s)
+        : null;
       const streamingNode = e("span", null,
         s || e("span", { className: "thinking" }, tr(lang, "streaming")),
         e("span", { className: "cursor-blink" }, "▊")
       );
       // File chips: shown below completed Coder assistant messages when open_file is supported.
       const isCoderAsst = !m.streaming && m.role === "assistant" && m.pane !== "observer" && m.pane !== "chat";
+      const canMetaDiagnose = isFailedCoderMessage(m);
       const fileChips = (canOpen && isCoderAsst) ? extractPathHints(s, 10) : [];
       return e(
         "div",
@@ -3295,6 +3736,12 @@
                   content: String(m.content || ""),
                 }),
               }, tr(lang, "reader")) : null,
+              canMetaDiagnose ? e("button", {
+                className: "pill-btn",
+                type: "button",
+                disabled: metaBusy || sendingObserver,
+                onClick: () => runMetaDiagnose(`msg:${m.id}`),
+              }, tr(lang, "whyFail")) : null,
               e("button", {
                 className: copiedId === m.id ? "copied" : "",
                 onClick: () => copyText(m.content || "", m.id),
@@ -3330,12 +3777,16 @@
           e(
             "div",
             { className: "content" + (isCollapsed ? " content-collapsed" : "") },
-            m.streaming ? streamingNode : renderWithThink(
-              s,
-              execResults[m.id] || {},
-              canExec ? ((blockIdx, langHint, codeText) => runCmd(m.id, blockIdx, langHint, codeText)) : null,
-              canOpen ? openFile : null
-            ),
+            m.streaming
+              ? streamingNode
+              : metaDiagnosis
+                ? renderMetaDiagnosisCard(metaDiagnosis)
+                : renderWithThink(
+                    s,
+                    execResults[m.id] || {},
+                    canExec ? ((blockIdx, langHint, codeText) => runCmd(m.id, blockIdx, langHint, codeText)) : null,
+                    canOpen ? openFile : null
+                  ),
             choices && choices.length
               ? e(
                   "div",
@@ -3439,6 +3890,555 @@
       if (pane === "observer") return all.filter((m) => m.pane === "observer");
       if (pane === "chat") return all.filter((m) => m.pane === "chat");
       return all.filter((m) => m.pane !== "observer" && m.pane !== "chat");
+    };
+
+    const isMetaDiagnoseMessage = (m) =>
+      String(m && m.metaKind ? m.metaKind : "").trim().toLowerCase() === META_DIAGNOSE_KIND;
+
+    const observerConversationMessages = () =>
+      paneMessages("observer").filter((m) => !isMetaDiagnoseMessage(m));
+
+    const metaDigestText = (text, maxChars, maxLines) => {
+      let out = String(text || "")
+        .replace(/\r\n/g, "\n")
+        .replace(/(authorization\s*:\s*bearer\s+)[^\s]+/ig, "$1[redacted]")
+        .replace(/(api[_ -]?key\s*[:=]\s*)[^\s"']+/ig, "$1[redacted]")
+        .replace(/(token\s*[:=]\s*)[^\s"']+/ig, "$1[redacted]")
+        .replace(/(cookie\s*[:=]\s*)[^\s"']+/ig, "$1[redacted]")
+        .replace(/\b(sk-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,}|hf_[A-Za-z0-9_]{10,})\b/g, "[redacted]")
+        .trim();
+      const limitLines = typeof maxLines === "number" ? Math.max(1, maxLines) : 8;
+      out = out
+        .split("\n")
+        .map((line) => String(line || "").trimEnd())
+        .filter((line) => line.trim())
+        .slice(0, limitLines)
+        .join("\n");
+      const limitChars = typeof maxChars === "number" ? Math.max(32, maxChars) : 320;
+      if (out.length > limitChars) out = out.slice(0, limitChars - 3) + "...";
+      return out;
+    };
+
+    const metaFirstLine = (text, maxChars) => {
+      const line = metaDigestText(text, maxChars || 180, 2).split("\n")[0] || "";
+      return String(line || "").trim();
+    };
+
+    const metaFailurePattern = (text) =>
+      /(?:\bFAILED\b|\[error\]|\[stop\]|REJECTED BY USER|sandbox breach|stderr:|error:|fatal:|traceback|exception|⚠ The command failed|invalid self-reflection|missing valid <plan>|Missing <think>|\[goal_check\]\s+The task is NOT complete yet|Tests are failing|Build is failing)/i.test(
+        String(text || "")
+      );
+
+    const isFailedCoderMessage = (m) =>
+      !!(m && !m.streaming && m.role === "assistant" && m.pane === "coder" && metaFailurePattern(m.content));
+
+    const detectMetaFailureKind = (text) => {
+      const s = String(text || "").toLowerCase();
+      if (!s.trim()) return "unclear";
+      if (loopInfo && Number(loopInfo.depth) > 0 && (s.includes("loop") || s.includes("repeated") || s.includes("same"))) {
+        return "loop";
+      }
+      if (s.includes("no tool call") || s.includes("[stop]") || s.includes("goal_check")) return "no_tool";
+      if (
+        s.includes("write_file failed") ||
+        s.includes("patch_file failed") ||
+        s.includes("apply_diff failed") ||
+        s.includes("rejected by user") ||
+        s.includes("unsafe path")
+      ) return "bad_edit";
+      if (s.includes("false success")) return "false_success";
+      if (
+        s.includes("failed") ||
+        s.includes("[error]") ||
+        s.includes("stderr:") ||
+        s.includes("error:") ||
+        s.includes("fatal:") ||
+        s.includes("exception") ||
+        s.includes("traceback") ||
+        s.includes("sandbox breach")
+      ) return "tool_error";
+      if (loopInfo && Number(loopInfo.depth) > 0) return "loop";
+      return "unclear";
+    };
+
+    const deriveMetaToolCallSnapshots = (msgs, cwd) => {
+      const out = [];
+      const toolNames = ["read_file", "write_file", "patch_file", "apply_diff", "search_files", "list_dir", "glob", "exec", "done"];
+      for (let i = msgs.length - 1; i >= 0 && out.length < 4; i--) {
+        const m = msgs[i];
+        if (!m || m.role !== "assistant") continue;
+        const content = String(m.content || "");
+        const blocks = extractCodeBlocks(content, 2, 180);
+        for (const body of blocks) {
+          if (out.length >= 4) break;
+          const first = metaFirstLine(body, 140);
+          if (!first) continue;
+          out.push({ name: "exec", args_preview: first, cwd: cwd || null });
+        }
+        for (const name of toolNames) {
+          if (out.length >= 4) break;
+          const re = new RegExp(`\\b${name}\\b`, "i");
+          if (!re.test(content)) continue;
+          out.push({ name, args_preview: metaFirstLine(content, 160), cwd: cwd || null });
+        }
+      }
+      return out.slice(0, 4);
+    };
+
+    const deriveMetaToolResultSnapshots = (msgs) => {
+      const out = [];
+      for (let i = msgs.length - 1; i >= 0 && out.length < 4; i--) {
+        const m = msgs[i];
+        if (!m || m.role !== "assistant") continue;
+        const content = String(m.content || "");
+        if (!content.trim()) continue;
+        const ok = !metaFailurePattern(content) && /(?:^OK\b|\[goal_check:[^\]]+\] OK|\[goal_check\] all requested stop checks passed)/i.test(content);
+        if (!ok && !metaFailurePattern(content)) continue;
+        out.push({
+          ok,
+          summary: metaFirstLine(content, 160),
+          stderr_digest: ok ? null : metaDigestText(content, 220, 5),
+        });
+      }
+      return out.slice(0, 4);
+    };
+
+    const buildMetaLoopSignals = (toolCalls, toolResults, assistantMessages) => {
+      const norm = (value) => normalizeScratchEntry(value);
+      const sameHeadCount = (items, keyFn) => {
+        if (!items.length) return 0;
+        const head = norm(keyFn(items[0]));
+        if (!head) return 0;
+        return items.filter((item) => norm(keyFn(item)) === head).length;
+      };
+      return {
+        same_command_repeats: sameHeadCount(toolCalls, (item) => item && item.args_preview),
+        same_error_repeats: sameHeadCount(toolResults.filter((item) => item && !item.ok), (item) => item && (item.stderr_digest || item.summary)),
+        same_output_repeats: sameHeadCount(assistantMessages, (item) => item && item.content),
+        ui_loop_depth: Math.max(0, Number(loopInfo && loopInfo.depth) || 0),
+      };
+    };
+
+    const findMetaTargetMessage = (selector) => {
+      const raw = String(selector || "").trim();
+      const all = (activeThread && Array.isArray(activeThread.messages)) ? activeThread.messages : [];
+      if (!all.length) return null;
+      if (/^msg:/i.test(raw)) {
+        const id = raw.replace(/^msg:/i, "").trim();
+        const msg = all.find((m) => String(m && m.id || "") === id) || null;
+        if (!msg) return null;
+        if (isMetaDiagnoseMessage(msg)) return null;
+        if (msg.pane !== "coder" || msg.role !== "assistant") return null;
+        return msg;
+      }
+      const coderMsgs = paneMessages("coder");
+      for (let i = coderMsgs.length - 1; i >= 0; i--) {
+        if (isFailedCoderMessage(coderMsgs[i])) return coderMsgs[i];
+      }
+      if (loopInfo && Number(loopInfo.depth) > 0) {
+        for (let i = coderMsgs.length - 1; i >= 0; i--) {
+          const m = coderMsgs[i];
+          if (m && m.role === "assistant" && !m.streaming) return m;
+        }
+      }
+      return null;
+    };
+
+    const buildMetaFailurePacket = async (selector) => {
+      if (!activeThread) return null;
+      const governorContract = await getGovernorContract();
+      const target = findMetaTargetMessage(selector);
+      if (!target) return null;
+      const coderMsgs = paneMessages("coder");
+      const targetIdx = coderMsgs.findIndex((m) => m.id === target.id);
+      const baseMsgs = targetIdx >= 0
+        ? coderMsgs.slice(Math.max(0, targetIdx - 8), targetIdx + 1)
+        : coderMsgs.slice(-8);
+      const recentUsers = baseMsgs.filter((m) => m.role === "user").slice(-3);
+      const recentAssistants = baseMsgs
+        .filter((m) => m.role === "assistant" && !m.streaming && m.id !== target.id)
+        .slice(-3);
+      const curCwd = resolvedCwd(config.toolRoot, activeThread.id, activeThread.workdir);
+      const toolCalls = deriveMetaToolCallSnapshots(baseMsgs, curCwd);
+      const toolResults = deriveMetaToolResultSnapshots(baseMsgs);
+      const loopSignals = buildMetaLoopSignals(toolCalls, toolResults, baseMsgs.filter((m) => m.role === "assistant" && !m.streaming).slice(-4));
+      const approvalSignals = [];
+      if (pendingEdits.length) approvalSignals.push(`pending_edit_approvals=${pendingEdits.length}`);
+      if (pendingCommands.length) approvalSignals.push(`pending_command_approvals=${pendingCommands.length}`);
+      if (/rejected by user/i.test(String(target.content || ""))) approvalSignals.push("user_rejected_action");
+      const projectBits = [];
+      if (projectScan && projectScan.stack_label) projectBits.push(String(projectScan.stack_label));
+      if (String(config.toolRoot || "").trim()) projectBits.push(`tool_root=${String(config.toolRoot || "").trim()}`);
+      if (String(activeThread.workdir || "").trim()) projectBits.push(`workdir=${String(activeThread.workdir || "").trim()}`);
+      const recentUserDigest = recentUsers.map((m) => metaDigestText(m.content, 220, 4)).filter(Boolean);
+      const recentAssistantDigest = recentAssistants.map((m) => metaDigestText(m.content, 220, 4)).filter(Boolean);
+      return {
+        thread_id: String(activeThread.id || ""),
+        target_message_id: String(target.id || ""),
+        task_summary: recentUserDigest[recentUserDigest.length - 1] || metaFirstLine(activeThread.title || "", 120),
+        expected_outcome: recentUserDigest[recentUserDigest.length - 1] || "Complete the requested task without failure.",
+        actual_outcome: metaDigestText(target.content, 320, 8),
+        failure_kind: detectMetaFailureKind(target.content),
+        coder_mode: String(config.mode || "").trim(),
+        coder_provider: String(config.codeProvider || config.provider || "").trim(),
+        coder_model: String(coderActiveModel() || "").trim(),
+        observer_model: String(observerActiveModel() || "").trim(),
+        tool_root: resolvedThreadRoot(config.toolRoot, activeThread.id) || null,
+        cur_cwd: curCwd || null,
+        checkpoint: gitCheckpoint || null,
+        system_prompt_digest: metaDigestText([
+          `coder_mode=${String(config.mode || "").trim()}`,
+          `observer_mode=${String(config.observerMode || "").trim()}`,
+          `edit_approval=${config.requireEditApproval ? "on" : "off"}`,
+          `command_approval=${config.requireCommandApproval ? "on" : "off"}`,
+          `governor_blocks=${Array.isArray(governorContract && governorContract.prompt_layout && governorContract.prompt_layout.block_order) ? governorContract.prompt_layout.block_order.join(">") : "plan>think>impact>reflect"}`,
+        ].join("\n"), 320, 8),
+        project_context_digest: projectBits.length ? projectBits.join(" | ") : null,
+        agents_md_digest: null,
+        available_tools: contractToolNames(governorContract).slice(0, 16),
+        recent_user_messages: recentUserDigest,
+        recent_assistant_messages: recentAssistantDigest,
+        recent_tool_calls: toolCalls,
+        recent_tool_results: toolResults,
+        last_error_digest: metaFailurePattern(target.content) ? metaDigestText(target.content, 240, 5) : null,
+        loop_signals: loopSignals,
+        approval_signals: approvalSignals,
+        packet_notes: [
+          "observer history excluded from packet context",
+          "tool snapshots derived from visible coder thread content",
+          "credential-like substrings redacted in digests",
+        ],
+      };
+    };
+
+    const buildMetaDiagnosePrompt = (packet) => {
+      const langName = lang === "fr" ? "French" : lang === "en" ? "English" : "Japanese";
+      const schema = {
+        summary: `${langName} summary`,
+        primary_failure: "contract_ambiguity",
+        causes: [
+          {
+            label: "contract_ambiguity",
+            why: `${langName} explanation`,
+            evidence: ["evidence 1", "evidence 2"],
+            fix_layer: "instruction",
+            minimal_patch: `${langName} minimal patch`,
+            confidence: 0.84,
+          },
+        ],
+        recommended_experiments: [
+          {
+            change: `${langName} experiment change`,
+            verify: `${langName} verification`,
+            expected_signal: `${langName} expected signal`,
+          },
+        ],
+        do_not_change: ["repo code itself"],
+      };
+      return [
+        "This is meta analysis, not implementation.",
+        "Tool calls, code changes, and diff application are forbidden.",
+        "Your task is to diagnose the immediate failure by layer, using the failure packet only.",
+        `Write summary/why/evidence/minimal_patch/experiments in ${langName}.`,
+        "Keep fix_layer values in English enum form.",
+        "Return JSON only. No markdown. No backticks. No commentary outside JSON.",
+        "",
+        "Requirements:",
+        "- Identify up to 3 causes.",
+        "- Each cause must include evidence.",
+        "- Each cause must choose exactly one fix_layer.",
+        "- Keep patches minimal and rerunnable.",
+        "- Distinguish repo_code vs agent/harness issues.",
+        "- Do not overclaim; use confidence 0.0..1.0.",
+        "",
+        "fix_layer enum:",
+        META_FIX_LAYERS.join(" | "),
+        "",
+        "Output schema:",
+        JSON.stringify(schema, null, 2),
+        "",
+        "failure packet:",
+        "<packet>",
+        JSON.stringify(packet, null, 2),
+        "</packet>",
+      ].join("\n");
+    };
+
+    const metaConfigDigest = (packet, obsProvider, obsModel) => {
+      const seed = JSON.stringify({
+        thread_id: packet && packet.thread_id || "",
+        coder_mode: packet && packet.coder_mode || "",
+        observer_mode: String(config && config.observerMode || "").trim(),
+        provider: String(obsProvider || "").trim(),
+        model: String(obsModel || "").trim(),
+        tool_root: packet && packet.tool_root || "",
+        cur_cwd: packet && packet.cur_cwd || "",
+        require_edit_approval: !!(config && config.requireEditApproval),
+        require_command_approval: !!(config && config.requireCommandApproval),
+        auto_observe: !!(config && config.autoObserve),
+      });
+      const h = fnv1a64(seed);
+      return h.toString(16).padStart(16, "0");
+    };
+
+    const saveMetaDiagnoseArtifact = async (root, artifact) =>
+      postJson("/api/meta_diagnose/save", {
+        root: String(root || "").trim() || undefined,
+        artifact,
+      });
+
+    const listMetaDiagnoseArtifacts = async (root, limit) =>
+      postJson("/api/meta_diagnose/list", {
+        root: String(root || "").trim() || undefined,
+        limit: typeof limit === "number" ? limit : 120,
+      });
+
+    const readMetaDiagnoseArtifact = async (root, name) =>
+      postJson("/api/meta_diagnose/read", {
+        root: String(root || "").trim() || undefined,
+        name: String(name || "").trim(),
+      });
+
+    const currentMetaArtifactRoot = () =>
+      resolvedThreadRoot(config.toolRoot, activeThread && activeThread.id) || "";
+
+    const loadMetaArtifactDetail = async (root, name) => {
+      const artifactName = String(name || "").trim();
+      if (!artifactName) {
+        setMetaArtifactSelectedName("");
+        setMetaArtifactDetail(null);
+        return;
+      }
+      setMetaArtifactDetailLoading(true);
+      try {
+        const res = await readMetaDiagnoseArtifact(root, artifactName);
+        setMetaArtifactSelectedName(artifactName);
+        setMetaArtifactDetail({
+          name: artifactName,
+          path: String(res && res.path || "").trim(),
+          artifact: res && typeof res.artifact === "object" ? res.artifact : null,
+          raw: String(res && res.raw || "").trim(),
+          parse_ok: !!(res && res.parse_ok),
+          parse_error: res && res.parse_error ? String(res.parse_error) : "",
+        });
+      } catch (err) {
+        setMetaArtifactDetail(null);
+        showToast(`${tr(lang, "metaViewerReadFailed")}: ${prettyErr(err)}`, "error");
+      } finally {
+        setMetaArtifactDetailLoading(false);
+      }
+    };
+
+    const refreshMetaArtifacts = async (preserveSelection) => {
+      if (!activeThread) {
+        setMetaArtifacts([]);
+        setMetaArtifactRoot("");
+        setMetaArtifactSelectedName("");
+        setMetaArtifactDetail(null);
+        return;
+      }
+      const root = currentMetaArtifactRoot();
+      setMetaArtifactsLoading(true);
+      setMetaArtifactsError("");
+      try {
+        const res = await listMetaDiagnoseArtifacts(root, 160);
+        const items = Array.isArray(res && res.items) ? res.items : [];
+        setMetaArtifactRoot(root);
+        setMetaArtifacts(items);
+        const keepName =
+          preserveSelection && items.some((item) => String(item && item.name || "") === metaArtifactSelectedName)
+            ? metaArtifactSelectedName
+            : String(items[0] && items[0].name || "");
+        if (!keepName) {
+          setMetaArtifactSelectedName("");
+          setMetaArtifactDetail(null);
+        } else {
+          await loadMetaArtifactDetail(root, keepName);
+        }
+      } catch (err) {
+        setMetaArtifacts([]);
+        setMetaArtifactDetail(null);
+        setMetaArtifactsError(prettyErr(err));
+        showToast(`${tr(lang, "metaViewerLoadFailed")}: ${prettyErr(err)}`, "error");
+      } finally {
+        setMetaArtifactsLoading(false);
+      }
+    };
+
+    const runMetaDiagnoseForPacket = async (packet) => {
+      if (!activeThread || !packet || typeof packet !== "object") return;
+      if (sendingObserver || metaBusy) return;
+      const threadId = activeThread.id;
+      const obsProvider = String(config.observerProvider || "").trim() || config.provider;
+      const obsBaseUrl = String(config.observerBaseUrl || "").trim() || config.baseUrl;
+      const obsModel = String(config.observerModel || "").trim() || (config.chatModel || config.model);
+      const obsKey = String(observerApiKey || "").trim() || String(chatApiKey || "").trim() || String(codeApiKey || "").trim();
+      const prompt = buildMetaDiagnosePrompt(packet);
+      const startedAt = new Date().toISOString();
+      const targetLabel = `[META-DIAGNOSE] target=${packet.target_message_id} kind=${packet.failure_kind}`;
+      const userMsg = {
+        id: uid(),
+        pane: "observer",
+        role: "user",
+        content: targetLabel,
+        ts: Date.now(),
+        metaKind: META_DIAGNOSE_KIND,
+        metaTargetId: packet.target_message_id,
+      };
+      const asstId = uid();
+      const asstMsg = {
+        id: asstId,
+        pane: "observer",
+        role: "assistant",
+        content: "",
+        ts: Date.now(),
+        streaming: true,
+        metaKind: META_DIAGNOSE_KIND,
+        metaTargetId: packet.target_message_id,
+      };
+      setThreadState((s) => ({
+        ...s,
+        threads: s.threads.map((t) => (
+          t.id === threadId
+            ? { ...t, updatedAt: Date.now(), messages: [...(t.messages || []), userMsg, asstMsg] }
+            : t
+        )),
+      }));
+      setObserverSubTab("analysis");
+      setMetaBusy(true);
+      setSendingObserver(true);
+      showToast(tr(lang, "metaDiagnoseRunning"), "info");
+      requestAnimationFrame(() => scrollBottom(observerBodyRef));
+      const ac = new AbortController();
+      abortObserverRef.current = ac;
+      const obsCfg = {
+        ...config,
+        mode: config.observerMode,
+        persona: config.observerPersona,
+        cot: "off",
+        autonomy: "off",
+        provider: obsProvider,
+        baseUrl: obsBaseUrl,
+        model: obsModel,
+        chatModel: obsModel,
+        codeModel: obsModel,
+      };
+      const reqBody = buildReq(obsCfg, obsKey, [], prompt, null);
+      reqBody.lang = String(lang || "ja").trim().toLowerCase();
+      reqBody.force_tools = false;
+      reqBody.temperature = 0.2;
+      reqBody.max_tokens = 1800;
+      let rawResponse = "";
+      let diagnosis = null;
+      let parseError = null;
+      try {
+        let j = await postJson("/api/chat", reqBody, ac.signal);
+        rawResponse = String((j && j.content) || "").trim();
+        let parsedResult = parseMetaDiagnosisResult(rawResponse);
+        diagnosis = parsedResult.diagnosis;
+        parseError = parsedResult.parseError;
+        if (!diagnosis && !ac.signal.aborted) {
+          showToast(tr(lang, "metaDiagnoseJsonRetry"), "info");
+          const retryBody = buildReq(
+            obsCfg,
+            obsKey,
+            [
+              { role: "user", content: prompt },
+              { role: "assistant", content: rawResponse },
+            ],
+            "Return ONLY valid JSON matching the requested schema. No markdown. No backticks. No commentary.",
+            null
+          );
+          retryBody.lang = reqBody.lang;
+          retryBody.force_tools = false;
+          retryBody.temperature = 0.1;
+          retryBody.max_tokens = 1800;
+          j = await postJson("/api/chat", retryBody, ac.signal);
+          rawResponse = String((j && j.content) || "").trim();
+          parsedResult = parseMetaDiagnosisResult(rawResponse);
+          diagnosis = parsedResult.diagnosis;
+          parseError = parsedResult.parseError;
+        }
+        const finalText = diagnosis ? JSON.stringify(diagnosis, null, 2) : rawResponse || "{}";
+        setMsg(threadId, asstId, finalText, observerBodyRef);
+      } catch (err) {
+        const msg = prettyErr(err);
+        if (ac.signal.aborted) {
+          rawResponse = `[${tr(lang, "stop")}]`;
+          parseError = "aborted";
+          setMsg(threadId, asstId, rawResponse, observerBodyRef);
+        } else {
+          rawResponse = `[${tr(lang, "error")}] ${msg}`;
+          parseError = `request_failed: ${msg}`;
+          setMsg(threadId, asstId, rawResponse, observerBodyRef);
+        }
+      } finally {
+        const artifact = {
+          ts: startedAt,
+          thread_id: packet.thread_id,
+          target_message_id: packet.target_message_id,
+          packet,
+          observer_prompt: prompt,
+          raw_response: rawResponse,
+          diagnosis: diagnosis || null,
+          parse_ok: !!diagnosis,
+          parse_error: diagnosis ? null : (parseError || "invalid_json_or_schema"),
+          provider: String(obsProvider || "").trim(),
+          model: String(obsModel || "").trim(),
+          config_digest: metaConfigDigest(packet, obsProvider, obsModel),
+        };
+        try {
+          const saveRoot = packet.tool_root || resolvedThreadRoot(config.toolRoot, threadId) || "";
+          const saved = await saveMetaDiagnoseArtifact(saveRoot, artifact);
+          if (saved && saved.path) {
+            showToast(`${tr(lang, "metaDiagnoseSaved")}: ${String(saved.path)}`, "success");
+            if (observerSubTab === "meta") await refreshMetaArtifacts(true);
+          }
+        } catch (saveErr) {
+          showToast(`${tr(lang, "metaDiagnoseSaveFailed")}: ${prettyErr(saveErr)}`, "error");
+        }
+        setMetaBusy(false);
+        setSendingObserver(false);
+        if (abortObserverRef.current === ac) abortObserverRef.current = null;
+      }
+    };
+
+    const runMetaDiagnose = async (selector) => {
+      if (!activeThread) return;
+      let targetSpec = String(selector || "").trim();
+      if (!targetSpec || normalizeScratchEntry(targetSpec) === "last-fail") targetSpec = "last-fail";
+      const packet = await buildMetaFailurePacket(targetSpec);
+      if (!packet) {
+        showToast(tr(lang, /^msg:/i.test(targetSpec) ? "metaDiagnoseBadTarget" : "metaDiagnoseMissingTarget"), "error");
+        return;
+      }
+      await runMetaDiagnoseForPacket(packet);
+    };
+
+    const rerunMetaDiagnoseFromArtifact = async (detail) => {
+      const artifact = detail && detail.artifact && typeof detail.artifact === "object" ? detail.artifact : null;
+      if (!artifact) return;
+      const targetId = String(artifact.target_message_id || "").trim();
+      const artifactThreadId = String(artifact.thread_id || "").trim();
+      const liveSelector = targetId ? `msg:${targetId}` : "";
+      const liveTarget = liveSelector
+        && activeThread
+        && (!artifactThreadId || artifactThreadId === String(activeThread.id || "").trim())
+        ? findMetaTargetMessage(liveSelector)
+        : null;
+      if (liveTarget) {
+        await runMetaDiagnose(liveSelector);
+        return;
+      }
+      const packet = artifact.packet && typeof artifact.packet === "object"
+        ? JSON.parse(JSON.stringify(artifact.packet))
+        : null;
+      if (!packet) {
+        showToast(tr(lang, "metaDiagnoseBadTarget"), "error");
+        return;
+      }
+      showToast(tr(lang, "metaViewerRerunSavedPacket"), "info");
+      await runMetaDiagnoseForPacket(packet);
     };
 
     const finishStreaming = (threadId, msgId) => {
@@ -3616,7 +4616,7 @@
 
         const cwdNow = resolvedCwd(config.toolRoot, threadId, activeThread.workdir);
         const coderMsgs = paneMessages("coder");
-        const obsMsgs = paneMessages("observer");
+        const obsMsgs = observerConversationMessages();
         const lastCoderUser = pickLast(coderMsgs, "user");
         const lastCoderAsst = pickLast(coderMsgs, "assistant");
         const lastObsAsst = pickLast(obsMsgs, "assistant");
@@ -6037,6 +7037,12 @@
             setCoderInput("");
             return;
           }
+          if (cmd === "/meta-diagnose") {
+            setCoderInput("");
+            setObserverSubTab("analysis");
+            await runMetaDiagnose(arg || "last-fail");
+            return;
+          }
         }
 
         const coderCfg = String(config.mode || "").trim() === "Observer" ? { ...config, mode: "VIBE" } : config;
@@ -6216,7 +7222,7 @@
       if (!text) return;
 
       const threadId = activeThread.id;
-      const history = paneMessages("observer").map((m) => ({ role: m.role, content: m.content }));
+      const history = observerConversationMessages().map((m) => ({ role: m.role, content: m.content }));
       const prevObserverAssts = (() => {
         const out = [];
         for (let i = history.length - 1; i >= 0 && out.length < 4; i--) {
@@ -6444,7 +7450,7 @@
             if (k) approved.add(k);
           }
 
-          const obsMsgs = paneMessages("observer");
+          const obsMsgs = observerConversationMessages();
           const map = new Map(); // normTitle -> proposal
           let scanned = 0;
           for (let i = (obsMsgs || []).length - 1; i >= 0 && scanned < 12; i--) {
@@ -6953,6 +7959,11 @@
 
       const coderMsgs = paneMessages("coder");
       const observerMsgs = paneMessages("observer");
+      const observerAnalysisMsgs = observerMsgs.filter((m) => !isMetaDiagnoseMessage(m));
+      const lastObserverMetaMsg = (() => {
+        const last = observerMsgs.length ? observerMsgs[observerMsgs.length - 1] : null;
+        return last && isMetaDiagnoseMessage(last) ? last : null;
+      })();
       const filterMsgs = (msgs, q) => {
         const needle = String(q || "").trim().toLowerCase();
         if (!needle) return msgs;
@@ -7004,9 +8015,9 @@
         return out;
       })();
       let lastObserverAsst = null;
-      for (let i = observerMsgs.length - 1; i >= 0; i--) {
-        if (observerMsgs[i].role === "assistant") {
-          lastObserverAsst = observerMsgs[i];
+      for (let i = observerAnalysisMsgs.length - 1; i >= 0; i--) {
+        if (observerAnalysisMsgs[i].role === "assistant") {
+          lastObserverAsst = observerAnalysisMsgs[i];
         break;
       }
     }
@@ -7016,8 +8027,8 @@
 
     // Detect current development phase from the latest Observer message that contains one.
     const observerPhase = (() => {
-      for (let i = observerMsgs.length - 1; i >= 0; i--) {
-        const m = observerMsgs[i];
+      for (let i = observerAnalysisMsgs.length - 1; i >= 0; i--) {
+        const m = observerAnalysisMsgs[i];
         if (m.role === "assistant" && !m.streaming) {
           const p = parsePhase(String(m.content || ""));
           if (p) return p;
@@ -8359,6 +9370,18 @@
                       tr(lang, "loopDetected") + " ×" + String(loopInfo.depth)
                     )
                   : null,
+                lastObserverMetaMsg
+                  ? e(
+                      "span",
+                      {
+                        className: "pill meta-pill",
+                        title: lastObserverMetaMsg.metaTargetId
+                          ? `[META-DIAGNOSE] target=${lastObserverMetaMsg.metaTargetId}`
+                          : "[META-DIAGNOSE]",
+                      },
+                      tr(lang, "metaBadge")
+                    )
+                  : null,
                 observerPhase && e("span", { className: "phase-indicator phase-" + observerPhase }, observerPhase),
                 config.autoObserve && e("span", { className: "pill auto-badge" }, "AUTO"),
                 e("button", {
@@ -8374,6 +9397,10 @@
                 className: "obs-subtab" + (observerSubTab === "analysis" ? " active" : ""),
                 onClick: () => setObserverSubTab("analysis"),
               }, tr(lang, "observer")),
+              e("button", {
+                className: "obs-subtab" + (observerSubTab === "meta" ? " active" : ""),
+                onClick: () => setObserverSubTab("meta"),
+              }, tr(lang, "metaViewer")),
               e("button", {
                 className: "obs-subtab" + (observerSubTab === "chat" ? " active" : ""),
                 onClick: () => setObserverSubTab("chat"),
@@ -8504,7 +9531,11 @@
                     }, paneMessages("chat").length + " msgs")
                   )
                 )
-              : e(React.Fragment, { key: "analysis" },
+              : observerSubTab === "meta"
+                ? e(React.Fragment, { key: "meta" },
+                    e("div", { className: "obs-scroll-zone" }, renderMetaViewer())
+                  )
+                : e(React.Fragment, { key: "analysis" },
                   e("div", { className: "obs-scroll-zone" },
                   e(
                     "div",

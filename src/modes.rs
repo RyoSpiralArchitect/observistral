@@ -50,6 +50,10 @@ impl Mode {
     }
 }
 
+pub fn parse_mode(s: &str) -> Option<Mode> {
+    <Mode as ValueEnum>::from_str(s.trim(), true).ok()
+}
+
 pub fn supported_modes() -> Vec<&'static str> {
     vec![
         "実況",

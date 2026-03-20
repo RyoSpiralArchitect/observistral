@@ -32,6 +32,7 @@ __pycache__/
 # Local dev / sandbox artifacts
 .venv/
 .tmp/
+.spiral/
 tests/_tmp/
 
 # Local scratch projects created during demos/tests (keep out of git)

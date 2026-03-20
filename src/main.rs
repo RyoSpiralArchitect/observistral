@@ -15,6 +15,8 @@ mod personas;
 mod project;
 mod providers;
 mod repl;
+mod repo_map;
+mod runtime_eval;
 mod server;
 mod streaming;
 mod task_graph;
@@ -64,6 +66,9 @@ enum Command {
 
     /// Headless coding agent (agentic loop with tools; like TUI Coder but CLI-only)
     Agent(AgentArgs),
+
+    /// Run a fixture-driven runtime evaluation suite against the headless Coder
+    Eval(EvalArgs),
 
     /// Review `git diff` with Observer (or diff批評) and print critique
     Review(ReviewArgs),
@@ -196,6 +201,37 @@ struct ReviewArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+struct EvalArgs {
+    /// Directory to evaluate against (defaults to current directory)
+    #[arg(long, short = 'C', alias = "root")]
+    tool_root: Option<String>,
+
+    /// Runtime eval spec JSON file
+    #[arg(long, default_value = ".obstral/runtime_eval.json")]
+    spec: PathBuf,
+
+    /// Output directory for per-case artifacts and the final report
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
+
+    /// Optional explicit report path (defaults to <out_dir>/report.json)
+    #[arg(long)]
+    report_out: Option<PathBuf>,
+
+    /// Only run cases whose id or tags contain this substring
+    #[arg(long)]
+    filter: Option<String>,
+
+    /// Cap the number of selected cases
+    #[arg(long)]
+    max_cases: Option<usize>,
+
+    /// Continue running remaining cases after a failed case
+    #[arg(long)]
+    continue_on_error: bool,
+}
+
+#[derive(Args, Debug, Clone)]
 struct InitArgs {
     /// Directory to write `.obstral.md` into (defaults to current directory)
     #[arg(long, short = 'C', alias = "root")]
@@ -298,6 +334,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Chat { prompt }) => run_chat(prompt, cli.common).await,
         Some(Command::Agent(args)) => run_agent(args, cli.common).await,
+        Some(Command::Eval(args)) => run_eval(args, cli.common).await,
         Some(Command::Review(args)) => run_review(args, cli.common).await,
         Some(Command::Init(args)) => run_init(args, cli.common).await,
         Some(Command::Repl) => repl::run(cli.common.to_partial_config()).await,
@@ -827,6 +864,29 @@ fn resolve_session_path(session_path: PathBuf, tool_root: Option<&str>) -> PathB
 }
 
 async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
+    run_agent_with_behavior(args, common, AgentRunBehavior::default()).await
+}
+
+#[derive(Clone, Copy)]
+struct AgentRunBehavior {
+    stream_deltas: bool,
+    print_git_diff_summary: bool,
+}
+
+impl Default for AgentRunBehavior {
+    fn default() -> Self {
+        Self {
+            stream_deltas: true,
+            print_git_diff_summary: true,
+        }
+    }
+}
+
+async fn run_agent_with_behavior(
+    args: AgentArgs,
+    common: CommonArgs,
+    behavior: AgentRunBehavior,
+) -> Result<()> {
     let AgentArgs {
         prompt,
         tool_root: tool_root_arg,
@@ -1038,7 +1098,7 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
             .map(|p| p.prompt)
             .unwrap_or("");
         let lang_instruction = crate::modes::language_instruction(Some(&lang), &cfg.mode);
-        let system = crate::tui::agent::coder_system(persona_prompt, lang_instruction);
+        let system = crate::tui::agent::coder_system(persona_prompt, lang_instruction, None);
         vec![json!({"role":"system","content": system})]
     };
     messages_json.extend(at_ref_messages_json);
@@ -1151,6 +1211,7 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
                 agents_md_for_task,
                 test_cmd_for_task,
                 command_approval,
+                None,
                 autosaver_for_task,
                 approver_for_task.as_ref(),
             )
@@ -1165,8 +1226,10 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
                     let Some(token) = token else { break };
                     match token {
                         streaming::StreamToken::Delta(s) => {
-                            stdout.write_all(s.as_bytes()).ok();
-                            stdout.flush().ok();
+                            if behavior.stream_deltas {
+                                stdout.write_all(s.as_bytes()).ok();
+                                stdout.flush().ok();
+                            }
                         }
                         streaming::StreamToken::ToolCall(tc) => {
                             if let Some(ref tw) = trace {
@@ -1183,6 +1246,16 @@ async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
                         streaming::StreamToken::GovernorState(s) => {
                             if let Some(ref tw) = trace {
                                 let _ = tw.event("governor_state", json!(s));
+                            }
+                        }
+                        streaming::StreamToken::RealizeState(s) => {
+                            if let Some(ref tw) = trace {
+                                let _ = tw.event("realize_state", json!(s));
+                            }
+                        }
+                        streaming::StreamToken::Telemetry(ev) => {
+                            if let Some(ref tw) = trace {
+                                let _ = tw.event(&ev.event, ev.data);
                             }
                         }
                         streaming::StreamToken::Checkpoint(hash) => {
@@ -1389,7 +1462,7 @@ For each proposal you address, verify with commands/tests. When finished, call d
     }
 
     // CLI nicety: show a compact git diff summary from the auto-created checkpoint.
-    if result.is_ok() {
+    if behavior.print_git_diff_summary && result.is_ok() {
         let checkpoint_final = checkpoint.as_deref().map(|s| s.to_string());
         if let (Some(ref root), Some(ref hash)) = (tool_root, checkpoint_final.as_deref()) {
             let stat = std::process::Command::new("git")
@@ -1438,6 +1511,212 @@ For each proposal you address, verify with commands/tests. When finished, call d
     }
 
     result
+}
+
+fn resolve_eval_path(path: PathBuf, base_dir: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn resolve_eval_case_root(
+    base_root: &std::path::Path,
+    defaults: &crate::runtime_eval::RuntimeEvalDefaults,
+    case: &crate::runtime_eval::RuntimeEvalCase,
+) -> String {
+    let raw = case
+        .tool_root
+        .as_deref()
+        .or(defaults.tool_root.as_deref())
+        .unwrap_or(".");
+    let root = {
+        let pb = std::path::PathBuf::from(raw);
+        if pb.is_absolute() {
+            pb
+        } else {
+            base_root.join(pb)
+        }
+    };
+    normalize_tool_root(Some(root.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+}
+
+async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
+    let EvalArgs {
+        tool_root,
+        spec,
+        out_dir,
+        report_out,
+        filter,
+        max_cases,
+        continue_on_error,
+    } = args;
+
+    let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let base_root = normalize_tool_root(tool_root).unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+    let base_root_path = std::path::PathBuf::from(&base_root);
+    let spec_path = resolve_eval_path(spec, &cwd);
+    let spec_data = crate::runtime_eval::load_spec(&spec_path)?;
+
+    let out_dir = match out_dir {
+        Some(p) => resolve_eval_path(p, &base_root_path),
+        None => base_root_path.join(format!(
+            ".tmp/runtime_eval_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        )),
+    };
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("failed to create runtime eval out dir: {}", out_dir.display()))?;
+    let report_path = report_out
+        .map(|p| resolve_eval_path(p, &base_root_path))
+        .unwrap_or_else(|| out_dir.join("report.json"));
+
+    let filter_lc = filter.as_deref().map(|s| s.trim().to_ascii_lowercase());
+    let mut selected: Vec<crate::runtime_eval::RuntimeEvalCase> = spec_data
+        .cases
+        .iter()
+        .filter(|case| {
+            if let Some(f) = filter_lc.as_deref() {
+                case.id.to_ascii_lowercase().contains(f)
+                    || case
+                        .tags
+                        .iter()
+                        .any(|tag| tag.to_ascii_lowercase().contains(f))
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+    if let Some(limit) = max_cases.map(|n| n.max(1)) {
+        selected.truncate(limit);
+    }
+    if selected.is_empty() {
+        anyhow::bail!("runtime eval selected 0 cases");
+    }
+
+    eprintln!(
+        "[eval] spec={} cases={} out={}",
+        spec_path.display(),
+        selected.len(),
+        out_dir.display()
+    );
+
+    let mut reports: Vec<crate::runtime_eval::RuntimeEvalCaseReport> = Vec::new();
+    for (idx, case) in selected.iter().enumerate() {
+        let case_dir = out_dir.join(format!(
+            "{:03}-{}",
+            idx + 1,
+            crate::runtime_eval::sanitize_case_id(&case.id)
+        ));
+        std::fs::create_dir_all(&case_dir)
+            .with_context(|| format!("failed to create case artifact dir: {}", case_dir.display()))?;
+        let trace_path = case_dir.join("trace.jsonl");
+        let session_path = case_dir.join("session.json");
+        let json_path = case_dir.join("final.json");
+        let graph_path = case_dir.join("graph.json");
+        let case_root = resolve_eval_case_root(&base_root_path, &spec_data.defaults, case);
+        let case_lang = case
+            .lang
+            .clone()
+            .or_else(|| spec_data.defaults.lang.clone())
+            .unwrap_or_else(|| "ja".to_string());
+        let case_max_iters = case.max_iters.or(spec_data.defaults.max_iters);
+        let case_autofix = case.autofix.or(spec_data.defaults.autofix);
+
+        eprintln!(
+            "[eval] case {}/{}: {}",
+            idx + 1,
+            selected.len(),
+            case.id
+        );
+
+        let started = std::time::Instant::now();
+        let run_result = run_agent_with_behavior(
+            AgentArgs {
+                prompt: Some(case.prompt.clone()),
+                tool_root: Some(case_root.clone()),
+                lang: case_lang,
+                max_iters: case_max_iters,
+                yes: false,
+                no_approval: true,
+                no_command_approval: false,
+                no_edit_approval: false,
+                session: Some(session_path.clone()),
+                new_session: true,
+                autofix: case_autofix,
+                trace_out: Some(trace_path.clone()),
+                json_out: Some(json_path.clone()),
+                graph_out: Some(graph_path.clone()),
+            },
+            common.clone(),
+            AgentRunBehavior {
+                stream_deltas: false,
+                print_git_diff_summary: false,
+            },
+        )
+        .await;
+        let duration_ms = started.elapsed().as_millis();
+        let run_error = run_result.err().map(|e| format!("{e:#}"));
+        let report = crate::runtime_eval::evaluate_case(
+            case,
+            &case_root,
+            crate::runtime_eval::RuntimeEvalArtifacts {
+                case_dir,
+                trace_path,
+                session_path,
+                json_path,
+                graph_path,
+            },
+            duration_ms,
+            run_error.clone(),
+        )?;
+
+        let passed = report.ok;
+        let tools = report.metrics.tool_call_count;
+        let msgs = report.metrics.messages_len;
+        let suffix = if let Some(err) = run_error.as_deref() {
+            format!("error={err}")
+        } else {
+            format!("tools={tools} messages={msgs}")
+        };
+        eprintln!(
+            "[eval] {} {} ({suffix})",
+            if passed { "PASS" } else { "FAIL" },
+            report.id
+        );
+        reports.push(report);
+
+        if !passed && !continue_on_error {
+            eprintln!("[eval] stopping on first failure (use --continue-on-error to keep going)");
+            break;
+        }
+    }
+
+    let report = crate::runtime_eval::build_report(spec_path.clone(), out_dir.clone(), reports);
+    crate::runtime_eval::save_report(&report_path, &report)?;
+
+    eprintln!(
+        "[eval] summary: {}/{} passed, report={}",
+        report.summary.passed,
+        report.summary.total,
+        report_path.display()
+    );
+
+    if report.summary.failed > 0 {
+        anyhow::bail!(
+            "runtime eval failed: {}/{} case(s) failed",
+            report.summary.failed,
+            report.summary.total
+        );
+    }
+
+    Ok(())
 }
 
 async fn run_init(args: InitArgs, _common: CommonArgs) -> Result<()> {

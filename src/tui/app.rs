@@ -2,7 +2,9 @@ use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 
 use crate::config::RunConfig;
-use crate::streaming::GovernorState;
+use crate::streaming::{GovernorState, RealizeState};
+
+use super::agent::RealizePreset;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -156,6 +158,7 @@ pub struct App {
     pub observer_cfg: RunConfig,
     pub chat_cfg: RunConfig,
     pub tool_root: Option<String>,
+    pub prefs_root: Option<String>,
     /// Stack label detected at first Coder send (e.g. "Rust · React · git:main").
     pub project_stack_label: Option<String>,
     /// Git commit hash created at the start of the last Coder session (for /rollback).
@@ -177,6 +180,10 @@ pub struct App {
     pub coder_iter: u32,
     /// Latest governor status snapshot from the agentic loop.
     pub coder_governor: Option<GovernorState>,
+    /// Session-scoped realize-on-demand preset for the Coder.
+    pub coder_realize_preset: RealizePreset,
+    /// Latest realize-on-demand status snapshot for the Coder.
+    pub coder_realize_state: Option<RealizeState>,
 
     /// Running task handles used for Ctrl+K cancellation.
     pub coder_task: Option<JoinHandle<()>>,
@@ -202,6 +209,10 @@ pub struct App {
     /// When set, the next Tick will rewrite the last assistant message into this language.
     pub observer_lang_pending: Option<String>,
 
+    /// True while the current Observer response is a `/meta-diagnose` run.
+    /// Used to suppress auto-fix / loop-rewrite behaviors on diagnostic JSON.
+    pub observer_meta_mode: bool,
+
     /// Background task planning state (Chat -> TaskRouter -> Tasks tab).
     pub planning_tasks: bool,
     pub tasks: Vec<Task>,
@@ -214,6 +225,7 @@ impl App {
         observer_cfg: RunConfig,
         chat_cfg: RunConfig,
         tool_root: Option<String>,
+        prefs_root: Option<String>,
         auto_observe: bool,
         lang: String,
         coder_max_iters: Option<usize>,
@@ -237,6 +249,7 @@ impl App {
             observer_cfg,
             chat_cfg,
             tool_root,
+            prefs_root,
             project_stack_label: None,
             last_git_checkpoint: None,
             project_test_cmd: None,
@@ -247,6 +260,8 @@ impl App {
             tick_count: 0,
             coder_iter: 0,
             coder_governor: None,
+            coder_realize_preset: RealizePreset::tui_default(),
+            coder_realize_state: None,
             coder_task: None,
             observer_task: None,
             chat_task: None,
@@ -257,6 +272,7 @@ impl App {
             observer_loop_pending: None,
             observer_lang_retry_budget: 0,
             observer_lang_pending: None,
+            observer_meta_mode: false,
             planning_tasks: false,
             tasks: Vec::new(),
             tasks_cursor: 0,

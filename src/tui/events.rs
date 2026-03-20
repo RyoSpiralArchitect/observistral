@@ -4,6 +4,11 @@ use crossterm::event::{
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use crate::modes::{language_instruction, mode_prompt};
@@ -14,6 +19,7 @@ use crate::types::{ChatMessage, ChatRequest};
 
 use super::agent;
 use super::app::{App, Focus, Message, RightTab, Role, Task, TaskPhase, TaskTarget};
+use super::prefs;
 
 // ── Clipboard ─────────────────────────────────────────────────────────────────
 
@@ -88,6 +94,22 @@ async fn fake_stream_text(tx: &mpsc::Sender<StreamToken>, text: &str) {
     let _ = tx.send(StreamToken::Done).await;
 }
 
+fn realize_state_summary_line(state: &crate::streaming::RealizeState) -> String {
+    let pending = if state.pending { "yes" } else { "no" };
+    format!(
+        "[realize summary] pending={pending} drift={:.2} latency={:.1} leakage={} missing={}",
+        state.mean_drift, state.mean_realize_latency, state.early_leakage, state.missing
+    )
+}
+
+fn should_report_realize_summary(state: &crate::streaming::RealizeState) -> bool {
+    state.pending
+        || state.mean_drift > 0.0
+        || state.mean_realize_latency > 0.0
+        || state.early_leakage > 0
+        || state.missing > 0
+}
+
 // ── Slash command handler ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +117,18 @@ enum PaneId {
     Coder,
     Observer,
     Chat,
+}
+
+fn save_current_tui_prefs(app: &App) -> anyhow::Result<std::path::PathBuf> {
+    let saved = prefs::snapshot_app_prefs(app);
+    prefs::save_prefs(app.prefs_root.as_deref(), &saved)
+}
+
+fn load_tui_prefs_into_app(app: &mut App) -> anyhow::Result<Option<agent::RealizePreset>> {
+    let saved = prefs::load_prefs(app.prefs_root.as_deref())?;
+    let preset = saved.coder_realize();
+    prefs::apply_prefs_to_app(app, &saved);
+    Ok(preset)
 }
 
 /// Returns true if `text` was a slash command (caller should NOT send to AI).
@@ -196,7 +230,14 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                         PaneId::Observer => app.observer_cfg = new_cfg,
                         PaneId::Chat => app.chat_cfg = new_cfg,
                     }
-                    push!(format!("{:?} provider <- {p}", pane));
+                    match save_current_tui_prefs(app) {
+                        Ok(path) => push!(format!(
+                            "{:?} provider <- {p}  [saved {}]",
+                            pane,
+                            path.display()
+                        )),
+                        Err(e) => push!(format!("{:?} provider <- {p}  [save_warn: {e}]", pane)),
+                    }
                 }
                 Err(e) => push!(format!("error: {e}")),
             }
@@ -275,15 +316,23 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                         PaneId::Observer => app.observer_cfg = new_cfg,
                         PaneId::Chat => app.chat_cfg = new_cfg,
                     }
-                    push!(format!(
-                        "{:?} base_url <- {}",
-                        pane,
-                        if base_url.is_empty() {
-                            "(default)"
-                        } else {
-                            &base_url
-                        }
-                    ));
+                    let label = if base_url.is_empty() {
+                        "(default)".to_string()
+                    } else {
+                        base_url.clone()
+                    };
+                    match save_current_tui_prefs(app) {
+                        Ok(path) => push!(format!(
+                            "{:?} base_url <- {}  [saved {}]",
+                            pane,
+                            label,
+                            path.display()
+                        )),
+                        Err(e) => push!(format!(
+                            "{:?} base_url <- {}  [save_warn: {e}]",
+                            pane, label
+                        )),
+                    }
                 }
                 Err(e) => push!(format!("error: {e}")),
             }
@@ -300,17 +349,50 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                 match pane {
                     PaneId::Coder => {
                         app.coder_cfg.model = arg.to_string();
-                        push!(format!("coder model <- {arg}"));
                     }
                     PaneId::Observer => {
                         app.observer_cfg.model = arg.to_string();
-                        push!(format!("observer model <- {arg}"));
                     }
                     PaneId::Chat => {
                         app.chat_cfg.model = arg.to_string();
-                        push!(format!("chat model <- {arg}"));
                     }
                 }
+                let label = match pane {
+                    PaneId::Coder => "coder",
+                    PaneId::Observer => "observer",
+                    PaneId::Chat => "chat",
+                };
+                match save_current_tui_prefs(app) {
+                    Ok(path) => push!(format!(
+                        "{label} model <- {arg}  [saved {}]",
+                        path.display()
+                    )),
+                    Err(e) => push!(format!("{label} model <- {arg}  [save_warn: {e}]")),
+                }
+            }
+        }
+        "/mode" => {
+            if arg.is_empty() {
+                let m = match pane {
+                    PaneId::Coder => app.coder_cfg.mode.label(),
+                    PaneId::Observer => app.observer_cfg.mode.label(),
+                    PaneId::Chat => app.chat_cfg.mode.label(),
+                };
+                push!(format!("mode: {m}"));
+            } else if let Some(mode) = crate::modes::parse_mode(arg) {
+                let label = mode.label().to_string();
+                match pane {
+                    PaneId::Coder => app.coder_cfg.mode = mode,
+                    PaneId::Observer => app.observer_cfg.mode = mode,
+                    PaneId::Chat => app.chat_cfg.mode = mode,
+                }
+                match save_current_tui_prefs(app) {
+                    Ok(path) => push!(format!("mode <- {label}  [saved {}]", path.display())),
+                    Err(e) => push!(format!("mode <- {label}  [save_warn: {e}]")),
+                }
+            } else {
+                let values = crate::modes::supported_modes().join("|");
+                push!(format!("usage: /mode <{values}>"));
             }
         }
         "/persona" => {
@@ -330,7 +412,12 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                             PaneId::Observer => app.observer_cfg.persona = key.clone(),
                             PaneId::Chat => app.chat_cfg.persona = key.clone(),
                         }
-                        push!(format!("persona <- {key}"));
+                        match save_current_tui_prefs(app) {
+                            Ok(path) => {
+                                push!(format!("persona <- {key}  [saved {}]", path.display()))
+                            }
+                            Err(e) => push!(format!("persona <- {key}  [save_warn: {e}]")),
+                        }
                     }
                     Err(e) => push!(format!("error: {e}")),
                 }
@@ -351,7 +438,10 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                     PaneId::Observer => app.observer_cfg.temperature = t,
                     PaneId::Chat => app.chat_cfg.temperature = t,
                 }
-                push!(format!("temperature <- {t:.2}"));
+                match save_current_tui_prefs(app) {
+                    Ok(path) => push!(format!("temperature <- {t:.2}  [saved {}]", path.display())),
+                    Err(e) => push!(format!("temperature <- {t:.2}  [save_warn: {e}]")),
+                }
             } else {
                 push!("usage: /temp 0.0-2.0".to_string());
             }
@@ -363,9 +453,46 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                 let v = arg.trim().to_ascii_lowercase();
                 if v == "ja" || v == "en" || v == "fr" {
                     app.lang = v.clone();
-                    push!(format!("lang <- {v}"));
+                    match save_current_tui_prefs(app) {
+                        Ok(path) => push!(format!("lang <- {v}  [saved {}]", path.display())),
+                        Err(e) => push!(format!("lang <- {v}  [save_warn: {e}]")),
+                    }
                 } else {
                     push!("usage: /lang ja|en|fr".to_string());
+                }
+            }
+        }
+        "/realize" => {
+            if arg.is_empty() {
+                let mut msg = format!(
+                    "coder realize: {}  prefs: {}  (usage: /realize <off|low|mid|high>)",
+                    app.coder_realize_preset.summary(),
+                    prefs::root_label(app.prefs_root.as_deref())
+                );
+                if let Some(ref state) = app.coder_realize_state {
+                    msg.push_str(&format!("\n{}", realize_state_summary_line(state)));
+                }
+                push!(msg);
+            } else {
+                match arg.parse::<agent::RealizePreset>() {
+                    Ok(preset) => {
+                        app.coder_realize_preset = preset;
+                        if matches!(preset, agent::RealizePreset::Off) {
+                            app.coder_realize_state = None;
+                        }
+                        match save_current_tui_prefs(app) {
+                            Ok(path) => push!(format!(
+                                "coder realize <- {}  [saved {}]",
+                                app.coder_realize_preset.summary(),
+                                path.display()
+                            )),
+                            Err(e) => push!(format!(
+                                "coder realize <- {}  [save_warn: {e}]",
+                                app.coder_realize_preset.summary()
+                            )),
+                        }
+                    }
+                    Err(_) => push!("usage: /realize <off|low|mid|high>".to_string()),
                 }
             }
         }
@@ -375,7 +502,19 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                 push!(format!("tool_root: {r}"));
             } else {
                 app.tool_root = Some(arg.to_string());
-                push!(format!("tool_root <- {arg}"));
+                app.prefs_root = Some(arg.to_string());
+                let _ = std::fs::create_dir_all(arg);
+                match load_tui_prefs_into_app(app) {
+                    Ok(Some(preset)) => push!(format!(
+                        "tool_root <- {arg}  [prefs loaded: realize={}]",
+                        preset.label()
+                    )),
+                    Ok(None) => push!(format!(
+                        "tool_root <- {arg}  [prefs root: {}]",
+                        prefs::root_label(app.prefs_root.as_deref())
+                    )),
+                    Err(e) => push!(format!("tool_root <- {arg}  [prefs_warn: {e}]")),
+                }
             }
         }
         "/find" => {
@@ -393,7 +532,7 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
         }
         "/autofix" => {
             app.auto_fix_mode = !app.auto_fix_mode;
-            push!(format!(
+            let status = format!(
                 "auto-fix mode: {} — Observer reviews will {} be forwarded to Coder",
                 if app.auto_fix_mode { "ON" } else { "OFF" },
                 if app.auto_fix_mode {
@@ -401,7 +540,11 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                 } else {
                     "NOT"
                 }
-            ));
+            );
+            match save_current_tui_prefs(app) {
+                Ok(path) => push!(format!("{status}  [saved {}]", path.display())),
+                Err(e) => push!(format!("{status}  [save_warn: {e}]")),
+            }
         }
         "/diff" => {
             let root = app
@@ -545,20 +688,26 @@ test_cmd: {test_cmd}
             }
         }
         "/help" | "/?" => {
-            push!("/model <name>       set model\n\
+            push!(
+                "pane-scoped & persisted: /provider /base_url /mode /model /persona /temp\n\
+/model <name>       set model\n\
 /provider <name>    set provider (or show)\n\
 /base_url <url>     set base_url (or show; use `default` to reset)\n\
 /persona <name>     set persona\n\
+/mode <name>        set mode\n\
 /temp <0.0-2.0>     set temperature\n\
 /lang <ja|en|fr>    set language\n\
+/realize <mode>     set coder latent-plan mode (off|low|mid|high)\n\
 /root <path>        set tool_root\n\
 /find <text>        filter history\n\
+/meta-diagnose [...] send coder failure to Observer\n\
 /autofix            toggle Observer→Coder auto-fix pipeline\n\
 /diff               show session diff from git checkpoint\n\
 /init               generate .obstral.md template\n\
 /rollback           restore git checkpoint from session start\n\
 Ctrl+R              cycle right tab\n"
-                .to_string());
+                    .to_string()
+            );
         }
         _ => push!(format!("unknown command: {cmd} (try /help)")),
     }
@@ -759,7 +908,10 @@ async fn handle_key(
         KeyCode::Tab => app.toggle_focus(),
 
         // Cycle right-side tab (Observer/Chat/Tasks)
-        KeyCode::Char('r') if ctrl => app.cycle_right_tab(),
+        KeyCode::Char('r') if ctrl => {
+            app.cycle_right_tab();
+            let _ = save_current_tui_prefs(app);
+        }
 
         // Yank (copy) last assistant message to clipboard
         KeyCode::Char('y') if ctrl => {
@@ -794,6 +946,7 @@ async fn handle_key(
         // Toggle auto-observe
         KeyCode::Char('a') if ctrl => {
             app.auto_observe = !app.auto_observe;
+            let _ = save_current_tui_prefs(app);
         }
 
         // Trigger Observer manually
@@ -832,6 +985,7 @@ async fn handle_key(
                 if let Some(handle) = app.observer_task.take() {
                     handle.abort();
                 }
+                app.observer_meta_mode = false;
                 app.ignore_observer_tokens = true;
                 app.observer.finish_stream();
                 app.observer.push_tool("(ストリーミング停止)".to_string());
@@ -945,8 +1099,17 @@ fn handle_coder_token(token: StreamToken, app: &mut App) {
         StreamToken::GovernorState(s) => {
             app.coder_governor = Some(s);
         }
+        StreamToken::RealizeState(s) => {
+            app.coder_realize_state = Some(s);
+        }
+        StreamToken::Telemetry(_) => {}
         StreamToken::Done => {
             app.coder.finish_stream();
+            if let Some(ref state) = app.coder_realize_state {
+                if should_report_realize_summary(state) {
+                    app.coder.push_tool(realize_state_summary_line(state));
+                }
+            }
         }
         StreamToken::Error(e) => {
             app.coder.push_tool(format!("ERROR: {e}"));
@@ -966,9 +1129,17 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
         StreamToken::Delta(s) => {
             app.observer.push_delta(&s);
         }
-        StreamToken::ToolCall(_) | StreamToken::Checkpoint(_) | StreamToken::GovernorState(_) => {}
+        StreamToken::ToolCall(_)
+        | StreamToken::Checkpoint(_)
+        | StreamToken::GovernorState(_)
+        | StreamToken::RealizeState(_)
+        | StreamToken::Telemetry(_) => {}
         StreamToken::Done => {
             app.observer.finish_stream();
+            if app.observer_meta_mode {
+                app.observer_meta_mode = false;
+                return;
+            }
             // A — auto-fix pipeline: queue the review text for Coder on next Tick.
             if app.auto_fix_mode && !app.coder.streaming {
                 if let Some(review) = app
@@ -1049,6 +1220,7 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
             }
         }
         StreamToken::Error(e) => {
+            app.observer_meta_mode = false;
             app.observer.push_tool(format!("ERROR: {e}"));
             app.observer.finish_stream();
         }
@@ -1065,7 +1237,11 @@ fn handle_chat_token(token: StreamToken, app: &mut App) {
         StreamToken::Delta(s) => {
             app.chat.push_delta(&s);
         }
-        StreamToken::ToolCall(_) | StreamToken::Checkpoint(_) | StreamToken::GovernorState(_) => {}
+        StreamToken::ToolCall(_)
+        | StreamToken::Checkpoint(_)
+        | StreamToken::GovernorState(_)
+        | StreamToken::RealizeState(_)
+        | StreamToken::Telemetry(_) => {}
         StreamToken::Done => {
             app.chat.finish_stream();
         }
@@ -1126,6 +1302,11 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
         return;
     }
 
+    if let Some(selector) = parse_meta_diagnose_command(&text) {
+        send_meta_diagnose(app, tx, &selector).await;
+        return;
+    }
+
     // Handle slash commands before sending to AI.
     if handle_slash_command(&text, app, PaneId::Coder) {
         return;
@@ -1140,6 +1321,7 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
     app.coder_iter = 0;
     app.coder.scroll = 0; // pin to bottom for new output
     app.ignore_coder_tokens = false;
+    app.coder_realize_state = None;
 
     // Resolve tool_root early (needed for @ref file reads below).
     let tool_root = app.tool_root.clone().or_else(|| {
@@ -1178,12 +1360,13 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
     let history = app.coder.chat_history();
     let cfg = app.coder_cfg.clone();
     let max_iters = app.coder_max_iters.unwrap_or(agent::DEFAULT_MAX_ITERS);
+    let realize_preset = app.coder_realize_preset;
 
     let persona_prompt = resolve_persona(&cfg.persona)
         .map(|p| p.prompt)
         .unwrap_or("");
     let lang = language_instruction(Some(&app.lang), &cfg.mode);
-    let system = agent::coder_system(persona_prompt, lang);
+    let system = agent::coder_system(persona_prompt, lang, Some(realize_preset));
     let mut messages = vec![ChatMessage {
         role: "system".to_string(),
         content: system,
@@ -1234,6 +1417,7 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
             agents_md,
             test_cmd,
             false,
+            Some(realize_preset),
             &approver,
         )
         .await
@@ -1247,6 +1431,12 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
 async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
     let text = app.coder.textarea.lines().join("\n").trim().to_string();
     if text.is_empty() || app.coder.streaming {
+        return;
+    }
+
+    if let Some(selector) = parse_meta_diagnose_command(&text) {
+        app.coder.textarea = tui_textarea::TextArea::default();
+        send_meta_diagnose(app, tx, &selector).await;
         return;
     }
 
@@ -1330,6 +1520,605 @@ fn build_recent_tool_outputs(messages: &[Message]) -> String {
     format!("\n\n[Recent tool outputs — last {count}]\n{snippet}")
 }
 
+fn parse_meta_diagnose_command(text: &str) -> Option<String> {
+    let raw = text.trim();
+    let cmd = "/meta-diagnose";
+    if raw == cmd {
+        return Some("last-fail".to_string());
+    }
+    raw.strip_prefix(cmd).and_then(|rest| {
+        if rest.starts_with(char::is_whitespace) {
+            let arg = rest.trim();
+            Some(if arg.is_empty() {
+                "last-fail".to_string()
+            } else {
+                arg.to_string()
+            })
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_tui_meta_target_index(selector: &str) -> Result<Option<usize>, String> {
+    let selector = selector.trim();
+    if selector.is_empty() || selector.eq_ignore_ascii_case("last-fail") {
+        return Ok(None);
+    }
+    let Some(raw_id) = selector.strip_prefix("msg:") else {
+        return Err(
+            "meta-diagnose: expected `/meta-diagnose`, `/meta-diagnose last-fail`, or `/meta-diagnose msg:coder-<index>`"
+                .to_string(),
+        );
+    };
+    let raw_id = raw_id.trim();
+    if raw_id.is_empty() {
+        return Err("meta-diagnose: missing message id after `msg:`".to_string());
+    }
+    let numeric = raw_id.strip_prefix("coder-").unwrap_or(raw_id);
+    numeric.parse::<usize>().map(Some).map_err(|_| {
+        format!("meta-diagnose: invalid message id `{raw_id}` (expected `coder-<index>`)")
+    })
+}
+
+fn resolve_tui_meta_target(messages: &[Message], selector: &str) -> Result<usize, String> {
+    if let Some(target_idx) = parse_tui_meta_target_index(selector)? {
+        let Some(target_msg) = messages.get(target_idx) else {
+            return Err(format!(
+                "meta-diagnose: no coder message found for `coder-{target_idx}`"
+            ));
+        };
+        if !matches!(target_msg.role, Role::Assistant) || !target_msg.complete {
+            return Err(format!(
+                "meta-diagnose: `coder-{target_idx}` is not a completed coder assistant message"
+            ));
+        }
+        if !meta_failure_like(&target_msg.content) {
+            return Err(format!(
+                "meta-diagnose: `coder-{target_idx}` is not failure-like"
+            ));
+        }
+        return Ok(target_idx);
+    }
+
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| {
+            matches!(m.role, Role::Assistant) && m.complete && meta_failure_like(&m.content)
+        })
+        .map(|(idx, _)| idx)
+        .ok_or_else(|| "meta-diagnose: no failed coder message found".to_string())
+}
+
+fn meta_digest_text(text: &str, max_chars: usize, max_lines: usize) -> String {
+    let mut out = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .map(|line| line.trim_end().to_string())
+        .filter(|line| !line.trim().is_empty())
+        .take(max_lines.max(1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if out.len() > max_chars.max(32) {
+        out.truncate(max_chars.max(32) - 3);
+        out.push_str("...");
+    }
+    out
+}
+
+fn meta_first_line(text: &str, max_chars: usize) -> String {
+    meta_digest_text(text, max_chars, 2)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn meta_failure_like(text: &str) -> bool {
+    let s = text.to_ascii_lowercase();
+    s.contains("failed")
+        || s.contains("[error]")
+        || s.contains("[stop]")
+        || s.contains("stderr:")
+        || s.contains("error:")
+        || s.contains("fatal:")
+        || s.contains("traceback")
+        || s.contains("exception")
+        || s.contains("rejected by user")
+        || s.contains("sandbox breach")
+        || s.contains("missing valid <plan>")
+        || s.contains("missing <think>")
+        || s.contains("[goal_check]")
+}
+
+fn meta_failure_kind(text: &str) -> &'static str {
+    let s = text.to_ascii_lowercase();
+    if s.contains("[stop]") || s.contains("no tool call") || s.contains("[goal_check]") {
+        "no_tool"
+    } else if s.contains("write_file failed")
+        || s.contains("patch_file failed")
+        || s.contains("apply_diff failed")
+        || s.contains("rejected by user")
+        || s.contains("unsafe path")
+    {
+        "bad_edit"
+    } else if s.contains("false success") {
+        "false_success"
+    } else if meta_failure_like(text) {
+        "tool_error"
+    } else {
+        "unclear"
+    }
+}
+
+fn now_iso_utc() -> String {
+    fn civil_from_days(days: i64) -> (i32, u32, u32) {
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = mp + if mp < 10 { 3 } else { -9 };
+        let year = y + if m <= 2 { 1 } else { 0 };
+        (year as i32, m as u32, d as u32)
+    }
+
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let hour = sod / 3_600;
+    let minute = (sod % 3_600) / 60;
+    let second = sod % 60;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn compact_meta_stamp(ts: &str) -> String {
+    let digits: String = ts.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() >= 14 {
+        format!("{}T{}Z", &digits[..8], &digits[8..14])
+    } else {
+        format!(
+            "unix{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        )
+    }
+}
+
+fn meta_slug(value: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in value.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            prev_dash = false;
+            Some(ch.to_ascii_lowercase())
+        } else if ch == '-' || ch == '_' {
+            prev_dash = false;
+            Some(ch)
+        } else if prev_dash {
+            None
+        } else {
+            prev_dash = true;
+            Some('-')
+        };
+        if let Some(ch) = mapped {
+            out.push(ch);
+        }
+    }
+    let trimmed = out.trim_matches('-').trim_matches('_');
+    let base = if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed
+    };
+    base.chars().take(64).collect()
+}
+
+fn save_tui_meta_diagnose_artifact(
+    tool_root: Option<&str>,
+    artifact: &serde_json::Value,
+) -> anyhow::Result<PathBuf> {
+    let base = tool_root
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = base.join(".obstral").join("meta-diagnose");
+    let ts = artifact
+        .get("ts")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let thread_id = artifact
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("tui-session");
+    let target_id = artifact
+        .get("target_message_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("msg");
+    let stem = format!(
+        "{}__thread-{}__msg-{}",
+        compact_meta_stamp(ts),
+        meta_slug(thread_id, "thread"),
+        meta_slug(target_id, "msg")
+    );
+    let mut path = dir.join(format!("{stem}.json"));
+    if path.exists() {
+        for idx in 1..1000u32 {
+            let candidate = dir.join(format!("{stem}__{idx:02}.json"));
+            if !candidate.exists() {
+                path = candidate;
+                break;
+            }
+        }
+    }
+    crate::trace_writer::safe_mkdir(&path)?;
+    let json = serde_json::to_string_pretty(artifact)?;
+    std::fs::write(&path, json.as_bytes())?;
+
+    let index_path = dir.join("index.jsonl");
+    crate::trace_writer::safe_mkdir(&index_path)?;
+    let index_line = json!({
+        "ts": artifact.get("ts").cloned().unwrap_or(serde_json::Value::Null),
+        "thread_id": artifact.get("thread_id").cloned().unwrap_or(serde_json::Value::Null),
+        "target_message_id": artifact.get("target_message_id").cloned().unwrap_or(serde_json::Value::Null),
+        "path": path.to_string_lossy(),
+        "parse_ok": artifact.get("parse_ok").cloned().unwrap_or(serde_json::Value::Null),
+        "parse_error": artifact.get("parse_error").cloned().unwrap_or(serde_json::Value::Null),
+        "provider": artifact.get("provider").cloned().unwrap_or(serde_json::Value::Null),
+        "model": artifact.get("model").cloned().unwrap_or(serde_json::Value::Null),
+        "primary_failure": artifact
+            .get("diagnosis")
+            .and_then(|v| v.get("primary_failure"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    });
+    let mut index = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&index_path)?;
+    index.write_all(format!("{index_line}\n").as_bytes())?;
+    Ok(path)
+}
+
+fn build_tui_meta_failure_packet_for_selector(
+    app: &App,
+    selector: &str,
+) -> Result<serde_json::Value, String> {
+    let target_idx = resolve_tui_meta_target(&app.coder.messages, selector)?;
+    let Some(target_msg) = app.coder.messages.get(target_idx) else {
+        return Err(format!(
+            "meta-diagnose: no coder message found for `coder-{target_idx}`"
+        ));
+    };
+    let start = target_idx.saturating_sub(8);
+    let base = &app.coder.messages[start..=target_idx];
+    let recent_users: Vec<String> = base
+        .iter()
+        .filter(|m| matches!(m.role, Role::User) && m.complete)
+        .rev()
+        .take(3)
+        .map(|m| meta_digest_text(&m.content, 220, 4))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let recent_assistant: Vec<String> = base
+        .iter()
+        .enumerate()
+        .filter(|(i, m)| {
+            *i + start != target_idx && matches!(m.role, Role::Assistant) && m.complete
+        })
+        .rev()
+        .take(3)
+        .map(|(_, m)| meta_digest_text(&m.content, 220, 4))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let actual_outcome = meta_digest_text(&target_msg.content, 320, 8);
+    let system_digest = meta_digest_text(
+        &format!(
+            "coder_mode={:?}\nobserver_mode={:?}\ncoder_provider={}\nobserver_provider={}",
+            app.coder_cfg.mode,
+            app.observer_cfg.mode,
+            app.coder_cfg.provider,
+            app.observer_cfg.provider
+        ),
+        320,
+        8,
+    );
+    Ok(json!({
+        "thread_id": app.tool_root.clone().unwrap_or_else(|| "tui-session".to_string()),
+        "target_message_id": format!("coder-{}", target_idx),
+        "task_summary": recent_users.last().cloned().unwrap_or_default(),
+        "expected_outcome": recent_users.last().cloned().unwrap_or_else(|| "Complete the requested task without failure.".to_string()),
+        "actual_outcome": actual_outcome,
+        "failure_kind": meta_failure_kind(&target_msg.content),
+        "coder_mode": format!("{:?}", app.coder_cfg.mode),
+        "coder_provider": app.coder_cfg.provider.to_string(),
+        "coder_model": app.coder_cfg.model.clone(),
+        "observer_model": app.observer_cfg.model.clone(),
+        "tool_root": app.tool_root.clone(),
+        "cur_cwd": app.tool_root.clone(),
+        "checkpoint": app.last_git_checkpoint.clone(),
+        "system_prompt_digest": system_digest,
+        "project_context_digest": app.project_stack_label.clone(),
+        "agents_md_digest": serde_json::Value::Null,
+        "available_tools": Vec::<String>::new(),
+        "recent_user_messages": recent_users,
+        "recent_assistant_messages": recent_assistant,
+        "recent_tool_calls": Vec::<serde_json::Value>::new(),
+        "recent_tool_results": Vec::<serde_json::Value>::new(),
+        "last_error_digest": meta_first_line(&target_msg.content, 240),
+        "loop_signals": {
+            "same_command_repeats": 0,
+            "same_error_repeats": 0,
+            "same_output_repeats": 0,
+            "ui_loop_depth": 0,
+        },
+        "approval_signals": Vec::<String>::new(),
+        "packet_notes": vec![
+            "tui meta-diagnose packet built from visible coder history".to_string(),
+            "tui path does not preserve structured tool-call snapshots".to_string(),
+        ],
+    }))
+}
+
+fn build_tui_meta_diagnose_prompt(packet: &serde_json::Value, lang: &str) -> String {
+    let lang_name = match lang {
+        "fr" => "French",
+        "en" => "English",
+        _ => "Japanese",
+    };
+    let schema = json!({
+        "summary": format!("{lang_name} summary"),
+        "primary_failure": "contract_ambiguity",
+        "causes": [{
+            "label": "contract_ambiguity",
+            "why": format!("{lang_name} explanation"),
+            "evidence": ["evidence 1", "evidence 2"],
+            "fix_layer": "instruction",
+            "minimal_patch": format!("{lang_name} minimal patch"),
+            "confidence": 0.84
+        }],
+        "recommended_experiments": [{
+            "change": format!("{lang_name} experiment change"),
+            "verify": format!("{lang_name} verification"),
+            "expected_signal": format!("{lang_name} expected signal")
+        }],
+        "do_not_change": ["repo code itself"]
+    });
+    format!(
+        "This is meta analysis, not implementation.\n\
+Tool calls, code changes, and diff application are forbidden.\n\
+Your task is to diagnose the immediate failure by layer, using the failure packet only.\n\
+Write summary/why/evidence/minimal_patch/experiments in {lang_name}.\n\
+Keep fix_layer values in English enum form.\n\
+Return JSON only. No markdown. No backticks. No commentary outside JSON.\n\n\
+Requirements:\n\
+- Identify up to 3 causes.\n\
+- Each cause must include evidence.\n\
+- Each cause must choose exactly one fix_layer.\n\
+- Keep patches minimal and rerunnable.\n\
+- Distinguish repo_code vs agent/harness issues.\n\
+- Do not overclaim; use confidence 0.0..1.0.\n\n\
+fix_layer enum:\n\
+guideline | instruction | skill | harness | tool | index | schema_ci | repo_code | no_change\n\n\
+Output schema:\n\
+{}\n\n\
+failure packet:\n\
+<packet>\n\
+{}\n\
+</packet>",
+        serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".to_string()),
+        serde_json::to_string_pretty(packet).unwrap_or_else(|_| "{}".to_string())
+    )
+}
+
+async fn send_meta_diagnose(app: &mut App, tx: &mpsc::Sender<StreamToken>, selector: &str) {
+    app.right_tab = RightTab::Observer;
+    app.observer.scroll = 0;
+    let selector = selector.trim();
+    let packet = match build_tui_meta_failure_packet_for_selector(app, selector) {
+        Ok(packet) => packet,
+        Err(msg) => {
+            app.observer.push_tool(msg);
+            return;
+        }
+    };
+
+    if let Some(handle) = app.observer_task.take() {
+        handle.abort();
+    }
+
+    let started_at = now_iso_utc();
+    let prompt = build_tui_meta_diagnose_prompt(&packet, &app.lang);
+    let cfg = app.observer_cfg.clone();
+    let tool_root = app.tool_root.clone();
+    let lang = app.lang.clone();
+    let target_id = packet
+        .get("target_message_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("msg")
+        .to_string();
+    let failure_kind = packet
+        .get("failure_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unclear")
+        .to_string();
+
+    app.ignore_observer_tokens = false;
+    app.observer_meta_mode = true;
+    app.observer.push_user(format!(
+        "[META-DIAGNOSE] target={target_id} kind={failure_kind}"
+    ));
+    app.observer.streaming = true;
+    app.observer
+        .messages
+        .push(Message::new_streaming(Role::Assistant));
+
+    let tx = tx.clone();
+    let handle = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let provider = providers::build_provider(client, &cfg);
+        let system = format!(
+            "{}\n\n[Language]\n{}",
+            mode_prompt(&cfg.mode),
+            language_instruction(Some(&lang), &cfg.mode)
+        );
+        let req = ChatRequest {
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: system,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: prompt.clone(),
+                },
+            ],
+            temperature: Some(0.2),
+            max_tokens: Some(cfg.max_tokens.min(1_800)),
+            metadata: None,
+        };
+
+        let (raw_response, diagnosis, parse_ok, parse_error) = match provider.chat(&req).await {
+            Ok(resp) => {
+                let raw = resp.content.trim().to_string();
+                match serde_json::from_str::<serde_json::Value>(&raw) {
+                    Ok(v) if v.is_object() => (raw, v, true, serde_json::Value::Null),
+                    Ok(_) => (
+                        raw.clone(),
+                        serde_json::Value::Null,
+                        false,
+                        serde_json::Value::String("json_root_not_object".to_string()),
+                    ),
+                    Err(e) => (
+                        raw.clone(),
+                        serde_json::Value::Null,
+                        false,
+                        serde_json::Value::String(format!("invalid_json: {e}")),
+                    ),
+                }
+            }
+            Err(e) => {
+                let msg = format!("[error] {e}");
+                (
+                    msg.clone(),
+                    serde_json::Value::Null,
+                    false,
+                    serde_json::Value::String(format!("request_failed: {e}")),
+                )
+            }
+        };
+
+        let config_digest = {
+            let seed = json!({
+                "thread_id": packet.get("thread_id").cloned().unwrap_or(serde_json::Value::Null),
+                "coder_mode": packet.get("coder_mode").cloned().unwrap_or(serde_json::Value::Null),
+                "observer_mode": format!("{:?}", cfg.mode),
+                "provider": cfg.provider.to_string(),
+                "model": cfg.model,
+                "tool_root": tool_root,
+            })
+            .to_string();
+            let mut hasher = DefaultHasher::new();
+            seed.hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        };
+
+        let artifact = json!({
+            "ts": started_at,
+            "thread_id": packet.get("thread_id").cloned().unwrap_or(serde_json::Value::Null),
+            "target_message_id": packet.get("target_message_id").cloned().unwrap_or(serde_json::Value::Null),
+            "packet": packet,
+            "observer_prompt": prompt,
+            "raw_response": raw_response,
+            "diagnosis": diagnosis,
+            "parse_ok": parse_ok,
+            "parse_error": if parse_ok { serde_json::Value::Null } else { parse_error },
+            "provider": cfg.provider.to_string(),
+            "model": cfg.model.clone(),
+            "config_digest": config_digest,
+        });
+        let saved_note = match save_tui_meta_diagnose_artifact(tool_root.as_deref(), &artifact) {
+            Ok(path) => format!("\n\n[saved] {}", path.display()),
+            Err(e) => format!("\n\n[save_error] {e}"),
+        };
+        let display = if parse_ok {
+            format!(
+                "{}{}",
+                serde_json::to_string_pretty(
+                    artifact
+                        .get("diagnosis")
+                        .unwrap_or(&serde_json::Value::Null)
+                )
+                .unwrap_or_else(|_| raw_response.clone()),
+                saved_note
+            )
+        } else {
+            format!("{raw_response}{saved_note}")
+        };
+        fake_stream_text(&tx, &display).await;
+    });
+    app.observer_task = Some(handle);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: Role, content: &str) -> Message {
+        Message::new_complete(role, content.to_string())
+    }
+
+    #[test]
+    fn parses_meta_diagnose_message_selector() {
+        assert_eq!(
+            parse_meta_diagnose_command("/meta-diagnose msg:coder-7").as_deref(),
+            Some("msg:coder-7")
+        );
+    }
+
+    #[test]
+    fn resolves_last_failed_coder_message() {
+        let messages = vec![
+            msg(Role::User, "first"),
+            msg(Role::Assistant, "ok"),
+            msg(Role::Assistant, "[error] failed once"),
+            msg(Role::Assistant, "FAILED (exit_code: 1)"),
+        ];
+        assert_eq!(resolve_tui_meta_target(&messages, "last-fail").unwrap(), 3);
+    }
+
+    #[test]
+    fn resolves_explicit_meta_message_id() {
+        let messages = vec![
+            msg(Role::User, "first"),
+            msg(Role::Assistant, "ok"),
+            msg(Role::Assistant, "[error] failed once"),
+        ];
+        assert_eq!(
+            resolve_tui_meta_target(&messages, "msg:coder-2").unwrap(),
+            2
+        );
+        assert!(resolve_tui_meta_target(&messages, "msg:coder-1").is_err());
+    }
+}
+
 async fn send_observer_message(
     app: &mut App,
     tx: &mpsc::Sender<StreamToken>,
@@ -1340,6 +2129,11 @@ async fn send_observer_message(
         None => {
             let t = app.observer.textarea.lines().join("\n").trim().to_string();
             if t.is_empty() {
+                return;
+            }
+            if let Some(selector) = parse_meta_diagnose_command(&t) {
+                app.observer.textarea = tui_textarea::TextArea::default();
+                send_meta_diagnose(app, tx, &selector).await;
                 return;
             }
             // Handle slash commands before sending to AI.
@@ -1359,6 +2153,7 @@ async fn send_observer_message(
         handle.abort();
     }
 
+    app.observer_meta_mode = false;
     app.observer.scroll = 0;
     app.ignore_observer_tokens = false;
     // Each new Observer send gets a single anti-loop retry budget.

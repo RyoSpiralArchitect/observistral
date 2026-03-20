@@ -71,6 +71,27 @@ In the Web UI, the stack label appears below the toolRoot field in Settings.
 
 The scan runs once per session, takes under 200 ms, and silently skips anything it can't read.
 
+### Deep Repo Map for Offline Code Navigation
+
+OBSTRAL now also ships a lightweight repo-map helper for codebase navigation and benchmarking:
+
+```bash
+python3 scripts/repo_map.py build --root .
+python3 scripts/repo_map.py query "project context scan" --root .
+python3 scripts/repo_map.py query "observer transcript critique" --root . --explain
+python3 scripts/repo_map.py show --root . --file src/project.rs --symbol ProjectContext
+python3 scripts/repo_map.py eval --root .
+```
+
+This is not wired into the runtime loop yet. It is a foundation layer for:
+- better file/symbol targeting before full agent integration
+- partial file loading instead of whole-file reads
+- repeatable query benchmarks under `.obstral/repo_map.eval.json`
+- repo-local ranking cleanup via `.obstralignore`
+- score breakdowns and confidence/margin signals before runtime integration
+
+The runtime now also detects when a repo-map is ready and can use it as a lazy fallback after a literal `search_files` miss or a `read_file` path miss, instead of paying the cost on every turn.
+
 ---
 
 ## What Makes OBSTRAL Different
@@ -188,6 +209,8 @@ The final `done` call is also acceptance-aware now: it must explicitly report wh
 ### Goal Verification on Stop (No False "Done")
 
 When the model returns `finish_reason=stop` without tool calls, OBSTRAL can automatically run lightweight checks (repo init, tests, build) and push a `[goal_check]` message back into the loop if anything is missing or failing. That stop-path now uses the same shared policy and shared goal-check log format in both TUI and Web GUI.
+
+The Web GUI also has a `/meta-diagnose` MVP now: run `/meta-diagnose`, `/meta-diagnose last-fail`, or `/meta-diagnose msg:<message-id>` in the Coder composer to send the last failure to the Observer as a JSON-only meta diagnosis. Failed Coder messages also expose a `Why did this fail?` button. Each run is saved under `.obstral/meta-diagnose/` with the failure packet, observer prompt, raw response, parsed diagnosis, and parse status. The Observer pane also includes a lightweight `Meta` tab that lists saved artifacts, shows compact `primary_failure` counts, opens their details/raw JSON, and can re-run a diagnosis from the saved target or packet. The TUI also supports `/meta-diagnose`, `/meta-diagnose last-fail`, and `/meta-diagnose msg:coder-<index>` from either the Coder or Observer input, saving the same artifact set locally.
 
 ### @file References: Skip the Read Turn
 
@@ -367,6 +390,10 @@ obstral agent -C . --vibe --session
 # write machine-readable artifacts (trace + snapshot + execution graph)
 obstral agent "fix the failing test" -C . --vibe --trace-out .tmp/obstral_trace.jsonl --json-out .tmp/obstral_final.json --graph-out .tmp/obstral_graph.json
 
+# run the runtime eval harness against fixture cases
+obstral eval -C . --spec .obstral/runtime_eval.json
+obstral eval -C . --spec .obstral/runtime_eval.json --filter repo-map --continue-on-error
+
 # auto-fix loop (Coder → Observer diff review → Coder)
 obstral agent "fix the failing test" -C . --vibe --autofix
 obstral agent "fix the failing test" -C . --vibe --autofix 3
@@ -439,6 +466,35 @@ Related artifacts:
 
 Session JSON may contain code and tool outputs — treat it as sensitive.
 
+### Runtime Eval Harness
+
+`obstral eval` runs a fixture-driven suite against the headless Coder and writes per-case artifacts plus a final JSON report.
+
+Example:
+
+```bash
+obstral eval -C . --spec .obstral/runtime_eval.json
+```
+
+What it writes:
+- `<out_dir>/<case>/trace.jsonl`: JSONL trace from the run
+- `<out_dir>/<case>/session.json`: resumable session snapshot
+- `<out_dir>/<case>/final.json`: final snapshot copy for scoring
+- `<out_dir>/<case>/graph.json`: execution graph
+- `<out_dir>/report.json`: aggregated pass/fail report
+
+Useful flags:
+- `--filter <text>`: run only matching case ids/tags
+- `--max-cases <n>`: cap selected cases
+- `--continue-on-error`: keep running after a failed case
+- `--out-dir <path>` / `--report-out <path>`: override artifact paths
+
+Current v1 guidance:
+- fixtures should be read-only or run against a disposable workspace
+- eval runs non-interactively so cases must not rely on manual approvals
+- scoring is artifact-based today: completion, errors, tool usage, assistant output, graph size
+- the report also surfaces light telemetry from traces: iterations, repo-map fallback hits, governor/recovery pressure, and realize summary counters
+
 ### Approvals
 
 - **Web UI**: edits/commands can queue as pending items. Approve/reject from the browser.
@@ -487,15 +543,21 @@ In the Web UI, Chat has two optional helpers:
 
 | Command | Effect |
 |---|---|
-| `/model <name>` | Switch model mid-session |
-| `/provider <name>` | Switch provider mid-session (or show current) |
-| `/base_url <url>` | Switch base_url mid-session (or show; use `default` to reset) |
-| `/persona <key>` | Switch Coder persona |
-| `/temp <0.0–2.0>` | Adjust temperature |
+| `/model <name>` | Switch the current pane's model mid-session |
+| `/provider <name>` | Switch the current pane's provider mid-session (or show current) |
+| `/base_url <url>` | Switch the current pane's base_url mid-session (or show; use `default` to reset) |
+| `/mode <name>` | Switch the current pane's mode |
+| `/persona <key>` | Switch the current pane's persona |
+| `/temp <0.0–2.0>` | Adjust the current pane's temperature |
+| `/realize <off\|low\|mid\|high>` | Set the Coder's realize-on-demand strength and persist it under `.obstral/tui_prefs.json` (`mid` default in TUI) |
 | `/root <path>` | Change tool_root for subsequent sends |
 | `/lang ja\|en\|fr` | Switch UI + prompt language |
+| `/autofix` | Toggle Observer → Coder auto-fix forwarding |
 | `/find <query>` | Filter messages in the current pane |
+| `/meta-diagnose [last-fail\|msg:coder-<index>]` | Send a selected Coder failure to Observer for JSON-only diagnosis |
 | `/help` | Show all commands |
+
+Most TUI knobs are stored per project in `.obstral/tui_prefs.json`, including pane `provider/base_url/mode/model/persona/temp`, Coder `/realize`, `/lang`, `/autofix`, `Ctrl+A` auto-observe, and the last right-side tab.
 
 ---
 

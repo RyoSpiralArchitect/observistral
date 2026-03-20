@@ -89,6 +89,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let o_m = truncate_model(&app.observer_cfg.model, 20);
     let c_p = provider_abbrev(&app.coder_cfg.provider);
     let o_p = provider_abbrev(&app.observer_cfg.provider);
+    let c_mode = truncate_model(app.coder_cfg.mode.label(), 8);
+    let o_mode = truncate_model(app.observer_cfg.mode.label(), 8);
+    let right_tab = match app.right_tab {
+        RightTab::Observer => "OBS",
+        RightTab::Chat => "CHAT",
+        RightTab::Tasks => "TASKS",
+    };
 
     let row1 = Line::from(vec![
         Span::styled(
@@ -104,6 +111,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(CODER_BLUE).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("@{c_p}"), Style::default().fg(MUTED)),
+        Span::styled(format!(" ·{c_mode}"), Style::default().fg(MUTED)),
         Span::styled(iter, Style::default().fg(ACCENT)),
         Span::styled("  │  O: ", Style::default().fg(MUTED)),
         Span::styled(
@@ -111,6 +119,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(OBS_MAG).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("@{o_p}"), Style::default().fg(MUTED)),
+        Span::styled(format!(" ·{o_mode}"), Style::default().fg(MUTED)),
         if app.auto_observe {
             Span::styled(
                 "  ◉ AUTO",
@@ -119,10 +128,19 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             Span::raw("")
         },
+        if app.auto_fix_mode {
+            Span::styled(
+                "  ◈ FIX",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("")
+        },
         Span::styled(
             format!("  LANG: {}", app.lang.to_ascii_uppercase()),
             Style::default().fg(MUTED),
         ),
+        Span::styled(format!("  TAB:{right_tab}"), Style::default().fg(MUTED)),
         Span::styled(
             app.project_stack_label
                 .as_deref()
@@ -211,6 +229,14 @@ fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView,
         PaneView::Observer => provider_abbrev(&app.observer_cfg.provider),
         PaneView::Chat => provider_abbrev(&app.chat_cfg.provider),
     };
+    let (mode, persona) = match view {
+        PaneView::Coder => (app.coder_cfg.mode.label(), app.coder_cfg.persona.as_str()),
+        PaneView::Observer => (
+            app.observer_cfg.mode.label(),
+            app.observer_cfg.persona.as_str(),
+        ),
+        PaneView::Chat => (app.chat_cfg.mode.label(), app.chat_cfg.persona.as_str()),
+    };
 
     let border_style = if focused {
         Style::default().fg(brand)
@@ -250,12 +276,56 @@ fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView,
             Style::default().fg(brand).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!(" @{prov}"), Style::default().fg(MUTED)),
+        Span::styled(
+            format!(" mode:{}", truncate_model(mode, 10)),
+            Style::default().fg(MUTED),
+        ),
+        Span::styled(
+            format!(" persona:{}", truncate_model(persona, 12)),
+            Style::default().fg(MUTED),
+        ),
         Span::styled(spin, Style::default().fg(ACCENT)),
         Span::styled(scroll_badge, Style::default().fg(WARN)),
         Span::styled(find_badge, Style::default().fg(MUTED)),
     ];
 
     if view == PaneView::Coder {
+        let realize_color = match app.coder_realize_preset {
+            super::agent::RealizePreset::Off => MUTED,
+            super::agent::RealizePreset::Low => SUCCESS,
+            super::agent::RealizePreset::Mid => ACCENT,
+            super::agent::RealizePreset::High => WARN,
+        };
+        spans.push(Span::styled(
+            format!(" rz:{}", app.coder_realize_preset.label()),
+            Style::default().fg(realize_color),
+        ));
+        if let Some(ref rz) = app.coder_realize_state {
+            let status = if rz.pending {
+                format!(
+                    " latent:{}/{} d:{:.2}",
+                    rz.age_turns.min(rz.window_end),
+                    rz.window_end,
+                    rz.latest_drift.unwrap_or(rz.mean_drift)
+                )
+            } else if rz.mean_drift > 0.0 || rz.mean_realize_latency > 0.0 {
+                format!(" rzμ:{:.2}/l{:.1}", rz.mean_drift, rz.mean_realize_latency)
+            } else {
+                String::new()
+            };
+            if !status.is_empty() {
+                let status_color = if rz.pending {
+                    if rz.latest_drift.unwrap_or(0.0) >= 0.45 {
+                        WARN
+                    } else {
+                        MUTED
+                    }
+                } else {
+                    MUTED
+                };
+                spans.push(Span::styled(status, Style::default().fg(status_color)));
+            }
+        }
         if let Some(ref g) = app.coder_governor {
             if let Some(ref stage) = g.recovery_stage {
                 spans.push(Span::styled(

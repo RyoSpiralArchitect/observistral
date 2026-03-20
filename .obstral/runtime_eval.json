@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "defaults": {
+    "tool_root": ".",
+    "lang": "en",
+    "max_iters": 8
+  },
+  "cases": [
+    {
+      "id": "slash-realize-command",
+      "tags": ["tui", "prefs", "slash"],
+      "prompt": "Locate where the /realize slash command is handled in the TUI. Do not edit anything. Use tools as needed. Final answer must include the file path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "assistant_contains", "value": "src/tui/events.rs" }
+      ]
+    },
+    {
+      "id": "pane-prefs-storage",
+      "tags": ["tui", "prefs"],
+      "prompt": "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything. Final answer must include the main file path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "assistant_contains", "value": "src/tui/prefs.rs" }
+      ]
+    },
+    {
+      "id": "repo-map-read-file-fallback",
+      "tags": ["repo-map", "coder", "fallback"],
+      "prompt": "Find where the coder-side repo-map fallback for read_file misses is wired into the TUI agent flow. Do not edit anything. Final answer must include the file path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "assistant_contains", "value": "src/tui/agent.rs" }
+      ]
+    }
+  ]
+}

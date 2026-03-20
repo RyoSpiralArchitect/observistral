@@ -21,6 +21,8 @@
 ///   8. Impact check  — after every successful mutation, require a short <impact>
 ///      block that states what changed and what acceptance criterion moved before
 ///      allowing the next tool call.
+///   9. Realize-on-demand (experimental) — plan-bearing no-tool turns can stay latent
+///      until a tool call or deadline materializes them back into audit history.
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
@@ -34,7 +36,8 @@ use crate::config::{ProviderKind, RunConfig};
 use crate::exec;
 use crate::governor_contract;
 use crate::streaming::{
-    stream_openai_compat_json, GovernorState, ReflectionSummary, StreamToken, ToolCallData,
+    stream_openai_compat_json, GovernorState, RealizeState, ReflectionSummary, StreamToken,
+    TelemetryEvent, ToolCallData,
 };
 use crate::types::ChatMessage;
 use std::path::Path;
@@ -70,6 +73,914 @@ async fn autosave_best_effort(
     };
     let _ = tx
         .send(StreamToken::Delta(format!("\n[autosave] WARN: {warn}\n")))
+        .await;
+}
+
+async fn emit_telemetry_event(
+    tx: &mpsc::Sender<StreamToken>,
+    event: &str,
+    data: serde_json::Value,
+) {
+    let _ = tx
+        .send(StreamToken::Telemetry(TelemetryEvent {
+            event: event.to_string(),
+            data,
+        }))
+        .await;
+}
+
+async fn emit_repo_map_fallback_telemetry(
+    tx: &mpsc::Sender<StreamToken>,
+    tool_name: &str,
+    query: &str,
+    fallback: &crate::repo_map::RepoMapFallback,
+) {
+    emit_telemetry_event(
+        tx,
+        "repo_map_fallback",
+        json!({
+            "tool": tool_name,
+            "query": query,
+            "top_path": fallback.top_path,
+            "top_dir": fallback.top_dir,
+            "top_confidence": fallback.top_confidence,
+            "typo_likely": fallback.typo_likely,
+            "reasons": fallback.top_path_reasons,
+        }),
+    )
+    .await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoMapHintStrength {
+    Strong,
+    Medium,
+    Weak,
+}
+
+fn repo_map_hint_strength(confidence: f64) -> RepoMapHintStrength {
+    if confidence >= 0.85 {
+        RepoMapHintStrength::Strong
+    } else if confidence >= 0.60 {
+        RepoMapHintStrength::Medium
+    } else {
+        RepoMapHintStrength::Weak
+    }
+}
+
+fn repo_map_action_verb(confidence: f64) -> &'static str {
+    match repo_map_hint_strength(confidence) {
+        RepoMapHintStrength::Strong => "Prefer",
+        RepoMapHintStrength::Medium => "Start with",
+        RepoMapHintStrength::Weak => "Consider",
+    }
+}
+
+fn repo_map_typo_intro(confidence: f64) -> &'static str {
+    match repo_map_hint_strength(confidence) {
+        RepoMapHintStrength::Strong => "repo_map strong path-typo.",
+        RepoMapHintStrength::Medium => "repo_map medium path-typo.",
+        RepoMapHintStrength::Weak => "repo_map weak path-typo.",
+    }
+}
+
+fn repo_map_fallback_intro(confidence: f64) -> &'static str {
+    match repo_map_hint_strength(confidence) {
+        RepoMapHintStrength::Strong => "repo_map strong candidate.",
+        RepoMapHintStrength::Medium => "repo_map medium candidate.",
+        RepoMapHintStrength::Weak => "repo_map weak candidate.",
+    }
+}
+
+fn repo_map_confidence_guidance(confidence: f64) -> &'static str {
+    match repo_map_hint_strength(confidence) {
+        RepoMapHintStrength::Strong => {
+            "Treat the top candidate as the default next step unless your broader plan clearly points elsewhere."
+        }
+        RepoMapHintStrength::Medium => {
+            "Start there, but keep the rest of the fallback list in view before committing."
+        }
+        RepoMapHintStrength::Weak => {
+            "Treat the fallback list as suggestions only and compare multiple candidates before retrying."
+        }
+    }
+}
+
+fn repo_map_reason_suffix(reasons: &[String]) -> String {
+    if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", reasons.join(", "))
+    }
+}
+
+fn repo_map_display_level(confidence: f64) -> &'static str {
+    match repo_map_hint_strength(confidence) {
+        RepoMapHintStrength::Strong => "strong",
+        RepoMapHintStrength::Medium => "medium",
+        RepoMapHintStrength::Weak => "weak",
+    }
+}
+
+fn repo_map_display_next_step(fallback: &crate::repo_map::RepoMapFallback) -> String {
+    match (fallback.top_dir.as_deref(), fallback.top_path.as_deref()) {
+        (Some(candidate_dir), Some(candidate_path)) => {
+            format!(
+                "list_dir '{}' -> read_file '{}'",
+                candidate_dir, candidate_path
+            )
+        }
+        (Some(candidate_dir), None) => format!("list_dir '{}'", candidate_dir),
+        (None, Some(candidate_path)) => format!("read_file '{}'", candidate_path),
+        (None, None) => "inspect fallback list".to_string(),
+    }
+}
+
+fn build_repo_map_display_banner(
+    tool_name: &str,
+    fallback: &crate::repo_map::RepoMapFallback,
+) -> String {
+    let confidence = fallback.top_confidence.unwrap_or(0.0);
+    let level = repo_map_display_level(confidence);
+    let flavor = if fallback.typo_likely {
+        "path-typo"
+    } else {
+        "candidate"
+    };
+    let next = repo_map_display_next_step(fallback);
+    format!("[repo_map:{tool_name}] {level} {flavor} -> {next}\n")
+}
+
+fn build_repo_map_search_hint(
+    pattern: &str,
+    fallback: &crate::repo_map::RepoMapFallback,
+) -> String {
+    let confidence = fallback.top_confidence.unwrap_or(0.0);
+    let action = repo_map_action_verb(confidence);
+    let guidance = repo_map_confidence_guidance(confidence);
+    match fallback.top_path.as_deref() {
+        Some(path) => format!(
+            "Literal search found no matches for '{}'. {}\n\
+{} read_file '{}' next (top_confidence={:.2}).\n\
+{}",
+            pattern,
+            repo_map_fallback_intro(confidence),
+            action,
+            path,
+            confidence,
+            guidance
+        ),
+        None => format!(
+            "Literal search found no matches for '{}'. Use the repo_map fallback candidates from the tool output before retrying.\n\
+{}",
+            pattern, guidance
+        ),
+    }
+}
+
+fn build_repo_map_read_hint(path: &str, fallback: &crate::repo_map::RepoMapFallback) -> String {
+    let confidence = fallback.top_confidence.unwrap_or(0.0);
+    let action = repo_map_action_verb(confidence);
+    let reason_suffix = repo_map_reason_suffix(&fallback.top_path_reasons);
+    let guidance = repo_map_confidence_guidance(confidence);
+    match fallback.top_path.as_deref() {
+        Some(candidate) if fallback.typo_likely => format!(
+            "read_file failed for '{}'. {}\n\
+{} read_file '{}' next (top_confidence={:.2}){}.\n\
+{}",
+            path,
+            repo_map_typo_intro(confidence),
+            action,
+            candidate,
+            confidence,
+            reason_suffix,
+            guidance
+        ),
+        Some(candidate) => format!(
+            "read_file failed for '{}'. {}\n\
+{} read_file '{}' next (top_confidence={:.2}).\n\
+{}",
+            path,
+            repo_map_fallback_intro(confidence),
+            action,
+            candidate,
+            confidence,
+            guidance
+        ),
+        None => format!(
+            "read_file failed for '{}'. Use the repo_map fallback candidates from the tool output before retrying.\n\
+{}",
+            path, guidance
+        ),
+    }
+}
+
+fn build_repo_map_list_dir_hint(dir: &str, fallback: &crate::repo_map::RepoMapFallback) -> String {
+    let confidence = fallback.top_confidence.unwrap_or(0.0);
+    let action = repo_map_action_verb(confidence);
+    let reason_suffix = repo_map_reason_suffix(&fallback.top_path_reasons);
+    let guidance = repo_map_confidence_guidance(confidence);
+    match (fallback.top_dir.as_deref(), fallback.top_path.as_deref(), fallback.typo_likely) {
+        (Some(candidate_dir), Some(candidate_path), true) => format!(
+            "list_dir failed for '{}'. {}\n\
+{} list_dir '{}' next; if you were actually targeting a file, read_file '{}' after that (top_confidence={:.2}){}.\n\
+{}",
+            dir,
+            repo_map_typo_intro(confidence),
+            action,
+            candidate_dir,
+            candidate_path,
+            confidence,
+            reason_suffix,
+            guidance
+        ),
+        (Some(candidate_dir), None, true) => format!(
+            "list_dir failed for '{}'. {}\n\
+{} list_dir '{}' next (top_confidence={:.2}){}.\n\
+{}",
+            dir,
+            repo_map_typo_intro(confidence),
+            action,
+            candidate_dir,
+            confidence,
+            reason_suffix,
+            guidance
+        ),
+        (None, Some(candidate_path), true) => format!(
+            "list_dir failed for '{}'. {}\n\
+{} read_file '{}' next (top_confidence={:.2}){}.\n\
+{}",
+            dir,
+            repo_map_typo_intro(confidence),
+            action,
+            candidate_path,
+            confidence,
+            reason_suffix,
+            guidance
+        ),
+        (Some(candidate_dir), Some(candidate_path), false) => format!(
+            "list_dir failed for '{}'. {}\n\
+{} list_dir '{}' first; if that still misses your target, read_file '{}' next (top_confidence={:.2}).\n\
+{}",
+            dir,
+            repo_map_fallback_intro(confidence),
+            action,
+            candidate_dir,
+            candidate_path,
+            confidence,
+            guidance
+        ),
+        (Some(candidate_dir), None, false) => format!(
+            "list_dir failed for '{}'. {}\n\
+{} list_dir '{}' first (top_confidence={:.2}).\n\
+{}",
+            dir,
+            repo_map_fallback_intro(confidence),
+            action,
+            candidate_dir,
+            confidence,
+            guidance
+        ),
+        (None, Some(candidate_path), false) => format!(
+            "list_dir failed for '{}'. {}\n\
+{} read_file '{}' first (top_confidence={:.2}).\n\
+{}",
+            dir,
+            repo_map_fallback_intro(confidence),
+            action,
+            candidate_path,
+            confidence,
+            guidance
+        ),
+        (None, None, _) => format!(
+            "list_dir failed for '{}'. Use the repo_map fallback candidates from the tool output before retrying.\n\
+{}",
+            dir, guidance
+        ),
+    }
+}
+
+fn build_repo_map_glob_hint(pattern: &str, fallback: &crate::repo_map::RepoMapFallback) -> String {
+    let confidence = fallback.top_confidence.unwrap_or(0.0);
+    let action = repo_map_action_verb(confidence);
+    let reason_suffix = repo_map_reason_suffix(&fallback.top_path_reasons);
+    let guidance = repo_map_confidence_guidance(confidence);
+    match (fallback.top_dir.as_deref(), fallback.top_path.as_deref(), fallback.typo_likely) {
+        (Some(candidate_dir), Some(candidate_path), true) => format!(
+            "Literal glob found no matches for '{}'. {}\n\
+{} inspect '{}' first; if needed, read_file '{}' after that (top_confidence={:.2}){}.\n\
+{}",
+            pattern,
+            repo_map_typo_intro(confidence),
+            action,
+            candidate_dir,
+            candidate_path,
+            confidence,
+            reason_suffix,
+            guidance
+        ),
+        (Some(candidate_dir), None, true) => format!(
+            "Literal glob found no matches for '{}'. {}\n\
+{} inspect '{}' first (top_confidence={:.2}){}.\n\
+{}",
+            pattern,
+            repo_map_typo_intro(confidence),
+            action,
+            candidate_dir,
+            confidence,
+            reason_suffix,
+            guidance
+        ),
+        (None, Some(candidate_path), true) => format!(
+            "Literal glob found no matches for '{}'. {}\n\
+{} read_file '{}' next (top_confidence={:.2}){}.\n\
+{}",
+            pattern,
+            repo_map_typo_intro(confidence),
+            action,
+            candidate_path,
+            confidence,
+            reason_suffix,
+            guidance
+        ),
+        (Some(candidate_dir), Some(candidate_path), false) => format!(
+            "Literal glob found no matches for '{}'. {}\n\
+{} list_dir '{}' first; if needed, read_file '{}' next (top_confidence={:.2}).\n\
+{}",
+            pattern,
+            repo_map_fallback_intro(confidence),
+            action,
+            candidate_dir,
+            candidate_path,
+            confidence,
+            guidance
+        ),
+        (Some(candidate_dir), None, false) => format!(
+            "Literal glob found no matches for '{}'. {}\n\
+{} list_dir '{}' first (top_confidence={:.2}).\n\
+{}",
+            pattern,
+            repo_map_fallback_intro(confidence),
+            action,
+            candidate_dir,
+            confidence,
+            guidance
+        ),
+        (None, Some(candidate_path), false) => format!(
+            "Literal glob found no matches for '{}'. {}\n\
+{} read_file '{}' first (top_confidence={:.2}).\n\
+{}",
+            pattern,
+            repo_map_fallback_intro(confidence),
+            action,
+            candidate_path,
+            confidence,
+            guidance
+        ),
+        (None, None, _) => format!(
+            "Literal glob found no matches for '{}'. Use the repo_map fallback candidates from the tool output before retrying.\n\
+{}",
+            pattern, guidance
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriftMetric {
+    Cos,
+    Kl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealizePreset {
+    Off,
+    Low,
+    Mid,
+    High,
+}
+
+impl RealizePreset {
+    pub const fn tui_default() -> Self {
+        Self::Mid
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Mid => "mid",
+            Self::High => "high",
+        }
+    }
+
+    fn config(self) -> RealizeOnDemandConfig {
+        match self {
+            Self::Off => {
+                let mut cfg = RealizeOnDemandConfig::default();
+                cfg.enabled = false;
+                cfg
+            }
+            Self::Low => RealizeOnDemandConfig {
+                enabled: true,
+                defer_threshold: 0.62,
+                window_start: 1,
+                window_end: 2,
+                drift_metric: DriftMetric::Cos,
+                lambda_min: 0.08,
+                lambda_max: 0.45,
+            },
+            Self::Mid => RealizeOnDemandConfig {
+                enabled: true,
+                defer_threshold: 0.45,
+                window_start: 1,
+                window_end: 3,
+                drift_metric: DriftMetric::Cos,
+                lambda_min: 0.15,
+                lambda_max: 0.90,
+            },
+            Self::High => RealizeOnDemandConfig {
+                enabled: true,
+                defer_threshold: 0.30,
+                window_start: 1,
+                window_end: 4,
+                drift_metric: DriftMetric::Cos,
+                lambda_min: 0.25,
+                lambda_max: 1.30,
+            },
+        }
+    }
+
+    pub fn summary(self) -> String {
+        if self == Self::Off {
+            return "off (latent claim/plan defer disabled)".to_string();
+        }
+        let cfg = self.config();
+        format!(
+            "{} (threshold={:.2}, window={}..{}, drift={}, lambda={:.2}..{:.2})",
+            self.label(),
+            cfg.defer_threshold,
+            cfg.window_start,
+            cfg.window_end,
+            match cfg.drift_metric {
+                DriftMetric::Cos => "cos",
+                DriftMetric::Kl => "kl",
+            },
+            cfg.lambda_min,
+            cfg.lambda_max
+        )
+    }
+}
+
+impl std::str::FromStr for RealizePreset {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "low" => Ok(Self::Low),
+            "mid" | "medium" => Ok(Self::Mid),
+            "high" => Ok(Self::High),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RealizeOnDemandConfig {
+    enabled: bool,
+    defer_threshold: f64,
+    window_start: usize,
+    window_end: usize,
+    drift_metric: DriftMetric,
+    lambda_min: f64,
+    lambda_max: f64,
+}
+
+impl Default for RealizeOnDemandConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            defer_threshold: 0.45,
+            window_start: 1,
+            window_end: 3,
+            drift_metric: DriftMetric::Cos,
+            lambda_min: 0.15,
+            lambda_max: 0.90,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LatentPlanBuffer {
+    raw_text: String,
+    plan: PlanBlock,
+    summary: String,
+    latest_intent: Option<String>,
+    anchor_baseline: String,
+    created_iter: usize,
+    defer_score: f64,
+    tail_updates: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RealizeMetrics {
+    within_window_turns: usize,
+    early_leakage: usize,
+    missing: usize,
+    total_drift: f64,
+    drift_samples: usize,
+    realize_count: usize,
+    total_realize_latency: usize,
+}
+
+impl RealizeMetrics {
+    fn mean_drift(&self) -> f64 {
+        if self.drift_samples == 0 {
+            0.0
+        } else {
+            self.total_drift / self.drift_samples as f64
+        }
+    }
+
+    fn mean_realize_latency(&self) -> f64 {
+        if self.realize_count == 0 {
+            0.0
+        } else {
+            self.total_realize_latency as f64 / self.realize_count as f64
+        }
+    }
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_realization_window(raw: &str) -> Option<(usize, usize)> {
+    let trimmed = raw.trim();
+    let (lhs, rhs) = trimmed
+        .split_once(':')
+        .or_else(|| trimmed.split_once(','))
+        .or_else(|| trimmed.split_once('-'))?;
+    let start = lhs.trim().parse::<usize>().ok()?;
+    let end = rhs.trim().parse::<usize>().ok()?;
+    if start > end || end == 0 {
+        return None;
+    }
+    Some((start, end))
+}
+
+impl RealizeOnDemandConfig {
+    fn resolve(preset: Option<RealizePreset>) -> Self {
+        match preset {
+            Some(preset) => preset.config(),
+            None => Self::from_env(),
+        }
+    }
+
+    fn from_env() -> Self {
+        let mut cfg = Self::default();
+        cfg.enabled = env_bool("OBSTRAL_REALIZE_ON_DEMAND", false);
+        cfg.defer_threshold =
+            env_f64("OBSTRAL_REALIZE_DEFER_THRESHOLD", cfg.defer_threshold).clamp(0.05, 1.0);
+        if let Ok(raw) = std::env::var("OBSTRAL_REALIZATION_WINDOW") {
+            if let Some((start, end)) = parse_realization_window(&raw) {
+                cfg.window_start = start;
+                cfg.window_end = end.max(start);
+            }
+        }
+        cfg.drift_metric = match std::env::var("OBSTRAL_REALIZE_DRIFT_METRIC")
+            .unwrap_or_else(|_| "cos".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "kl" => DriftMetric::Kl,
+            _ => DriftMetric::Cos,
+        };
+        cfg.lambda_min = env_f64("OBSTRAL_REALIZE_LAMBDA_MIN", cfg.lambda_min).clamp(0.0, 4.0);
+        cfg.lambda_max = env_f64("OBSTRAL_REALIZE_LAMBDA_MAX", cfg.lambda_max).clamp(0.0, 4.0);
+        if cfg.lambda_max < cfg.lambda_min {
+            cfg.lambda_max = cfg.lambda_min;
+        }
+        cfg
+    }
+
+    fn within_window(&self, age_turns: usize) -> bool {
+        age_turns >= self.window_start && age_turns < self.window_end
+    }
+
+    fn lambda_for_age(&self, age_turns: usize) -> f64 {
+        if self.window_end <= self.window_start {
+            return self.lambda_max;
+        }
+        let numer = age_turns.saturating_sub(self.window_start) as f64;
+        let denom = (self.window_end - self.window_start).max(1) as f64;
+        let frac = (numer / denom).clamp(0.0, 1.0);
+        self.lambda_min + (self.lambda_max - self.lambda_min) * frac
+    }
+}
+
+fn token_freqs(s: &str) -> BTreeMap<String, f64> {
+    let mut out = BTreeMap::<String, f64>::new();
+    let mut cur = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            cur.push(ch.to_ascii_lowercase());
+        } else if !cur.is_empty() {
+            *out.entry(std::mem::take(&mut cur)).or_insert(0.0) += 1.0;
+        }
+    }
+    if !cur.is_empty() {
+        *out.entry(cur).or_insert(0.0) += 1.0;
+    }
+    out
+}
+
+fn cosine_token_distance(a: &str, b: &str) -> f64 {
+    let fa = token_freqs(a);
+    let fb = token_freqs(b);
+    if fa.is_empty() || fb.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0;
+    let mut na = 0.0;
+    let mut nb = 0.0;
+    for value in fa.values() {
+        na += value * value;
+    }
+    for value in fb.values() {
+        nb += value * value;
+    }
+    for (token, av) in &fa {
+        if let Some(bv) = fb.get(token) {
+            dot += av * bv;
+        }
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    if denom <= f64::EPSILON {
+        0.0
+    } else {
+        (1.0 - (dot / denom)).clamp(0.0, 1.0)
+    }
+}
+
+fn kl_token_distance(a: &str, b: &str) -> f64 {
+    let fa = token_freqs(a);
+    let fb = token_freqs(b);
+    if fa.is_empty() || fb.is_empty() {
+        return 0.0;
+    }
+    let sum_a: f64 = fa.values().sum();
+    let sum_b: f64 = fb.values().sum();
+    let eps = 1e-6;
+    let mut all_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    all_keys.extend(fa.keys().cloned());
+    all_keys.extend(fb.keys().cloned());
+    let mut kl = 0.0;
+    for key in all_keys {
+        let pa = fa.get(&key).copied().unwrap_or(0.0) / sum_a + eps;
+        let pb = fb.get(&key).copied().unwrap_or(0.0) / sum_b + eps;
+        kl += pa * (pa / pb).ln();
+    }
+    kl.clamp(0.0, 4.0) / 4.0
+}
+
+fn drift_distance(metric: DriftMetric, tail: &str, anchor: &str) -> f64 {
+    match metric {
+        DriftMetric::Cos => cosine_token_distance(tail, anchor),
+        DriftMetric::Kl => kl_token_distance(tail, anchor),
+    }
+}
+
+fn strip_tag_block_owned(text: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let Some(start) = text.find(&open) else {
+        return text.to_string();
+    };
+    let rest = &text[start + open.len()..];
+    let Some(end_rel) = rest.find(&close) else {
+        return text.to_string();
+    };
+    let end = start + open.len() + end_rel + close.len();
+    let mut out = String::new();
+    out.push_str(text[..start].trim_end());
+    if !out.is_empty() && !text[end..].trim_start().is_empty() {
+        out.push('\n');
+    }
+    out.push_str(text[end..].trim_start());
+    out
+}
+
+fn parse_realize_block(text: &str) -> Option<String> {
+    let body = extract_tag_block(text, "realize")?;
+    let fields = parse_tag_fields(body);
+    for (key, value) in fields {
+        if key == "reason" && !value.trim().is_empty() {
+            return Some(compact_one_line(value.trim(), 160));
+        }
+    }
+    if body.trim().is_empty() {
+        None
+    } else {
+        Some(compact_one_line(body.trim(), 160))
+    }
+}
+
+fn strip_known_latent_tags(text: &str) -> String {
+    let no_plan = strip_tag_block_owned(text, "plan");
+    let no_think = strip_tag_block_owned(&no_plan, "think");
+    strip_tag_block_owned(&no_think, "realize")
+}
+
+fn think_intent_summary(think: &ThinkBlock) -> String {
+    format!(
+        "tool: {}; next: {}; verify: {}",
+        compact_one_line(think.tool.as_str(), 24),
+        compact_one_line(think.next.as_str(), 80),
+        compact_one_line(think.verify.as_str(), 70)
+    )
+}
+
+fn latent_plan_summary(plan: &PlanBlock, raw_text: &str, latest_intent: Option<&str>) -> String {
+    let mut out = format!("goal: {}", compact_one_line(plan.goal.as_str(), 120));
+    if !plan.steps.is_empty() {
+        let steps = plan
+            .steps
+            .iter()
+            .take(2)
+            .map(|s| compact_one_line(s, 80))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        out.push_str(&format!("; steps: {steps}"));
+    }
+    if !plan.acceptance_criteria.is_empty() {
+        let acc = plan
+            .acceptance_criteria
+            .iter()
+            .take(2)
+            .map(|s| compact_one_line(s, 70))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        out.push_str(&format!("; acceptance: {acc}"));
+    }
+    let tail = compact_one_line(strip_known_latent_tags(raw_text).as_str(), 120);
+    if tail != "-" {
+        out.push_str(&format!("; tail: {tail}"));
+    }
+    if let Some(intent) = latest_intent.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("; intent: {}", compact_one_line(intent, 120)));
+    }
+    out
+}
+
+fn build_anchor_baseline(
+    root_user_text: &str,
+    active_plan: Option<&PlanBlock>,
+    working_mem: &WorkingMemory,
+) -> String {
+    let mut parts = vec![compact_one_line(root_user_text, 220)];
+    if let Some(plan) = active_plan {
+        parts.push(format!(
+            "active_goal: {}",
+            compact_one_line(plan.goal.as_str(), 120)
+        ));
+    }
+    if let Some(strategy) = working_mem.chosen_strategy.as_deref() {
+        parts.push(format!("strategy: {}", compact_one_line(strategy, 120)));
+    }
+    parts.join(" | ")
+}
+
+fn latent_plan_defer_score(raw_text: &str, plan: &PlanBlock) -> f64 {
+    let plan_bonus = if plan.steps.len() >= 2 { 0.45 } else { 0.35 };
+    let acceptance_bonus = (plan.acceptance_criteria.len().min(2) as f64) * 0.10;
+    let narrative = strip_known_latent_tags(raw_text);
+    let narrative_bonus = (narrative.trim().chars().count().min(160) as f64 / 160.0) * 0.15;
+    (plan_bonus + acceptance_bonus + narrative_bonus).clamp(0.0, 1.0)
+}
+
+fn latent_intent_defer_score(raw_text: &str, think: &ThinkBlock) -> f64 {
+    let tool_bonus = 0.18;
+    let next_bonus = if think.next.trim().is_empty() {
+        0.0
+    } else {
+        0.16
+    };
+    let verify_bonus = if think.verify.trim().is_empty() {
+        0.0
+    } else {
+        0.12
+    };
+    let narrative = strip_known_latent_tags(raw_text);
+    let narrative_bonus = (narrative.trim().chars().count().min(120) as f64 / 120.0) * 0.10;
+    (tool_bonus + next_bonus + verify_bonus + narrative_bonus).clamp(0.0, 1.0)
+}
+
+fn build_realize_pending_hint(
+    cfg: &RealizeOnDemandConfig,
+    latent: &LatentPlanBuffer,
+    metrics: &RealizeMetrics,
+    age_turns: usize,
+    drift: f64,
+) -> String {
+    let window_state = if cfg.within_window(age_turns) {
+        "within_window"
+    } else {
+        "deadline_near"
+    };
+    let lambda = cfg.lambda_for_age(age_turns);
+    format!(
+        "[Realize-on-Demand]\n\
+There is a pending latent plan/claim buffer that is NOT committed yet.\n\
+window_state: {window_state}\n\
+age_turns: {age_turns}/{window_end}\n\
+defer_score: {defer_score:.2}\n\
+drift_metric: {metric}\n\
+drift: {drift:.3}\n\
+drift_penalty_lambda: {lambda:.2}\n\
+mean_drift: {mean_drift:.3}\n\
+summary: {summary}\n\
+latest_intent: {intent}\n\
+Rule: stay close to that summary. If you are ready to commit it, emit <realize>reason: why now</realize>.\n\
+A tool call also counts as realization, so do not wander before committing.",
+        window_end = cfg.window_end,
+        defer_score = latent.defer_score,
+        metric = match cfg.drift_metric {
+            DriftMetric::Cos => "cos",
+            DriftMetric::Kl => "kl",
+        },
+        mean_drift = metrics.mean_drift(),
+        summary = latent.summary,
+        intent = latent.latest_intent.as_deref().unwrap_or("-")
+    )
+}
+
+fn build_realize_banner(
+    reason: &str,
+    latency: usize,
+    drift: f64,
+    metrics: &RealizeMetrics,
+) -> String {
+    format!(
+        "\n[realize] {reason} latency={latency} mean_latency={mean_latency:.2} drift={drift:.3} mean_drift={mean_drift:.3} missing={missing} leakage={leakage}\n",
+        mean_latency = metrics.mean_realize_latency(),
+        mean_drift = metrics.mean_drift(),
+        missing = metrics.missing,
+        leakage = metrics.early_leakage
+    )
+}
+
+fn build_realize_state(
+    cfg: &RealizeOnDemandConfig,
+    latent: Option<&LatentPlanBuffer>,
+    iter: usize,
+    latest_drift: Option<f64>,
+    metrics: &RealizeMetrics,
+) -> RealizeState {
+    RealizeState {
+        pending: latent.is_some(),
+        age_turns: latent
+            .map(|pending| iter.saturating_sub(pending.created_iter))
+            .unwrap_or(0),
+        window_end: cfg.window_end,
+        latest_drift: if latent.is_some() { latest_drift } else { None },
+        mean_drift: metrics.mean_drift(),
+        mean_realize_latency: metrics.mean_realize_latency(),
+        missing: metrics.missing,
+        early_leakage: metrics.early_leakage,
+    }
+}
+
+async fn emit_realize_state(
+    tx: &mpsc::Sender<StreamToken>,
+    cfg: &RealizeOnDemandConfig,
+    latent: Option<&LatentPlanBuffer>,
+    iter: usize,
+    latest_drift: Option<f64>,
+    metrics: &RealizeMetrics,
+) {
+    let _ = tx
+        .send(StreamToken::RealizeState(build_realize_state(
+            cfg,
+            latent,
+            iter,
+            latest_drift,
+            metrics,
+        )))
         .await;
 }
 
@@ -451,6 +1362,36 @@ When ALL steps from your <plan> are verified complete:\n\
   (3) which acceptance criteria remain, if any, and (4) the exact verification command used for each completed criterion.\n\
   Do NOT call done while any command is still failing.";
 
+fn realize_on_demand_addon(preset: Option<RealizePreset>) -> Option<String> {
+    let cfg = RealizeOnDemandConfig::resolve(preset);
+    if !cfg.enabled {
+        return None;
+    }
+    let preset_label = match preset {
+        Some(preset) => preset.label(),
+        None => "env",
+    };
+    Some(format!(
+        "Realize-on-demand (experimental) is enabled.\n\
+Plan-bearing no-tool turns may be held latent before they are committed.\n\
+- If you want to commit a pending latent plan/claim explicitly, emit <realize>reason: why now</realize>.\n\
+- A tool call also counts as realization.\n\
+- Stay close to the latest latent summary while it is pending; wandering raises drift.\n\
+- Session preset: {}.\n\
+- Current defaults: defer_threshold={:.2}, realization_window={}..{}, drift_metric={}, lambda={}..{}.",
+        preset_label,
+        cfg.defer_threshold,
+        cfg.window_start,
+        cfg.window_end,
+        match cfg.drift_metric {
+            DriftMetric::Cos => "cos",
+            DriftMetric::Kl => "kl",
+        },
+        cfg.lambda_min,
+        cfg.lambda_max
+    ))
+}
+
 fn has_in_path(cmd: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -552,11 +1493,19 @@ Rules:\n\
 }
 
 /// Build the full Coder system prompt: base + scratchpad + OS rules + persona + language.
-pub fn coder_system(persona_prompt: &str, lang_instruction: &str) -> String {
+pub fn coder_system(
+    persona_prompt: &str,
+    lang_instruction: &str,
+    realize_preset: Option<RealizePreset>,
+) -> String {
     let mut s = CODER_BASE_SYSTEM.to_string();
     s.push_str(&governor_contract::scratchpad_addon());
     s.push_str("\n\n");
     s.push_str(&host_capability_addon());
+    if let Some(addon) = realize_on_demand_addon(realize_preset) {
+        s.push_str("\n\n");
+        s.push_str(&addon);
+    }
     if cfg!(target_os = "windows") {
         s.push_str(WIN_SYSTEM_ADDON);
     }
@@ -2504,6 +3453,32 @@ fn effective_verify_ok_step(
             .max(),
         VerificationLevel::Behavioral => last_behavioral_verify_ok_step,
     }
+}
+
+fn adopt_valid_plan(
+    plan: &PlanBlock,
+    working_mem: &mut WorkingMemory,
+    active_plan: &mut Option<PlanBlock>,
+    intent_required_verification: &mut VerificationLevel,
+    path_required_verification: VerificationLevel,
+    required_verification: &mut VerificationLevel,
+    recovery: &mut RecoveryGovernor,
+    last_verify_ok_step: &mut Option<usize>,
+    last_build_verify_ok_step: Option<usize>,
+    last_behavioral_verify_ok_step: Option<usize>,
+) {
+    working_mem.sync_to_plan(plan);
+    if let Some(level) = verification_level_from_plan(plan) {
+        *intent_required_verification = level;
+        *required_verification = (*intent_required_verification).max(path_required_verification);
+        recovery.required_verification = *required_verification;
+        *last_verify_ok_step = effective_verify_ok_step(
+            *required_verification,
+            last_build_verify_ok_step,
+            last_behavioral_verify_ok_step,
+        );
+    }
+    *active_plan = Some(plan.clone());
 }
 
 fn upgrade_required_verification_from_messages(
@@ -4500,6 +5475,7 @@ pub async fn run_agentic(
     // Command to run after every successful file edit (e.g. "cargo test 2>&1").
     test_cmd: Option<String>,
     command_approval_required: bool,
+    realize_preset: Option<RealizePreset>,
     approver: &dyn Approver,
 ) -> Result<AgenticEndState> {
     let messages_json: Vec<serde_json::Value> = messages_in
@@ -4522,6 +5498,7 @@ pub async fn run_agentic(
         agents_md,
         test_cmd,
         command_approval_required,
+        realize_preset,
         None,
         approver,
     )
@@ -4539,6 +5516,7 @@ pub async fn run_agentic_json(
     // Command to run after every successful file edit (e.g. "cargo test 2>&1").
     test_cmd: Option<String>,
     command_approval_required: bool,
+    realize_preset: Option<RealizePreset>,
     autosaver: Option<Arc<crate::agent_session::SessionAutoSaver>>,
     approver: &dyn Approver,
 ) -> Result<AgenticEndState> {
@@ -4596,6 +5574,9 @@ Fix: use --provider openai-compatible (or --provider mistral).",
     let goal_wants_actions = wants_local_actions(&root_user_text);
     let mut intent_required_verification =
         infer_required_verification_level(&root_user_text, test_cmd.as_deref());
+    let realize_cfg = RealizeOnDemandConfig::resolve(realize_preset);
+    let mut latent_plan: Option<LatentPlanBuffer> = None;
+    let mut realize_metrics = RealizeMetrics::default();
 
     // Keep messages as serde_json::Value throughout to preserve tool_call_id.
     let mut messages: Vec<serde_json::Value> = start.messages;
@@ -4664,6 +5645,9 @@ Execute only the new minimal action: {}",
             last_reflection.as_ref(),
         )))
         .await;
+    if realize_cfg.enabled {
+        emit_realize_state(&tx, &realize_cfg, None, 0, None, &realize_metrics).await;
+    }
 
     // Resolve tool_root once (absolute path) and track cwd across tool calls.
     // This prevents the classic "cd didn't persist, so git add ran in the wrong repo" failure.
@@ -4772,6 +5756,19 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
     for iter in 0..max_iters {
         // ── Prune old tool results before sending to save context tokens ───
         prune_old_tool_results(&mut messages);
+        emit_telemetry_event(
+            &tx,
+            "agent_iter",
+            json!({
+                "iter": iter + 1,
+                "max_iters": max_iters,
+                "messages_len": messages.len(),
+                "state": format!("{state:?}").to_ascii_lowercase(),
+                "recovery_stage": recovery.stage_label(),
+                "latent_pending": latent_plan.is_some(),
+            }),
+        )
+        .await;
 
         // C — Token budget guardian: warn once when context grows large.
         let approx_tokens = approx_tokens_messages(&messages);
@@ -4822,6 +5819,76 @@ This is the LAST model call for this run.\n\
             }
         }
 
+        let mut latent_drift_for_prompt: Option<f64> = None;
+        if realize_cfg.enabled {
+            let deadline_realize = if let Some(latent) = latent_plan.as_ref() {
+                let age_turns = iter.saturating_sub(latent.created_iter);
+                let drift = drift_distance(
+                    realize_cfg.drift_metric,
+                    &latent.summary,
+                    &latent.anchor_baseline,
+                );
+                realize_metrics.total_drift += drift;
+                realize_metrics.drift_samples += 1;
+                if realize_cfg.within_window(age_turns) {
+                    realize_metrics.within_window_turns += 1;
+                }
+                latent_drift_for_prompt = Some(drift);
+                if age_turns >= realize_cfg.window_end {
+                    latent_plan.take().map(|buf| (buf, age_turns, drift))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some((latent, latency, drift)) = deadline_realize {
+                realize_metrics.missing += 1;
+                realize_metrics.realize_count += 1;
+                realize_metrics.total_realize_latency += latency;
+                adopt_valid_plan(
+                    &latent.plan,
+                    &mut working_mem,
+                    &mut active_plan,
+                    &mut intent_required_verification,
+                    path_required_verification,
+                    &mut required_verification,
+                    &mut recovery,
+                    &mut last_verify_ok_step,
+                    last_build_verify_ok_step,
+                    last_behavioral_verify_ok_step,
+                );
+                messages.push(json!({"role": "assistant", "content": latent.raw_text}));
+                let _ = tx
+                    .send(StreamToken::Delta(build_realize_banner(
+                        "deadline",
+                        latency,
+                        drift,
+                        &realize_metrics,
+                    )))
+                    .await;
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+            }
+            emit_realize_state(
+                &tx,
+                &realize_cfg,
+                latent_plan.as_ref(),
+                iter,
+                latent_drift_for_prompt,
+                &realize_metrics,
+            )
+            .await;
+        }
+
         // ── Stream from model ──────────────────────────────────────────────
         // Inject a one-shot governor hint if we detected a repeated failure pattern.
         let mut msgs_for_call = messages.clone();
@@ -4842,6 +5909,24 @@ This is the LAST model call for this run.\n\
             msgs_for_call.push(json!({
                 "role": "system",
                 "content": memory_prompt,
+            }));
+        }
+
+        if let (true, Some(latent), Some(drift)) = (
+            realize_cfg.enabled,
+            latent_plan.as_ref(),
+            latent_drift_for_prompt,
+        ) {
+            let age_turns = iter.saturating_sub(latent.created_iter);
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": build_realize_pending_hint(
+                    &realize_cfg,
+                    latent,
+                    &realize_metrics,
+                    age_turns,
+                    drift,
+                ),
             }));
         }
 
@@ -4917,6 +6002,8 @@ This is the LAST model call for this run.\n\
                     tool_calls.push(tc);
                 }
                 StreamToken::GovernorState(_) => {} // not emitted by inner stream
+                StreamToken::RealizeState(_) => {}  // not emitted by inner stream
+                StreamToken::Telemetry(_) => {}     // not emitted by inner stream
                 StreamToken::Done => break,
                 StreamToken::Error(e) => {
                     let _ = tx.send(StreamToken::Error(e.clone())).await;
@@ -5092,6 +6179,10 @@ Execute only the new minimal action: {}",
             impact_required = None;
         }
 
+        let realize_reason = parse_realize_block(&assistant_text);
+        let assistant_text_clean = strip_tag_block_owned(&assistant_text, "realize")
+            .trim()
+            .to_string();
         let parsed_plan = parse_plan_block(&assistant_text);
         let parsed_think = parse_think_block(&assistant_text);
         let mut validated_plan_for_turn: Option<PlanBlock> = None;
@@ -5110,6 +6201,59 @@ Execute only the new minimal action: {}",
         }
 
         let tool_call: Option<ToolCallData> = tool_calls.pop();
+
+        if realize_cfg.enabled {
+            let materialize_reason = if let Some(reason) = realize_reason.as_ref() {
+                Some(format!("explicit:{reason}"))
+            } else if tool_call.is_some() {
+                Some("tool_call".to_string())
+            } else {
+                None
+            };
+            if let Some(reason) = materialize_reason {
+                if let Some(latent) = latent_plan.take() {
+                    let latency = iter.saturating_sub(latent.created_iter);
+                    let drift = drift_distance(
+                        realize_cfg.drift_metric,
+                        &latent.summary,
+                        &latent.anchor_baseline,
+                    );
+                    realize_metrics.realize_count += 1;
+                    realize_metrics.total_realize_latency += latency;
+                    adopt_valid_plan(
+                        &latent.plan,
+                        &mut working_mem,
+                        &mut active_plan,
+                        &mut intent_required_verification,
+                        path_required_verification,
+                        &mut required_verification,
+                        &mut recovery,
+                        &mut last_verify_ok_step,
+                        last_build_verify_ok_step,
+                        last_behavioral_verify_ok_step,
+                    );
+                    messages.push(json!({"role": "assistant", "content": latent.raw_text}));
+                    let _ = tx
+                        .send(StreamToken::Delta(build_realize_banner(
+                            &reason,
+                            latency,
+                            drift,
+                            &realize_metrics,
+                        )))
+                        .await;
+                    autosave_best_effort(
+                        &autosaver,
+                        &tx,
+                        tool_root_abs.as_deref(),
+                        checkpoint.as_deref(),
+                        cur_cwd.as_deref(),
+                        &messages,
+                    )
+                    .await;
+                    emit_realize_state(&tx, &realize_cfg, None, iter, None, &realize_metrics).await;
+                }
+            }
+        }
 
         if let Some(ref tc) = tool_call {
             let candidate_plan = match parsed_plan.as_ref() {
@@ -5306,23 +6450,22 @@ Execute only the new minimal action: {}",
         if let Some(ref tc) = tool_call {
             state = AgentState::Executing;
             if let Some(plan) = parsed_plan.clone() {
-                working_mem.sync_to_plan(&plan);
-                if let Some(level) = verification_level_from_plan(&plan) {
-                    intent_required_verification = level;
-                    required_verification =
-                        intent_required_verification.max(path_required_verification);
-                    recovery.required_verification = required_verification;
-                    last_verify_ok_step = effective_verify_ok_step(
-                        required_verification,
-                        last_build_verify_ok_step,
-                        last_behavioral_verify_ok_step,
-                    );
-                }
-                active_plan = Some(plan);
+                adopt_valid_plan(
+                    &plan,
+                    &mut working_mem,
+                    &mut active_plan,
+                    &mut intent_required_verification,
+                    path_required_verification,
+                    &mut required_verification,
+                    &mut recovery,
+                    &mut last_verify_ok_step,
+                    last_build_verify_ok_step,
+                    last_behavioral_verify_ok_step,
+                );
             }
             messages.push(json!({
                 "role": "assistant",
-                "content": assistant_text,
+                "content": assistant_text_clean,
                 "tool_calls": [{
                     "id": tc.id,
                     "type": "function",
@@ -5333,24 +6476,187 @@ Execute only the new minimal action: {}",
                 }]
             }));
         } else {
-            if let Some(plan) = parsed_plan {
-                if validate_plan(&plan).is_ok() {
-                    working_mem.sync_to_plan(&plan);
-                    if let Some(level) = verification_level_from_plan(&plan) {
-                        intent_required_verification = level;
-                        required_verification =
-                            intent_required_verification.max(path_required_verification);
-                        recovery.required_verification = required_verification;
-                        last_verify_ok_step = effective_verify_ok_step(
-                            required_verification,
-                            last_build_verify_ok_step,
-                            last_behavioral_verify_ok_step,
+            if realize_cfg.enabled {
+                if let Some(plan) = parsed_plan
+                    .as_ref()
+                    .filter(|plan| validate_plan(plan).is_ok())
+                {
+                    let defer_score = latent_plan_defer_score(&assistant_text_clean, plan);
+                    if defer_score >= realize_cfg.defer_threshold {
+                        let latest_intent = parsed_think.as_ref().map(think_intent_summary);
+                        let leakage = !strip_known_latent_tags(&assistant_text_clean)
+                            .trim()
+                            .is_empty();
+                        if leakage {
+                            realize_metrics.early_leakage += 1;
+                        }
+                        let summary = latent_plan_summary(
+                            plan,
+                            &assistant_text_clean,
+                            latest_intent.as_deref(),
                         );
+                        let anchor = build_anchor_baseline(
+                            &root_user_text,
+                            active_plan.as_ref(),
+                            &working_mem,
+                        );
+                        let drift = drift_distance(realize_cfg.drift_metric, &summary, &anchor);
+                        realize_metrics.total_drift += drift;
+                        realize_metrics.drift_samples += 1;
+                        latent_plan = Some(LatentPlanBuffer {
+                            raw_text: assistant_text_clean.clone(),
+                            plan: plan.clone(),
+                            summary,
+                            latest_intent,
+                            anchor_baseline: anchor,
+                            created_iter: iter,
+                            defer_score,
+                            tail_updates: 0,
+                        });
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "\n[realize] deferred plan score={defer_score:.2} drift={drift:.3} window=0/{}\n",
+                                realize_cfg.window_end
+                            )))
+                            .await;
+                        emit_realize_state(
+                            &tx,
+                            &realize_cfg,
+                            latent_plan.as_ref(),
+                            iter,
+                            Some(drift),
+                            &realize_metrics,
+                        )
+                        .await;
+                        continue;
                     }
-                    active_plan = Some(plan);
+                } else if latent_plan.is_none() {
+                    if let (Some(active), Some(think)) =
+                        (active_plan.as_ref(), parsed_think.as_ref())
+                    {
+                        let defer_score = latent_intent_defer_score(&assistant_text_clean, think);
+                        if defer_score >= realize_cfg.defer_threshold {
+                            let latest_intent = Some(think_intent_summary(think));
+                            let leakage = !strip_known_latent_tags(&assistant_text_clean)
+                                .trim()
+                                .is_empty();
+                            if leakage {
+                                realize_metrics.early_leakage += 1;
+                            }
+                            let summary = latent_plan_summary(
+                                active,
+                                &assistant_text_clean,
+                                latest_intent.as_deref(),
+                            );
+                            let anchor = build_anchor_baseline(
+                                &root_user_text,
+                                active_plan.as_ref(),
+                                &working_mem,
+                            );
+                            let drift = drift_distance(realize_cfg.drift_metric, &summary, &anchor);
+                            realize_metrics.total_drift += drift;
+                            realize_metrics.drift_samples += 1;
+                            latent_plan = Some(LatentPlanBuffer {
+                                raw_text: assistant_text_clean.clone(),
+                                plan: active.clone(),
+                                summary,
+                                latest_intent,
+                                anchor_baseline: anchor,
+                                created_iter: iter,
+                                defer_score,
+                                tail_updates: 0,
+                            });
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "\n[realize] deferred intent score={defer_score:.2} drift={drift:.3} window=0/{}\n",
+                                    realize_cfg.window_end
+                                )))
+                                .await;
+                            emit_realize_state(
+                                &tx,
+                                &realize_cfg,
+                                latent_plan.as_ref(),
+                                iter,
+                                Some(drift),
+                                &realize_metrics,
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                } else if let Some(latent) = latent_plan.as_mut() {
+                    if !assistant_text_clean.is_empty() {
+                        if !latent.raw_text.trim().is_empty() {
+                            latent.raw_text.push_str("\n\n");
+                        }
+                        latent.raw_text.push_str(&assistant_text_clean);
+                        if let Some(think) = parsed_think.as_ref() {
+                            latent.latest_intent = Some(think_intent_summary(think));
+                        }
+                        latent.summary = latent_plan_summary(
+                            &latent.plan,
+                            &latent.raw_text,
+                            latent.latest_intent.as_deref(),
+                        );
+                        latent.tail_updates += 1;
+                        realize_metrics.early_leakage += 1;
+                        let drift = drift_distance(
+                            realize_cfg.drift_metric,
+                            &latent.summary,
+                            &latent.anchor_baseline,
+                        );
+                        realize_metrics.total_drift += drift;
+                        realize_metrics.drift_samples += 1;
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "\n[realize] buffered latent tail updates={} drift={drift:.3}\n",
+                                latent.tail_updates
+                            )))
+                            .await;
+                        emit_realize_state(
+                            &tx,
+                            &realize_cfg,
+                            latent_plan.as_ref(),
+                            iter,
+                            Some(drift),
+                            &realize_metrics,
+                        )
+                        .await;
+                        continue;
+                    }
                 }
             }
-            messages.push(json!({"role": "assistant", "content": assistant_text}));
+
+            if assistant_text_clean.is_empty() && realize_reason.is_some() {
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+                continue;
+            }
+
+            if let Some(plan) = parsed_plan {
+                if validate_plan(&plan).is_ok() {
+                    adopt_valid_plan(
+                        &plan,
+                        &mut working_mem,
+                        &mut active_plan,
+                        &mut intent_required_verification,
+                        path_required_verification,
+                        &mut required_verification,
+                        &mut recovery,
+                        &mut last_verify_ok_step,
+                        last_build_verify_ok_step,
+                        last_behavioral_verify_ok_step,
+                    );
+                }
+            }
+            messages.push(json!({"role": "assistant", "content": assistant_text_clean}));
             autosave_best_effort(
                 &autosaver,
                 &tx,
@@ -5364,8 +6670,8 @@ Execute only the new minimal action: {}",
             // Model didn't call tools. If the user asked for local actions, try implied scripts
             // (PowerShell/bash code fences) as a fallback so non-tool-calling models can still act.
             if goal_wants_actions && iter + 1 < max_iters {
-                let implied_scripts = extract_implied_exec_scripts(&assistant_text);
-                let implied_files = extract_implied_write_files(&assistant_text);
+                let implied_scripts = extract_implied_exec_scripts(&assistant_text_clean);
+                let implied_files = extract_implied_write_files(&assistant_text_clean);
                 if !implied_scripts.is_empty() || !implied_files.is_empty() {
                     let _ = tx
                         .send(StreamToken::Delta(
@@ -5613,8 +6919,7 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
                                 Ok(p) => p,
                                 Err(e) => {
                                     state = AgentState::Recovery;
-                                    let msg =
-                                        format!("ERROR: {e}\npath: {path}\n(action skipped)");
+                                    let msg = format!("ERROR: {e}\npath: {path}\n(action skipped)");
                                     let _ = tx
                                         .send(StreamToken::Delta(format!(
                                             "[RESULT_FILE_ERR] {}\n",
@@ -6705,8 +8010,22 @@ Required now: {}",
             let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
 
             let base = tool_root_abs.as_deref();
-            let (result, is_error) =
+            let (mut result, is_error) =
                 crate::file_tools::tool_list_dir(&dir, max_entries, include_hidden, base);
+            let mut repo_map_hint: Option<String> = None;
+            let mut repo_map_display: Option<String> = None;
+            if is_error && !dir.trim().is_empty() {
+                if let Some(root) = tool_root_abs.as_deref() {
+                    if let Some(fallback) = crate::repo_map::lazy_list_dir_fallback(root, &dir) {
+                        emit_repo_map_fallback_telemetry(&tx, "list_dir", &dir, &fallback).await;
+                        result.push_str("\n");
+                        result.push_str(&fallback.content);
+                        repo_map_display =
+                            Some(build_repo_map_display_banner("list_dir", &fallback));
+                        repo_map_hint = Some(build_repo_map_list_dir_hint(&dir, &fallback));
+                    }
+                }
+            }
             recovery.on_diagnostic_result(!is_error);
 
             let first_line = result.lines().next().unwrap_or("").to_string();
@@ -6716,6 +8035,10 @@ Required now: {}",
                         "[RESULT_FILE_ERR] {first_line}\n"
                     )))
                     .await;
+                if let Some(display) = repo_map_display {
+                    let _ = tx.send(StreamToken::Delta(display)).await;
+                }
+                pending_system_hint = repo_map_hint;
                 state = AgentState::Recovery;
             } else {
                 let _ = tx
@@ -6787,7 +8110,20 @@ Required now: {}",
             let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
 
             let base = tool_root_abs.as_deref();
-            let (result, is_error) = crate::file_tools::tool_glob_files(&pattern, &dir, base);
+            let (mut result, is_error) = crate::file_tools::tool_glob_files(&pattern, &dir, base);
+            let mut repo_map_hint: Option<String> = None;
+            let mut repo_map_display: Option<String> = None;
+            if !is_error && result.starts_with("[glob] No files matching") {
+                if let Some(root) = tool_root_abs.as_deref() {
+                    if let Some(fallback) = crate::repo_map::lazy_glob_fallback(root, &pattern) {
+                        emit_repo_map_fallback_telemetry(&tx, "glob", &pattern, &fallback).await;
+                        result.push_str("\n");
+                        result.push_str(&fallback.content);
+                        repo_map_display = Some(build_repo_map_display_banner("glob", &fallback));
+                        repo_map_hint = Some(build_repo_map_glob_hint(&pattern, &fallback));
+                    }
+                }
+            }
             recovery.on_diagnostic_result(!is_error);
 
             let first_line = result.lines().next().unwrap_or("").to_string();
@@ -6802,6 +8138,9 @@ Required now: {}",
                 let _ = tx
                     .send(StreamToken::Delta(format!("[RESULT_GLOB] {first_line}\n")))
                     .await;
+                if let Some(display) = repo_map_display {
+                    let _ = tx.send(StreamToken::Delta(display)).await;
+                }
                 state = if recovery.in_recovery() {
                     AgentState::Recovery
                 } else {
@@ -6814,6 +8153,8 @@ Required now: {}",
                         "Recovery stage=verify: {}",
                         verification_requirement_hint(required_verification, test_cmd.as_deref())
                     ))
+                } else if repo_map_hint.is_some() {
+                    repo_map_hint
                 } else {
                     None
                 };
@@ -6870,7 +8211,26 @@ Required now: {}",
             let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
 
             let base = tool_root_abs.as_deref();
-            let (result, is_error) = crate::file_tools::tool_search_files(&pattern, &dir, ci, base);
+            let (mut result, is_error) =
+                crate::file_tools::tool_search_files(&pattern, &dir, ci, base);
+            let mut repo_map_hint: Option<String> = None;
+            let mut repo_map_display: Option<String> = None;
+            if !is_error
+                && result.starts_with("[search_files] No matches for")
+                && dir.trim().is_empty()
+            {
+                if let Some(root) = tool_root_abs.as_deref() {
+                    if let Some(fallback) = crate::repo_map::lazy_search_fallback(root, &pattern) {
+                        emit_repo_map_fallback_telemetry(&tx, "search_files", &pattern, &fallback)
+                            .await;
+                        result.push_str("\n");
+                        result.push_str(&fallback.content);
+                        repo_map_display =
+                            Some(build_repo_map_display_banner("search_files", &fallback));
+                        repo_map_hint = Some(build_repo_map_search_hint(&pattern, &fallback));
+                    }
+                }
+            }
             recovery.on_diagnostic_result(!is_error);
 
             let first_line = result.lines().next().unwrap_or("").to_string();
@@ -6887,6 +8247,9 @@ Required now: {}",
                         "[RESULT_SEARCH] {first_line}\n"
                     )))
                     .await;
+                if let Some(display) = repo_map_display {
+                    let _ = tx.send(StreamToken::Delta(display)).await;
+                }
                 state = if recovery.in_recovery() {
                     AgentState::Recovery
                 } else {
@@ -6899,6 +8262,8 @@ Required now: {}",
                         "Recovery stage=verify: {}",
                         verification_requirement_hint(required_verification, test_cmd.as_deref())
                     ))
+                } else if repo_map_hint.is_some() {
+                    repo_map_hint
                 } else {
                     None
                 };
@@ -6943,6 +8308,8 @@ Required now: {}",
             let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
 
             let base = tool_root_abs.as_deref();
+            let mut repo_map_hint: Option<String> = None;
+            let mut repo_map_display: Option<String> = None;
 
             // Cache key: canonical absolute path string.
             let cache_key = crate::file_tools::resolve_safe_path(&path, base)
@@ -6967,7 +8334,28 @@ Required now: {}",
                             false,
                         )
                     } else {
-                        let (content, err) = crate::file_tools::tool_read_file(&path, base);
+                        let (mut content, err) = crate::file_tools::tool_read_file(&path, base);
+                        if err {
+                            if let Some(root) = tool_root_abs.as_deref() {
+                                if let Some(fallback) =
+                                    crate::repo_map::lazy_read_fallback(root, &path)
+                                {
+                                    emit_repo_map_fallback_telemetry(
+                                        &tx,
+                                        "read_file",
+                                        &path,
+                                        &fallback,
+                                    )
+                                    .await;
+                                    content.push_str("\n");
+                                    content.push_str(&fallback.content);
+                                    repo_map_display =
+                                        Some(build_repo_map_display_banner("read_file", &fallback));
+                                    repo_map_hint =
+                                        Some(build_repo_map_read_hint(&path, &fallback));
+                                }
+                            }
+                        }
                         if !err {
                             file_cache.insert(cache_key.clone(), content.clone());
                         }
@@ -7192,6 +8580,11 @@ Action required: call read_file(path) first to confirm current contents, then re
                         "[RESULT_FILE_ERR] {first_line}\n"
                     )))
                     .await;
+                if tc.name.as_str() == "read_file" {
+                    if let Some(display) = repo_map_display {
+                        let _ = tx.send(StreamToken::Delta(display)).await;
+                    }
+                }
                 state = AgentState::Recovery;
                 // D — escalate after 3 consecutive file-tool failures.
                 let hint = if rejected_by_user {
@@ -7204,6 +8597,8 @@ Action required: call read_file(path) first to confirm current contents, then re
                          Instead: call read_file to inspect the actual file state, then choose \
                          a completely different strategy (e.g. write_file instead of patch_file)."
                     )
+                } else if tc.name.as_str() == "read_file" && repo_map_hint.is_some() {
+                    repo_map_hint.unwrap_or_default()
                 } else {
                     format!(
                         "File tool error: {first_line}\n\
@@ -7781,6 +9176,51 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
                     "\n[agent] iteration cap ({max_iters}) reached.\n"
                 )))
                 .await;
+        }
+    }
+
+    if realize_cfg.enabled {
+        if let Some(latent) = latent_plan.take() {
+            let latency = max_iters.saturating_sub(latent.created_iter);
+            let drift = drift_distance(
+                realize_cfg.drift_metric,
+                &latent.summary,
+                &latent.anchor_baseline,
+            );
+            realize_metrics.missing += 1;
+            realize_metrics.realize_count += 1;
+            realize_metrics.total_realize_latency += latency;
+            adopt_valid_plan(
+                &latent.plan,
+                &mut working_mem,
+                &mut active_plan,
+                &mut intent_required_verification,
+                path_required_verification,
+                &mut required_verification,
+                &mut recovery,
+                &mut last_verify_ok_step,
+                last_build_verify_ok_step,
+                last_behavioral_verify_ok_step,
+            );
+            messages.push(json!({"role": "assistant", "content": latent.raw_text}));
+            let _ = tx
+                .send(StreamToken::Delta(build_realize_banner(
+                    "session_end",
+                    latency,
+                    drift,
+                    &realize_metrics,
+                )))
+                .await;
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
+            emit_realize_state(&tx, &realize_cfg, None, max_iters, None, &realize_metrics).await;
         }
     }
 
@@ -8582,5 +10022,62 @@ verify: exit code is zero\n\
         ];
 
         assert_eq!(last_impact_step_from_messages(&messages), Some(1));
+    }
+
+    #[test]
+    fn parse_realize_block_extracts_reason() {
+        let text = "<realize>\nreason: enough evidence to commit this plan\n</realize>";
+        assert_eq!(
+            parse_realize_block(text).as_deref(),
+            Some("enough evidence to commit this plan")
+        );
+    }
+
+    #[test]
+    fn strip_known_latent_tags_preserves_surrounding_text() {
+        let text = "before\n<plan>\ngoal: x\nsteps: 1) a 2) b\nacceptance: 1) ok\nrisks: r\nassumptions: a\n</plan>\nafter";
+        assert_eq!(strip_known_latent_tags(text), "before\nafter");
+    }
+
+    #[test]
+    fn cosine_drift_is_lower_for_nearby_text() {
+        let anchor = "fix repo map fallback for read_file and list_dir";
+        let near = "fix repo map fallback for read_file";
+        let far = "compose a critique about unrelated observer prose";
+        assert!(cosine_token_distance(anchor, near) < cosine_token_distance(anchor, far));
+    }
+
+    #[test]
+    fn realize_preset_parser_accepts_named_levels() {
+        assert_eq!(
+            "off".parse::<RealizePreset>().ok(),
+            Some(RealizePreset::Off)
+        );
+        assert_eq!(
+            "low".parse::<RealizePreset>().ok(),
+            Some(RealizePreset::Low)
+        );
+        assert_eq!(
+            "mid".parse::<RealizePreset>().ok(),
+            Some(RealizePreset::Mid)
+        );
+        assert_eq!(
+            "medium".parse::<RealizePreset>().ok(),
+            Some(RealizePreset::Mid)
+        );
+        assert_eq!(
+            "high".parse::<RealizePreset>().ok(),
+            Some(RealizePreset::High)
+        );
+    }
+
+    #[test]
+    fn realize_preset_mid_matches_tui_default_shape() {
+        let cfg = RealizeOnDemandConfig::resolve(Some(RealizePreset::Mid));
+        assert!(cfg.enabled);
+        assert_eq!(cfg.defer_threshold, 0.45);
+        assert_eq!((cfg.window_start, cfg.window_end), (1, 3));
+        assert_eq!(cfg.lambda_min, 0.15);
+        assert_eq!(cfg.lambda_max, 0.90);
     }
 }

@@ -1,0 +1,743 @@
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+fn default_spec_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeEvalSpec {
+    #[serde(default = "default_spec_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub defaults: RuntimeEvalDefaults,
+    #[serde(default)]
+    pub cases: Vec<RuntimeEvalCase>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeEvalDefaults {
+    #[serde(default)]
+    pub tool_root: Option<String>,
+    #[serde(default)]
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub max_iters: Option<usize>,
+    #[serde(default)]
+    pub autofix: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeEvalCase {
+    pub id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub tool_root: Option<String>,
+    #[serde(default)]
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub max_iters: Option<usize>,
+    #[serde(default)]
+    pub autofix: Option<usize>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub checks: Vec<RuntimeEvalCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimeEvalCheck {
+    Completed,
+    ErrorFree,
+    AssistantContains { value: String },
+    AssistantNotContains { value: String },
+    ToolCallSeen { name: String },
+    ToolCallMin { name: String, min: usize },
+    TraceEventSeen { event: String },
+    MessagesMin { min: usize },
+    GraphNodesMin { min: usize },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeEvalArtifacts {
+    pub case_dir: PathBuf,
+    pub trace_path: PathBuf,
+    pub session_path: PathBuf,
+    pub json_path: PathBuf,
+    pub graph_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeEvalMetrics {
+    pub completed: bool,
+    pub error_count: usize,
+    pub tool_call_count: usize,
+    pub unique_tool_calls: Vec<String>,
+    pub tool_call_histogram: BTreeMap<String, usize>,
+    pub trace_events: BTreeMap<String, usize>,
+    pub iteration_count: usize,
+    pub max_iteration: usize,
+    pub messages_len: usize,
+    pub graph_nodes: usize,
+    pub graph_edges: usize,
+    pub governor_events: usize,
+    pub realize_events: usize,
+    pub checkpoint_count: usize,
+    pub round_count: usize,
+    pub repo_map_fallback_count: usize,
+    pub repo_map_fallback_histogram: BTreeMap<String, usize>,
+    pub repo_map_typo_fallbacks: usize,
+    pub recovery_enter_count: usize,
+    pub recovery_stage_histogram: BTreeMap<String, usize>,
+    pub max_consecutive_failures: usize,
+    pub max_same_command_repeats: usize,
+    pub max_same_error_repeats: usize,
+    pub max_same_output_repeats: usize,
+    pub max_file_tool_consec_failures: usize,
+    pub realize_mean_drift_last: Option<f64>,
+    pub realize_mean_latency_last: Option<f64>,
+    pub realize_missing_last: Option<usize>,
+    pub realize_early_leakage_last: Option<usize>,
+    pub last_assistant: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeEvalCheckResult {
+    pub label: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeEvalCaseReport {
+    pub id: String,
+    pub ok: bool,
+    pub root: String,
+    pub duration_ms: u128,
+    pub prompt: String,
+    pub tags: Vec<String>,
+    pub run_error: Option<String>,
+    pub artifacts: RuntimeEvalArtifacts,
+    pub metrics: RuntimeEvalMetrics,
+    pub checks: Vec<RuntimeEvalCheckResult>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeEvalSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub avg_duration_ms: f64,
+    pub avg_tool_calls: f64,
+    pub avg_iterations: f64,
+    pub avg_messages: f64,
+    pub avg_repo_map_fallbacks: f64,
+    pub avg_recovery_enters: f64,
+    pub passed_ids: Vec<String>,
+    pub failed_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeEvalReport {
+    pub version: u32,
+    pub spec_path: PathBuf,
+    pub out_dir: PathBuf,
+    pub generated_at_ms: u128,
+    pub summary: RuntimeEvalSummary,
+    pub cases: Vec<RuntimeEvalCaseReport>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TraceLine {
+    event: String,
+    #[serde(default)]
+    data: Value,
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+pub fn load_spec(path: &Path) -> Result<RuntimeEvalSpec> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read runtime eval spec: {}", path.display()))?;
+    let spec: RuntimeEvalSpec = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse runtime eval spec: {}", path.display()))?;
+    if spec.version != 1 {
+        anyhow::bail!(
+            "unsupported runtime eval spec version {} (expected 1)",
+            spec.version
+        );
+    }
+    if spec.cases.is_empty() {
+        anyhow::bail!("runtime eval spec contains no cases");
+    }
+    Ok(spec)
+}
+
+pub fn save_report(path: &Path, report: &RuntimeEvalReport) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create runtime eval report dir: {}", parent.display()))?;
+    let text =
+        serde_json::to_string_pretty(report).context("failed to serialize runtime eval report")?;
+    std::fs::write(path, text)
+        .with_context(|| format!("failed to write runtime eval report: {}", path.display()))?;
+    Ok(())
+}
+
+pub fn sanitize_case_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    let mut prev_dash = false;
+    for ch in id.trim().chars() {
+        let good = ch.is_ascii_alphanumeric() || ch == '_' || ch == '-';
+        let mapped = if good { ch } else { '-' };
+        if mapped == '-' {
+            if prev_dash {
+                continue;
+            }
+            prev_dash = true;
+            out.push('-');
+        } else {
+            prev_dash = false;
+            out.push(mapped.to_ascii_lowercase());
+        }
+    }
+    let out = out.trim_matches('-');
+    if out.is_empty() {
+        "case".to_string()
+    } else {
+        out.to_string()
+    }
+}
+
+pub fn evaluate_case(
+    case: &RuntimeEvalCase,
+    root: &str,
+    artifacts: RuntimeEvalArtifacts,
+    duration_ms: u128,
+    run_error: Option<String>,
+) -> Result<RuntimeEvalCaseReport> {
+    let trace_lines = load_trace_lines(&artifacts.trace_path)?;
+    let metrics = collect_metrics(&trace_lines, &artifacts)?;
+    let checks = evaluate_checks(case, &metrics, run_error.as_deref());
+    let ok = checks.iter().all(|c| c.ok) && run_error.is_none();
+    Ok(RuntimeEvalCaseReport {
+        id: case.id.clone(),
+        ok,
+        root: root.to_string(),
+        duration_ms,
+        prompt: case.prompt.clone(),
+        tags: case.tags.clone(),
+        run_error,
+        artifacts,
+        metrics,
+        checks,
+    })
+}
+
+pub fn summarize_cases(cases: &[RuntimeEvalCaseReport]) -> RuntimeEvalSummary {
+    let total = cases.len();
+    let passed = cases.iter().filter(|c| c.ok).count();
+    let failed = total.saturating_sub(passed);
+    let avg_duration_ms = avg(cases.iter().map(|c| c.duration_ms as f64).collect());
+    let avg_tool_calls = avg(cases.iter().map(|c| c.metrics.tool_call_count as f64).collect());
+    let avg_iterations = avg(cases.iter().map(|c| c.metrics.iteration_count as f64).collect());
+    let avg_messages = avg(cases.iter().map(|c| c.metrics.messages_len as f64).collect());
+    let avg_repo_map_fallbacks = avg(
+        cases
+            .iter()
+            .map(|c| c.metrics.repo_map_fallback_count as f64)
+            .collect(),
+    );
+    let avg_recovery_enters = avg(
+        cases
+            .iter()
+            .map(|c| c.metrics.recovery_enter_count as f64)
+            .collect(),
+    );
+    let mut passed_ids = Vec::new();
+    let mut failed_ids = Vec::new();
+    for case in cases {
+        if case.ok {
+            passed_ids.push(case.id.clone());
+        } else {
+            failed_ids.push(case.id.clone());
+        }
+    }
+    RuntimeEvalSummary {
+        total,
+        passed,
+        failed,
+        avg_duration_ms,
+        avg_tool_calls,
+        avg_iterations,
+        avg_messages,
+        avg_repo_map_fallbacks,
+        avg_recovery_enters,
+        passed_ids,
+        failed_ids,
+    }
+}
+
+pub fn build_report(
+    spec_path: PathBuf,
+    out_dir: PathBuf,
+    cases: Vec<RuntimeEvalCaseReport>,
+) -> RuntimeEvalReport {
+    RuntimeEvalReport {
+        version: 1,
+        spec_path,
+        out_dir,
+        generated_at_ms: now_ms(),
+        summary: summarize_cases(&cases),
+        cases,
+    }
+}
+
+fn avg(values: Vec<f64>) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
+fn load_trace_lines(path: &Path) -> Result<Vec<TraceLine>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read trace file: {}", path.display()))?;
+    let mut out = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let trace: TraceLine = serde_json::from_str(line).with_context(|| {
+            format!("failed to parse trace line {} from {}", idx + 1, path.display())
+        })?;
+        out.push(trace);
+    }
+    Ok(out)
+}
+
+fn collect_metrics(trace_lines: &[TraceLine], artifacts: &RuntimeEvalArtifacts) -> Result<RuntimeEvalMetrics> {
+    let mut metrics = RuntimeEvalMetrics::default();
+    let mut tool_names = BTreeSet::new();
+    let mut agent_end_ok = None;
+    let mut last_recovery_stage: Option<String> = None;
+
+    for line in trace_lines {
+        *metrics.trace_events.entry(line.event.clone()).or_insert(0) += 1;
+        match line.event.as_str() {
+            "tool_call" => {
+                metrics.tool_call_count += 1;
+                if let Some(name) = line.data.get("name").and_then(|v| v.as_str()) {
+                    tool_names.insert(name.to_string());
+                    *metrics.tool_call_histogram.entry(name.to_string()).or_insert(0) += 1;
+                }
+            }
+            "error" => metrics.error_count += 1,
+            "checkpoint" => metrics.checkpoint_count += 1,
+            "round_start" => metrics.round_count += 1,
+            "agent_iter" => {
+                metrics.iteration_count += 1;
+                if let Some(iter) = line.data.get("iter").and_then(|v| v.as_u64()) {
+                    metrics.max_iteration = metrics.max_iteration.max(iter as usize);
+                }
+            }
+            "repo_map_fallback" => {
+                metrics.repo_map_fallback_count += 1;
+                if line
+                    .data
+                    .get("typo_likely")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    metrics.repo_map_typo_fallbacks += 1;
+                }
+                if let Some(tool) = line.data.get("tool").and_then(|v| v.as_str()) {
+                    *metrics
+                        .repo_map_fallback_histogram
+                        .entry(tool.to_string())
+                        .or_insert(0) += 1;
+                }
+            }
+            "governor_state" => {
+                metrics.governor_events += 1;
+                let stage = line
+                    .data
+                    .get("recovery_stage")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if let Some(ref current) = stage {
+                    *metrics
+                        .recovery_stage_histogram
+                        .entry(current.clone())
+                        .or_insert(0) += 1;
+                }
+                if stage.is_some() && last_recovery_stage.is_none() {
+                    metrics.recovery_enter_count += 1;
+                }
+                last_recovery_stage = stage;
+                metrics.max_consecutive_failures = metrics.max_consecutive_failures.max(
+                    line.data
+                        .get("consecutive_failures")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize,
+                );
+                metrics.max_same_command_repeats = metrics.max_same_command_repeats.max(
+                    line.data
+                        .get("same_command_repeats")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize,
+                );
+                metrics.max_same_error_repeats = metrics.max_same_error_repeats.max(
+                    line.data
+                        .get("same_error_repeats")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize,
+                );
+                metrics.max_same_output_repeats = metrics.max_same_output_repeats.max(
+                    line.data
+                        .get("same_output_repeats")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize,
+                );
+                metrics.max_file_tool_consec_failures = metrics
+                    .max_file_tool_consec_failures
+                    .max(
+                        line.data
+                            .get("file_tool_consec_failures")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize,
+                    );
+            }
+            "realize_state" => {
+                metrics.realize_events += 1;
+                metrics.realize_mean_drift_last = line.data.get("mean_drift").and_then(|v| v.as_f64());
+                metrics.realize_mean_latency_last = line
+                    .data
+                    .get("mean_realize_latency")
+                    .and_then(|v| v.as_f64());
+                metrics.realize_missing_last = line
+                    .data
+                    .get("missing")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                metrics.realize_early_leakage_last = line
+                    .data
+                    .get("early_leakage")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+            }
+            "agent_end" => {
+                agent_end_ok = line.data.get("ok").and_then(|v| v.as_bool());
+            }
+            _ => {}
+        }
+    }
+    metrics.unique_tool_calls = tool_names.into_iter().collect();
+    metrics.completed = agent_end_ok
+        .or_else(|| metrics.trace_events.get("done").map(|n| *n > 0))
+        .unwrap_or(false)
+        && metrics.error_count == 0;
+
+    let session_value = load_session_value(&artifacts.json_path)
+        .or_else(|_| load_session_value(&artifacts.session_path))
+        .unwrap_or(Value::Null);
+    if let Some(messages) = session_value.get("messages").and_then(|v| v.as_array()) {
+        metrics.messages_len = messages.len();
+        metrics.last_assistant = messages
+            .iter()
+            .rev()
+            .find(|msg| msg.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .and_then(|msg| msg.get("content").and_then(|v| v.as_str()))
+            .map(|s| s.to_string());
+    }
+
+    let graph_value = load_graph_value(&artifacts.graph_path).unwrap_or(Value::Null);
+    metrics.graph_nodes = graph_value
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .map(|v| v.len())
+        .unwrap_or(0);
+    metrics.graph_edges = graph_value
+        .get("edges")
+        .and_then(|v| v.as_array())
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    Ok(metrics)
+}
+
+fn load_session_value(path: &Path) -> Result<Value> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read session snapshot: {}", path.display()))?;
+    let value: Value = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse session snapshot: {}", path.display()))?;
+    Ok(value)
+}
+
+fn load_graph_value(path: &Path) -> Result<Value> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read graph artifact: {}", path.display()))?;
+    let value: Value = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse graph artifact: {}", path.display()))?;
+    Ok(value)
+}
+
+fn evaluate_checks(
+    case: &RuntimeEvalCase,
+    metrics: &RuntimeEvalMetrics,
+    run_error: Option<&str>,
+) -> Vec<RuntimeEvalCheckResult> {
+    let checks = if case.checks.is_empty() {
+        vec![RuntimeEvalCheck::Completed, RuntimeEvalCheck::ErrorFree]
+    } else {
+        case.checks.clone()
+    };
+    checks
+        .iter()
+        .map(|check| evaluate_check(check, metrics, run_error))
+        .collect()
+}
+
+fn evaluate_check(
+    check: &RuntimeEvalCheck,
+    metrics: &RuntimeEvalMetrics,
+    run_error: Option<&str>,
+) -> RuntimeEvalCheckResult {
+    match check {
+        RuntimeEvalCheck::Completed => RuntimeEvalCheckResult {
+            label: "completed".to_string(),
+            ok: metrics.completed,
+            detail: format!("completed={}", metrics.completed),
+        },
+        RuntimeEvalCheck::ErrorFree => RuntimeEvalCheckResult {
+            label: "error_free".to_string(),
+            ok: run_error.is_none() && metrics.error_count == 0,
+            detail: match run_error {
+                Some(err) => format!("run_error={err}"),
+                None => format!("error_count={}", metrics.error_count),
+            },
+        },
+        RuntimeEvalCheck::AssistantContains { value } => {
+            let hay = metrics.last_assistant.as_deref().unwrap_or("");
+            RuntimeEvalCheckResult {
+                label: format!("assistant_contains:{value}"),
+                ok: hay.contains(value),
+                detail: if hay.is_empty() {
+                    "last assistant message missing".to_string()
+                } else {
+                    format!("matched={}", hay.contains(value))
+                },
+            }
+        }
+        RuntimeEvalCheck::AssistantNotContains { value } => {
+            let hay = metrics.last_assistant.as_deref().unwrap_or("");
+            RuntimeEvalCheckResult {
+                label: format!("assistant_not_contains:{value}"),
+                ok: !hay.contains(value),
+                detail: format!("matched={}", hay.contains(value)),
+            }
+        }
+        RuntimeEvalCheck::ToolCallSeen { name } => {
+            let count = metrics.tool_call_histogram.get(name).copied().unwrap_or(0);
+            RuntimeEvalCheckResult {
+                label: format!("tool_call_seen:{name}"),
+                ok: count > 0,
+                detail: format!("count={count}"),
+            }
+        }
+        RuntimeEvalCheck::ToolCallMin { name, min } => {
+            let count = metrics.tool_call_histogram.get(name).copied().unwrap_or(0);
+            RuntimeEvalCheckResult {
+                label: format!("tool_call_min:{name}>={min}"),
+                ok: count >= *min,
+                detail: format!("count={count}"),
+            }
+        }
+        RuntimeEvalCheck::TraceEventSeen { event } => {
+            let count = metrics.trace_events.get(event).copied().unwrap_or(0);
+            RuntimeEvalCheckResult {
+                label: format!("trace_event_seen:{event}"),
+                ok: count > 0,
+                detail: format!("count={count}"),
+            }
+        }
+        RuntimeEvalCheck::MessagesMin { min } => RuntimeEvalCheckResult {
+            label: format!("messages_min:{min}"),
+            ok: metrics.messages_len >= *min,
+            detail: format!("messages={}", metrics.messages_len),
+        },
+        RuntimeEvalCheck::GraphNodesMin { min } => RuntimeEvalCheckResult {
+            label: format!("graph_nodes_min:{min}"),
+            ok: metrics.graph_nodes >= *min,
+            detail: format!("graph_nodes={}", metrics.graph_nodes),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn write_json(path: &Path, value: &Value) {
+        std::fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn sanitize_case_id_collapses_noise() {
+        assert_eq!(sanitize_case_id("  Hello World / 42  "), "hello-world-42");
+        assert_eq!(sanitize_case_id("???"), "case");
+    }
+
+    #[test]
+    fn evaluate_case_collects_metrics_and_checks() {
+        let dir = tempdir().unwrap();
+        let trace_path = dir.path().join("trace.jsonl");
+        let session_path = dir.path().join("session.json");
+        let json_path = dir.path().join("final.json");
+        let graph_path = dir.path().join("graph.json");
+        std::fs::write(
+            &trace_path,
+            concat!(
+                "{\"event\":\"tool_call\",\"data\":{\"name\":\"search_files\"}}\n",
+                "{\"event\":\"tool_call\",\"data\":{\"name\":\"read_file\"}}\n",
+                "{\"event\":\"done\",\"data\":{}}\n",
+                "{\"event\":\"agent_end\",\"data\":{\"ok\":true}}\n"
+            ),
+        )
+        .unwrap();
+        write_json(
+            &json_path,
+            &serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": "sys"},
+                    {"role": "assistant", "content": "Found it in src/tui/events.rs"}
+                ]
+            }),
+        );
+        write_json(
+            &session_path,
+            &serde_json::json!({
+                "messages": [
+                    {"role": "assistant", "content": "fallback"}
+                ]
+            }),
+        );
+        write_json(
+            &graph_path,
+            &serde_json::json!({
+                "nodes": [{"id":"1"},{"id":"2"}],
+                "edges": [{"from":"1","to":"2"}]
+            }),
+        );
+
+        let case = RuntimeEvalCase {
+            id: "realize-events".to_string(),
+            prompt: "locate slash command".to_string(),
+            tool_root: None,
+            lang: None,
+            max_iters: None,
+            autofix: None,
+            tags: vec!["smoke".to_string()],
+            checks: vec![
+                RuntimeEvalCheck::Completed,
+                RuntimeEvalCheck::ErrorFree,
+                RuntimeEvalCheck::AssistantContains {
+                    value: "src/tui/events.rs".to_string(),
+                },
+                RuntimeEvalCheck::ToolCallSeen {
+                    name: "read_file".to_string(),
+                },
+                RuntimeEvalCheck::ToolCallMin {
+                    name: "search_files".to_string(),
+                    min: 1,
+                },
+                RuntimeEvalCheck::MessagesMin { min: 2 },
+                RuntimeEvalCheck::GraphNodesMin { min: 2 },
+            ],
+        };
+
+        let report = evaluate_case(
+            &case,
+            ".",
+            RuntimeEvalArtifacts {
+                case_dir: dir.path().to_path_buf(),
+                trace_path,
+                session_path,
+                json_path,
+                graph_path,
+            },
+            123,
+            None,
+        )
+        .unwrap();
+
+        assert!(report.ok);
+        assert_eq!(report.metrics.tool_call_count, 2);
+        assert_eq!(report.metrics.graph_nodes, 2);
+        assert_eq!(report.metrics.messages_len, 2);
+        assert_eq!(report.metrics.repo_map_fallback_count, 0);
+        assert!(report
+            .metrics
+            .last_assistant
+            .unwrap_or_default()
+            .contains("src/tui/events.rs"));
+    }
+
+    #[test]
+    fn default_checks_fail_on_run_error() {
+        let dir = tempdir().unwrap();
+        let trace_path = dir.path().join("trace.jsonl");
+        let session_path = dir.path().join("session.json");
+        let json_path = dir.path().join("final.json");
+        let graph_path = dir.path().join("graph.json");
+        std::fs::write(
+            &trace_path,
+            "{\"event\":\"error\",\"data\":{\"message\":\"boom\"}}\n",
+        )
+        .unwrap();
+        write_json(&json_path, &serde_json::json!({"messages": []}));
+        write_json(&session_path, &serde_json::json!({"messages": []}));
+        write_json(&graph_path, &serde_json::json!({"nodes": [], "edges": []}));
+        let case = RuntimeEvalCase {
+            id: "broken".to_string(),
+            prompt: "x".to_string(),
+            tool_root: None,
+            lang: None,
+            max_iters: None,
+            autofix: None,
+            tags: vec![],
+            checks: vec![],
+        };
+        let report = evaluate_case(
+            &case,
+            ".",
+            RuntimeEvalArtifacts {
+                case_dir: dir.path().to_path_buf(),
+                trace_path,
+                session_path,
+                json_path,
+                graph_path,
+            },
+            5,
+            Some("agent failed".to_string()),
+        )
+        .unwrap();
+        assert!(!report.ok);
+        assert_eq!(report.checks.len(), 2);
+        assert!(report.checks.iter().any(|c| !c.ok));
+    }
+}

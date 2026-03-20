@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod app;
 pub mod events;
+pub mod prefs;
 pub mod ui;
 
 use anyhow::{Context, Result};
@@ -204,6 +205,11 @@ Tip: you can still use Anthropic/HF for other panes via `--observer-provider` / 
     let auto_observe = args.auto_observe;
     let lang = args.lang.clone();
     let max_iters = args.max_iters;
+    let prefs_root = args
+        .tool_root
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(prefs::default_prefs_root);
 
     // Windows: force UTF-8 so Japanese/French and box-drawing characters don't mojibake.
     #[cfg(target_os = "windows")]
@@ -242,10 +248,14 @@ Tip: you can still use Anthropic/HF for other panes via `--observer-provider` / 
         observer_cfg,
         chat_cfg,
         tool_root,
+        prefs_root.clone(),
         auto_observe,
         lang,
         max_iters,
     );
+    if let Ok(prefs) = prefs::load_prefs(prefs_root.as_deref()) {
+        prefs::apply_prefs_to_app(&mut app, &prefs);
+    }
     let result = events::run_event_loop(&mut app, &mut terminal).await;
 
     // ── Restore terminal ──────────────────────────────────────────────────────

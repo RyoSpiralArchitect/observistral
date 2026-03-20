@@ -4,6 +4,7 @@
 /// injected into the Coder's system message so it understands the project
 /// without having to ask.
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -50,6 +51,15 @@ pub struct ProjectContext {
     pub agents_md: Option<String>,
     /// Auto-detected or .obstral.md-configured test command.
     pub test_cmd: Option<String>,
+    repo_map: Option<RepoMapStatus>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RepoMapStatus {
+    available: bool,
+    ready: bool,
+    files: usize,
+    symbols: usize,
 }
 
 // ── Main scan function ─────────────────────────────────────────────────────────
@@ -89,6 +99,9 @@ impl ProjectContext {
         // Test command: from .obstral.md `test_cmd:` line, then auto-detect from stack.
         let test_cmd = detect_test_cmd(&root, agents_md.as_deref());
 
+        // Repo-map status: cheap local signal for future lazy integration.
+        let repo_map = detect_repo_map_status(&root);
+
         Some(ProjectContext {
             root,
             stack,
@@ -101,6 +114,7 @@ impl ProjectContext {
             readme_excerpt,
             agents_md,
             test_cmd,
+            repo_map,
         })
     }
 
@@ -132,6 +146,17 @@ impl ProjectContext {
             let cmd = cmd.trim();
             if !cmd.is_empty() {
                 out.push_str(&format!("test_cmd: {cmd}\n"));
+            }
+        }
+
+        if let Some(ref repo_map) = self.repo_map {
+            if repo_map.ready {
+                out.push_str(&format!(
+                    "repo_map: ready  files={}  symbols={}\n",
+                    repo_map.files, repo_map.symbols
+                ));
+            } else if repo_map.available {
+                out.push_str("repo_map: available  build with `python3 scripts/repo_map.py build --root .`\n");
             }
         }
 
@@ -245,6 +270,34 @@ fn detect_stack(root: &str) -> Vec<String> {
     }
 
     stack
+}
+
+fn detect_repo_map_status(root: &str) -> Option<RepoMapStatus> {
+    let script_path = Path::new(root).join("scripts").join("repo_map.py");
+    let index_path = Path::new(root).join(".spiral").join("repo_map.json");
+    if !script_path.is_file() && !index_path.is_file() {
+        return None;
+    }
+
+    let mut status = RepoMapStatus {
+        available: script_path.is_file(),
+        ready: false,
+        files: 0,
+        symbols: 0,
+    };
+
+    if let Ok(src) = std::fs::read_to_string(&index_path) {
+        if let Ok(v) = serde_json::from_str::<Value>(&src) {
+            status.ready = true;
+            status.files = v.get("files_indexed").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+            status.symbols = v
+                .get("symbols_indexed")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0) as usize;
+        }
+    }
+
+    Some(status)
 }
 
 // ── Git scanning ──────────────────────────────────────────────────────────────

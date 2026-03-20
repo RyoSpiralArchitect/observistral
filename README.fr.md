@@ -189,6 +189,8 @@ L'appel final `done` devient lui aussi \"acceptance-aware\" : il doit maintenant
 
 Quand le modele renvoie `finish_reason=stop` sans tool calls, OBSTRAL peut executer automatiquement des checks legers (repo init, tests, build) et injecter un message `[goal_check]` dans la boucle si quelque chose manque ou echoue. Ce chemin de stop suit maintenant la meme politique partagee et le meme format de log goal-check dans le TUI et la Web GUI.
 
+La Web GUI a maintenant aussi un MVP `/meta-diagnose` : lancez `/meta-diagnose`, `/meta-diagnose last-fail` ou `/meta-diagnose msg:<message-id>` dans le composeur Coder pour envoyer le dernier echec a l'Observer sous forme de diagnostic meta JSON-only. Les messages Coder en echec affichent aussi un bouton `Why did this fail?`. Chaque execution est enregistree dans `.obstral/meta-diagnose/` avec le failure packet, le prompt Observer, la reponse brute, le diagnostic parse et l'etat du parse. Le panneau Observer inclut aussi un onglet `Meta` leger pour lister les artifacts sauvegardes, afficher un petit comptage par `primary_failure`, ouvrir leurs details / JSON brut, et relancer un diagnostic depuis la cible ou le packet sauvegarde. Le TUI prend aussi en charge `/meta-diagnose`, `/meta-diagnose last-fail` et `/meta-diagnose msg:coder-<index>` depuis la zone Coder ou Observer, en sauvegardant les memes artifacts localement.
+
 ### References @fichier : sautez le tour de lecture
 
 Tapez `@chemin` n'importe ou dans votre message pour injecter le contenu du fichier comme contexte avant que votre prompt atteigne le Coder :
@@ -479,6 +481,7 @@ Dans l'UI Web, deux aides optionnelles :
 | `/root <chemin>` | Modifier le tool_root pour les envois suivants |
 | `/lang ja\|en\|fr` | Changer la langue de l'UI et des prompts |
 | `/find <requete>` | Filtrer les messages dans le panneau courant |
+| `/meta-diagnose [last-fail\|msg:coder-<index>]` | Envoyer un echec Coder cible a l'Observer pour un diagnostic JSON-only |
 | `/help` | Afficher toutes les commandes |
 
 ---

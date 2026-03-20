@@ -1,0 +1,122 @@
+{
+  "cases": [
+    {
+      "name": "project_scan_result",
+      "query": "ProjectScanResult",
+      "expect_paths": ["src/project.rs"],
+      "require_first": true,
+      "min_confidence": 0.8,
+      "top_k": 5
+    },
+    {
+      "name": "project_context_scan",
+      "query": "project context scan",
+      "expect_paths": ["src/project.rs"],
+      "path_glob": "src/**",
+      "require_first": true,
+      "min_confidence": 0.65,
+      "min_margin": 4.0,
+      "top_k": 5
+    },
+    {
+      "name": "observer_from_transcript",
+      "query": "run_observer_from_transcript",
+      "expect_paths": ["src/observer/engine.rs"],
+      "require_first": true,
+      "min_confidence": 0.8,
+      "top_k": 5
+    },
+    {
+      "name": "observer_transcript_critique",
+      "query": "observer transcript critique",
+      "expect_paths": ["src/observer/engine.rs"],
+      "path_glob": "src/observer/**",
+      "require_first": true,
+      "min_confidence": 0.65,
+      "top_k": 5
+    },
+    {
+      "name": "search_files_tool",
+      "query": "tool_search_files",
+      "expect_paths": ["src/file_tools.rs"],
+      "require_first": true,
+      "min_confidence": 0.8,
+      "top_k": 5
+    },
+    {
+      "name": "task_graph_save",
+      "query": "save_graph_atomic",
+      "expect_paths": ["src/task_graph.rs"],
+      "require_first": true,
+      "min_confidence": 0.75,
+      "top_k": 5
+    },
+    {
+      "name": "hf_subprocess_provider",
+      "query": "HuggingFaceSubprocessProvider",
+      "expect_paths": ["src/providers/hf_subprocess.rs"],
+      "path_glob": "src/providers/**",
+      "require_first": true,
+      "min_confidence": 0.8,
+      "top_k": 5
+    },
+    {
+      "name": "agentic_json_loop",
+      "query": "agentic json loop",
+      "expect_paths": ["src/tui/agent.rs"],
+      "path_glob": "src/tui/**",
+      "max_rank": 2,
+      "min_confidence": 0.55,
+      "top_k": 5
+    },
+    {
+      "name": "dangerous_command_guard",
+      "query": "check dangerous command",
+      "expect_paths": ["src/exec.rs"],
+      "require_first": true,
+      "min_confidence": 0.65,
+      "reject_paths": ["src/server.rs"],
+      "top_k": 5
+    },
+    {
+      "name": "fuzzy_project_stack_git",
+      "query": "project stack key files git branch",
+      "expect_paths": ["src/project.rs"],
+      "max_rank": 2,
+      "min_confidence": 0.45,
+      "top_k": 5
+    },
+    {
+      "name": "fuzzy_file_search_tool_root",
+      "query": "search files under tool root literal pattern",
+      "expect_paths": ["src/file_tools.rs"],
+      "max_rank": 3,
+      "min_confidence": 0.35,
+      "top_k": 5
+    },
+    {
+      "name": "fuzzy_exec_guard_git_reset",
+      "query": "git reset hard dangerous command blocklist",
+      "expect_paths": ["src/exec.rs"],
+      "max_rank": 2,
+      "min_confidence": 0.45,
+      "top_k": 5
+    },
+    {
+      "name": "typo_path_tui_agent",
+      "query": "src tui agnt rs",
+      "expect_paths": ["src/tui/agent.rs"],
+      "max_rank": 2,
+      "min_confidence": 0.35,
+      "top_k": 5
+    },
+    {
+      "name": "typo_path_observer_engine",
+      "query": "obsrver engin rs",
+      "expect_paths": ["src/observer/engine.rs"],
+      "max_rank": 2,
+      "min_confidence": 0.35,
+      "top_k": 5
+    }
+  ]
+}
