@@ -188,6 +188,47 @@ fn prompt_from_json_messages(messages: &[serde_json::Value]) -> String {
     out
 }
 
+fn normalize_mistral_messages(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
+    let mut system_head = String::new();
+    let mut seen_non_system = false;
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|x| x.as_str()).unwrap_or("");
+        if role != "system" {
+            seen_non_system = true;
+            out.push(msg.clone());
+            continue;
+        }
+
+        let content = msg.get("content").and_then(|x| x.as_str()).unwrap_or("").trim();
+        if content.is_empty() {
+            continue;
+        }
+
+        if !seen_non_system {
+            if !system_head.is_empty() {
+                system_head.push_str("\n\n");
+            }
+            system_head.push_str(content);
+        } else {
+            out.push(json!({
+                "role": "user",
+                "content": format!("[System note]\n{content}")
+            }));
+        }
+    }
+
+    if system_head.is_empty() {
+        out
+    } else {
+        let mut with_head = Vec::with_capacity(out.len() + 1);
+        with_head.push(json!({"role": "system", "content": system_head}));
+        with_head.extend(out);
+        with_head
+    }
+}
+
 /// Simple chat: converts ChatMessage slice to JSON and delegates.
 pub async fn stream_openai_compat(
     client: &reqwest::Client,
@@ -212,9 +253,14 @@ pub async fn stream_openai_compat_json(
     tools: Option<&serde_json::Value>,
     tx: mpsc::Sender<StreamToken>,
 ) -> Result<()> {
+    let prepared_messages: Vec<serde_json::Value> = match cfg.provider {
+        ProviderKind::Mistral => normalize_mistral_messages(messages),
+        _ => messages.to_vec(),
+    };
+
     let mut payload = json!({
         "model": cfg.model,
-        "messages": messages,
+        "messages": prepared_messages,
         "temperature": cfg.temperature,
         "max_tokens": cfg.max_tokens,
         "stream": true,
@@ -340,7 +386,7 @@ pub async fn stream_openai_compat_json(
         r
     } else if want_completions {
         let url = format!("{}/completions", cfg.base_url.trim_end_matches('/'));
-        let prompt = prompt_from_json_messages(messages);
+    let prompt = prompt_from_json_messages(&prepared_messages);
         let mut comp_payload = json!({
             "model": cfg.model,
             "prompt": prompt,
