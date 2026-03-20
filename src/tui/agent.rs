@@ -6676,7 +6676,9 @@ Execute only the new minimal action: {}",
                     );
                 }
             }
-            messages.push(json!({"role": "assistant", "content": assistant_text_clean}));
+            if !assistant_text_clean.is_empty() {
+                messages.push(json!({"role": "assistant", "content": assistant_text_clean}));
+            }
             autosave_best_effort(
                 &autosaver,
                 &tx,

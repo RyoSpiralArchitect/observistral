@@ -195,13 +195,25 @@ fn normalize_mistral_messages(messages: &[serde_json::Value]) -> Vec<serde_json:
 
     for msg in messages {
         let role = msg.get("role").and_then(|x| x.as_str()).unwrap_or("");
+        let content = msg.get("content").and_then(|x| x.as_str()).unwrap_or("").trim();
+        let has_tool_calls = msg
+            .get("tool_calls")
+            .and_then(|x| x.as_array())
+            .map(|arr| !arr.is_empty())
+            .unwrap_or(false);
+
+        // Mistral is strict about assistant turns: they must contain text or tool_calls.
+        // Drop no-op assistant placeholders rather than sending invalid transcript entries.
+        if role == "assistant" && content.is_empty() && !has_tool_calls {
+            continue;
+        }
+
         if role != "system" {
             seen_non_system = true;
             out.push(msg.clone());
             continue;
         }
 
-        let content = msg.get("content").and_then(|x| x.as_str()).unwrap_or("").trim();
         if content.is_empty() {
             continue;
         }
@@ -735,4 +747,47 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return Some(0);
     }
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_mistral_messages_drops_empty_assistant_without_tool_calls() {
+        let input = vec![
+            json!({"role":"system","content":"one"}),
+            json!({"role":"user","content":"hello"}),
+            json!({"role":"assistant","content":""}),
+            json!({"role":"system","content":"later note"}),
+        ];
+
+        let out = normalize_mistral_messages(&input);
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"], "hello");
+        assert_eq!(out[2]["role"], "user");
+        assert_eq!(out[2]["content"], "[System note]\nlater note");
+    }
+
+    #[test]
+    fn normalize_mistral_messages_keeps_assistant_tool_call_turns() {
+        let input = vec![
+            json!({"role":"system","content":"one"}),
+            json!({"role":"user","content":"hello"}),
+            json!({
+                "role":"assistant",
+                "content":"",
+                "tool_calls":[{"id":"call_1","type":"function","function":{"name":"exec","arguments":"{}"}}]
+            }),
+        ];
+
+        let out = normalize_mistral_messages(&input);
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2]["role"], "assistant");
+        assert!(out[2]["tool_calls"].is_array());
+    }
 }
