@@ -3301,6 +3301,42 @@ fn validate_done_acceptance(
     Ok(evidence_rows)
 }
 
+fn build_done_acceptance_recovery_hint(error_text: &str, known_commands: &[String]) -> String {
+    let mut lines = Vec::new();
+    let low = error_text.to_ascii_lowercase();
+
+    if low.contains("cover every completed acceptance criterion exactly once") {
+        lines.push(
+            "Hint: each completed_acceptance item needs exactly one acceptance_evidence row."
+                .to_string(),
+        );
+        lines.push(
+            "If you do not have proof yet, move that criterion from completed_acceptance to remaining_acceptance."
+                .to_string(),
+        );
+    }
+
+    if low.contains("known successful verification command") {
+        lines.push(
+            "Hint: cite only commands that already succeeded in this session; do not invent a new proof command inside done."
+                .to_string(),
+        );
+    }
+
+    if !known_commands.is_empty() {
+        lines.push("Known successful commands you can cite now:".to_string());
+        for command in known_commands.iter().rev().take(6) {
+            lines.push(format!("- {}", compact_one_line(command, 200)));
+        }
+    }
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", lines.join("\n"))
+    }
+}
+
 fn build_impact_prompt(
     reason: &str,
     plan: Option<&PlanBlock>,
@@ -8165,7 +8201,15 @@ Required now: {}",
                 Err(e) => {
                     state = AgentState::Recovery;
                     recovery.stage = Some(RecoveryStage::Verify);
-                    let block = governor_contract::done_invalid_acceptance_message(&e.to_string());
+                    let hint = build_done_acceptance_recovery_hint(
+                        &e.to_string(),
+                        &known_acceptance_commands,
+                    );
+                    let block = format!(
+                        "{}{}",
+                        governor_contract::done_invalid_acceptance_message(&e.to_string()),
+                        hint
+                    );
 
                     let _ = tx
                         .send(StreamToken::Delta(format!(
