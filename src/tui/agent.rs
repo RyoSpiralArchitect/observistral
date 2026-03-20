@@ -2638,6 +2638,150 @@ fn normalize_memory_entry(s: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn strip_matching_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+fn split_top_level_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    let mut in_quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in s.chars() {
+        if escaped {
+            cur.push(ch);
+            escaped = false;
+            continue;
+        }
+        match in_quote {
+            Some(q) => {
+                cur.push(ch);
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == q {
+                    in_quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => {
+                    in_quote = Some(ch);
+                    cur.push(ch);
+                }
+                '(' | '[' | '{' => {
+                    depth = depth.saturating_add(1);
+                    cur.push(ch);
+                }
+                ')' | ']' | '}' => {
+                    depth = depth.saturating_sub(1);
+                    cur.push(ch);
+                }
+                ',' if depth == 0 => {
+                    let part = cur.trim();
+                    if !part.is_empty() {
+                        out.push(part.to_string());
+                    }
+                    cur.clear();
+                }
+                _ => cur.push(ch),
+            },
+        }
+    }
+
+    let tail = cur.trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
+}
+
+fn canonicalize_arg_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => compact_one_line(s.trim(), 160),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        _ => compact_one_line(&value.to_string(), 160),
+    }
+}
+
+fn canonicalize_named_command(name: &str, args: &[(String, String)]) -> Option<String> {
+    let normalized_name = name
+        .trim()
+        .trim_matches('<')
+        .trim_matches('>')
+        .trim()
+        .to_ascii_lowercase();
+    if normalized_name.is_empty() {
+        return None;
+    }
+    let mut normalized_args = args
+        .iter()
+        .filter_map(|(key, value)| {
+            let key = key.trim().to_ascii_lowercase();
+            let value = compact_one_line(strip_matching_quotes(value.trim()).trim(), 160);
+            if key.is_empty() || value.is_empty() || value == "-" {
+                None
+            } else {
+                Some((key, value))
+            }
+        })
+        .collect::<Vec<_>>();
+    normalized_args.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let joined = normalized_args
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("{normalized_name}({joined})"))
+}
+
+fn canonicalize_tool_call_command(name: &str, arguments: &str) -> Option<String> {
+    if name.trim().eq_ignore_ascii_case("exec") {
+        return parse_exec_command_from_args(arguments).map(|cmd| compact_one_line(&cmd, 200));
+    }
+    let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+    let obj = value.as_object()?;
+    let args = obj
+        .iter()
+        .map(|(key, value)| (key.clone(), canonicalize_arg_value(value)))
+        .collect::<Vec<_>>();
+    canonicalize_named_command(name, &args)
+}
+
+fn canonicalize_evidence_command(command: &str) -> String {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(open_idx) = trimmed.find('(') {
+        if trimmed.ends_with(')') {
+            let name = trimmed[..open_idx].trim();
+            let inner = &trimmed[open_idx + 1..trimmed.len() - 1];
+            let args = split_top_level_args(inner)
+                .into_iter()
+                .filter_map(|part| {
+                    let (key, value) = part.split_once('=')?;
+                    Some((key.trim().to_string(), value.trim().to_string()))
+                })
+                .collect::<Vec<_>>();
+            if let Some(sig) = canonicalize_named_command(name, &args) {
+                return sig;
+            }
+        }
+    }
+    normalize_memory_entry(trimmed)
+}
+
 fn remember_recent_unique(
     items: &mut Vec<String>,
     value: &str,
@@ -2979,20 +3123,95 @@ fn acceptance_reference_label(plan: &PlanBlock, idx: usize) -> String {
     format!("acceptance {}: {}", idx + 1, criterion)
 }
 
-fn resolve_known_verification_command<'a>(
+fn collect_successful_observation_commands(messages: &[serde_json::Value]) -> Vec<String> {
+    let mut pending: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut commands = Vec::new();
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if role == "assistant" {
+            let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for tc in tool_calls {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if !matches!(name, "read_file" | "list_dir" | "glob" | "search_files") {
+                    continue;
+                }
+                let arguments = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let Some(signature) = canonicalize_tool_call_command(name, arguments) else {
+                    continue;
+                };
+                pending.insert(id.to_string(), signature);
+            }
+            continue;
+        }
+
+        if role != "tool" {
+            continue;
+        }
+
+        let tool_call_id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if tool_call_id.is_empty() {
+            continue;
+        }
+        let Some(signature) = pending.remove(tool_call_id) else {
+            continue;
+        };
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if non_exec_tool_succeeded(content) {
+            remember_recent_unique(&mut commands, signature.as_str(), 12, 200);
+        }
+    }
+
+    commands
+}
+
+fn collect_known_acceptance_commands(
+    messages: &[serde_json::Value],
+    working_mem: &WorkingMemory,
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    for command in &working_mem.successful_verifications {
+        remember_recent_unique(&mut commands, command.as_str(), 16, 200);
+    }
+    for command in collect_successful_observation_commands(messages) {
+        remember_recent_unique(&mut commands, command.as_str(), 16, 200);
+    }
+    commands
+}
+
+fn resolve_known_acceptance_command<'a>(
     command: &str,
-    working_mem: &'a WorkingMemory,
+    known_commands: &'a [String],
 ) -> Option<&'a str> {
-    let want = normalize_memory_entry(command);
+    let want = canonicalize_evidence_command(command);
     if want.is_empty() {
         return None;
     }
 
-    working_mem
-        .successful_verifications
+    known_commands
         .iter()
         .find(|candidate| {
-            let sig = normalize_memory_entry(candidate);
+            let sig = canonicalize_evidence_command(candidate);
             !sig.is_empty() && (sig == want || sig.contains(&want) || want.contains(&sig))
         })
         .map(|s| s.as_str())
@@ -3003,7 +3222,7 @@ fn validate_done_acceptance(
     completed_acceptance: &[String],
     remaining_acceptance: &[String],
     acceptance_evidence: &[DoneAcceptanceEvidence],
-    working_mem: &WorkingMemory,
+    known_commands: &[String],
 ) -> Result<Vec<(usize, String)>> {
     let Some(plan) = plan else {
         return Err(anyhow!(governor_contract::done_requires_plan_message()));
@@ -3070,7 +3289,7 @@ fn validate_done_acceptance(
             ));
         }
         let Some(known_command) =
-            resolve_known_verification_command(evidence.command.as_str(), working_mem)
+            resolve_known_acceptance_command(evidence.command.as_str(), known_commands)
         else {
             return Err(anyhow!(
                 governor_contract::done_evidence_unknown_command_message()
@@ -7932,13 +8151,15 @@ Required now: {}",
             let acceptance_evidence = parse_done_acceptance_evidence(&args["acceptance_evidence"]);
             let next_steps = args["next_steps"].as_str().unwrap_or("").trim();
             let done_plan = validated_plan_for_turn.as_ref().or(active_plan.as_ref());
+            let known_acceptance_commands =
+                collect_known_acceptance_commands(&messages, &working_mem);
 
             let evidence_rows = match validate_done_acceptance(
                 done_plan,
                 &completed_acceptance,
                 &remaining_acceptance,
                 &acceptance_evidence,
-                &working_mem,
+                &known_acceptance_commands,
             ) {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -9752,15 +9973,14 @@ remaining_gap: still need to run cargo test\n\
             criterion: "acceptance 1".to_string(),
             command: "cargo check".to_string(),
         }];
-        let mut working_mem = WorkingMemory::default();
-        working_mem.remember_successful_verification("cargo check");
+        let known_commands = vec!["cargo check".to_string()];
 
         assert!(validate_done_acceptance(
             Some(&plan),
             &completed_acceptance,
             &remaining_acceptance,
             &acceptance_evidence,
-            &working_mem,
+            &known_commands,
         )
         .is_ok());
     }
@@ -9784,15 +10004,14 @@ remaining_gap: still need to run cargo test\n\
             criterion: "acceptance 1".to_string(),
             command: "cargo check".to_string(),
         }];
-        let mut working_mem = WorkingMemory::default();
-        working_mem.remember_successful_verification("cargo check");
+        let known_commands = vec!["cargo check".to_string()];
 
         assert!(validate_done_acceptance(
             Some(&plan),
             &completed_acceptance,
             &remaining_acceptance,
             &acceptance_evidence,
-            &working_mem,
+            &known_commands,
         )
         .is_err());
     }
@@ -9813,15 +10032,14 @@ remaining_gap: still need to run cargo test\n\
             criterion: "acceptance 9".to_string(),
             command: "cargo check".to_string(),
         }];
-        let mut working_mem = WorkingMemory::default();
-        working_mem.remember_successful_verification("cargo check");
+        let known_commands = vec!["cargo check".to_string()];
 
         assert!(validate_done_acceptance(
             Some(&plan),
             &completed_acceptance,
             &remaining_acceptance,
             &acceptance_evidence,
-            &working_mem,
+            &known_commands,
         )
         .is_err());
     }
@@ -9839,15 +10057,14 @@ remaining_gap: still need to run cargo test\n\
         let completed_acceptance = vec!["acceptance 1".to_string()];
         let remaining_acceptance = Vec::new();
         let acceptance_evidence = Vec::new();
-        let mut working_mem = WorkingMemory::default();
-        working_mem.remember_successful_verification("cargo check");
+        let known_commands = vec!["cargo check".to_string()];
 
         assert!(validate_done_acceptance(
             Some(&plan),
             &completed_acceptance,
             &remaining_acceptance,
             &acceptance_evidence,
-            &working_mem,
+            &known_commands,
         )
         .is_err());
     }
@@ -9868,17 +10085,61 @@ remaining_gap: still need to run cargo test\n\
             criterion: "acceptance 1".to_string(),
             command: "cargo test".to_string(),
         }];
-        let mut working_mem = WorkingMemory::default();
-        working_mem.remember_successful_verification("cargo check");
+        let known_commands = vec!["cargo check".to_string()];
 
         assert!(validate_done_acceptance(
             Some(&plan),
             &completed_acceptance,
             &remaining_acceptance,
             &acceptance_evidence,
-            &working_mem,
+            &known_commands,
         )
         .is_err());
+    }
+
+    #[test]
+    fn validate_done_acceptance_accepts_canonicalized_tool_evidence() {
+        let plan = PlanBlock {
+            goal: "locate slash command".to_string(),
+            steps: vec!["inspect".to_string(), "confirm".to_string()],
+            acceptance_criteria: vec![
+                "The exact file path is identified".to_string(),
+                "The handler context is confirmed".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+
+        let completed_acceptance = vec![
+            "acceptance 1".to_string(),
+            "acceptance 2".to_string(),
+        ];
+        let remaining_acceptance = Vec::new();
+        let acceptance_evidence = vec![
+            DoneAcceptanceEvidence {
+                criterion: "acceptance 1".to_string(),
+                command: "search_files(pattern=\"/realize\", dir=\"src/tui/events.rs\")"
+                    .to_string(),
+            },
+            DoneAcceptanceEvidence {
+                criterion: "acceptance 2".to_string(),
+                command: "read_file(path=\"src/tui/events.rs\")".to_string(),
+            },
+        ];
+        let known_commands = vec![
+            "search_files(dir=/Users/ignored, pattern=nope)".to_string(),
+            "search_files(dir=src/tui/events.rs, pattern=/realize)".to_string(),
+            "read_file(path=src/tui/events.rs)".to_string(),
+        ];
+
+        assert!(validate_done_acceptance(
+            Some(&plan),
+            &completed_acceptance,
+            &remaining_acceptance,
+            &acceptance_evidence,
+            &known_commands,
+        )
+        .is_ok());
     }
 
     #[test]
