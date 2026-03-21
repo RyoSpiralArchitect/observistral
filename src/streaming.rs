@@ -116,14 +116,39 @@ fn retry_after_duration(headers: &reqwest::header::HeaderMap) -> Option<Duration
     Some(Duration::from_secs(secs.min(15)))
 }
 
-fn backoff_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+fn max_connect_retries(provider: &ProviderKind) -> usize {
+    match provider {
+        // Mistral commonly returns bursty 429s during eval runs; a slightly deeper budget
+        // keeps the single-case harness usable without changing task logic.
+        ProviderKind::Mistral => 5,
+        _ => 3,
+    }
+}
+
+fn backoff_delay(
+    provider: &ProviderKind,
+    status: Option<reqwest::StatusCode>,
+    attempt: usize,
+    retry_after: Option<Duration>,
+) -> Duration {
     // attempt: 0..N (0 = first retry)
     let pow = attempt.min(5) as u32;
     // Keep this robust even if the cap changes in the future.
     let factor = 1u64.checked_shl(pow).unwrap_or(u64::MAX);
-    let base_ms = 500u64.saturating_mul(factor);
-    let mut d = Duration::from_millis(base_ms.min(6000));
+    let (base_ms, cap_ms, rate_limit_floor_ms) = match provider {
+        ProviderKind::Mistral => (1000u64, 20_000u64, 5000u64),
+        _ => (500u64, 6000u64, 0u64),
+    };
+    let base_ms = base_ms.saturating_mul(factor);
+    let mut d = Duration::from_millis(base_ms.min(cap_ms));
+    if status == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) && rate_limit_floor_ms > 0 {
+        let floor = Duration::from_millis(rate_limit_floor_ms);
+        if d < floor {
+            d = floor;
+        }
+    }
     if let Some(ra) = retry_after {
+        let ra = ra.min(Duration::from_secs(30));
         if ra > d {
             d = ra;
         }
@@ -133,6 +158,28 @@ fn backoff_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
 
 fn is_retryable_send_error(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect()
+}
+
+async fn emit_retry_telemetry(
+    tx: &mpsc::Sender<StreamToken>,
+    provider: &ProviderKind,
+    status: Option<reqwest::StatusCode>,
+    attempt: usize,
+    delay: Duration,
+    url: &str,
+) {
+    let _ = tx
+        .send(StreamToken::Telemetry(TelemetryEvent {
+            event: "provider_retry".to_string(),
+            data: json!({
+                "provider": provider.key(),
+                "status": status.map(|s| s.as_u16()),
+                "attempt": attempt + 1,
+                "delay_ms": delay.as_millis() as u64,
+                "url": url,
+            }),
+        }))
+        .await;
 }
 
 fn swap_max_tokens_to_max_completion_tokens(payload: &mut serde_json::Value) {
@@ -301,7 +348,7 @@ pub async fn stream_openai_compat_json(
 
     let mut resp: Option<reqwest::Response> = None;
 
-    const MAX_CONNECT_RETRIES: usize = 3;
+    let max_connect_retries = max_connect_retries(&cfg.provider);
 
     for url in stream_chat_urls_for_base_url(&cfg.base_url) {
         let proxy_hint = if cfg!(target_os = "windows") {
@@ -328,9 +375,10 @@ pub async fn stream_openai_compat_json(
                 Err(e) => {
                     let retryable = is_retryable_send_error(&e);
                     let err = anyhow!(e).context(connect_ctx.clone());
-                    if attempt < MAX_CONNECT_RETRIES && retryable {
+                    if attempt < max_connect_retries && retryable {
                         last_err = Some(err);
-                        let d = backoff_delay(attempt, None);
+                        let d = backoff_delay(&cfg.provider, None, attempt, None);
+                        emit_retry_telemetry(&tx, &cfg.provider, None, attempt, d, &url).await;
                         attempt = attempt.saturating_add(1);
                         tokio::time::sleep(d).await;
                         continue;
@@ -383,8 +431,9 @@ pub async fn stream_openai_compat_json(
                 break;
             }
 
-            if attempt < MAX_CONNECT_RETRIES && is_retryable_status(status) {
-                let d = backoff_delay(attempt, ra);
+            if attempt < max_connect_retries && is_retryable_status(status) {
+                let d = backoff_delay(&cfg.provider, Some(status), attempt, ra);
+                emit_retry_telemetry(&tx, &cfg.provider, Some(status), attempt, d, &url).await;
                 attempt = attempt.saturating_add(1);
                 tokio::time::sleep(d).await;
                 continue;
@@ -426,8 +475,9 @@ pub async fn stream_openai_compat_json(
             let r = match req.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    if attempt < MAX_CONNECT_RETRIES && is_retryable_send_error(&e) {
-                        let d = backoff_delay(attempt, None);
+                    if attempt < max_connect_retries && is_retryable_send_error(&e) {
+                        let d = backoff_delay(&cfg.provider, None, attempt, None);
+                        emit_retry_telemetry(&tx, &cfg.provider, None, attempt, d, &url).await;
                         attempt = attempt.saturating_add(1);
                         tokio::time::sleep(d).await;
                         continue;
@@ -453,8 +503,9 @@ pub async fn stream_openai_compat_json(
                 continue;
             }
 
-            if attempt < MAX_CONNECT_RETRIES && is_retryable_status(status) {
-                let d = backoff_delay(attempt, ra);
+            if attempt < max_connect_retries && is_retryable_status(status) {
+                let d = backoff_delay(&cfg.provider, Some(status), attempt, ra);
+                emit_retry_telemetry(&tx, &cfg.provider, Some(status), attempt, d, &url).await;
                 attempt = attempt.saturating_add(1);
                 tokio::time::sleep(d).await;
                 continue;
@@ -614,7 +665,7 @@ pub async fn stream_anthropic(
         "stream": true,
     });
 
-    const MAX_CONNECT_RETRIES: usize = 3;
+    let max_connect_retries = max_connect_retries(&cfg.provider);
     let mut attempt: usize = 0;
     let resp = loop {
         let r = client
@@ -634,8 +685,9 @@ pub async fn stream_anthropic(
         let r = match r {
             Ok(r) => r,
             Err(e) => {
-                if attempt < MAX_CONNECT_RETRIES && is_retryable_send_error(&e) {
-                    let d = backoff_delay(attempt, None);
+                if attempt < max_connect_retries && is_retryable_send_error(&e) {
+                    let d = backoff_delay(&cfg.provider, None, attempt, None);
+                    emit_retry_telemetry(&tx, &cfg.provider, None, attempt, d, &url).await;
                     attempt = attempt.saturating_add(1);
                     tokio::time::sleep(d).await;
                     continue;
@@ -651,8 +703,9 @@ pub async fn stream_anthropic(
 
         let ra = retry_after_duration(r.headers());
         let body = r.text().await.unwrap_or_default();
-        if attempt < MAX_CONNECT_RETRIES && is_retryable_status(status) {
-            let d = backoff_delay(attempt, ra);
+        if attempt < max_connect_retries && is_retryable_status(status) {
+            let d = backoff_delay(&cfg.provider, Some(status), attempt, ra);
+            emit_retry_telemetry(&tx, &cfg.provider, Some(status), attempt, d, &url).await;
             attempt = attempt.saturating_add(1);
             tokio::time::sleep(d).await;
             continue;
@@ -793,5 +846,22 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert_eq!(out[2]["role"], "assistant");
         assert!(out[2]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn mistral_retry_budget_is_deeper() {
+        assert_eq!(max_connect_retries(&ProviderKind::Mistral), 5);
+        assert_eq!(max_connect_retries(&ProviderKind::Anthropic), 3);
+    }
+
+    #[test]
+    fn mistral_429_backoff_has_floor() {
+        let d = backoff_delay(
+            &ProviderKind::Mistral,
+            Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            0,
+            None,
+        );
+        assert!(d >= Duration::from_secs(5));
     }
 }

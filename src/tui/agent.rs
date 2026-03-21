@@ -3714,7 +3714,9 @@ Final answer must include the file path.",
 fn first_slash_literal(text: &str) -> Option<String> {
     text.split_whitespace().find_map(|token| {
         let trimmed = token
-            .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | ',' | '.' | ':' | ';' | ')' | '('))
+            .trim_matches(|ch: char| {
+                matches!(ch, '`' | '"' | '\'' | ',' | '.' | ':' | ';' | ')' | '(')
+            })
             .trim();
         if !trimmed.starts_with('/') || trimmed.len() < 2 {
             return None;
@@ -3735,7 +3737,8 @@ fn build_mistral_think_only_hint(root_user_text: &str, think: &ThinkBlock) -> St
     let tool = think.tool.trim();
     let suggested = match tool {
         "search_files" => {
-            let pattern = first_slash_literal(root_user_text).unwrap_or_else(|| "realize".to_string());
+            let pattern =
+                first_slash_literal(root_user_text).unwrap_or_else(|| "realize".to_string());
             format!("search_files(pattern=\"{pattern}\", dir=\"src\")")
         }
         "list_dir" => "list_dir(dir=\"src\")".to_string(),
@@ -4599,10 +4602,9 @@ fn mistral_nested_tool_payload(tc: &ToolCallData) -> Option<(Vec<String>, ToolCa
                 .and_then(|v| v.as_str())
         })?
         .trim();
-    let tool_args = obj.get("arguments").or_else(|| {
-        obj.get("function")
-            .and_then(|v| v.get("parameters"))
-    })?;
+    let tool_args = obj
+        .get("arguments")
+        .or_else(|| obj.get("function").and_then(|v| v.get("parameters")))?;
     if tool_name.is_empty() {
         return None;
     }
@@ -8168,9 +8170,7 @@ Execute only the new minimal action: {}",
                 let note = if parsed_think.is_some() {
                     build_mistral_think_only_hint(
                         &root_user_text,
-                        parsed_think
-                            .as_ref()
-                            .expect("parsed_think checked above"),
+                        parsed_think.as_ref().expect("parsed_think checked above"),
                     )
                 } else {
                     "\
@@ -11329,9 +11329,7 @@ remaining_gap: still need to run cargo test\n\
     #[test]
     fn first_slash_literal_extracts_command_token() {
         assert_eq!(
-            first_slash_literal(
-                "Locate where the `/realize` slash command is handled in the TUI."
-            ),
+            first_slash_literal("Locate where the `/realize` slash command is handled in the TUI."),
             Some("/realize".to_string())
         );
     }
