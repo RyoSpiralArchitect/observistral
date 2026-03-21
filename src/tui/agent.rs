@@ -4372,6 +4372,74 @@ fn pseudo_tool_call_to_block_text(tc: &ToolCallData) -> Option<String> {
     pseudo_block_text_from_named_args(&tc.name, &args)
 }
 
+fn inline_block_from_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    let (tag, rest, fields, close_tag) = if let Some(rest) = trimmed.strip_prefix("plan>") {
+        (
+            "plan",
+            rest.trim(),
+            [
+                "goal:",
+                "steps:",
+                "acceptance:",
+                "acceptance_criteria:",
+                "risks:",
+                "assumptions:",
+            ]
+            .as_slice(),
+            "</plan>",
+        )
+    } else if let Some(rest) = trimmed.strip_prefix("think>") {
+        (
+            "think",
+            rest.trim(),
+            [
+                "goal:", "step:", "tool:", "risk:", "doubt:", "next:", "verify:",
+            ]
+            .as_slice(),
+            "</think>",
+        )
+    } else {
+        return None;
+    };
+
+    let mut body = rest.to_string();
+    for field in fields.iter().skip(1) {
+        body = body.replace(field, &format!("\n{field}"));
+    }
+    body = body.replace(close_tag, &format!("\n{close_tag}"));
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!("<{tag}>\n{body}"))
+}
+
+fn mistral_nested_tool_payload(tc: &ToolCallData) -> Option<(Vec<String>, ToolCallData)> {
+    let value: serde_json::Value = serde_json::from_str(&tc.arguments).ok()?;
+    let obj = value.as_object()?;
+    let mut prelude = Vec::new();
+    if let Some(think) = obj.get("think").and_then(|v| v.as_str()) {
+        let think = think.trim();
+        if !think.is_empty() {
+            prelude.push(format!("<think>\n{think}\n</think>"));
+        }
+    }
+    let tool_name = obj.get("tool").and_then(|v| v.as_str())?.trim();
+    let tool_args = obj.get("arguments")?;
+    if tool_name.is_empty() {
+        return None;
+    }
+    Some((
+        prelude,
+        ToolCallData {
+            id: tc.id.clone(),
+            name: tool_name.to_string(),
+            arguments: tool_args.to_string(),
+        },
+    ))
+}
+
 fn split_concatenated_json_values(raw: &str) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     let de = serde_json::Deserializer::from_str(raw).into_iter::<serde_json::Value>();
@@ -4386,6 +4454,13 @@ fn split_concatenated_json_values(raw: &str) -> Vec<serde_json::Value> {
 
 fn normalize_mistral_tool_call(tc: &ToolCallData) -> (Vec<String>, Option<ToolCallData>) {
     if let Some(block) = pseudo_tool_call_to_block_text(tc) {
+        return (vec![block], None);
+    }
+    if let Some(block) = inline_block_from_name(&tc.name) {
+        if let Some((mut prelude, normalized)) = mistral_nested_tool_payload(tc) {
+            prelude.insert(0, block);
+            return (prelude, Some(normalized));
+        }
         return (vec![block], None);
     }
 
@@ -11191,6 +11266,53 @@ verify: exit code is zero\n\
             normalized.arguments,
             serde_json::json!({"pattern":"/realize","dir":"src"}).to_string()
         );
+    }
+
+    #[test]
+    fn normalize_mistral_tool_call_extracts_inline_plan_name_and_nested_tool() {
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "plan>goal: locate handler steps: 1) search src 2) read file acceptance: 1) path identified risks: wrong file assumptions: repo is local </plan>".to_string(),
+            arguments: serde_json::json!({
+                "tool": "search_files",
+                "arguments": {"pattern": "/realize", "dir": "src"}
+            })
+            .to_string(),
+        };
+
+        let (blocks, normalized) = normalize_mistral_tool_call(&tc);
+        assert_eq!(blocks.len(), 1);
+        let plan = parse_plan_block(&blocks[0]).expect("plan parsed");
+        assert_eq!(plan.goal, "locate handler");
+        let normalized = normalized.expect("real tool preserved");
+        assert_eq!(normalized.name, "search_files");
+        assert_eq!(
+            normalized.arguments,
+            serde_json::json!({"pattern":"/realize","dir":"src"}).to_string()
+        );
+    }
+
+    #[test]
+    fn normalize_mistral_tool_call_extracts_inline_plan_and_nested_think() {
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "plan>goal: locate handler steps: 1) search src 2) read file acceptance: 1) path identified risks: wrong file assumptions: repo is local </plan>".to_string(),
+            arguments: serde_json::json!({
+                "think": "goal: inspect slash command\nstep: 1\ntool: search_files\nrisk: wrong path\ndoubt: maybe aliased\nnext: search /realize\nverify: find a match",
+                "tool": "search_files",
+                "arguments": {"pattern": "/realize", "dir": "src"}
+            })
+            .to_string(),
+        };
+
+        let (blocks, normalized) = normalize_mistral_tool_call(&tc);
+        assert_eq!(blocks.len(), 2);
+        let plan = parse_plan_block(&blocks[0]).expect("plan parsed");
+        let think = parse_think_block(&blocks[1]).expect("think parsed");
+        assert_eq!(plan.goal, "locate handler");
+        assert_eq!(think.tool, "search_files");
+        let normalized = normalized.expect("real tool preserved");
+        assert_eq!(normalized.name, "search_files");
     }
 
     #[test]
