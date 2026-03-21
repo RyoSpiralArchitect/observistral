@@ -1012,6 +1012,16 @@ async fn emit_realize_state(
         .await;
 }
 
+fn read_only_task_addon() -> &'static str {
+    "[Read-Only Task Contract]\n\
+This task is read-only inspection only.\n\
+- Do NOT edit files.\n\
+- Do NOT run exec/build/test/manual-behavioral checks just to finish.\n\
+- Use observation tools only: list_dir, glob, search_files, read_file.\n\
+- Once the file path and handling context are confirmed by successful observation commands, call done directly.\n\
+- In read-only plans, acceptance should focus on locating and confirming the code path/context; meta constraints like `no files modified` are constraints, not acceptance targets."
+}
+
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
 pub const DEFAULT_MAX_ITERS: usize = 12;
@@ -3633,6 +3643,72 @@ fn build_read_only_evidence_scores(
             }
         })
         .collect()
+}
+
+fn build_read_only_completion_hint(
+    root_user_text: &str,
+    plan: &PlanBlock,
+    messages: &[serde_json::Value],
+    working_mem: &WorkingMemory,
+) -> Option<String> {
+    let evidence = collect_observation_evidence(messages);
+    if evidence.reads.is_empty() {
+        return None;
+    }
+
+    let scores = build_read_only_evidence_scores(root_user_text, plan, &evidence);
+    let strong: Vec<&CriterionEvidenceScore> =
+        scores.iter().filter(|score| score.total >= 0.85).collect();
+    let medium_or_better = scores.iter().filter(|score| score.total >= 0.60).count();
+    if strong.is_empty() || medium_or_better < 2 {
+        return None;
+    }
+
+    let known_commands = collect_known_acceptance_commands(messages, working_mem);
+    let cite_commands: Vec<String> = strong
+        .iter()
+        .flat_map(|score| score.suggested_commands.iter().cloned())
+        .chain(known_commands.iter().rev().cloned())
+        .fold(Vec::<String>::new(), |mut acc, command| {
+            remember_recent_unique(&mut acc, command.as_str(), 4, 200);
+            acc
+        });
+
+    let completed_lines = strong
+        .iter()
+        .take(2)
+        .map(|score| {
+            format!(
+                "- acceptance {}: {}",
+                score.idx + 1,
+                compact_one_line(plan.acceptance_criteria[score.idx].as_str(), 160)
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut out = String::from(
+        "[Read-Only Completion]\n\
+This is a read-only inspection task. Do NOT run exec/build/test/smoke checks.\n\
+You already have enough observation evidence to call done directly now.\n",
+    );
+    if !completed_lines.is_empty() {
+        out.push_str("Completed candidates now:\n");
+        out.push_str(&completed_lines.join("\n"));
+        out.push('\n');
+    }
+    if !cite_commands.is_empty() {
+        out.push_str("Cite successful commands:\n");
+        for command in cite_commands.iter().take(3) {
+            out.push_str("- ");
+            out.push_str(command);
+            out.push('\n');
+        }
+    }
+    out.push_str(
+        "If your plan includes meta constraints like `no files modified`, keep them in remaining_acceptance instead of blocking done.\n\
+Final answer must include the file path.",
+    );
+    Some(out)
 }
 
 fn parse_leading_ordinal(reference: &str) -> Option<usize> {
@@ -6861,6 +6937,13 @@ Fix: use --provider openai-compatible (or --provider mistral).",
 
     // Keep messages as serde_json::Value throughout to preserve tool_call_id.
     let mut messages: Vec<serde_json::Value> = start.messages;
+    if root_read_only && !has_system_prefix(&messages, "[Read-Only Task Contract]") {
+        let pos = messages.len().min(4);
+        messages.insert(
+            pos,
+            json!({"role":"system","content": read_only_task_addon()}),
+        );
+    }
     let mut active_plan = last_plan_from_messages(&messages)
         .filter(|plan| validate_plan_for_task(plan, root_read_only).is_ok());
     if let Some(plan) = active_plan.as_ref() {
@@ -9380,6 +9463,16 @@ Required now: {}",
                 "tool_call_id": tc.id,
                 "content": result,
             }));
+            if !is_error && root_read_only && pending_system_hint.is_none() {
+                if let Some(plan) = active_plan.as_ref() {
+                    pending_system_hint = build_read_only_completion_hint(
+                        &root_user_text,
+                        plan,
+                        &messages,
+                        &working_mem,
+                    );
+                }
+            }
             autosave_best_effort(
                 &autosaver,
                 &tx,
@@ -9488,6 +9581,16 @@ Required now: {}",
                 "tool_call_id": tc.id,
                 "content": result,
             }));
+            if !is_error && root_read_only && pending_system_hint.is_none() {
+                if let Some(plan) = active_plan.as_ref() {
+                    pending_system_hint = build_read_only_completion_hint(
+                        &root_user_text,
+                        plan,
+                        &messages,
+                        &working_mem,
+                    );
+                }
+            }
             autosave_best_effort(
                 &autosaver,
                 &tx,
@@ -11084,6 +11187,70 @@ remaining_gap: still need to run cargo test\n\
             .suggested_commands
             .iter()
             .any(|cmd| cmd.contains("read_file")));
+    }
+
+    #[test]
+    fn build_read_only_completion_hint_promotes_done_after_strong_observation() {
+        let plan = PlanBlock {
+            goal: "Locate the /realize slash command handler in the TUI".to_string(),
+            steps: vec![
+                "search src".to_string(),
+                "read the matching file".to_string(),
+                "confirm the context".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path containing the `/realize` slash command handler is identified."
+                    .to_string(),
+                "The handler logic is confirmed to be part of the TUI component.".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"/realize\",\"dir\":\"src\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: '/realize' — 1 match(es)]\nsrc/tui/events.rs:465:         \"/realize\" => {"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/tui/events.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/tui/events.rs] (2918 lines, 108025 bytes)\nfn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {\n    match cmd_lc.as_str() {\n        \"/realize\" => {"
+            }),
+        ];
+
+        let hint = build_read_only_completion_hint(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            &plan,
+            &messages,
+            &WorkingMemory::default(),
+        )
+        .expect("completion hint");
+
+        assert!(hint.contains("call done directly now"));
+        assert!(hint.contains("src/tui/events.rs") || hint.contains("read_file"));
     }
 
     #[test]
