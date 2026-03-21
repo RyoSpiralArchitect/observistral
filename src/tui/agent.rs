@@ -2758,6 +2758,31 @@ fn canonicalize_tool_call_command(name: &str, arguments: &str) -> Option<String>
     canonicalize_named_command(name, &args)
 }
 
+fn parse_named_command_signature(
+    command: &str,
+) -> Option<(String, std::collections::BTreeMap<String, String>)> {
+    let trimmed = command.trim();
+    let open_idx = trimmed.find('(')?;
+    if !trimmed.ends_with(')') {
+        return None;
+    }
+    let name = trimmed[..open_idx].trim().to_ascii_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    let inner = &trimmed[open_idx + 1..trimmed.len() - 1];
+    let mut args = std::collections::BTreeMap::new();
+    for part in split_top_level_args(inner) {
+        let (key, value) = part.split_once('=')?;
+        let key = key.trim().to_ascii_lowercase();
+        let value = compact_one_line(strip_matching_quotes(value.trim()).trim(), 160);
+        if !key.is_empty() && !value.is_empty() && value != "-" {
+            args.insert(key, value);
+        }
+    }
+    Some((name, args))
+}
+
 fn canonicalize_evidence_command(command: &str) -> String {
     let trimmed = command.trim();
     if trimmed.is_empty() {
@@ -2775,6 +2800,63 @@ fn canonicalize_evidence_command(command: &str) -> String {
                 })
                 .collect::<Vec<_>>();
             if let Some(sig) = canonicalize_named_command(name, &args) {
+                return sig;
+            }
+        }
+    }
+
+    let low = trimmed.to_ascii_lowercase();
+    if let Some(rest) = trimmed.strip_prefix("read_file ") {
+        if let Some(sig) = canonicalize_named_command(
+            "read_file",
+            &[("path".to_string(), rest.trim().to_string())],
+        ) {
+            return sig;
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("list_dir ") {
+        if let Some(sig) =
+            canonicalize_named_command("list_dir", &[("path".to_string(), rest.trim().to_string())])
+        {
+            return sig;
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("glob ") {
+        if let Some(sig) =
+            canonicalize_named_command("glob", &[("pattern".to_string(), rest.trim().to_string())])
+        {
+            return sig;
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("search_files ") {
+        if let Some((pattern, dir)) = rest.rsplit_once(" in ") {
+            if let Some(sig) = canonicalize_named_command(
+                "search_files",
+                &[
+                    ("pattern".to_string(), pattern.trim().to_string()),
+                    ("dir".to_string(), dir.trim().to_string()),
+                ],
+            ) {
+                return sig;
+            }
+        }
+    }
+    if low.starts_with("grep ") {
+        let pattern = trimmed
+            .split('"')
+            .nth(1)
+            .or_else(|| trimmed.split('\'').nth(1))
+            .map(|s| s.trim().to_string());
+        let path = trimmed
+            .split_whitespace()
+            .last()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let (Some(pattern), Some(path)) = (pattern, path) {
+            if let Some(sig) = canonicalize_named_command(
+                "search_files",
+                &[("pattern".to_string(), pattern), ("dir".to_string(), path)],
+            ) {
                 return sig;
             }
         }
@@ -3142,23 +3224,61 @@ fn token_overlap_score(
     (overlap / denom).clamp(0.0, 1.0)
 }
 
-fn is_read_only_observation_task(root_user_text: &str, plan: Option<&PlanBlock>) -> bool {
+fn is_root_read_only_observation_task(root_user_text: &str) -> bool {
     let low = root_user_text.to_ascii_lowercase();
     let observe_terms = [
         "locate",
         "find",
         "where",
         "inspect",
+        "identify",
         "read-only",
         "read only",
         "read the file",
+        "look up",
+        "trace",
         "do not edit",
         "don't edit",
         "no edit",
         "no edits",
         "without editing",
     ];
-    let mutate_terms = [
+    let explicit_no_edit = [
+        "read-only",
+        "read only",
+        "do not edit",
+        "don't edit",
+        "no edit",
+        "no edits",
+        "without editing",
+    ]
+    .iter()
+    .any(|term| low.contains(term));
+    let strong_mutate_terms = [
+        "patch",
+        "modify",
+        "write",
+        "create",
+        "implement",
+        "fix",
+        "refactor",
+        "rename",
+        "delete",
+    ];
+    if !observe_terms.iter().any(|term| low.contains(term)) {
+        return false;
+    }
+    if low.contains("edit") && !explicit_no_edit {
+        return false;
+    }
+    if strong_mutate_terms.iter().any(|term| low.contains(term)) {
+        return false;
+    }
+    true
+}
+
+fn read_only_plan_violation(plan: &PlanBlock) -> Option<String> {
+    let forbidden = [
         "edit",
         "patch",
         "modify",
@@ -3166,39 +3286,48 @@ fn is_read_only_observation_task(root_user_text: &str, plan: Option<&PlanBlock>)
         "create",
         "implement",
         "fix",
-        "build",
-        "test",
-        "compile",
         "refactor",
+        "build",
+        "compile",
+        "test",
+        "behavioral",
+        "smoke",
+        "cargo",
+        "pytest",
+        "npm",
+        "jest",
+        "playwright",
+        "vitest",
+        "run",
+        "exec",
+        "execute",
     ];
-    if !observe_terms.iter().any(|term| low.contains(term)) {
-        return false;
-    }
-    if mutate_terms
-        .iter()
-        .any(|term| low.contains(term) && !low.contains("do not edit"))
-    {
-        return false;
-    }
+    let check_field = |label: String, text: &str| -> Option<String> {
+        let tokens = keyword_tokens(text);
+        for term in forbidden {
+            if tokens.contains(term) {
+                return Some(format!(
+                    "read-only observation task plans must stay inspect-only; found `{term}` in {label}"
+                ));
+            }
+        }
+        None
+    };
 
-    if let Some(plan) = plan {
-        let steps_low = plan
-            .steps
-            .iter()
-            .map(|step| step.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        if steps_low.iter().any(|step| {
-            [
-                "write", "patch", "apply", "edit", "fix", "build", "test", "compile",
-            ]
-            .iter()
-            .any(|term| step.contains(term))
-        }) {
-            return false;
+    if let Some(msg) = check_field("goal".to_string(), &plan.goal) {
+        return Some(msg);
+    }
+    for (idx, step) in plan.steps.iter().enumerate() {
+        if let Some(msg) = check_field(format!("step {}", idx + 1), step) {
+            return Some(msg);
         }
     }
-
-    true
+    for (idx, criterion) in plan.acceptance_criteria.iter().enumerate() {
+        if let Some(msg) = check_field(format!("acceptance {}", idx + 1), criterion) {
+            return Some(msg);
+        }
+    }
+    None
 }
 
 fn parse_search_hit_count(content: &str) -> usize {
@@ -3659,7 +3788,31 @@ fn resolve_known_acceptance_command<'a>(
         .iter()
         .find(|candidate| {
             let sig = canonicalize_evidence_command(candidate);
-            !sig.is_empty() && (sig == want || sig.contains(&want) || want.contains(&sig))
+            if sig.is_empty() {
+                return false;
+            }
+            if sig == want || sig.contains(&want) || want.contains(&sig) {
+                return true;
+            }
+            let Some((want_name, want_args)) = parse_named_command_signature(&want) else {
+                return false;
+            };
+            let Some((cand_name, cand_args)) = parse_named_command_signature(&sig) else {
+                return false;
+            };
+            if want_name != cand_name {
+                return false;
+            }
+            want_args
+                .iter()
+                .all(|(key, want_value)| match cand_args.get(key) {
+                    Some(cand_value) if cand_value == want_value => true,
+                    Some(cand_value) if want_name == "search_files" && key == "dir" => {
+                        want_value.starts_with(&format!("{cand_value}/"))
+                            || cand_value.starts_with(&format!("{want_value}/"))
+                    }
+                    _ => false,
+                })
         })
         .map(|s| s.as_str())
 }
@@ -4705,6 +4858,16 @@ fn validate_plan(plan: &PlanBlock) -> Result<()> {
         .any(|criterion| criterion.trim().is_empty())
     {
         return Err(anyhow!(governor_contract::plan_empty_acceptance_message()));
+    }
+    Ok(())
+}
+
+fn validate_plan_for_task(plan: &PlanBlock, root_read_only: bool) -> Result<()> {
+    validate_plan(plan)?;
+    if root_read_only {
+        if let Some(msg) = read_only_plan_violation(plan) {
+            return Err(anyhow!(msg));
+        }
     }
     Ok(())
 }
@@ -6562,6 +6725,7 @@ Fix: use --provider openai-compatible (or --provider mistral).",
         .unwrap_or("")
         .to_string();
     let root_user_text_low = root_user_text.to_ascii_lowercase();
+    let root_read_only = is_root_read_only_observation_task(&root_user_text);
     let verification_contract = governor_contract::verification();
     let wants_repo_goal =
         text_contains_any(&root_user_text_low, &verification_contract.goal_repo_terms);
@@ -6579,8 +6743,8 @@ Fix: use --provider openai-compatible (or --provider mistral).",
 
     // Keep messages as serde_json::Value throughout to preserve tool_call_id.
     let mut messages: Vec<serde_json::Value> = start.messages;
-    let mut active_plan =
-        last_plan_from_messages(&messages).filter(|plan| validate_plan(plan).is_ok());
+    let mut active_plan = last_plan_from_messages(&messages)
+        .filter(|plan| validate_plan_for_task(plan, root_read_only).is_ok());
     if let Some(plan) = active_plan.as_ref() {
         if let Some(level) = verification_level_from_plan(plan) {
             intent_required_verification = level;
@@ -7142,7 +7306,7 @@ Execute only the new minimal action: {}",
 
         if let Some(reason) = impact_required.clone() {
             let impact_plan = parse_plan_block(&assistant_text)
-                .filter(|plan| validate_plan(plan).is_ok())
+                .filter(|plan| validate_plan_for_task(plan, root_read_only).is_ok())
                 .or_else(|| active_plan.clone());
             let impact = match parse_impact_block(&assistant_text) {
                 Some(impact) => impact,
@@ -7277,7 +7441,7 @@ Execute only the new minimal action: {}",
         if let Some(ref tc) = tool_call {
             let candidate_plan = match parsed_plan.as_ref() {
                 Some(plan) => {
-                    if let Err(e) = validate_plan(plan) {
+                    if let Err(e) = validate_plan_for_task(plan, root_read_only) {
                         state = AgentState::Recovery;
                         recovery.stage = Some(RecoveryStage::Diagnose);
                         let block = governor_contract::invalid_plan_message(&e.to_string());
@@ -7502,7 +7666,7 @@ Execute only the new minimal action: {}",
             if realize_cfg.enabled {
                 if let Some(plan) = parsed_plan
                     .as_ref()
-                    .filter(|plan| validate_plan(plan).is_ok())
+                    .filter(|plan| validate_plan_for_task(plan, root_read_only).is_ok())
                 {
                     let defer_score = latent_plan_defer_score(&assistant_text_clean, plan);
                     if defer_score >= realize_cfg.defer_threshold {
@@ -7664,7 +7828,7 @@ Execute only the new minimal action: {}",
             }
 
             if let Some(ref plan) = parsed_plan {
-                if validate_plan(&plan).is_ok() {
+                if validate_plan_for_task(&plan, root_read_only).is_ok() {
                     adopt_valid_plan(
                         &plan,
                         &mut working_mem,
@@ -7695,7 +7859,7 @@ Execute only the new minimal action: {}",
             if matches!(cfg.provider, ProviderKind::Mistral)
                 && (parsed_plan
                     .as_ref()
-                    .filter(|plan| validate_plan(plan).is_ok())
+                    .filter(|plan| validate_plan_for_task(plan, root_read_only).is_ok())
                     .is_some()
                     || parsed_think.is_some())
                 && iter + 1 < max_iters
@@ -8679,10 +8843,7 @@ Required now: {}",
             let done_plan = validated_plan_for_turn.as_ref().or(active_plan.as_ref());
             let known_acceptance_commands =
                 collect_known_acceptance_commands(&messages, &working_mem);
-            let read_only_scores = if done_plan
-                .filter(|plan| is_read_only_observation_task(&root_user_text, Some(plan)))
-                .is_some()
-            {
+            let read_only_scores = if root_read_only {
                 done_plan
                     .map(|plan| {
                         let observation_evidence = collect_observation_evidence(&messages);
@@ -10766,6 +10927,79 @@ remaining_gap: still need to run cargo test\n\
             .suggested_commands
             .iter()
             .any(|cmd| cmd.contains("read_file")));
+    }
+
+    #[test]
+    fn root_read_only_detection_ignores_plan_drift_verbs() {
+        assert!(is_root_read_only_observation_task(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything."
+        ));
+        assert!(!is_root_read_only_observation_task(
+            "Fix the /realize command and update the handler implementation."
+        ));
+    }
+
+    #[test]
+    fn validate_plan_for_task_rejects_behavioral_acceptance_for_read_only_tasks() {
+        let plan = PlanBlock {
+            goal: "locate slash command handler".to_string(),
+            steps: vec![
+                "search src".to_string(),
+                "read src/tui/events.rs".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path is identified".to_string(),
+                "A behavioral test must confirm the /realize command works in the TUI.".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo is local".to_string(),
+        };
+
+        assert!(validate_plan_for_task(&plan, true).is_err());
+        assert!(validate_plan_for_task(&plan, false).is_ok());
+    }
+
+    #[test]
+    fn validate_done_acceptance_accepts_read_only_shorthand_evidence() {
+        let plan = PlanBlock {
+            goal: "locate slash command".to_string(),
+            steps: vec![
+                "inspect src".to_string(),
+                "read src/tui/events.rs".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path is identified".to_string(),
+                "The handler context is confirmed".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+
+        let completed_acceptance = vec!["acceptance 1".to_string(), "acceptance 2".to_string()];
+        let remaining_acceptance = Vec::new();
+        let acceptance_evidence = vec![
+            DoneAcceptanceEvidence {
+                criterion: "acceptance 1".to_string(),
+                command: "grep -n \"/realize\" src/tui/events.rs".to_string(),
+            },
+            DoneAcceptanceEvidence {
+                criterion: "acceptance 2".to_string(),
+                command: "read_file src/tui/events.rs".to_string(),
+            },
+        ];
+        let known_commands = vec![
+            "search_files(dir=src, pattern=/realize)".to_string(),
+            "read_file(path=src/tui/events.rs)".to_string(),
+        ];
+
+        assert!(validate_done_acceptance(
+            Some(&plan),
+            &completed_acceptance,
+            &remaining_acceptance,
+            &acceptance_evidence,
+            &known_commands,
+        )
+        .is_ok());
     }
 
     #[test]
