@@ -4544,8 +4544,19 @@ fn mistral_nested_tool_payload(tc: &ToolCallData) -> Option<(Vec<String>, ToolCa
             prelude.push(format!("<think>\n{think}\n</think>"));
         }
     }
-    let tool_name = obj.get("tool").and_then(|v| v.as_str())?.trim();
-    let tool_args = obj.get("arguments")?;
+    let tool_name = obj
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            obj.get("function")
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str())
+        })?
+        .trim();
+    let tool_args = obj.get("arguments").or_else(|| {
+        obj.get("function")
+            .and_then(|v| v.get("parameters"))
+    })?;
     if tool_name.is_empty() {
         return None;
     }
@@ -11561,6 +11572,33 @@ verify: exit code is zero\n\
             arguments: serde_json::json!({
                 "tool": "search_files",
                 "arguments": {"pattern": "/realize", "dir": "src"}
+            })
+            .to_string(),
+        };
+
+        let (blocks, normalized) = normalize_mistral_tool_call(&tc);
+        assert_eq!(blocks.len(), 1);
+        let plan = parse_plan_block(&blocks[0]).expect("plan parsed");
+        assert_eq!(plan.goal, "locate handler");
+        let normalized = normalized.expect("real tool preserved");
+        assert_eq!(normalized.name, "search_files");
+        assert_eq!(
+            normalized.arguments,
+            serde_json::json!({"pattern":"/realize","dir":"src"}).to_string()
+        );
+    }
+
+    #[test]
+    fn normalize_mistral_tool_call_extracts_inline_plan_with_function_wrapper_arguments() {
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "plan><goal>locate handler</goal><steps>1) search src 2) read file</steps><acceptance>1) path identified</acceptance><risks>wrong file</risks><assumptions>repo is local</assumptions></plan>".to_string(),
+            arguments: serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "search_files",
+                    "parameters": {"pattern": "/realize", "dir": "src"}
+                }
             })
             .to_string(),
         };
