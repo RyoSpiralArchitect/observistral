@@ -4050,7 +4050,50 @@ fn extract_tag_block<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     Some(rest[..end].trim())
 }
 
+fn parse_nested_tag_fields(body: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel_open) = body[cursor..].find('<') {
+        let open_start = cursor + rel_open;
+        let name_start = open_start + 1;
+        let Some(rel_name_end) = body[name_start..].find('>') else {
+            break;
+        };
+        let name_end = name_start + rel_name_end;
+        let raw_name = body[name_start..name_end].trim();
+        if raw_name.is_empty()
+            || raw_name.starts_with('/')
+            || raw_name.contains(char::is_whitespace)
+            || raw_name.contains('=')
+        {
+            cursor = name_end + 1;
+            continue;
+        }
+
+        let close = format!("</{raw_name}>");
+        let value_start = name_end + 1;
+        let Some(rel_close_start) = body[value_start..].find(&close) else {
+            cursor = value_start;
+            continue;
+        };
+        let value_end = value_start + rel_close_start;
+        let value = body[value_start..value_end].trim();
+        if !value.is_empty() {
+            out.push((raw_name.to_ascii_lowercase(), value.to_string()));
+        }
+        cursor = value_end + close.len();
+    }
+
+    out
+}
+
 fn parse_tag_fields(body: &str) -> Vec<(String, String)> {
+    let nested = parse_nested_tag_fields(body);
+    if !nested.is_empty() {
+        return nested;
+    }
+
     let mut out: Vec<(String, String)> = Vec::new();
     let mut current_key: Option<String> = None;
     let mut current_value = String::new();
@@ -11155,6 +11198,24 @@ assumptions: shared contract is loaded\n\
     }
 
     #[test]
+    fn parses_xml_style_plan_block_fields() {
+        let text = "\
+<plan>\n\
+<goal>locate the slash command handler</goal>\n\
+<steps>1) search src 2) read the matching file 3) verify the handler</steps>\n\
+<acceptance>1) exact file path identified 2) handler block confirmed</acceptance>\n\
+<risks>wrong file or command aliasing</risks>\n\
+<assumptions>the TUI code is local</assumptions>\n\
+</plan>\n";
+        let plan = parse_plan_block(text).expect("plan parsed");
+        assert_eq!(plan.goal, "locate the slash command handler");
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.acceptance_criteria.len(), 2);
+        assert_eq!(plan.steps[0], "search src");
+        assert_eq!(plan.acceptance_criteria[1], "handler block confirmed");
+    }
+
+    #[test]
     fn validates_plan_requires_numbered_steps() {
         let plan = PlanBlock {
             goal: "ship fix".to_string(),
@@ -11231,6 +11292,24 @@ verify: exit code is zero\n\
         assert_eq!(think.step, 3);
         assert_eq!(think.tool, "exec");
         assert_eq!(think.next, "cargo test");
+    }
+
+    #[test]
+    fn parses_xml_style_think_block_fields() {
+        let text = "\
+<think>\n\
+<goal>find the realize handler</goal>\n\
+<step>1 (search for the slash command)</step>\n\
+<tool>search_files</tool>\n\
+<risk>wrong path scope</risk>\n\
+<doubt>could be registered indirectly</doubt>\n\
+<next>search /realize inside src</next>\n\
+<verify>match appears in a TUI file</verify>\n\
+</think>\n";
+        let think = parse_think_block(text).expect("think parsed");
+        assert_eq!(think.step, 1);
+        assert_eq!(think.tool, "search_files");
+        assert_eq!(think.next, "search /realize inside src");
     }
 
     #[test]
