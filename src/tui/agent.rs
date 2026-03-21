@@ -4122,7 +4122,9 @@ fn extract_tag_block<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     let close = format!("</{tag}>");
     let start = text.find(&open)?;
     let rest = &text[start + open.len()..];
-    let end = rest.find(&close)?;
+    let end = rest
+        .find(&close)
+        .or_else(|| rest.find(&format!("</{tag}")))?;
     Some(rest[..end].trim())
 }
 
@@ -11391,6 +11393,22 @@ assumptions: shared contract is loaded\n\
         assert_eq!(plan.acceptance_criteria.len(), 2);
         assert_eq!(plan.steps[0], "search src");
         assert_eq!(plan.acceptance_criteria[1], "handler block confirmed");
+    }
+
+    #[test]
+    fn parses_plan_block_with_truncated_closing_tag() {
+        let text = "\
+<plan>\n\
+goal: locate slash command\n\
+steps: 1) search src 2) read the matching file\n\
+acceptance: 1) path identified 2) handler confirmed\n\
+risks: wrong file\n\
+assumptions: repo indexed\n\
+</plan";
+        let plan = parse_plan_block(text).expect("plan parsed");
+        assert_eq!(plan.goal, "locate slash command");
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.acceptance_criteria.len(), 2);
     }
 
     #[test]
