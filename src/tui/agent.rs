@@ -7903,19 +7903,58 @@ Execute only the new minimal action: {}",
             }
 
             if let Some(ref plan) = parsed_plan {
-                if validate_plan_for_task(&plan, root_read_only).is_ok() {
-                    adopt_valid_plan(
-                        &plan,
-                        &mut working_mem,
-                        &mut active_plan,
-                        &mut intent_required_verification,
-                        path_required_verification,
-                        &mut required_verification,
-                        &mut recovery,
-                        &mut last_verify_ok_step,
-                        last_build_verify_ok_step,
-                        last_behavioral_verify_ok_step,
-                    );
+                match validate_plan_for_task(&plan, root_read_only) {
+                    Ok(()) => {
+                        adopt_valid_plan(
+                            &plan,
+                            &mut working_mem,
+                            &mut active_plan,
+                            &mut intent_required_verification,
+                            path_required_verification,
+                            &mut required_verification,
+                            &mut recovery,
+                            &mut last_verify_ok_step,
+                            last_build_verify_ok_step,
+                            last_behavioral_verify_ok_step,
+                        );
+                    }
+                    Err(e) => {
+                        state = AgentState::Recovery;
+                        recovery.stage = Some(RecoveryStage::Diagnose);
+                        let mut block = governor_contract::invalid_plan_message(&e.to_string());
+                        if root_read_only {
+                            block.push_str(
+                                "\nFor this task, keep the plan strictly read-only: inspect/search/read only; no build/test/behavioral verification in steps or acceptance.",
+                            );
+                        }
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                            )))
+                            .await;
+                        pending_system_hint = Some(block);
+                        autosave_best_effort(
+                            &autosaver,
+                            &tx,
+                            tool_root_abs.as_deref(),
+                            checkpoint.as_deref(),
+                            cur_cwd.as_deref(),
+                            &messages,
+                        )
+                        .await;
+                        let _ = tx
+                            .send(StreamToken::GovernorState(build_governor_state(
+                                state,
+                                &recovery,
+                                &mem,
+                                file_tool_consec_failures,
+                                last_mutation_step,
+                                last_verify_ok_step,
+                                last_reflection.as_ref(),
+                            )))
+                            .await;
+                        continue;
+                    }
                 }
             }
             if !assistant_text_clean.is_empty() {
