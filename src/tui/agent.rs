@@ -3711,6 +3711,50 @@ Final answer must include the file path.",
     Some(out)
 }
 
+fn first_slash_literal(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(|token| {
+        let trimmed = token
+            .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | ',' | '.' | ':' | ';' | ')' | '('))
+            .trim();
+        if !trimmed.starts_with('/') || trimmed.len() < 2 {
+            return None;
+        }
+        let tail = &trimmed[1..];
+        if tail
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '/'))
+        {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn build_mistral_think_only_hint(root_user_text: &str, think: &ThinkBlock) -> String {
+    let tool = think.tool.trim();
+    let suggested = match tool {
+        "search_files" => {
+            let pattern = first_slash_literal(root_user_text).unwrap_or_else(|| "realize".to_string());
+            format!("search_files(pattern=\"{pattern}\", dir=\"src\")")
+        }
+        "list_dir" => "list_dir(dir=\"src\")".to_string(),
+        "glob" => "glob(pattern=\"*realize*\", dir=\"src\")".to_string(),
+        "read_file" => "read_file(path=\"src/tui/events.rs\")".to_string(),
+        _ => "search_files(pattern=\"realize\", dir=\"src\")".to_string(),
+    };
+
+    format!(
+        "[Mistral compatibility]\n\
+`think` is not a real tool call.\n\
+Next assistant turn:\n\
+1) emit the <think> block as plain text\n\
+2) call ONE real tool immediately after it\n\
+Suggested real tool for this task: {suggested}\n\
+Do NOT emit a `think` tool_call again."
+    )
+}
+
 fn parse_leading_ordinal(reference: &str) -> Option<usize> {
     let trimmed = reference.trim_start();
     let digits_len = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
@@ -8065,6 +8109,9 @@ Execute only the new minimal action: {}",
                             block.push_str(
                                 "\nFor this task, keep the plan strictly read-only: inspect/search/read only; no build/test/behavioral verification in steps or acceptance.",
                             );
+                            block.push_str(
+                                "\nRewrite any build/test step into an inspection step. Example: replace `run cargo test` with `read the matching file and confirm the command branch`.",
+                            );
                         }
                         let _ = tx
                             .send(StreamToken::Delta(format!(
@@ -8119,17 +8166,20 @@ Execute only the new minimal action: {}",
             {
                 state = AgentState::Recovery;
                 let note = if parsed_think.is_some() {
-                    "\
-[Mistral compatibility]\n\
-Your think block was recorded.\n\
-Next assistant turn: call ONE real tool that matches the recorded think.tool."
+                    build_mistral_think_only_hint(
+                        &root_user_text,
+                        parsed_think
+                            .as_ref()
+                            .expect("parsed_think checked above"),
+                    )
                 } else {
                     "\
 [Mistral compatibility]\n\
 Your plan block was recorded.\n\
 Next assistant turn: emit a <think> block and call ONE real tool."
+                        .to_string()
                 };
-                pending_system_hint = Some(note.to_string());
+                pending_system_hint = Some(note);
                 let _ = tx
                     .send(StreamToken::Delta(
                         "\n[compat] recorded structured block; continuing to real tool call\n"
@@ -11274,6 +11324,35 @@ remaining_gap: still need to run cargo test\n\
         assert!(!is_root_read_only_observation_task(
             "Fix the /realize command and update the handler implementation."
         ));
+    }
+
+    #[test]
+    fn first_slash_literal_extracts_command_token() {
+        assert_eq!(
+            first_slash_literal(
+                "Locate where the `/realize` slash command is handled in the TUI."
+            ),
+            Some("/realize".to_string())
+        );
+    }
+
+    #[test]
+    fn build_mistral_think_only_hint_suggests_real_tool() {
+        let think = ThinkBlock {
+            goal: "find direct references".to_string(),
+            step: 1,
+            tool: "search_files".to_string(),
+            risk: "dynamic dispatch".to_string(),
+            doubt: "might be indirect".to_string(),
+            next: "search for /realize".to_string(),
+            verify: "see a TUI match".to_string(),
+        };
+        let hint = build_mistral_think_only_hint(
+            "Locate where the /realize slash command is handled in the TUI.",
+            &think,
+        );
+        assert!(hint.contains("think` is not a real tool call"));
+        assert!(hint.contains("search_files(pattern=\"/realize\", dir=\"src\")"));
     }
 
     #[test]
