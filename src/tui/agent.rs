@@ -7441,7 +7441,9 @@ This is the LAST model call for this run.\n\
                 }
                 StreamToken::GovernorState(_) => {} // not emitted by inner stream
                 StreamToken::RealizeState(_) => {}  // not emitted by inner stream
-                StreamToken::Telemetry(_) => {}     // not emitted by inner stream
+                StreamToken::Telemetry(ev) => {
+                    let _ = tx.send(StreamToken::Telemetry(ev)).await;
+                }
                 StreamToken::Done => break,
                 StreamToken::Error(e) => {
                     let _ = tx.send(StreamToken::Error(e.clone())).await;

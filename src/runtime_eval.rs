@@ -91,6 +91,10 @@ pub struct RuntimeEvalMetrics {
     pub repo_map_fallback_count: usize,
     pub repo_map_fallback_histogram: BTreeMap<String, usize>,
     pub repo_map_typo_fallbacks: usize,
+    pub provider_retry_count: usize,
+    pub provider_retry_histogram: BTreeMap<String, usize>,
+    pub provider_retry_total_delay_ms: u64,
+    pub provider_retry_max_delay_ms: u64,
     pub recovery_enter_count: usize,
     pub recovery_stage_histogram: BTreeMap<String, usize>,
     pub max_consecutive_failures: usize,
@@ -136,6 +140,8 @@ pub struct RuntimeEvalSummary {
     pub avg_iterations: f64,
     pub avg_messages: f64,
     pub avg_repo_map_fallbacks: f64,
+    pub avg_provider_retries: f64,
+    pub avg_provider_retry_delay_ms: f64,
     pub avg_recovery_enters: f64,
     pub passed_ids: Vec<String>,
     pub failed_ids: Vec<String>,
@@ -268,6 +274,14 @@ pub fn summarize_cases(cases: &[RuntimeEvalCaseReport]) -> RuntimeEvalSummary {
         .iter()
         .map(|c| c.metrics.repo_map_fallback_count as f64)
         .collect());
+    let avg_provider_retries = avg(cases
+        .iter()
+        .map(|c| c.metrics.provider_retry_count as f64)
+        .collect());
+    let avg_provider_retry_delay_ms = avg(cases
+        .iter()
+        .map(|c| c.metrics.provider_retry_total_delay_ms as f64)
+        .collect());
     let avg_recovery_enters = avg(cases
         .iter()
         .map(|c| c.metrics.recovery_enter_count as f64)
@@ -290,6 +304,8 @@ pub fn summarize_cases(cases: &[RuntimeEvalCaseReport]) -> RuntimeEvalSummary {
         avg_iterations,
         avg_messages,
         avg_repo_map_fallbacks,
+        avg_provider_retries,
+        avg_provider_retry_delay_ms,
         avg_recovery_enters,
         passed_ids,
         failed_ids,
@@ -389,6 +405,32 @@ fn collect_metrics(
                         .entry(tool.to_string())
                         .or_insert(0) += 1;
                 }
+            }
+            "provider_retry" => {
+                metrics.provider_retry_count += 1;
+                let provider = line
+                    .data
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let status = line
+                    .data
+                    .get("status")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "send".to_string());
+                let key = format!("{provider}:{status}");
+                *metrics.provider_retry_histogram.entry(key).or_insert(0) += 1;
+                let delay_ms = line
+                    .data
+                    .get("delay_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                metrics.provider_retry_total_delay_ms = metrics
+                    .provider_retry_total_delay_ms
+                    .saturating_add(delay_ms);
+                metrics.provider_retry_max_delay_ms =
+                    metrics.provider_retry_max_delay_ms.max(delay_ms);
             }
             "governor_state" => {
                 metrics.governor_events += 1;
@@ -632,6 +674,7 @@ mod tests {
             concat!(
                 "{\"event\":\"tool_call\",\"data\":{\"name\":\"search_files\"}}\n",
                 "{\"event\":\"tool_call\",\"data\":{\"name\":\"read_file\"}}\n",
+                "{\"event\":\"provider_retry\",\"data\":{\"provider\":\"mistral\",\"status\":429,\"delay_ms\":5000}}\n",
                 "{\"event\":\"done\",\"data\":{}}\n",
                 "{\"event\":\"agent_end\",\"data\":{\"ok\":true}}\n"
             ),
@@ -708,6 +751,13 @@ mod tests {
         assert_eq!(report.metrics.graph_nodes, 2);
         assert_eq!(report.metrics.messages_len, 2);
         assert_eq!(report.metrics.repo_map_fallback_count, 0);
+        assert_eq!(report.metrics.provider_retry_count, 1);
+        assert_eq!(report.metrics.provider_retry_total_delay_ms, 5000);
+        assert_eq!(report.metrics.provider_retry_max_delay_ms, 5000);
+        assert_eq!(
+            report.metrics.provider_retry_histogram.get("mistral:429"),
+            Some(&1)
+        );
         assert!(report
             .metrics
             .last_assistant

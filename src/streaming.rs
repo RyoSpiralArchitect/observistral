@@ -121,7 +121,8 @@ fn max_connect_retries(provider: &ProviderKind) -> usize {
         // Mistral commonly returns bursty 429s during eval runs; a slightly deeper budget
         // keeps the single-case harness usable without changing task logic.
         ProviderKind::Mistral => 5,
-        _ => 3,
+        // Give other providers one extra retry by default without making UX feel stuck.
+        _ => 4,
     }
 }
 
@@ -851,7 +852,7 @@ mod tests {
     #[test]
     fn mistral_retry_budget_is_deeper() {
         assert_eq!(max_connect_retries(&ProviderKind::Mistral), 5);
-        assert_eq!(max_connect_retries(&ProviderKind::Anthropic), 3);
+        assert_eq!(max_connect_retries(&ProviderKind::Anthropic), 4);
     }
 
     #[test]
