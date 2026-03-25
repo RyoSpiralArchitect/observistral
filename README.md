@@ -1,7 +1,7 @@
 # OBSTRAL
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/badge/license-Apache%202.0-blue)
 ![UI](https://img.shields.io/badge/UI-web%20%2B%20TUI-2dd4bf)
 
 > **One prompt box is not enough.**
@@ -48,6 +48,8 @@ When you set `tool_root`, OBSTRAL automatically scans the project:
 ```
 [Project Context — auto-detected]
 stack: Rust, React (no bundler)
+explore:
+  - Rust: read Cargo.toml first, then src/lib.rs or src/main.rs, then tests/ or examples/ before editing.
 git:   branch=main  modified=2  untracked=1
 recent: "fix(observe): require all 4 blocks" · "feat(agent): error classifier"
 tree:
@@ -57,7 +59,7 @@ tree:
 key:  Cargo.toml · web/app.js · README.md
 ```
 
-This context is injected into the Coder's system message **before your first prompt**. The Coder already knows the stack, current branch, modified files, and directory layout when you start typing.
+This context is injected into the Coder's system message **before your first prompt**. The Coder already knows the stack, current branch, modified files, directory layout, and a small stack-aware exploration recipe when you start typing.
 
 In the TUI header you'll see a live badge: `▸ Rust · React · git:main`
 In the Web UI, the stack label appears below the toolRoot field in Settings.
@@ -68,6 +70,7 @@ In the Web UI, the stack label appears below the toolRoot field in Settings.
 - `pyproject.toml` / `requirements.txt` → Python
 - `go.mod` → Go
 - `pom.xml` → Java
+- `build.gradle*`, `Gemfile`, `composer.json`, `mix.exs`, `Package.swift`, `build.zig`, `*.tf`, `CMakeLists.txt`, `*.sln` / `*.csproj`, `deno.json*` → additional JVM / Ruby / PHP / Elixir / Swift / Zig / Terraform / C/C++ / .NET / Deno stacks
 
 The scan runs once per session, takes under 200 ms, and silently skips anything it can't read.
 
@@ -602,4 +605,4 @@ $env:GITHUB_TOKEN = "ghp_..."
 
 ## License
 
-MIT
+Apache License 2.0

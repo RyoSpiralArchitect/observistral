@@ -1,7 +1,7 @@
 # OBSTRAL
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/badge/license-Apache%202.0-blue)
 ![UI](https://img.shields.io/badge/UI-web%20%2B%20TUI-2dd4bf)
 
 > **Une seule boite de dialogue ne suffit pas.**
@@ -48,6 +48,8 @@ Quand vous definissez `tool_root`, OBSTRAL analyse automatiquement le projet :
 ```
 [Project Context — auto-detected]
 stack: Rust, React (no bundler)
+explore:
+  - Rust: read Cargo.toml first, then src/lib.rs or src/main.rs, then tests/ or examples/ before editing.
 git:   branch=main  modified=2  untracked=1
 recent: "fix(observe): require all 4 blocks" · "feat(agent): error classifier"
 tree:
@@ -57,7 +59,7 @@ tree:
 key:  Cargo.toml · web/app.js · README.md
 ```
 
-Ce contexte est injecte dans le message systeme du Coder **avant votre premier prompt**. Quand vous commencez a taper, le Coder connait deja le stack, la branche courante, les fichiers modifies et l'arborescence.
+Ce contexte est injecte dans le message systeme du Coder **avant votre premier prompt**. Quand vous commencez a taper, le Coder connait deja le stack, la branche courante, les fichiers modifies, l'arborescence, et une petite recette d'exploration adaptee au stack.
 
 Dans le TUI, un badge s'affiche en temps reel dans l'entete : `▸ Rust · React · git:main`
 Dans l'UI Web, le label du stack apparait sous le champ toolRoot dans les parametres.
@@ -68,6 +70,7 @@ Dans l'UI Web, le label du stack apparait sous le champ toolRoot dans les parame
 - `pyproject.toml` / `requirements.txt` → Python
 - `go.mod` → Go
 - `pom.xml` → Java
+- `build.gradle*`, `Gemfile`, `composer.json`, `mix.exs`, `Package.swift`, `build.zig`, `*.tf`, `CMakeLists.txt`, `*.sln` / `*.csproj`, `deno.json*` → detection additionnelle pour JVM / Ruby / PHP / Elixir / Swift / Zig / Terraform / C/C++ / .NET / Deno
 
 L'analyse s'execute une fois par session, prend moins de 200 ms et ignore silencieusement ce qu'elle ne peut pas lire.
 
@@ -527,4 +530,4 @@ $env:GITHUB_TOKEN = "ghp_..."
 
 ## Licence
 
-MIT
+Apache License 2.0

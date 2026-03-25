@@ -1738,32 +1738,9 @@ async fn run_init(args: InitArgs, _common: CommonArgs) -> Result<()> {
     }
 
     // Detect stack and test_cmd synchronously (same logic as TUI /init).
-    let has_cargo = root_p.join("Cargo.toml").exists();
-    let has_pkg = root_p.join("package.json").exists();
-    let has_py = root_p.join("pyproject.toml").exists() || root_p.join("requirements.txt").exists();
-    let has_go = root_p.join("go.mod").exists();
-    let stack = [
-        if has_cargo { Some("Rust") } else { None },
-        if has_pkg { Some("Node/React") } else { None },
-        if has_py { Some("Python") } else { None },
-        if has_go { Some("Go") } else { None },
-    ]
-    .iter()
-    .flatten()
-    .cloned()
-    .collect::<Vec<_>>()
-    .join(", ");
-    let test_cmd = if has_cargo {
-        "cargo test 2>&1"
-    } else if has_pkg {
-        "npm test --passWithNoTests 2>&1"
-    } else if has_py {
-        "pytest -q 2>&1"
-    } else if has_go {
-        "go test ./... 2>&1"
-    } else {
-        "# add your test command here"
-    };
+    let stack = crate::project::detect_stack_labels(&root_p).join(", ");
+    let test_cmd = crate::project::detect_test_command(&root_p, None)
+        .unwrap_or_else(|| "# add your test command here".to_string());
     let stack_line = if stack.is_empty() {
         "# auto-detected: unknown".to_string()
     } else {

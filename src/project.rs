@@ -149,6 +149,14 @@ impl ProjectContext {
             }
         }
 
+        let explore = build_explore_recipe(&self.root, &self.stack, self.test_cmd.as_deref());
+        if !explore.is_empty() {
+            out.push_str("explore:\n");
+            for line in explore.iter().take(4) {
+                out.push_str(&format!("  - {line}\n"));
+            }
+        }
+
         if let Some(ref repo_map) = self.repo_map {
             if repo_map.ready {
                 out.push_str(&format!(
@@ -220,53 +228,133 @@ impl ProjectContext {
     }
 }
 
+pub fn detect_stack_labels(root: &Path) -> Vec<String> {
+    detect_stack(root.to_string_lossy().as_ref())
+}
+
+pub fn detect_test_command(root: &Path, agents_md: Option<&str>) -> Option<String> {
+    detect_test_cmd(root.to_string_lossy().as_ref(), agents_md)
+}
+
 // ── Stack detection ───────────────────────────────────────────────────────────
 
 fn detect_stack(root: &str) -> Vec<String> {
     let mut stack: Vec<String> = Vec::new();
+    let root_path = Path::new(root);
+    let package_json = read_text_if_exists(&root_path.join("package.json"));
+
+    let mut push_stack = |label: &str| {
+        if !stack.iter().any(|item| item == label) {
+            stack.push(label.to_string());
+        }
+    };
 
     // Rust
-    if Path::new(root).join("Cargo.toml").is_file() {
-        stack.push("Rust".to_string());
+    if root_path.join("Cargo.toml").is_file() {
+        push_stack("Rust");
     }
 
-    // Node / React / TypeScript
-    let pkg_path = Path::new(root).join("package.json");
-    if pkg_path.is_file() {
-        if let Ok(src) = std::fs::read_to_string(&pkg_path) {
-            if src.contains("\"react\"") || src.contains("react-dom") {
-                stack.push("React".to_string());
-            } else if src.contains("\"typescript\"") || src.contains("tsconfig") {
-                stack.push("TypeScript".to_string());
-            } else {
-                stack.push("Node".to_string());
+    // Node / frontend runtimes
+    if package_json.is_some() {
+        push_stack("Node");
+        if let Some(src) = package_json.as_deref() {
+            if src.contains("\"next\"") {
+                push_stack("Next.js");
             }
-        } else {
-            stack.push("Node".to_string());
+            if src.contains("\"react\"") || src.contains("react-dom") {
+                push_stack("React");
+            }
+            if src.contains("\"vue\"") {
+                push_stack("Vue");
+            }
+            if src.contains("\"svelte\"") {
+                push_stack("Svelte");
+            }
+            if src.contains("\"typescript\"") {
+                push_stack("TypeScript");
+            }
+        }
+        if root_path.join("bun.lockb").is_file() || root_path.join("bun.lock").is_file() {
+            push_stack("Bun");
         }
     }
 
+    if root_path.join("deno.json").is_file() || root_path.join("deno.jsonc").is_file() {
+        push_stack("Deno");
+        push_stack("TypeScript");
+    }
+
     // Python
-    if Path::new(root).join("pyproject.toml").is_file()
-        || Path::new(root).join("requirements.txt").is_file()
-        || Path::new(root).join("setup.py").is_file()
+    if root_path.join("pyproject.toml").is_file()
+        || root_path.join("requirements.txt").is_file()
+        || root_path.join("setup.py").is_file()
+        || root_path.join("setup.cfg").is_file()
+        || root_path.join("Pipfile").is_file()
     {
-        stack.push("Python".to_string());
+        push_stack("Python");
     }
 
     // Go
-    if Path::new(root).join("go.mod").is_file() {
-        stack.push("Go".to_string());
+    if root_path.join("go.mod").is_file() {
+        push_stack("Go");
     }
 
-    // Java / Maven
-    if Path::new(root).join("pom.xml").is_file() {
-        stack.push("Java".to_string());
+    // Java / JVM
+    if root_path.join("pom.xml").is_file() {
+        push_stack("Java");
+        push_stack("Maven");
+    }
+    if root_path.join("build.gradle").is_file() || root_path.join("build.gradle.kts").is_file() {
+        push_stack("Gradle");
+        push_stack("JVM");
+    }
+
+    // Ruby
+    if root_path.join("Gemfile").is_file() {
+        push_stack("Ruby");
+    }
+
+    // PHP
+    if root_path.join("composer.json").is_file() {
+        push_stack("PHP");
+    }
+
+    // Elixir
+    if root_path.join("mix.exs").is_file() {
+        push_stack("Elixir");
+    }
+
+    // .NET
+    if has_top_level_suffix(root_path, &[".sln", ".csproj", ".fsproj", ".vbproj"]) {
+        push_stack(".NET");
+    }
+
+    // Swift
+    if root_path.join("Package.swift").is_file() {
+        push_stack("Swift");
+    }
+
+    // Zig
+    if root_path.join("build.zig").is_file() {
+        push_stack("Zig");
+    }
+
+    // Terraform
+    if has_top_level_suffix(root_path, &[".tf"]) || root_path.join("terraform.tfvars").is_file() {
+        push_stack("Terraform");
+    }
+
+    // C / C++
+    if root_path.join("CMakeLists.txt").is_file()
+        || root_path.join("meson.build").is_file()
+        || root_path.join("compile_commands.json").is_file()
+    {
+        push_stack("C/C++");
     }
 
     // tsconfig without package.json
-    if stack.is_empty() && Path::new(root).join("tsconfig.json").is_file() {
-        stack.push("TypeScript".to_string());
+    if root_path.join("tsconfig.json").is_file() {
+        push_stack("TypeScript");
     }
 
     stack
@@ -476,35 +564,341 @@ fn detect_test_cmd(root: &str, agents_md: Option<&str>) -> Option<String> {
 
     // 2. Auto-detect from stack.
     let p = Path::new(root);
+    let package_json = read_text_if_exists(&p.join("package.json"));
     if p.join("Cargo.toml").is_file() {
         return Some("cargo test 2>&1".to_string());
     }
     if p.join("package.json").is_file() {
         // Check for a "test" script in package.json
-        if let Ok(src) = std::fs::read_to_string(p.join("package.json")) {
+        if let Some(src) = package_json.as_deref() {
             if src.contains("\"test\"") {
-                let mgr = if p.join("pnpm-lock.yaml").is_file() {
+                let mgr = if p.join("bun.lockb").is_file() || p.join("bun.lock").is_file() {
+                    "bun"
+                } else if p.join("pnpm-lock.yaml").is_file() {
                     "pnpm"
                 } else if p.join("yarn.lock").is_file() {
                     "yarn"
                 } else {
                     "npm"
                 };
-                return Some(format!("{mgr} test --passWithNoTests 2>&1"));
+                return Some(if mgr == "bun" {
+                    "bun test 2>&1".to_string()
+                } else {
+                    format!("{mgr} test --passWithNoTests 2>&1")
+                });
             }
         }
+    }
+    if p.join("deno.json").is_file() || p.join("deno.jsonc").is_file() {
+        return Some("deno test 2>&1".to_string());
     }
     if p.join("pyproject.toml").is_file()
         || p.join("pytest.ini").is_file()
         || p.join("setup.cfg").is_file()
+        || p.join("requirements.txt").is_file()
     {
         return Some("pytest -q 2>&1".to_string());
     }
     if p.join("go.mod").is_file() {
         return Some("go test ./... 2>&1".to_string());
     }
+    if p.join("pom.xml").is_file() {
+        return Some("mvn test 2>&1".to_string());
+    }
+    if p.join("gradlew").is_file() {
+        return Some("./gradlew test 2>&1".to_string());
+    }
+    if p.join("build.gradle").is_file() || p.join("build.gradle.kts").is_file() {
+        return Some("gradle test 2>&1".to_string());
+    }
+    if p.join("mix.exs").is_file() {
+        return Some("mix test 2>&1".to_string());
+    }
+    if has_top_level_suffix(p, &[".sln", ".csproj", ".fsproj", ".vbproj"]) {
+        return Some("dotnet test 2>&1".to_string());
+    }
+    if p.join("Package.swift").is_file() {
+        return Some("swift test 2>&1".to_string());
+    }
+    if p.join("Gemfile").is_file() && (p.join("spec").is_dir() || p.join(".rspec").is_file()) {
+        return Some("bundle exec rspec 2>&1".to_string());
+    }
+    if p.join("composer.json").is_file()
+        && (p.join("phpunit.xml").is_file()
+            || p.join("phpunit.xml.dist").is_file()
+            || p.join("tests").is_dir())
+    {
+        return Some("vendor/bin/phpunit 2>&1".to_string());
+    }
+    if p.join("build.zig").is_file() {
+        return Some("zig build test 2>&1".to_string());
+    }
+    if has_top_level_suffix(p, &[".tf"]) || p.join("terraform.tfvars").is_file() {
+        return Some("terraform validate 2>&1".to_string());
+    }
 
     None
+}
+
+fn build_explore_recipe(root: &str, stack: &[String], test_cmd: Option<&str>) -> Vec<String> {
+    let root_path = Path::new(root);
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: Vec<&'static str> = Vec::new();
+    let mut push_once = |key: &'static str, text: String| {
+        if !seen.contains(&key) {
+            seen.push(key);
+            lines.push(text);
+        }
+    };
+
+    let rust_entry = first_existing_path(root_path, &["src/lib.rs", "src/main.rs", "src/bin"]);
+    let rust_tests = first_existing_path(root_path, &["tests", "examples"]);
+    let web_entry = first_existing_path(
+        root_path,
+        &[
+            "app",
+            "pages",
+            "src/main.tsx",
+            "src/main.ts",
+            "src/index.tsx",
+            "src/index.ts",
+            "src/index.js",
+            "src",
+        ],
+    );
+    let web_tests = first_existing_path(
+        root_path,
+        &[
+            "tests",
+            "__tests__",
+            "cypress",
+            "playwright.config.ts",
+            "vitest.config.ts",
+        ],
+    );
+    let python_entry = first_existing_path(
+        root_path,
+        &["pyproject.toml", "src", "app", "main.py", "manage.py"],
+    );
+    let python_tests = first_existing_path(root_path, &["tests", "test", "pytest.ini"]);
+    let go_entry = first_existing_path(root_path, &["go.mod", "cmd", "main.go", "internal", "pkg"]);
+    let go_tests = first_existing_path(root_path, &["*_test.go", "test", "tests"]);
+    let jvm_entry = first_existing_path(
+        root_path,
+        &[
+            "pom.xml",
+            "build.gradle.kts",
+            "build.gradle",
+            "src/main",
+            "src",
+        ],
+    );
+    let jvm_tests = first_existing_path(root_path, &["src/test", "test", "tests"]);
+    let ruby_entry = first_existing_path(root_path, &["Gemfile", "lib", "app"]);
+    let ruby_tests = first_existing_path(root_path, &["spec", "test", ".rspec"]);
+    let php_entry = first_existing_path(root_path, &["composer.json", "src", "app"]);
+    let php_tests = first_existing_path(root_path, &["tests", "phpunit.xml", "phpunit.xml.dist"]);
+    let elixir_entry = first_existing_path(root_path, &["mix.exs", "lib"]);
+    let elixir_tests = first_existing_path(root_path, &["test"]);
+    let dotnet_entry = first_existing_path(
+        root_path,
+        &["*.sln", "*.csproj", "*.fsproj", "*.vbproj", "src"],
+    );
+    let dotnet_tests = first_existing_path(root_path, &["tests", "test"]);
+    let swift_entry = first_existing_path(root_path, &["Package.swift", "Sources"]);
+    let swift_tests = first_existing_path(root_path, &["Tests"]);
+    let zig_entry = first_existing_path(root_path, &["build.zig", "src"]);
+    let terraform_entry = first_existing_path(
+        root_path,
+        &["main.tf", "versions.tf", "providers.tf", "modules"],
+    );
+    let cpp_entry = first_existing_path(
+        root_path,
+        &["CMakeLists.txt", "meson.build", "include", "src"],
+    );
+    let cpp_tests = first_existing_path(root_path, &["tests", "test"]);
+
+    for item in stack {
+        match item.as_str() {
+            "Rust" => push_once(
+                "rust",
+                format!(
+                    "Rust: read `Cargo.toml` first, then `{}`, then `{}` before editing.",
+                    rust_entry.as_deref().unwrap_or("src/lib.rs or src/main.rs"),
+                    rust_tests.as_deref().unwrap_or("tests/ or examples/"),
+                ),
+            ),
+            "Node" | "React" | "Next.js" | "Vue" | "Svelte" | "TypeScript" | "Bun" | "Deno" => push_once(
+                "web",
+                format!(
+                    "JS/TS: read `{}` first, then `{}`, then `{}` before editing.",
+                    if root_path.join("deno.json").is_file() || root_path.join("deno.jsonc").is_file() {
+                        "deno.json"
+                    } else {
+                        "package.json"
+                    },
+                    web_entry.as_deref().unwrap_or("src/ entrypoints"),
+                    web_tests.as_deref().unwrap_or("tests/"),
+                ),
+            ),
+            "Python" => push_once(
+                "python",
+                format!(
+                    "Python: read `{}` first, then `{}`, then `{}` before editing.",
+                    first_existing_path(
+                        root_path,
+                        &["pyproject.toml", "requirements.txt", "setup.cfg", "setup.py", "Pipfile"],
+                    )
+                    .unwrap_or_else(|| "pyproject.toml or requirements.txt".to_string()),
+                    python_entry.as_deref().unwrap_or("package entrypoints"),
+                    python_tests.as_deref().unwrap_or("tests/"),
+                ),
+            ),
+            "Go" => push_once(
+                "go",
+                format!(
+                    "Go: read `go.mod` first, then `{}`, then `{}` before editing.",
+                    go_entry.as_deref().unwrap_or("cmd/ or package entrypoints"),
+                    go_tests.as_deref().unwrap_or("*_test.go files"),
+                ),
+            ),
+            "Java" | "Maven" | "Gradle" | "JVM" => push_once(
+                "jvm",
+                format!(
+                    "JVM: read `{}` first, then `{}`, then `{}` before editing.",
+                    first_existing_path(root_path, &["pom.xml", "build.gradle.kts", "build.gradle"])
+                        .unwrap_or_else(|| "pom.xml or build.gradle".to_string()),
+                    jvm_entry.as_deref().unwrap_or("src/main"),
+                    jvm_tests.as_deref().unwrap_or("src/test"),
+                ),
+            ),
+            "Ruby" => push_once(
+                "ruby",
+                format!(
+                    "Ruby: read `Gemfile` first, then `{}`, then `{}` before editing.",
+                    ruby_entry.as_deref().unwrap_or("lib/"),
+                    ruby_tests.as_deref().unwrap_or("spec/ or test/"),
+                ),
+            ),
+            "PHP" => push_once(
+                "php",
+                format!(
+                    "PHP: read `composer.json` first, then `{}`, then `{}` before editing.",
+                    php_entry.as_deref().unwrap_or("src/"),
+                    php_tests.as_deref().unwrap_or("tests/"),
+                ),
+            ),
+            "Elixir" => push_once(
+                "elixir",
+                format!(
+                    "Elixir: read `mix.exs` first, then `{}`, then `{}` before editing.",
+                    elixir_entry.as_deref().unwrap_or("lib/"),
+                    elixir_tests.as_deref().unwrap_or("test/"),
+                ),
+            ),
+            ".NET" => push_once(
+                "dotnet",
+                format!(
+                    ".NET: read `{}` first, then `{}`, then `{}` before editing.",
+                    first_existing_path(root_path, &["*.sln", "*.csproj", "*.fsproj", "*.vbproj"])
+                        .unwrap_or_else(|| "*.sln or *.csproj".to_string()),
+                    dotnet_entry.as_deref().unwrap_or("Program.cs or project entrypoints"),
+                    dotnet_tests.as_deref().unwrap_or("test projects"),
+                ),
+            ),
+            "Swift" => push_once(
+                "swift",
+                format!(
+                    "Swift: read `Package.swift` first, then `{}`, then `{}` before editing.",
+                    swift_entry.as_deref().unwrap_or("Sources/"),
+                    swift_tests.as_deref().unwrap_or("Tests/"),
+                ),
+            ),
+            "Zig" => push_once(
+                "zig",
+                format!(
+                    "Zig: read `build.zig` first, then `{}`, then zig test targets before editing.",
+                    zig_entry.as_deref().unwrap_or("src/"),
+                ),
+            ),
+            "Terraform" => push_once(
+                "terraform",
+                format!(
+                    "Terraform: read `{}` first, then variables/outputs/modules before editing; inspect provider and module wiring first.",
+                    terraform_entry
+                        .as_deref()
+                        .unwrap_or("main.tf or provider/root *.tf files"),
+                ),
+            ),
+            "C/C++" => push_once(
+                "cpp",
+                format!(
+                    "C/C++: read `{}` first, then `{}`, then `{}` before editing.",
+                    first_existing_path(root_path, &["CMakeLists.txt", "meson.build"])
+                        .unwrap_or_else(|| "CMakeLists.txt or meson.build".to_string()),
+                    cpp_entry.as_deref().unwrap_or("include/ and src/"),
+                    cpp_tests.as_deref().unwrap_or("tests/"),
+                ),
+            ),
+            _ => {}
+        }
+    }
+
+    if lines.is_empty() {
+        let hint = if root_path.join("README.md").is_file() || root_path.join("readme.md").is_file()
+        {
+            "Start with README + key manifests, then read the smallest likely entrypoint before editing."
+        } else {
+            "Start with key manifests and likely entrypoints before editing any existing file."
+        };
+        lines.push(hint.to_string());
+    }
+
+    if let Some(cmd) = test_cmd.map(str::trim).filter(|cmd| !cmd.is_empty()) {
+        lines.push(format!(
+            "Verify after edits with `{cmd}` once the target files are understood."
+        ));
+    }
+
+    lines
+}
+
+fn read_text_if_exists(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+fn has_top_level_suffix(root: &Path, suffixes: &[&str]) -> bool {
+    std::fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flat_map(|rd| rd.flatten())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .any(|name| suffixes.iter().any(|suffix| name.ends_with(suffix)))
+}
+
+fn first_existing_path(root: &Path, candidates: &[&str]) -> Option<String> {
+    for candidate in candidates {
+        if candidate.contains('*') {
+            if let Some(found) = first_top_level_match(root, candidate) {
+                return Some(found);
+            }
+            continue;
+        }
+        let path = root.join(candidate);
+        if path.exists() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn first_top_level_match(root: &Path, pattern: &str) -> Option<String> {
+    let (prefix, suffix) = pattern.split_once('*').unwrap_or(("", pattern));
+    std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .find(|name| name.starts_with(prefix) && name.ends_with(suffix))
 }
 
 /// Read the first project instruction file found in `root`.
@@ -524,4 +918,72 @@ fn try_read_agents_file(root: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn detect_stack_labels_covers_more_ecosystems() {
+        let td = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            td.path().join("mix.exs"),
+            "defmodule Demo.MixProject do end",
+        )
+        .expect("mix");
+        fs::write(td.path().join("composer.json"), "{}").expect("composer");
+        fs::write(td.path().join("Package.swift"), "// swift package").expect("swift");
+        fs::write(td.path().join("main.tf"), "terraform {}").expect("tf");
+        fs::write(td.path().join("build.zig"), "const std = @import(\"std\");").expect("zig");
+        fs::write(
+            td.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.24)",
+        )
+        .expect("cmake");
+        fs::write(td.path().join("app.sln"), "").expect("sln");
+
+        let stack = detect_stack_labels(td.path());
+        assert!(stack.iter().any(|item| item == "Elixir"));
+        assert!(stack.iter().any(|item| item == "PHP"));
+        assert!(stack.iter().any(|item| item == "Swift"));
+        assert!(stack.iter().any(|item| item == "Terraform"));
+        assert!(stack.iter().any(|item| item == "Zig"));
+        assert!(stack.iter().any(|item| item == "C/C++"));
+        assert!(stack.iter().any(|item| item == ".NET"));
+    }
+
+    #[test]
+    fn context_text_includes_explore_recipe_and_detected_test_command() {
+        let td = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(td.path().join("src")).expect("src dir");
+        fs::write(
+            td.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("cargo");
+        fs::write(td.path().join("src/main.rs"), "fn main() {}").expect("main");
+
+        let ctx = ProjectContext {
+            root: td.path().to_string_lossy().into_owned(),
+            stack: detect_stack_labels(td.path()),
+            git_branch: None,
+            git_modified: 0,
+            git_untracked: 0,
+            git_recent: Vec::new(),
+            tree: Vec::new(),
+            key_files: vec!["Cargo.toml".to_string()],
+            readme_excerpt: None,
+            agents_md: None,
+            test_cmd: detect_test_command(td.path(), None),
+            repo_map: None,
+        };
+
+        let text = ctx.to_context_text();
+        assert!(text.contains("explore:"));
+        assert!(text.contains("Rust: read `Cargo.toml` first"));
+        assert!(text.contains("test_cmd: cargo test 2>&1"));
+        assert!(text.contains("Verify after edits with `cargo test 2>&1`"));
+    }
 }

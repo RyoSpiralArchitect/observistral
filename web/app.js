@@ -6840,6 +6840,9 @@
         );
         const sysExtras = [];
         sysExtras.push(`[Agent state]\nstate: ${agentState}`);
+        if (projectScan && String(projectScan.context_text || "").trim()) {
+          sysExtras.push(String(projectScan.context_text).trim());
+        }
         sysExtras.push(buildInstructionResolverPrompt(instructionResolver, activePlan, governorContract));
         sysExtras.push(buildTaskContractPrompt(taskContract, activePlan, governorContract));
         const assumptionPrompt = buildAssumptionLedgerPrompt(assumptionLedger);

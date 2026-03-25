@@ -590,35 +590,10 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                 ));
             } else {
                 // Detect stack and test_cmd synchronously.
-                let has_cargo = std::path::Path::new(&root).join("Cargo.toml").exists();
-                let has_pkg = std::path::Path::new(&root).join("package.json").exists();
-                let has_py = std::path::Path::new(&root).join("pyproject.toml").exists()
-                    || std::path::Path::new(&root)
-                        .join("requirements.txt")
-                        .exists();
-                let has_go = std::path::Path::new(&root).join("go.mod").exists();
-                let stack = [
-                    if has_cargo { Some("Rust") } else { None },
-                    if has_pkg { Some("Node/React") } else { None },
-                    if has_py { Some("Python") } else { None },
-                    if has_go { Some("Go") } else { None },
-                ]
-                .iter()
-                .flatten()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-                let test_cmd = if has_cargo {
-                    "cargo test 2>&1"
-                } else if has_pkg {
-                    "npm test --passWithNoTests 2>&1"
-                } else if has_py {
-                    "pytest -q 2>&1"
-                } else if has_go {
-                    "go test ./... 2>&1"
-                } else {
-                    "# add your test command here"
-                };
+                let root_path = std::path::Path::new(&root);
+                let stack = crate::project::detect_stack_labels(root_path).join(", ");
+                let test_cmd = crate::project::detect_test_command(root_path, None)
+                    .unwrap_or_else(|| "# add your test command here".to_string());
                 let stack_line = if stack.is_empty() {
                     "# auto-detected: unknown".to_string()
                 } else {
