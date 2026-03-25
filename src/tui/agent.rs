@@ -1373,6 +1373,9 @@ PRIORITY (safety-first default when unsure):\n\
 Plan enforcement:\n\
   - Every tool call MUST map to a step in your <plan>. If not, update <plan> first.\n\
   - Your <plan> MUST include explicit `acceptance:` criteria. Verification must satisfy them.\n\
+  - __INSTRUCTION_RESOLVER_SCRATCHPAD_RULE__\n\
+  - Before patch_file/apply_diff on an existing file, emit an <evidence> block naming the target file, concrete read/search evidence, remaining uncertainty, and the next probe/edit.\n\
+  - If evidence is weak or missing, do NOT mutate yet; use one diagnostic tool instead.\n\
 \n\
 Choose the right tool:\n\
   Quick directory listing  → list_dir      (structure discovery, low token)\n\
@@ -1537,6 +1540,10 @@ pub fn coder_system(
     realize_preset: Option<RealizePreset>,
 ) -> String {
     let mut s = CODER_BASE_SYSTEM.to_string();
+    s = s.replace(
+        "__INSTRUCTION_RESOLVER_SCRATCHPAD_RULE__",
+        governor_contract::instruction_resolver_scratchpad_rule_message().as_str(),
+    );
     s.push_str(&governor_contract::scratchpad_addon());
     s.push_str("\n\n");
     s.push_str(&host_capability_addon());
@@ -2442,6 +2449,469 @@ struct ImpactBlock {
     remaining_gap: String,
 }
 
+#[derive(Debug, Clone)]
+struct EvidenceBlock {
+    target_files: Vec<String>,
+    target_symbols: Vec<String>,
+    evidence: String,
+    open_questions: String,
+    next_probe: String,
+}
+
+#[derive(Debug, Clone)]
+struct TaskContract {
+    task_summary: String,
+    hard_constraints: Vec<String>,
+    non_goals: Vec<String>,
+    output_shape: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum InstructionAuthority {
+    Root,
+    System,
+    Project,
+    User,
+    Execution,
+}
+
+impl InstructionAuthority {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::System => "system",
+            Self::Project => "project",
+            Self::User => "user",
+            Self::Execution => "execution",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstructionSource {
+    TaskContract,
+    ProjectRules,
+    UserRequest,
+    Plan,
+    Think,
+}
+
+impl InstructionSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::TaskContract => "task_contract",
+            Self::ProjectRules => "project_rules",
+            Self::UserRequest => "user_request",
+            Self::Plan => "plan",
+            Self::Think => "think",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstructionPriority {
+    authority: InstructionAuthority,
+    explicit: bool,
+    locality: u8,
+    sequence: usize,
+}
+
+impl InstructionPriority {
+    fn outranks(&self, other: &Self) -> bool {
+        (
+            std::cmp::Reverse(governor_contract::instruction_authority_rank(
+                self.authority.as_str(),
+            )),
+            self.explicit,
+            self.locality,
+            self.sequence,
+        ) > (
+            std::cmp::Reverse(governor_contract::instruction_authority_rank(
+                other.authority.as_str(),
+            )),
+            other.explicit,
+            other.locality,
+            other.sequence,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InstructionConflict {
+    winner_authority: InstructionAuthority,
+    winner_source: InstructionSource,
+    loser_authority: InstructionAuthority,
+    loser_source: InstructionSource,
+    reason: String,
+}
+
+impl InstructionConflict {
+    fn render(&self) -> String {
+        governor_contract::instruction_resolver_conflict_message(
+            self.winner_authority.as_str(),
+            self.winner_source.as_str(),
+            self.loser_authority.as_str(),
+            self.loser_source.as_str(),
+            self.reason.as_str(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InstructionResolver {
+    task_summary: String,
+    root_read_only: bool,
+    project_rules_active: bool,
+}
+
+impl InstructionResolver {
+    fn new(task_summary: &str, root_read_only: bool, project_rules_active: bool) -> Self {
+        Self {
+            task_summary: compact_one_line(task_summary.trim(), 220),
+            root_read_only,
+            project_rules_active,
+        }
+    }
+
+    fn user_task_summary(&self) -> &str {
+        self.task_summary.as_str()
+    }
+
+    fn prompt(&self, required_verification: VerificationLevel) -> String {
+        let mut out = format!(
+            "[{}]\n{}\n",
+            governor_contract::instruction_resolver_title(),
+            governor_contract::instruction_resolver_priority_title()
+        );
+        for label in governor_contract::instruction_priority_labels() {
+            out.push_str("- ");
+            out.push_str(label.as_str());
+            out.push('\n');
+        }
+        out.push_str(governor_contract::instruction_resolver_rules_title());
+        out.push('\n');
+        for rule in governor_contract::instruction_resolver_rules() {
+            out.push_str("- ");
+            out.push_str(rule.as_str());
+            out.push('\n');
+        }
+        out.push_str(governor_contract::instruction_resolver_current_title());
+        out.push('\n');
+        out.push_str("- ");
+        out.push_str(
+            governor_contract::instruction_resolver_root_runtime_line_message(
+                InstructionAuthority::Root.as_str(),
+            )
+            .as_str(),
+        );
+        out.push('\n');
+        out.push_str("- ");
+        out.push_str(
+            governor_contract::instruction_resolver_user_task_line_message(
+                InstructionAuthority::User.as_str(),
+                InstructionSource::UserRequest.as_str(),
+                self.user_task_summary(),
+            )
+            .as_str(),
+        );
+        out.push('\n');
+        if self.root_read_only {
+            out.push_str("- ");
+            out.push_str(
+                governor_contract::instruction_resolver_read_only_line_message(
+                    InstructionAuthority::System.as_str(),
+                    InstructionSource::TaskContract.as_str(),
+                )
+                .as_str(),
+            );
+            out.push('\n');
+        }
+        out.push_str("- ");
+        out.push_str(
+            governor_contract::instruction_resolver_done_requires_line_message(
+                InstructionAuthority::System.as_str(),
+                InstructionSource::TaskContract.as_str(),
+                match required_verification {
+                    VerificationLevel::Build => "real build/check/lint",
+                    VerificationLevel::Behavioral => "real behavioral",
+                },
+            )
+            .as_str(),
+        );
+        out.push('\n');
+        if self.project_rules_active {
+            out.push_str("- ");
+            out.push_str(
+                governor_contract::instruction_resolver_project_rules_line_message(
+                    InstructionAuthority::Project.as_str(),
+                    InstructionSource::ProjectRules.as_str(),
+                )
+                .as_str(),
+            );
+            out.push('\n');
+        }
+        out
+    }
+
+    fn plan_conflict(&self, plan: &PlanBlock) -> Option<InstructionConflict> {
+        if !self.root_read_only {
+            return None;
+        }
+        let reason = read_only_plan_violation(plan)?;
+        let winner = InstructionPriority {
+            authority: InstructionAuthority::System,
+            explicit: true,
+            locality: 2,
+            sequence: 1,
+        };
+        let loser = InstructionPriority {
+            authority: InstructionAuthority::Execution,
+            explicit: true,
+            locality: 3,
+            sequence: 1,
+        };
+        if !winner.outranks(&loser) {
+            return None;
+        }
+        Some(InstructionConflict {
+            winner_authority: InstructionAuthority::System,
+            winner_source: InstructionSource::TaskContract,
+            loser_authority: InstructionAuthority::Execution,
+            loser_source: InstructionSource::Plan,
+            reason,
+        })
+    }
+
+    fn tool_conflict(
+        &self,
+        tc: &ToolCallData,
+        test_cmd: Option<&str>,
+    ) -> Option<InstructionConflict> {
+        if !self.root_read_only {
+            return None;
+        }
+        let reason = match tc.name.as_str() {
+            "write_file" | "patch_file" | "apply_diff" => {
+                Some(governor_contract::instruction_resolver_read_only_mutation_message())
+            }
+            "exec" => {
+                let command =
+                    parse_exec_command_from_args(tc.arguments.as_str()).unwrap_or_default();
+                match classify_exec_kind(command.as_str(), test_cmd) {
+                    ExecKind::Diagnostic => None,
+                    ExecKind::Verify => Some(
+                        governor_contract::instruction_resolver_read_only_verify_exec_message(
+                            command.as_str(),
+                        ),
+                    ),
+                    ExecKind::Action => Some(
+                        governor_contract::instruction_resolver_read_only_action_exec_message(
+                            command.as_str(),
+                        ),
+                    ),
+                }
+            }
+            _ => None,
+        }?;
+        let winner = InstructionPriority {
+            authority: InstructionAuthority::System,
+            explicit: true,
+            locality: 2,
+            sequence: 1,
+        };
+        let loser = InstructionPriority {
+            authority: InstructionAuthority::Execution,
+            explicit: true,
+            locality: 3,
+            sequence: 2,
+        };
+        if !winner.outranks(&loser) {
+            return None;
+        }
+        Some(InstructionConflict {
+            winner_authority: InstructionAuthority::System,
+            winner_source: InstructionSource::TaskContract,
+            loser_authority: InstructionAuthority::Execution,
+            loser_source: InstructionSource::Think,
+            reason,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssumptionStatus {
+    Unknown,
+    Confirmed,
+    Refuted,
+}
+
+impl AssumptionStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Confirmed => "confirmed",
+            Self::Refuted => "refuted",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AssumptionEntry {
+    text: String,
+    status: AssumptionStatus,
+    evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AssumptionLedger {
+    entries: Vec<AssumptionEntry>,
+}
+
+impl AssumptionLedger {
+    fn remember_unknown(&mut self, assumption: &str) {
+        let text = compact_one_line(assumption.trim(), 140);
+        if text == "-" {
+            return;
+        }
+        let sig = normalize_memory_entry(text.as_str());
+        if sig.is_empty() {
+            return;
+        }
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|entry| normalize_memory_entry(entry.text.as_str()) == sig)
+        {
+            if existing.status == AssumptionStatus::Unknown {
+                existing.text = text;
+            }
+            return;
+        }
+        self.entries.push(AssumptionEntry {
+            text,
+            status: AssumptionStatus::Unknown,
+            evidence: None,
+        });
+        if self.entries.len() > 8 {
+            self.entries.remove(0);
+        }
+    }
+
+    fn sync_to_plan(&mut self, plan: &PlanBlock) {
+        let plan_assumptions = parse_assumption_items(plan.assumptions.as_str());
+        for assumption in &plan_assumptions {
+            self.remember_unknown(assumption);
+        }
+        self.entries.retain(|entry| {
+            if entry.status == AssumptionStatus::Refuted {
+                return true;
+            }
+            let sig = normalize_memory_entry(entry.text.as_str());
+            plan_assumptions
+                .iter()
+                .any(|assumption| normalize_memory_entry(assumption.as_str()) == sig)
+        });
+    }
+
+    fn mark_refuted(&mut self, assumption: &str, evidence: Option<&str>) {
+        let text = compact_one_line(assumption.trim(), 140);
+        if text == "-" {
+            return;
+        }
+        let sig = normalize_memory_entry(text.as_str());
+        let evidence = evidence
+            .map(|item| compact_one_line(item.trim(), 160))
+            .filter(|item| item != "-");
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|entry| normalize_memory_entry(entry.text.as_str()) == sig)
+        {
+            existing.status = AssumptionStatus::Refuted;
+            existing.evidence = evidence;
+            existing.text = text;
+            return;
+        }
+        self.entries.push(AssumptionEntry {
+            text,
+            status: AssumptionStatus::Refuted,
+            evidence,
+        });
+        if self.entries.len() > 8 {
+            self.entries.remove(0);
+        }
+    }
+
+    fn refresh_confirmations(&mut self, working_mem: &WorkingMemory) {
+        let support = working_mem
+            .facts
+            .iter()
+            .chain(working_mem.successful_verifications.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in &mut self.entries {
+            if entry.status != AssumptionStatus::Unknown {
+                continue;
+            }
+            let assumption_sig = normalize_memory_entry(entry.text.as_str());
+            if assumption_sig.is_empty() {
+                continue;
+            }
+            let assumption_tokens = keyword_tokens(entry.text.as_str());
+            let best = support
+                .iter()
+                .map(|candidate| {
+                    let candidate_sig = normalize_memory_entry(candidate.as_str());
+                    let mut score = token_overlap_score(
+                        &assumption_tokens,
+                        &keyword_tokens(candidate.as_str()),
+                    );
+                    if !candidate_sig.is_empty()
+                        && (candidate_sig.contains(assumption_sig.as_str())
+                            || assumption_sig.contains(candidate_sig.as_str()))
+                    {
+                        score = score.max(0.9);
+                    }
+                    (score, candidate)
+                })
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some((score, candidate)) = best {
+                if score >= 0.72 {
+                    entry.status = AssumptionStatus::Confirmed;
+                    entry.evidence = Some(compact_one_line(candidate.as_str(), 160));
+                }
+            }
+        }
+    }
+
+    fn from_messages(messages: &[serde_json::Value], working_mem: &WorkingMemory) -> Self {
+        let mut ledger = Self::default();
+        for msg in messages {
+            if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+                continue;
+            }
+            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(plan) = parse_plan_block(content).filter(|p| validate_plan(p).is_ok()) {
+                ledger.sync_to_plan(&plan);
+            }
+            if let Some(reflect) = parse_reflection_block(content) {
+                ledger.mark_refuted(
+                    reflect.wrong_assumption.as_str(),
+                    Some(reflect.next_minimal_action.as_str()),
+                );
+            }
+        }
+        ledger.refresh_confirmations(working_mem);
+        ledger
+    }
+
+    fn has_refuted(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.status == AssumptionStatus::Refuted)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct WorkingMemory {
     facts: Vec<String>,
@@ -3063,6 +3533,178 @@ fn build_working_memory_prompt(mem: &WorkingMemory) -> Option<String> {
     Some(out)
 }
 
+fn derive_task_contract(
+    root_user_text: &str,
+    root_read_only: bool,
+    goal_wants_actions: bool,
+    required_verification: VerificationLevel,
+) -> TaskContract {
+    let task_summary = compact_one_line(root_user_text.trim(), 220);
+    let mut hard_constraints = vec![
+        "Solve the user’s requested task before any cleanup or refactor.".to_string(),
+        "Keep edits evidence-backed and scope-bounded.".to_string(),
+    ];
+    if root_read_only {
+        hard_constraints.push("This task is inspection-only: do not edit files.".to_string());
+        hard_constraints.push(
+            "Do not run build/test/behavior checks just to finish a read-only task.".to_string(),
+        );
+    } else if !goal_wants_actions {
+        hard_constraints.push(
+            "If the request is underspecified, inspect first and avoid speculative edits."
+                .to_string(),
+        );
+    }
+    match required_verification {
+        VerificationLevel::Behavioral => hard_constraints
+            .push("Completion requires a real behavioral verification command.".to_string()),
+        VerificationLevel::Build => hard_constraints
+            .push("Completion requires a real build/check/lint verification.".to_string()),
+    }
+
+    let non_goals = vec![
+        "Do not broaden scope into unrelated files or prompt/governor rewrites.".to_string(),
+        "Do not replace working code without evidence that it is the target.".to_string(),
+    ];
+
+    let output_shape = if root_read_only {
+        vec![
+            "Name the confirmed file path or symbol you located.".to_string(),
+            "Summarize the confirmed handling context from observation evidence.".to_string(),
+        ]
+    } else {
+        vec![
+            "Keep the final answer tied to changed files, verification, and remaining gaps."
+                .to_string(),
+            "If unfinished, leave the next exact command/file to continue from.".to_string(),
+        ]
+    };
+
+    TaskContract {
+        task_summary: if task_summary == "-" {
+            "complete the requested task".to_string()
+        } else {
+            task_summary
+        },
+        hard_constraints,
+        non_goals,
+        output_shape,
+    }
+}
+
+fn build_task_contract_prompt(
+    contract: &TaskContract,
+    active_plan: Option<&PlanBlock>,
+    required_verification: VerificationLevel,
+) -> String {
+    let mut out = String::from("[Task Contract]\n");
+    out.push_str("Task summary:\n");
+    out.push_str(&format!("- {}\n", contract.task_summary));
+    out.push_str("Hard constraints:\n");
+    for item in &contract.hard_constraints {
+        out.push_str(&format!("- {item}\n"));
+    }
+    out.push_str("Non-goals:\n");
+    for item in &contract.non_goals {
+        out.push_str(&format!("- {item}\n"));
+    }
+    out.push_str("Expected output shape:\n");
+    for item in &contract.output_shape {
+        out.push_str(&format!("- {item}\n"));
+    }
+    out.push_str("Verification floor:\n");
+    out.push_str(&format!(
+        "- {}\n",
+        match required_verification {
+            VerificationLevel::Build => "real build/check/lint before done",
+            VerificationLevel::Behavioral => "real behavioral test before done",
+        }
+    ));
+    if let Some(plan) = active_plan {
+        out.push_str("Current plan acceptance:\n");
+        for (idx, criterion) in plan.acceptance_criteria.iter().enumerate() {
+            out.push_str(&format!("- acceptance {}: {}\n", idx + 1, criterion));
+        }
+    }
+    out.push_str("If the next action would violate this contract, inspect/replan first.");
+    out
+}
+
+fn validate_plan_against_task_contract(plan: &PlanBlock, contract: &TaskContract) -> Result<()> {
+    let task_tokens = keyword_tokens(contract.task_summary.as_str());
+    if task_tokens.len() < 3 {
+        return Ok(());
+    }
+
+    let mut plan_tokens = keyword_tokens(plan.goal.as_str());
+    for step in &plan.steps {
+        plan_tokens.extend(keyword_tokens(step.as_str()));
+    }
+    for criterion in &plan.acceptance_criteria {
+        plan_tokens.extend(keyword_tokens(criterion.as_str()));
+    }
+
+    if token_overlap_score(&task_tokens, &plan_tokens) < 0.20 {
+        return Err(anyhow!(
+            governor_contract::task_contract_plan_drift_message()
+        ));
+    }
+
+    Ok(())
+}
+
+fn build_assumption_ledger_prompt(ledger: &AssumptionLedger) -> Option<String> {
+    if ledger.entries.is_empty() {
+        return None;
+    }
+    let mut out = String::from("[Assumption Ledger]\n");
+    let mut wrote = false;
+    let sections = [
+        ("Open assumptions", AssumptionStatus::Unknown),
+        ("Confirmed assumptions", AssumptionStatus::Confirmed),
+        ("Refuted assumptions", AssumptionStatus::Refuted),
+    ];
+    for (title, status) in sections {
+        let items = ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.status == status)
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            continue;
+        }
+        wrote = true;
+        out.push_str(title);
+        out.push_str(":\n");
+        for entry in items {
+            out.push_str(&format!("- [{}] {}", entry.status.as_str(), entry.text));
+            if let Some(evidence) = entry.evidence.as_deref() {
+                out.push_str(&format!(" — {evidence}"));
+            }
+            out.push('\n');
+        }
+    }
+    if !wrote {
+        return None;
+    }
+    out.push_str(
+        "Do not rely on refuted assumptions. Prefer probes that convert open assumptions into confirmed facts.",
+    );
+    Some(out)
+}
+
+fn parse_evidence_block(text: &str) -> Option<EvidenceBlock> {
+    let fields = parse_block_fields(text, "evidence")?;
+
+    Some(EvidenceBlock {
+        target_files: block_list_value(&fields, "target_files"),
+        target_symbols: block_list_value(&fields, "target_symbols"),
+        evidence: compact_one_line(block_text_value(&fields, "evidence").as_str(), 220),
+        open_questions: compact_one_line(block_text_value(&fields, "open_questions").as_str(), 180),
+        next_probe: compact_one_line(block_text_value(&fields, "next_probe").as_str(), 180),
+    })
+}
+
 fn parse_impact_block(text: &str) -> Option<ImpactBlock> {
     let fields = parse_block_fields(text, "impact")?;
 
@@ -3137,6 +3779,58 @@ fn validate_impact(impact: &ImpactBlock, plan: Option<&PlanBlock>) -> Result<()>
         ));
     }
     Ok(())
+}
+
+fn refuted_assumption_conflict(
+    ledger: &AssumptionLedger,
+    think: &ThinkBlock,
+    tc: &ToolCallData,
+) -> Option<String> {
+    let mut probe = format!("{} {}", think.goal, think.next);
+    if tc.name == "exec" {
+        if let Some(command) = parse_exec_command_from_args(tc.arguments.as_str()) {
+            probe.push(' ');
+            probe.push_str(command.as_str());
+        }
+    } else if let Some(path) = mutation_target_path(tc) {
+        probe.push(' ');
+        probe.push_str(path.as_str());
+    }
+
+    let probe_sig = normalize_memory_entry(probe.as_str());
+    let probe_tokens = keyword_tokens(probe.as_str());
+    if probe_sig.is_empty() && probe_tokens.is_empty() {
+        return None;
+    }
+
+    for entry in ledger
+        .entries
+        .iter()
+        .filter(|entry| entry.status == AssumptionStatus::Refuted)
+    {
+        let assumption_sig = normalize_memory_entry(entry.text.as_str());
+        let assumption_tokens = keyword_tokens(entry.text.as_str());
+        let overlap = token_overlap_score(&assumption_tokens, &probe_tokens);
+        let exec_retry = tc.name == "exec" && overlap >= 0.50;
+        if (!assumption_sig.is_empty()
+            && (probe_sig.contains(assumption_sig.as_str())
+                || assumption_sig.contains(probe_sig.as_str())))
+            || overlap >= 0.75
+            || exec_retry
+        {
+            let evidence_suffix = entry
+                .evidence
+                .as_deref()
+                .map(|evidence| format!(" ({evidence})"))
+                .unwrap_or_default();
+            return Some(governor_contract::assumption_refuted_reuse_message(
+                entry.text.as_str(),
+                evidence_suffix.as_str(),
+            ));
+        }
+    }
+
+    None
 }
 
 fn parse_string_list_arg(value: &serde_json::Value) -> Vec<String> {
@@ -3288,37 +3982,16 @@ fn is_root_read_only_observation_task(root_user_text: &str) -> bool {
 }
 
 fn read_only_plan_violation(plan: &PlanBlock) -> Option<String> {
-    let forbidden = [
-        "edit",
-        "patch",
-        "modify",
-        "write",
-        "create",
-        "implement",
-        "fix",
-        "refactor",
-        "build",
-        "compile",
-        "test",
-        "behavioral",
-        "smoke",
-        "cargo",
-        "pytest",
-        "npm",
-        "jest",
-        "playwright",
-        "vitest",
-        "run",
-        "exec",
-        "execute",
-    ];
     let check_field = |label: String, text: &str| -> Option<String> {
         let tokens = keyword_tokens(text);
-        for term in forbidden {
-            if tokens.contains(term) {
-                return Some(format!(
-                    "read-only observation task plans must stay inspect-only; found `{term}` in {label}"
-                ));
+        for term in governor_contract::instruction_resolver_read_only_forbidden_terms() {
+            if tokens.contains(term.as_str()) {
+                return Some(
+                    governor_contract::instruction_resolver_read_only_plan_term_message(
+                        term.as_str(),
+                        label.as_str(),
+                    ),
+                );
             }
         }
         None
@@ -3709,6 +4382,160 @@ You already have enough observation evidence to call done directly now.\n",
 Final answer must include the file path.",
     );
     Some(out)
+}
+
+fn evidence_path_matches(target: &str, candidate: &str) -> bool {
+    let target_sig = normalize_memory_entry(target);
+    let candidate_sig = normalize_memory_entry(candidate);
+    if target_sig.is_empty() || candidate_sig.is_empty() {
+        return false;
+    }
+    target_sig == candidate_sig
+        || target_sig.ends_with(candidate_sig.as_str())
+        || candidate_sig.ends_with(target_sig.as_str())
+}
+
+fn observation_supports_target_path(target: &str, evidence: &ObservationEvidence) -> bool {
+    evidence
+        .reads
+        .iter()
+        .any(|read| evidence_path_matches(target, read.path.as_str()))
+        || evidence.searches.iter().any(|search| {
+            search
+                .paths
+                .iter()
+                .any(|path| evidence_path_matches(target, path.as_str()))
+        })
+}
+
+fn mutation_tool_requires_evidence(tc: &ToolCallData) -> bool {
+    matches!(tc.name.as_str(), "patch_file" | "apply_diff")
+}
+
+fn mutation_target_path(tc: &ToolCallData) -> Option<String> {
+    let args = serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()?;
+    args.get("path")
+        .and_then(|v| v.as_str())
+        .map(|path| compact_one_line(path.trim(), 180))
+        .filter(|path| path != "-")
+}
+
+fn validate_evidence_block(
+    evidence_block: &EvidenceBlock,
+    tc: &ToolCallData,
+    observations: &ObservationEvidence,
+) -> Result<()> {
+    if evidence_block.target_files.is_empty() {
+        return Err(anyhow!(
+            governor_contract::evidence_missing_target_files_message()
+        ));
+    }
+    if evidence_block.evidence.trim().is_empty() {
+        return Err(anyhow!(
+            governor_contract::evidence_missing_evidence_message()
+        ));
+    }
+    if evidence_block.open_questions.trim().is_empty() {
+        return Err(anyhow!(
+            governor_contract::evidence_missing_open_questions_message()
+        ));
+    }
+    if evidence_block.next_probe.trim().is_empty() {
+        return Err(anyhow!(
+            governor_contract::evidence_missing_next_probe_message()
+        ));
+    }
+    if !mutation_tool_requires_evidence(tc) {
+        return Ok(());
+    }
+    let Some(target_path) = mutation_target_path(tc) else {
+        return Err(anyhow!(
+            governor_contract::evidence_unresolved_path_message()
+        ));
+    };
+    if !evidence_block
+        .target_files
+        .iter()
+        .any(|path| evidence_path_matches(path.as_str(), target_path.as_str()))
+    {
+        return Err(anyhow!(
+            governor_contract::evidence_target_mismatch_message(target_path.as_str())
+        ));
+    }
+    if !observation_supports_target_path(target_path.as_str(), observations) {
+        return Err(anyhow!(
+            governor_contract::evidence_missing_observation_message(target_path.as_str())
+        ));
+    }
+    Ok(())
+}
+
+fn build_evidence_gate_prompt(
+    tc: &ToolCallData,
+    observations: &ObservationEvidence,
+    ledger: &AssumptionLedger,
+) -> String {
+    let target_path = mutation_target_path(tc).unwrap_or_else(|| "<path>".to_string());
+    let mut out = format!(
+        "[Evidence Gate]\n\
+You are about to mutate an existing file via {}.\n\
+Target path: {target_path}\n\
+\n\
+Before this mutation, emit exactly:\n\
+<evidence>\n\
+target_files: 1) <exact target path>\n\
+target_symbols: 1) <symbol or area>\n\
+evidence: <what previous read/search proved>\n\
+open_questions: <what is still uncertain or `none`>\n\
+next_probe: <exact next action or edit target>\n\
+</evidence>\n\
+\n\
+Rules:\n\
+- `target_files` must include the actual file you are about to change.\n\
+- Base the block on real prior read/search evidence from this session.\n\
+- If the target is not yet supported by evidence, do NOT mutate; call one diagnostic tool instead.\n\
+- After the <evidence> block, call exactly one tool.",
+        tc.name
+    );
+
+    if !observations.reads.is_empty() {
+        out.push_str("\n\n[Observed reads]\n");
+        for read in observations.reads.iter().rev().take(3).rev() {
+            out.push_str(&format!("- {} -> {}\n", read.command, read.path));
+        }
+    }
+    if !observations.searches.is_empty() {
+        out.push_str("[Observed searches]\n");
+        for search in observations.searches.iter().rev().take(3).rev() {
+            let path_summary = if search.paths.is_empty() {
+                "(no paths)".to_string()
+            } else {
+                search
+                    .paths
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            out.push_str(&format!(
+                "- {} -> hits={} paths={}\n",
+                search.command, search.hit_count, path_summary
+            ));
+        }
+    }
+    if ledger.has_refuted() {
+        out.push_str("[Refuted assumptions]\n");
+        for entry in ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.status == AssumptionStatus::Refuted)
+            .take(2)
+        {
+            out.push_str(&format!("- {}\n", entry.text));
+        }
+    }
+    out
 }
 
 fn first_slash_literal(text: &str) -> Option<String> {
@@ -4352,6 +5179,15 @@ fn parse_plan_items(s: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_assumption_items(s: &str) -> Vec<String> {
+    parse_plan_items(s)
+        .into_iter()
+        .map(|item| compact_one_line(item.as_str(), 140))
+        .filter(|item| item != "-")
+        .take(6)
+        .collect()
+}
+
 fn parse_block_fields(text: &str, tag: &str) -> Option<BTreeMap<String, ParsedBlockValue>> {
     let body = extract_tag_block(text, tag)?;
     let mut out = BTreeMap::new();
@@ -4810,6 +5646,7 @@ fn effective_verify_ok_step(
 fn adopt_valid_plan(
     plan: &PlanBlock,
     working_mem: &mut WorkingMemory,
+    assumption_ledger: &mut AssumptionLedger,
     active_plan: &mut Option<PlanBlock>,
     intent_required_verification: &mut VerificationLevel,
     path_required_verification: VerificationLevel,
@@ -4820,6 +5657,8 @@ fn adopt_valid_plan(
     last_behavioral_verify_ok_step: Option<usize>,
 ) {
     working_mem.sync_to_plan(plan);
+    assumption_ledger.sync_to_plan(plan);
+    assumption_ledger.refresh_confirmations(working_mem);
     if let Some(level) = verification_level_from_plan(plan) {
         *intent_required_verification = level;
         *required_verification = (*intent_required_verification).max(path_required_verification);
@@ -5115,12 +5954,37 @@ fn validate_plan(plan: &PlanBlock) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_plan_for_task(plan: &PlanBlock, root_read_only: bool) -> Result<()> {
     validate_plan(plan)?;
     if root_read_only {
         if let Some(msg) = read_only_plan_violation(plan) {
             return Err(anyhow!(msg));
         }
+    }
+    Ok(())
+}
+
+fn validate_plan_against_instruction_resolver(
+    plan: &PlanBlock,
+    resolver: &InstructionResolver,
+) -> Result<()> {
+    if let Some(conflict) = resolver.plan_conflict(plan) {
+        return Err(anyhow!(conflict.render()));
+    }
+    Ok(())
+}
+
+fn validate_plan_for_task_contract(
+    plan: &PlanBlock,
+    root_read_only: bool,
+    contract: &TaskContract,
+    resolver: &InstructionResolver,
+) -> Result<()> {
+    validate_plan(plan)?;
+    validate_plan_against_task_contract(plan, contract)?;
+    if root_read_only {
+        validate_plan_against_instruction_resolver(plan, resolver)?;
     }
     Ok(())
 }
@@ -5425,50 +6289,26 @@ fn is_diagnostic_tool_name(name: &str) -> bool {
         .any(|tool| tool == name)
 }
 
+fn has_project_rules_context(messages: &[serde_json::Value]) -> bool {
+    messages.iter().any(|msg| {
+        if msg.get("role").and_then(|v| v.as_str()) != Some("system") {
+            return false;
+        }
+        let Some(content) = msg.get("content").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        governor_contract::instruction_resolver_project_rule_markers()
+            .iter()
+            .any(|marker| !marker.is_empty() && content.contains(marker))
+    })
+}
+
 fn is_diagnostic_command(command: &str) -> bool {
-    let c = command_sig(command);
-    let pats = [
-        "pwd",
-        "cd",
-        "set-location",
-        "pushd",
-        "popd",
-        "ls",
-        "dir",
-        "get-location",
-        "get-childitem",
-        "get-content",
-        "select-string",
-        "where",
-        "which",
-        "get-command",
-        "echo",
-        "write-output",
-        "whoami",
-        "hostname",
-        "git status",
-        "git rev-parse",
-        "git remote",
-        "git branch",
-        "git diff",
-        "rg",
-        "grep",
-        "cat",
-        "head",
-        "tail",
-        "sed -n",
-        "wc",
-        "cargo --version",
-        "rustc --version",
-        "python --version",
-        "node --version",
-        "npm --version",
-        "pnpm --version",
-        "yarn --version",
-        "go version",
-        "dotnet --info",
-    ];
-    pats.iter().any(|p| c.contains(p))
+    let sig = command_sig(command);
+    signature_matches_any(
+        sig.as_str(),
+        governor_contract::instruction_resolver_diagnostic_exec_signatures(),
+    )
 }
 
 fn verification_examples(level: VerificationLevel) -> String {
@@ -6990,6 +7830,19 @@ Fix: use --provider openai-compatible (or --provider mistral).",
     let goal_wants_actions = wants_local_actions(&root_user_text);
     let mut intent_required_verification =
         infer_required_verification_level(&root_user_text, test_cmd.as_deref());
+    let task_contract = derive_task_contract(
+        &root_user_text,
+        root_read_only,
+        goal_wants_actions,
+        intent_required_verification,
+    );
+    let instruction_resolver = InstructionResolver::new(
+        task_contract.task_summary.as_str(),
+        root_read_only,
+        project_context.is_some()
+            || agents_md.is_some()
+            || has_project_rules_context(&start.messages),
+    );
     let realize_cfg = RealizeOnDemandConfig::resolve(realize_preset);
     let mut latent_plan: Option<LatentPlanBuffer> = None;
     let mut realize_metrics = RealizeMetrics::default();
@@ -7003,8 +7856,10 @@ Fix: use --provider openai-compatible (or --provider mistral).",
             json!({"role":"system","content": read_only_task_addon()}),
         );
     }
-    let mut active_plan = last_plan_from_messages(&messages)
-        .filter(|plan| validate_plan_for_task(plan, root_read_only).is_ok());
+    let mut active_plan = last_plan_from_messages(&messages).filter(|plan| {
+        validate_plan_for_task_contract(plan, root_read_only, &task_contract, &instruction_resolver)
+            .is_ok()
+    });
     if let Some(plan) = active_plan.as_ref() {
         if let Some(level) = verification_level_from_plan(plan) {
             intent_required_verification = level;
@@ -7015,6 +7870,11 @@ Fix: use --provider openai-compatible (or --provider mistral).",
     let mut required_verification = intent_required_verification.max(path_required_verification);
     last_reflection = last_reflection_from_messages(&messages);
     let mut working_mem = WorkingMemory::from_messages(&messages, test_cmd.as_deref());
+    let mut assumption_ledger = AssumptionLedger::from_messages(&messages, &working_mem);
+    if let Some(plan) = active_plan.as_ref() {
+        assumption_ledger.sync_to_plan(plan);
+    }
+    assumption_ledger.refresh_confirmations(&working_mem);
     // Rebuild loop governor memory from the existing session so resuming runs doesn't
     // repeat the same failures from scratch.
     let mut mem = FailureMemory::from_recent_messages(&messages);
@@ -7273,6 +8133,7 @@ This is the LAST model call for this run.\n\
                 adopt_valid_plan(
                     &latent.plan,
                     &mut working_mem,
+                    &mut assumption_ledger,
                     &mut active_plan,
                     &mut intent_required_verification,
                     path_required_verification,
@@ -7328,10 +8189,31 @@ This is the LAST model call for this run.\n\
             msgs_for_call.push(json!({"role":"system","content": note}));
         }
 
+        msgs_for_call.push(json!({
+            "role": "system",
+            "content": instruction_resolver.prompt(required_verification),
+        }));
+
+        msgs_for_call.push(json!({
+            "role": "system",
+            "content": build_task_contract_prompt(
+                &task_contract,
+                active_plan.as_ref(),
+                required_verification
+            ),
+        }));
+
         if let Some(memory_prompt) = build_working_memory_prompt(&working_mem) {
             msgs_for_call.push(json!({
                 "role": "system",
                 "content": memory_prompt,
+            }));
+        }
+
+        if let Some(ledger_prompt) = build_assumption_ledger_prompt(&assumption_ledger) {
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": ledger_prompt,
             }));
         }
 
@@ -7537,11 +8419,18 @@ This is the LAST model call for this run.\n\
             reflection_required = None;
 
             if let Some(ref r) = last_reflection {
+                if !r.wrong_assumption.trim().is_empty() {
+                    assumption_ledger.mark_refuted(
+                        r.wrong_assumption.as_str(),
+                        Some(r.next_minimal_action.as_str()),
+                    );
+                }
                 if matches!(
                     r.strategy_change,
                     StrategyChange::Adjust | StrategyChange::Abandon
                 ) {
                     working_mem.set_strategy(r.next_minimal_action.as_str());
+                    assumption_ledger.refresh_confirmations(&working_mem);
                 }
                 if r.strategy_change == StrategyChange::Abandon {
                     pending_system_hint = Some(format!(
@@ -7568,7 +8457,15 @@ Execute only the new minimal action: {}",
 
         if let Some(reason) = impact_required.clone() {
             let impact_plan = parse_plan_block(&assistant_text)
-                .filter(|plan| validate_plan_for_task(plan, root_read_only).is_ok())
+                .filter(|plan| {
+                    validate_plan_for_task_contract(
+                        plan,
+                        root_read_only,
+                        &task_contract,
+                        &instruction_resolver,
+                    )
+                    .is_ok()
+                })
                 .or_else(|| active_plan.clone());
             let impact = match parse_impact_block(&assistant_text) {
                 Some(impact) => impact,
@@ -7668,6 +8565,7 @@ Execute only the new minimal action: {}",
                     adopt_valid_plan(
                         &latent.plan,
                         &mut working_mem,
+                        &mut assumption_ledger,
                         &mut active_plan,
                         &mut intent_required_verification,
                         path_required_verification,
@@ -7703,7 +8601,12 @@ Execute only the new minimal action: {}",
         if let Some(ref tc) = tool_call {
             let candidate_plan = match parsed_plan.as_ref() {
                 Some(plan) => {
-                    if let Err(e) = validate_plan_for_task(plan, root_read_only) {
+                    if let Err(e) = validate_plan_for_task_contract(
+                        plan,
+                        root_read_only,
+                        &task_contract,
+                        &instruction_resolver,
+                    ) {
                         state = AgentState::Recovery;
                         recovery.stage = Some(RecoveryStage::Diagnose);
                         let block = governor_contract::invalid_plan_message(&e.to_string());
@@ -7891,6 +8794,173 @@ Execute only the new minimal action: {}",
                 continue;
             }
 
+            if let Some(conflict) = refuted_assumption_conflict(&assumption_ledger, think, tc) {
+                state = AgentState::Recovery;
+                recovery.stage = Some(RecoveryStage::Diagnose);
+                let block = format!(
+                    "[Assumption Ledger] {conflict}\nGather new evidence or choose a different next action before retrying."
+                );
+
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                    )))
+                    .await;
+
+                push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+
+                pending_system_hint = Some(block);
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
+
+            if let Some(conflict) = instruction_resolver.tool_conflict(tc, test_cmd.as_deref()) {
+                state = AgentState::Recovery;
+                recovery.stage = Some(RecoveryStage::Diagnose);
+                let block = conflict.render();
+
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                    )))
+                    .await;
+
+                push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+
+                pending_system_hint = Some(block);
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
+
+            if mutation_tool_requires_evidence(tc) {
+                let observations = collect_observation_evidence(&messages);
+                let evidence_block = match parse_evidence_block(&assistant_text) {
+                    Some(block) => block,
+                    None => {
+                        state = AgentState::Recovery;
+                        recovery.stage = Some(RecoveryStage::Diagnose);
+                        let block =
+                            build_evidence_gate_prompt(tc, &observations, &assumption_ledger);
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                            )))
+                            .await;
+                        push_blocked_tool_exchange(
+                            &mut messages,
+                            &assistant_text_clean,
+                            tc,
+                            &block,
+                        );
+                        autosave_best_effort(
+                            &autosaver,
+                            &tx,
+                            tool_root_abs.as_deref(),
+                            checkpoint.as_deref(),
+                            cur_cwd.as_deref(),
+                            &messages,
+                        )
+                        .await;
+                        pending_system_hint = Some(block);
+                        let _ = tx
+                            .send(StreamToken::GovernorState(build_governor_state(
+                                state,
+                                &recovery,
+                                &mem,
+                                file_tool_consec_failures,
+                                last_mutation_step,
+                                last_verify_ok_step,
+                                last_reflection.as_ref(),
+                            )))
+                            .await;
+                        continue;
+                    }
+                };
+                if let Err(e) = validate_evidence_block(&evidence_block, tc, &observations) {
+                    state = AgentState::Recovery;
+                    recovery.stage = Some(RecoveryStage::Diagnose);
+                    let mut block = format!(
+                        "{}\n\n{}",
+                        governor_contract::evidence_invalid_message(&e.to_string()),
+                        build_evidence_gate_prompt(tc, &observations, &assumption_ledger)
+                    );
+                    if !evidence_block.target_symbols.is_empty() {
+                        block.push_str("\n\nCurrent target_symbols:\n");
+                        for symbol in &evidence_block.target_symbols {
+                            block.push_str("- ");
+                            block.push_str(symbol);
+                            block.push('\n');
+                        }
+                    }
+                    let _ = tx
+                        .send(StreamToken::Delta(format!(
+                            "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                        )))
+                        .await;
+                    push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
+                    autosave_best_effort(
+                        &autosaver,
+                        &tx,
+                        tool_root_abs.as_deref(),
+                        checkpoint.as_deref(),
+                        cur_cwd.as_deref(),
+                        &messages,
+                    )
+                    .await;
+                    pending_system_hint = Some(block);
+                    let _ = tx
+                        .send(StreamToken::GovernorState(build_governor_state(
+                            state,
+                            &recovery,
+                            &mem,
+                            file_tool_consec_failures,
+                            last_mutation_step,
+                            last_verify_ok_step,
+                            last_reflection.as_ref(),
+                        )))
+                        .await;
+                    continue;
+                }
+            }
+
             validated_plan_for_turn = Some(candidate_plan.clone());
             validated_think_for_turn = Some(think.clone());
         }
@@ -7902,6 +8972,7 @@ Execute only the new minimal action: {}",
                 adopt_valid_plan(
                     &plan,
                     &mut working_mem,
+                    &mut assumption_ledger,
                     &mut active_plan,
                     &mut intent_required_verification,
                     path_required_verification,
@@ -7926,10 +8997,15 @@ Execute only the new minimal action: {}",
             }));
         } else {
             if realize_cfg.enabled {
-                if let Some(plan) = parsed_plan
-                    .as_ref()
-                    .filter(|plan| validate_plan_for_task(plan, root_read_only).is_ok())
-                {
+                if let Some(plan) = parsed_plan.as_ref().filter(|plan| {
+                    validate_plan_for_task_contract(
+                        plan,
+                        root_read_only,
+                        &task_contract,
+                        &instruction_resolver,
+                    )
+                    .is_ok()
+                }) {
                     let defer_score = latent_plan_defer_score(&assistant_text_clean, plan);
                     if defer_score >= realize_cfg.defer_threshold {
                         let latest_intent = parsed_think.as_ref().map(think_intent_summary);
@@ -8090,11 +9166,17 @@ Execute only the new minimal action: {}",
             }
 
             if let Some(ref plan) = parsed_plan {
-                match validate_plan_for_task(&plan, root_read_only) {
+                match validate_plan_for_task_contract(
+                    &plan,
+                    root_read_only,
+                    &task_contract,
+                    &instruction_resolver,
+                ) {
                     Ok(()) => {
                         adopt_valid_plan(
                             &plan,
                             &mut working_mem,
+                            &mut assumption_ledger,
                             &mut active_plan,
                             &mut intent_required_verification,
                             path_required_verification,
@@ -8163,7 +9245,15 @@ Execute only the new minimal action: {}",
             if matches!(cfg.provider, ProviderKind::Mistral)
                 && (parsed_plan
                     .as_ref()
-                    .filter(|plan| validate_plan_for_task(plan, root_read_only).is_ok())
+                    .filter(|plan| {
+                        validate_plan_for_task_contract(
+                            plan,
+                            root_read_only,
+                            &task_contract,
+                            &instruction_resolver,
+                        )
+                        .is_ok()
+                    })
                     .is_some()
                     || parsed_think.is_some())
                 && iter + 1 < max_iters
@@ -9486,6 +10576,7 @@ Required now: {}",
                     next_action_for_turn,
                     test_cmd.as_deref(),
                 );
+                assumption_ledger.refresh_confirmations(&working_mem);
                 let path_level = verification_level_for_mutation_path(path.as_str());
                 if path_level > path_required_verification {
                     path_required_verification = path_level;
@@ -9639,6 +10730,7 @@ Required now: {}",
                     next_action_for_turn,
                     test_cmd.as_deref(),
                 );
+                assumption_ledger.refresh_confirmations(&working_mem);
             }
 
             messages.push(json!({
@@ -9746,6 +10838,7 @@ Required now: {}",
                     next_action_for_turn,
                     test_cmd.as_deref(),
                 );
+                assumption_ledger.refresh_confirmations(&working_mem);
             }
 
             messages.push(json!({
@@ -9855,6 +10948,7 @@ Required now: {}",
                     next_action_for_turn,
                     test_cmd.as_deref(),
                 );
+                assumption_ledger.refresh_confirmations(&working_mem);
             }
 
             messages.push(json!({
@@ -10213,6 +11307,7 @@ Action required: call read_file(path) first to confirm current contents, then re
                     next_action_for_turn,
                     test_cmd.as_deref(),
                 );
+                assumption_ledger.refresh_confirmations(&working_mem);
                 if matches!(tc.name.as_str(), "write_file" | "patch_file") {
                     let path_level = verification_level_for_mutation_path(path.as_str());
                     if path_level > path_required_verification {
@@ -10671,6 +11766,7 @@ This is blocked to prevent nested-repo / accidental repo-root modifications.\n\n
                 step_label_for_turn.as_deref(),
                 next_action_for_turn,
             );
+            assumption_ledger.refresh_confirmations(&working_mem);
             if exec_kind == ExecKind::Action {
                 impact_required = Some(format!(
                     "successful mutation command: {}",
@@ -10773,6 +11869,7 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
             adopt_valid_plan(
                 &latent.plan,
                 &mut working_mem,
+                &mut assumption_ledger,
                 &mut active_plan,
                 &mut intent_required_verification,
                 path_required_verification,
@@ -12137,5 +13234,246 @@ verify: exit code is zero\n\
         assert_eq!((cfg.window_start, cfg.window_end), (1, 3));
         assert_eq!(cfg.lambda_min, 0.15);
         assert_eq!(cfg.lambda_max, 0.90);
+    }
+
+    #[test]
+    fn parses_evidence_block_fields() {
+        let text = "\
+<evidence>\n\
+target_files: 1) src/tui/agent.rs\n\
+target_symbols: 1) run_agentic_json\n\
+evidence: read_file showed the recovery gate in src/tui/agent.rs\n\
+open_questions: none\n\
+next_probe: patch the recovery branch in run_agentic_json\n\
+</evidence>\n";
+
+        let block = parse_evidence_block(text).expect("evidence parsed");
+        assert_eq!(block.target_files, vec!["src/tui/agent.rs".to_string()]);
+        assert_eq!(block.target_symbols, vec!["run_agentic_json".to_string()]);
+        assert_eq!(
+            block.evidence,
+            "read_file showed the recovery gate in src/tui/agent.rs"
+        );
+    }
+
+    #[test]
+    fn validate_evidence_block_accepts_observed_patch_target() {
+        let evidence_block = EvidenceBlock {
+            target_files: vec!["src/tui/agent.rs".to_string()],
+            target_symbols: vec!["run_agentic_json".to_string()],
+            evidence: "read_file confirmed the target branch in src/tui/agent.rs".to_string(),
+            open_questions: "none".to_string(),
+            next_probe: "patch the recovery branch".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "patch_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "src/tui/agent.rs",
+                "search": "old",
+                "replace": "new"
+            })
+            .to_string(),
+        };
+        let observations = ObservationEvidence {
+            reads: vec![ObservationReadEvidence {
+                command: "read_file(path=src/tui/agent.rs)".to_string(),
+                path: "src/tui/agent.rs".to_string(),
+            }],
+            searches: Vec::new(),
+        };
+
+        assert!(validate_evidence_block(&evidence_block, &tc, &observations).is_ok());
+    }
+
+    #[test]
+    fn validate_evidence_block_rejects_unobserved_patch_target() {
+        let evidence_block = EvidenceBlock {
+            target_files: vec!["src/tui/agent.rs".to_string()],
+            target_symbols: vec!["run_agentic_json".to_string()],
+            evidence: "assumed the recovery branch lived there".to_string(),
+            open_questions: "exact line span".to_string(),
+            next_probe: "patch the recovery branch".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "patch_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "src/tui/agent.rs",
+                "search": "old",
+                "replace": "new"
+            })
+            .to_string(),
+        };
+        let observations = ObservationEvidence {
+            reads: vec![ObservationReadEvidence {
+                command: "read_file(path=src/server.rs)".to_string(),
+                path: "src/server.rs".to_string(),
+            }],
+            searches: Vec::new(),
+        };
+
+        let err = validate_evidence_block(&evidence_block, &tc, &observations)
+            .expect_err("target without observation should fail");
+        assert!(err.to_string().contains("lacks prior read/search evidence"));
+    }
+
+    #[test]
+    fn build_task_contract_prompt_mentions_read_only_constraint() {
+        let contract = derive_task_contract(
+            "Locate the slash command handler without editing files",
+            true,
+            false,
+            VerificationLevel::Build,
+        );
+        let prompt = build_task_contract_prompt(&contract, None, VerificationLevel::Build);
+        assert!(prompt.contains("inspection-only: do not edit files"));
+    }
+
+    #[test]
+    fn validate_plan_against_task_contract_rejects_drift() {
+        let contract = derive_task_contract(
+            "Fix the reflection gate in src/tui/agent.rs",
+            false,
+            true,
+            VerificationLevel::Behavioral,
+        );
+        let plan = PlanBlock {
+            goal: "rewrite README prose".to_string(),
+            steps: vec!["edit README".to_string(), "proofread docs".to_string()],
+            acceptance_criteria: vec!["README wording is updated".to_string()],
+            risks: "missing context".to_string(),
+            assumptions: "docs are the target".to_string(),
+        };
+
+        assert!(validate_plan_against_task_contract(&plan, &contract).is_err());
+    }
+
+    #[test]
+    fn instruction_priority_uses_authority_then_explicit_then_locality_then_sequence() {
+        let root = InstructionPriority {
+            authority: InstructionAuthority::Root,
+            explicit: false,
+            locality: 0,
+            sequence: 1,
+        };
+        let execution = InstructionPriority {
+            authority: InstructionAuthority::Execution,
+            explicit: true,
+            locality: 4,
+            sequence: 99,
+        };
+        let more_local = InstructionPriority {
+            authority: InstructionAuthority::System,
+            explicit: true,
+            locality: 3,
+            sequence: 1,
+        };
+        let less_local = InstructionPriority {
+            authority: InstructionAuthority::System,
+            explicit: true,
+            locality: 2,
+            sequence: 9,
+        };
+        let newer = InstructionPriority {
+            authority: InstructionAuthority::System,
+            explicit: true,
+            locality: 3,
+            sequence: 2,
+        };
+
+        assert!(root.outranks(&execution));
+        assert!(more_local.outranks(&less_local));
+        assert!(newer.outranks(&more_local));
+    }
+
+    #[test]
+    fn instruction_resolver_blocks_read_only_mutation_tool() {
+        let resolver =
+            InstructionResolver::new("Locate the handler without editing files", true, false);
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "patch_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "src/tui/agent.rs",
+                "search": "old",
+                "replace": "new"
+            })
+            .to_string(),
+        };
+
+        let conflict = resolver
+            .tool_conflict(&tc, None)
+            .expect("read-only mutation should conflict");
+        assert!(conflict
+            .render()
+            .contains("Higher-authority instruction wins"));
+        assert!(conflict.render().contains("system/task_contract"));
+    }
+
+    #[test]
+    fn instruction_resolver_rejects_read_only_plan_violation() {
+        let resolver =
+            InstructionResolver::new("Locate the handler without editing files", true, false);
+        let plan = PlanBlock {
+            goal: "patch the slash handler".to_string(),
+            steps: vec![
+                "edit src/tui/events.rs".to_string(),
+                "run cargo test".to_string(),
+            ],
+            acceptance_criteria: vec!["handler is patched".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "editing is allowed".to_string(),
+        };
+
+        let err = validate_plan_against_instruction_resolver(&plan, &resolver)
+            .expect_err("read-only plan should be rejected");
+        assert!(err.to_string().contains("[Instruction Resolver]"));
+    }
+
+    #[test]
+    fn assumption_ledger_marks_refuted_and_confirms_from_working_memory() {
+        let mut ledger = AssumptionLedger::default();
+        ledger.remember_unknown("reflection prompt exists");
+        ledger.mark_refuted(
+            "cargo check works unchanged",
+            Some("run targeted tests instead"),
+        );
+
+        let mut mem = WorkingMemory::default();
+        mem.remember_fact("reflection prompt exists in src/tui/agent.rs");
+        ledger.refresh_confirmations(&mem);
+
+        assert!(ledger.entries.iter().any(|entry| {
+            entry.text == "reflection prompt exists" && entry.status == AssumptionStatus::Confirmed
+        }));
+        assert!(ledger.entries.iter().any(|entry| {
+            entry.text == "cargo check works unchanged" && entry.status == AssumptionStatus::Refuted
+        }));
+    }
+
+    #[test]
+    fn refuted_assumption_conflict_blocks_reuse() {
+        let mut ledger = AssumptionLedger::default();
+        ledger.mark_refuted("cargo check works unchanged", Some("exit code was 1"));
+
+        let think = ThinkBlock {
+            goal: "verify the build quickly".to_string(),
+            step: 2,
+            tool: "exec".to_string(),
+            risk: "same build failure".to_string(),
+            doubt: "might still fail".to_string(),
+            next: "cargo check".to_string(),
+            verify: "exit code is zero".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "exec".to_string(),
+            arguments: serde_json::json!({"command":"cargo check"}).to_string(),
+        };
+
+        let msg = refuted_assumption_conflict(&ledger, &think, &tc)
+            .expect("refuted assumption should conflict");
+        assert!(msg.contains("cargo check works unchanged"));
     }
 }

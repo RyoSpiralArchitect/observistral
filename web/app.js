@@ -1192,6 +1192,17 @@
     think: { tag: "think", fields: [], rules: [] },
     reflect: { tag: "reflect", fields: [], rules: [] },
     impact: { tag: "impact", fields: [], rules: [] },
+    evidence: {
+      tag: "evidence",
+      fields: [
+        { key: "target_files", kind: "list", required: true, aliases: ["target_file"] },
+        { key: "target_symbols", kind: "list", required: false, aliases: ["target_symbol"] },
+        { key: "evidence", kind: "string", required: true },
+        { key: "open_questions", kind: "string", required: true },
+        { key: "next_probe", kind: "string", required: true },
+      ],
+      rules: [],
+    },
     done: {
       required_args: ["summary", "completed_acceptance", "remaining_acceptance", "acceptance_evidence"],
       acceptance_evidence_fields: ["criterion", "command"],
@@ -1228,6 +1239,97 @@
       ignore_command_signatures: [],
       build_command_signatures: [],
       behavioral_command_signatures: [],
+    },
+    instruction_resolver: {
+      title: "Instruction Resolver",
+      priority_title: "Priority order (highest -> lowest):",
+      rules_title: "Rules:",
+      current_title: "Current higher-authority instructions:",
+      priority_order: [
+        { authority: "root", label: "root/runtime safety" },
+        { authority: "system", label: "system/governor/task contract" },
+        { authority: "project", label: "project instructions" },
+        { authority: "user", label: "user request" },
+        {
+          authority: "execution",
+          label: "execution scratchpad (<plan>/<think>/<evidence>/<reflect>/<impact>)",
+        },
+      ],
+      rules: [
+        "Execution scratchpad is never authoritative.",
+        "If a scratchpad block conflicts with a higher layer, rewrite the scratchpad instead of following it.",
+      ],
+      project_rule_markers: [
+        "[Project Context",
+        "[Project Instructions",
+        "AGENTS.md",
+        ".obstral.md",
+      ],
+      read_only_forbidden_terms: [
+        "edit",
+        "patch",
+        "modify",
+        "write",
+        "create",
+        "implement",
+        "fix",
+        "refactor",
+        "build",
+        "compile",
+        "test",
+        "behavioral",
+        "smoke",
+        "cargo",
+        "pytest",
+        "npm",
+        "jest",
+        "playwright",
+        "vitest",
+        "run",
+        "exec",
+        "execute",
+      ],
+      diagnostic_exec_signatures: [
+        "pwd",
+        "cd",
+        "set-location",
+        "pushd",
+        "popd",
+        "ls",
+        "dir",
+        "get-location",
+        "get-childitem",
+        "get-content",
+        "select-string",
+        "where",
+        "which",
+        "get-command",
+        "echo",
+        "write-output",
+        "whoami",
+        "hostname",
+        "git status",
+        "git rev-parse",
+        "git remote",
+        "git branch",
+        "git diff",
+        "rg",
+        "grep",
+        "cat",
+        "head",
+        "tail",
+        "sed -n",
+        "wc",
+        "cargo --version",
+        "rustc --version",
+        "python --version",
+        "node --version",
+        "npm --version",
+        "pnpm --version",
+        "yarn --version",
+        "go version",
+        "dotnet --info",
+      ],
     },
     messages: {},
   });
@@ -1266,6 +1368,14 @@
     return DEFAULT_GOVERNOR_CONTRACT.verification || EMERGENCY_GOVERNOR_CONTRACT.verification;
   }
 
+  function contractInstructionResolver(contract) {
+    const source = contract && typeof contract === "object" && contract.instruction_resolver && typeof contract.instruction_resolver === "object"
+      ? contract.instruction_resolver
+      : null;
+    if (source) return source;
+    return DEFAULT_GOVERNOR_CONTRACT.instruction_resolver || EMERGENCY_GOVERNOR_CONTRACT.instruction_resolver;
+  }
+
   function verificationTerms(contract, key) {
     const verification = contractVerification(contract);
     const items = verification && Array.isArray(verification[key]) ? verification[key] : [];
@@ -1298,6 +1408,22 @@
     if (signatureMatchesVerificationTerms(sig, verificationTerms(contract, "behavioral_command_signatures"))) return "behavioral";
     if (signatureMatchesVerificationTerms(sig, verificationTerms(contract, "build_command_signatures"))) return "build";
     return "";
+  }
+
+  function isDiagnosticExecCommand(command, contract) {
+    const sig = normalizeScratchEntry(command);
+    if (!sig) return false;
+    const resolver = contractInstructionResolver(contract);
+    const signatures = resolver && Array.isArray(resolver.diagnostic_exec_signatures)
+      ? resolver.diagnostic_exec_signatures
+      : [];
+    return signatureMatchesVerificationTerms(sig, signatures);
+  }
+
+  function classifyExecKind(command, contract) {
+    if (verificationLevelForCommand(command, contract)) return "verify";
+    if (isDiagnosticExecCommand(command, contract)) return "diagnostic";
+    return "action";
   }
 
   function goalCheckRunners(contract) {
@@ -1760,7 +1886,28 @@
     impact_invalid: "Invalid impact check: {error}\nReason: {reason}\nEmit a valid <impact> block before the next tool call.",
     impact_one_tool: "Impact gate: expected exactly ONE tool call after <impact>, got {count}.\nFix: emit ONE <impact> block, then call exactly ONE tool.",
     impact_stop: "Impact check required but no tool call followed.\nReason: {reason}\nEmit <impact>...</impact> and then call exactly one tool.",
+    task_contract_plan_drift: "plan drifted away from the requested task; rewrite it around the actual request",
+    instruction_resolver_scratchpad_rule: "<plan>/<think>/<evidence>/<reflect>/<impact> are execution scratchpads, not authority. If they conflict with runtime/task/project/user instructions, rewrite the scratchpad.",
+    instruction_resolver_conflict: "[Instruction Resolver] Higher-authority instruction wins: {winner_authority}/{winner_source} over {loser_authority}/{loser_source}.\n{reason}\nRewrite the execution scratchpad instead of following the conflicting <plan>/<think>/<evidence>/<reflect>/<impact>.",
+    instruction_resolver_root_runtime_line: "[{authority}/runtime safety] sandbox, approval, and governor hard boundaries cannot be overridden.",
+    instruction_resolver_user_task_line: "[{authority}/{source}] stay on the requested task: {task_summary}",
+    instruction_resolver_read_only_line: "[{authority}/{source}] inspection-only task: no file mutations and no build/test/action exec.",
+    instruction_resolver_done_requires_line: "[{authority}/{source}] done requires {verification} verification.",
+    instruction_resolver_project_rules_line: "[{authority}/{source}] AGENTS.md / project context instructions outrank execution scratchpad.",
+    instruction_resolver_read_only_plan_term: "read-only observation task plans must stay inspect-only; found `{term}` in {label}",
+    instruction_resolver_read_only_mutation: "inspection-only task forbids file mutations",
+    instruction_resolver_read_only_verify_exec: "inspection-only task forbids verification exec: `{command}`",
+    instruction_resolver_read_only_action_exec: "inspection-only task forbids action exec: `{command}`",
     done_invalid_acceptance: "[Done Gate] Invalid acceptance summary: {error}\nRequired now: call `done` with `completed_acceptance`, `remaining_acceptance`, and `acceptance_evidence` that cover every current plan acceptance criterion and cite known-good verification commands.",
+    evidence_invalid: "[Evidence Gate] Invalid <evidence>: {error}",
+    evidence_missing_target_files: "evidence missing target_files",
+    evidence_missing_evidence: "evidence missing evidence",
+    evidence_missing_open_questions: "evidence missing open_questions",
+    evidence_missing_next_probe: "evidence missing next_probe",
+    evidence_unresolved_path: "evidence gate could not resolve mutation path",
+    evidence_target_mismatch: "evidence.target_files must include the mutation path `{target_path}`",
+    evidence_missing_observation: "mutation path `{target_path}` lacks prior read/search evidence",
+    assumption_refuted_reuse: "refuted assumption would be reused: `{assumption}`{evidence_suffix}",
     goal_check_repo_start: "[goal_check:repo] checking {requirements}",
     goal_check_repo_ok: "[goal_check:repo] OK",
     goal_check_exec_run: "[goal_check:{label}] run `{command}`",
@@ -2170,6 +2317,49 @@
     return contractMessage(contract, "impact_invalid_progress_reference");
   }
 
+  function taskContractPlanDriftMessage(contract) {
+    return contractMessage(contract, "task_contract_plan_drift");
+  }
+
+  function evidenceInvalidMessage(contract, error) {
+    return contractMessage(contract, "evidence_invalid", { error });
+  }
+
+  function evidenceMissingTargetFilesMessage(contract) {
+    return contractMessage(contract, "evidence_missing_target_files");
+  }
+
+  function evidenceMissingEvidenceMessage(contract) {
+    return contractMessage(contract, "evidence_missing_evidence");
+  }
+
+  function evidenceMissingOpenQuestionsMessage(contract) {
+    return contractMessage(contract, "evidence_missing_open_questions");
+  }
+
+  function evidenceMissingNextProbeMessage(contract) {
+    return contractMessage(contract, "evidence_missing_next_probe");
+  }
+
+  function evidenceUnresolvedPathMessage(contract) {
+    return contractMessage(contract, "evidence_unresolved_path");
+  }
+
+  function evidenceTargetMismatchMessage(contract, targetPath) {
+    return contractMessage(contract, "evidence_target_mismatch", { target_path: targetPath });
+  }
+
+  function evidenceMissingObservationMessage(contract, targetPath) {
+    return contractMessage(contract, "evidence_missing_observation", { target_path: targetPath });
+  }
+
+  function assumptionRefutedReuseMessage(contract, assumption, evidenceSuffix) {
+    return contractMessage(contract, "assumption_refuted_reuse", {
+      assumption,
+      evidence_suffix: evidenceSuffix,
+    });
+  }
+
   function doneInvalidAcceptanceMessage(contract, error) {
     return contractMessage(contract, "done_invalid_acceptance", { error });
   }
@@ -2366,13 +2556,738 @@
     return lines.join("\n");
   }
 
+  function keywordTokens(text) {
+    const parts = String(text || "")
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .map((part) => part.trim())
+      .filter((part) => part.length >= 3);
+    return new Set(parts);
+  }
+
+  function tokenOverlapScore(a, b) {
+    if (!(a instanceof Set) || !(b instanceof Set) || !a.size || !b.size) return 0;
+    let overlap = 0;
+    for (const item of a) if (b.has(item)) overlap++;
+    return Math.max(0, Math.min(1, overlap / Math.max(1, Math.min(a.size, b.size))));
+  }
+
+  function parseAssumptionItems(text) {
+    return parsePlanItems(text)
+      .map((item) => String(item || "").trim().replace(/\s+/g, " "))
+      .filter(Boolean)
+      .slice(0, 6);
+  }
+
+  function isRootReadOnlyObservationTask(text) {
+    const low = String(text || "").toLowerCase();
+    const observeTerms = [
+      "locate",
+      "find",
+      "where",
+      "inspect",
+      "identify",
+      "read-only",
+      "read only",
+      "read the file",
+      "look up",
+      "trace",
+      "do not edit",
+      "don't edit",
+      "no edit",
+      "no edits",
+      "without editing",
+    ];
+    const explicitNoEdit = [
+      "read-only",
+      "read only",
+      "do not edit",
+      "don't edit",
+      "no edit",
+      "no edits",
+      "without editing",
+    ].some((term) => low.includes(term));
+    const strongMutateTerms = [
+      "patch",
+      "modify",
+      "write",
+      "create",
+      "implement",
+      "fix",
+      "refactor",
+      "rename",
+      "delete",
+    ];
+    if (!observeTerms.some((term) => low.includes(term))) return false;
+    if (low.includes("edit") && !explicitNoEdit) return false;
+    if (strongMutateTerms.some((term) => low.includes(term))) return false;
+    return true;
+  }
+
+  function inferTaskVerificationFloor(rootUserText, activePlan, contract) {
+    const planText = activePlan
+      ? [
+          String(activePlan.goal || ""),
+          ...(Array.isArray(activePlan.acceptanceCriteria) ? activePlan.acceptanceCriteria : []),
+        ].join("\n")
+      : "";
+    const combined = [String(rootUserText || ""), planText].join("\n");
+    if (textMatchesVerificationTerms(combined, verificationTerms(contract, "goal_test_terms"))) {
+      return "behavioral";
+    }
+    if (textMatchesVerificationTerms(combined, verificationTerms(contract, "goal_build_terms"))) {
+      return "build";
+    }
+    return "build";
+  }
+
+  function deriveTaskContract(rootUserText, rootReadOnly, contract) {
+    const summary = String(rootUserText || "").trim().replace(/\s+/g, " ");
+    const hardConstraints = [
+      "Solve the user's requested task before cleanup or refactors.",
+      "Keep edits evidence-backed and scope-bounded.",
+    ];
+    if (rootReadOnly) {
+      hardConstraints.push("This task is inspection-only: do not edit files.");
+      hardConstraints.push("Do not run tests/builds just to finish a read-only task.");
+    } else {
+      hardConstraints.push("If the request is underspecified, inspect first and avoid speculative edits.");
+    }
+    const nonGoals = [
+      "Do not broaden scope into unrelated files or prompt/governor rewrites.",
+      "Do not replace working code without evidence that it is the target.",
+    ];
+    const outputShape = rootReadOnly
+      ? [
+          "Name the confirmed file path or symbol you located.",
+          "Summarize the confirmed handling context from observation evidence.",
+        ]
+      : [
+          "Tie the final answer to changed files, verification, and remaining gaps.",
+          "If unfinished, leave the next exact command or file to continue from.",
+        ];
+    return {
+      taskSummary: summary || "complete the requested task",
+      hardConstraints,
+      nonGoals,
+      outputShape,
+      verificationFloor: inferTaskVerificationFloor(rootUserText, null, contract),
+    };
+  }
+
+  const InstructionAuthority = Object.freeze({
+    ROOT: "root",
+    SYSTEM: "system",
+    PROJECT: "project",
+    USER: "user",
+    EXECUTION: "execution",
+  });
+
+  const InstructionSource = Object.freeze({
+    TASK_CONTRACT: "task_contract",
+    PROJECT_RULES: "project_rules",
+    USER_REQUEST: "user_request",
+    PLAN: "plan",
+    THINK: "think",
+  });
+
+  function instructionRank(contract, authority) {
+    const resolver = contractInstructionResolver(contract);
+    const layers = resolver && Array.isArray(resolver.priority_order) ? resolver.priority_order : [];
+    const normalized = String(authority || "").trim().toLowerCase();
+    const index = layers.findIndex((layer) => String(layer && layer.authority || "").trim().toLowerCase() === normalized);
+    return index >= 0 ? index : layers.length;
+  }
+
+  function instructionPriority(authority, explicit, locality, sequence) {
+    return {
+      authority: String(authority || InstructionAuthority.EXECUTION),
+      explicit: !!explicit,
+      locality: Number(locality) || 0,
+      sequence: Number(sequence) || 0,
+    };
+  }
+
+  function instructionOutranks(contract, a, b) {
+    const lhs = [
+      -instructionRank(contract, a && a.authority),
+      a && a.explicit ? 1 : 0,
+      Number(a && a.locality) || 0,
+      Number(a && a.sequence) || 0,
+    ];
+    const rhs = [
+      -instructionRank(contract, b && b.authority),
+      b && b.explicit ? 1 : 0,
+      Number(b && b.locality) || 0,
+      Number(b && b.sequence) || 0,
+    ];
+    for (let i = 0; i < lhs.length; i++) {
+      if (lhs[i] > rhs[i]) return true;
+      if (lhs[i] < rhs[i]) return false;
+    }
+    return false;
+  }
+
+  function hasProjectRulesContext(messages, contract) {
+    const resolver = contractInstructionResolver(contract);
+    const markers = resolver && Array.isArray(resolver.project_rule_markers)
+      ? resolver.project_rule_markers
+      : [];
+    return (Array.isArray(messages) ? messages : []).some((msg) => {
+      if (!msg || msg.role !== "system") return false;
+      const content = String(msg.content || "");
+      return markers.some((marker) => {
+        const term = String(marker || "");
+        return term && content.includes(term);
+      });
+    });
+  }
+
+  function buildInstructionResolver(taskSummary, rootReadOnly, projectRulesActive) {
+    return {
+      taskSummary: String(taskSummary || "").trim().replace(/\s+/g, " ") || "complete the requested task",
+      rootReadOnly: !!rootReadOnly,
+      projectRulesActive: !!projectRulesActive,
+    };
+  }
+
+  function renderInstructionConflict(conflict, contract) {
+    if (!conflict || typeof conflict !== "object") return "";
+    return contractMessage(contract, "instruction_resolver_conflict", {
+      winner_authority: String(conflict.winnerAuthority || "").trim(),
+      winner_source: String(conflict.winnerSource || "").trim(),
+      loser_authority: String(conflict.loserAuthority || "").trim(),
+      loser_source: String(conflict.loserSource || "").trim(),
+      reason: String(conflict.reason || "").trim(),
+    });
+  }
+
+  function readOnlyPlanViolation(plan, contract) {
+    const resolver = contractInstructionResolver(contract);
+    const forbidden = resolver && Array.isArray(resolver.read_only_forbidden_terms)
+      ? resolver.read_only_forbidden_terms
+      : [];
+    const checkField = (label, text) => {
+      const tokens = keywordTokens(text);
+      for (const term of forbidden) {
+        if (tokens.has(term)) {
+          return contractMessage(contract, "instruction_resolver_read_only_plan_term", {
+            term,
+            label,
+          });
+        }
+      }
+      return "";
+    };
+    return checkField("goal", plan && plan.goal)
+      || (Array.isArray(plan && plan.steps) ? plan.steps.map((step, idx) => checkField(`step ${idx + 1}`, step)).find(Boolean) : "")
+      || (Array.isArray(plan && plan.acceptanceCriteria) ? plan.acceptanceCriteria.map((criterion, idx) => checkField(`acceptance ${idx + 1}`, criterion)).find(Boolean) : "")
+      || "";
+  }
+
+  function validatePlanAgainstInstructionResolver(plan, resolver, contract) {
+    if (!resolver || !resolver.rootReadOnly) return "";
+    const reason = readOnlyPlanViolation(plan, contract);
+    if (!reason) return "";
+    const winner = instructionPriority(InstructionAuthority.SYSTEM, true, 2, 1);
+    const loser = instructionPriority(InstructionAuthority.EXECUTION, true, 3, 1);
+    if (!instructionOutranks(contract, winner, loser)) return "";
+    return renderInstructionConflict({
+      winnerAuthority: InstructionAuthority.SYSTEM,
+      winnerSource: InstructionSource.TASK_CONTRACT,
+      loserAuthority: InstructionAuthority.EXECUTION,
+      loserSource: InstructionSource.PLAN,
+      reason,
+    }, contract);
+  }
+
+  function instructionResolverToolConflict(resolver, toolName, toolArgs, contract) {
+    if (!resolver || !resolver.rootReadOnly) return "";
+    let reason = "";
+    if (toolName === "write_file" || toolName === "patch_file" || toolName === "apply_diff") {
+      reason = contractMessage(contract, "instruction_resolver_read_only_mutation");
+    } else if (toolName === "exec") {
+      let command = "";
+      try { command = String(JSON.parse(String(toolArgs || "{}")).command || "").trim(); } catch (_) {}
+      const kind = classifyExecKind(command, contract);
+      if (kind === "verify") {
+        reason = contractMessage(contract, "instruction_resolver_read_only_verify_exec", { command });
+      } else if (kind === "action") {
+        reason = contractMessage(contract, "instruction_resolver_read_only_action_exec", { command });
+      }
+    }
+    if (!reason) return "";
+    const winner = instructionPriority(InstructionAuthority.SYSTEM, true, 2, 1);
+    const loser = instructionPriority(InstructionAuthority.EXECUTION, true, 3, 2);
+    if (!instructionOutranks(contract, winner, loser)) return "";
+    return renderInstructionConflict({
+      winnerAuthority: InstructionAuthority.SYSTEM,
+      winnerSource: InstructionSource.TASK_CONTRACT,
+      loserAuthority: InstructionAuthority.EXECUTION,
+      loserSource: InstructionSource.THINK,
+      reason,
+    }, contract);
+  }
+
+  function buildInstructionResolverPrompt(resolver, activePlan, contract) {
+    const shared = contractInstructionResolver(contract);
+    const priorityOrder = shared && Array.isArray(shared.priority_order) ? shared.priority_order : [];
+    const rules = shared && Array.isArray(shared.rules) ? shared.rules : [];
+    const verificationFloor = inferTaskVerificationFloor(resolver && resolver.taskSummary, activePlan, contract);
+    const lines = [
+      `[${String(shared && shared.title || "Instruction Resolver")}]`,
+      String(shared && shared.priority_title || "Priority order (highest -> lowest):"),
+      ...priorityOrder.map((layer) => `- ${String(layer && (layer.label || layer.authority) || "").trim()}`).filter((line) => line !== "-"),
+      String(shared && shared.rules_title || "Rules:"),
+      ...rules.map((rule) => `- ${String(rule || "").trim()}`).filter((line) => line !== "-"),
+      String(shared && shared.current_title || "Current higher-authority instructions:"),
+      `- ${contractMessage(contract, "instruction_resolver_root_runtime_line", {
+        authority: InstructionAuthority.ROOT,
+      })}`,
+      `- ${contractMessage(contract, "instruction_resolver_user_task_line", {
+        authority: InstructionAuthority.USER,
+        source: InstructionSource.USER_REQUEST,
+        task_summary: resolver && resolver.taskSummary ? resolver.taskSummary : "complete the requested task",
+      })}`,
+      `- ${contractMessage(contract, "instruction_resolver_done_requires_line", {
+        authority: InstructionAuthority.SYSTEM,
+        source: InstructionSource.TASK_CONTRACT,
+        verification: verificationFloor === "behavioral" ? "real behavioral" : "real build/check/lint",
+      })}`,
+    ];
+    if (resolver && resolver.rootReadOnly) {
+      lines.splice(lines.length - 1, 0, `- ${contractMessage(contract, "instruction_resolver_read_only_line", {
+        authority: InstructionAuthority.SYSTEM,
+        source: InstructionSource.TASK_CONTRACT,
+      })}`);
+    }
+    if (resolver && resolver.projectRulesActive) {
+      lines.push(`- ${contractMessage(contract, "instruction_resolver_project_rules_line", {
+        authority: InstructionAuthority.PROJECT,
+        source: InstructionSource.PROJECT_RULES,
+      })}`);
+    }
+    return lines.join("\n");
+  }
+
+  function buildTaskContractPrompt(taskContract, activePlan, contract) {
+    const verificationFloor = inferTaskVerificationFloor(taskContract && taskContract.taskSummary, activePlan, contract);
+    const lines = ["[Task Contract]", "Task summary:", `- ${taskContract && taskContract.taskSummary ? taskContract.taskSummary : "complete the requested task"}`, "Hard constraints:"];
+    (taskContract && Array.isArray(taskContract.hardConstraints) ? taskContract.hardConstraints : []).forEach((item) => lines.push(`- ${item}`));
+    lines.push("Non-goals:");
+    (taskContract && Array.isArray(taskContract.nonGoals) ? taskContract.nonGoals : []).forEach((item) => lines.push(`- ${item}`));
+    lines.push("Expected output shape:");
+    (taskContract && Array.isArray(taskContract.outputShape) ? taskContract.outputShape : []).forEach((item) => lines.push(`- ${item}`));
+    lines.push("Verification floor:");
+    lines.push(`- ${verificationFloor === "behavioral" ? "real behavioral verification before done" : "real build/check/lint verification before done"}`);
+    if (activePlan && Array.isArray(activePlan.acceptanceCriteria) && activePlan.acceptanceCriteria.length) {
+      lines.push("Current plan acceptance:");
+      activePlan.acceptanceCriteria.forEach((criterion, idx) => {
+        lines.push(`- acceptance ${idx + 1}: ${criterion}`);
+      });
+    }
+    lines.push("If the next action would violate this contract, inspect or replan first.");
+    return lines.join("\n");
+  }
+
+  function validatePlanAgainstTaskContract(plan, taskContract, contract) {
+    const taskTokens = keywordTokens(taskContract && taskContract.taskSummary);
+    if (taskTokens.size < 3) return "";
+    const planTokens = keywordTokens([
+      String(plan && plan.goal || ""),
+      ...(plan && Array.isArray(plan.steps) ? plan.steps : []),
+      ...(plan && Array.isArray(plan.acceptanceCriteria) ? plan.acceptanceCriteria : []),
+    ].join("\n"));
+    return tokenOverlapScore(taskTokens, planTokens) < 0.2
+      ? taskContractPlanDriftMessage(contract)
+      : "";
+  }
+
+  function parseEvidenceBlock(text, contract) {
+    const values = parseBlockFields(contract, text, "evidence");
+    if (!values) return null;
+    return {
+      targetFiles: Array.isArray(values.target_files) ? values.target_files : [],
+      targetSymbols: Array.isArray(values.target_symbols) ? values.target_symbols : [],
+      evidence: String(values.evidence || "").trim().replace(/\s+/g, " "),
+      openQuestions: String(values.open_questions || "").trim().replace(/\s+/g, " "),
+      nextProbe: String(values.next_probe || "").trim().replace(/\s+/g, " "),
+    };
+  }
+
+  function parseReadFileResultPath(content) {
+    const first = String(content || "").split("\n")[0] || "";
+    const m = /^\[([^\]]+)\]/.exec(first.trim());
+    return m && m[1] ? String(m[1]).trim() : "";
+  }
+
+  function parseSearchHitCount(content) {
+    const first = String(content || "").split("\n")[0] || "";
+    const m = /—\s*(\d+)/.exec(first);
+    return m ? Number(m[1]) || 0 : 0;
+  }
+
+  function parseSearchResultPaths(content) {
+    return String(content || "")
+      .split("\n")
+      .slice(1)
+      .map((line) => String(line || "").trim())
+      .filter((line) => line && !line.startsWith("["))
+      .map((line) => {
+        const idx = line.indexOf(":");
+        return idx >= 0 ? line.slice(0, idx).trim() : "";
+      })
+      .filter(Boolean)
+      .slice(0, 8);
+  }
+
+  function toolContentSucceeded(content) {
+    const text = String(content || "");
+    if (!text.trim()) return false;
+    if (/^(?:ERROR|error:|FAILED\b|GOVERNOR BLOCKED|Awaiting approval)/i.test(text.trim())) return false;
+    return true;
+  }
+
+  function collectObservationEvidence(messages) {
+    const pending = new Map();
+    const evidence = { reads: [], searches: [] };
+    for (const msg of Array.isArray(messages) ? messages : []) {
+      if (msg && msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          const id = String(tc && tc.id || "").trim();
+          const fn = tc && tc.function && typeof tc.function === "object" ? tc.function : null;
+          const name = String(fn && fn.name || "").trim();
+          if (!id || !name) continue;
+          let args = {};
+          try { args = JSON.parse(String(fn && fn.arguments || "{}")); } catch (_) { args = {}; }
+          if (name === "read_file") {
+            pending.set(id, {
+              kind: "read",
+              command: `read_file(path=${String(args.path || "").trim()})`,
+              path: String(args.path || "").trim(),
+            });
+          } else if (name === "search_files") {
+            pending.set(id, {
+              kind: "search",
+              command: `search_files(pattern=${String(args.pattern || "").trim()}, dir=${String(args.dir || "").trim() || "."})`,
+              pattern: String(args.pattern || "").trim(),
+            });
+          }
+        }
+        continue;
+      }
+      if (!msg || msg.role !== "tool") continue;
+      const toolCallId = String(msg.tool_call_id || "").trim();
+      if (!toolCallId || !pending.has(toolCallId)) continue;
+      const pendingItem = pending.get(toolCallId);
+      pending.delete(toolCallId);
+      const content = String(msg.content || "");
+      if (!toolContentSucceeded(content)) continue;
+      if (pendingItem.kind === "read") {
+        const path = pendingItem.path || parseReadFileResultPath(content);
+        if (path) evidence.reads.push({ command: pendingItem.command, path });
+      } else if (pendingItem.kind === "search") {
+        evidence.searches.push({
+          command: pendingItem.command,
+          pattern: pendingItem.pattern,
+          hitCount: parseSearchHitCount(content),
+          paths: parseSearchResultPaths(content),
+        });
+      }
+    }
+    return evidence;
+  }
+
+  function evidencePathMatches(target, candidate) {
+    const targetSig = normalizeScratchEntry(target);
+    const candidateSig = normalizeScratchEntry(candidate);
+    if (!targetSig || !candidateSig) return false;
+    return targetSig === candidateSig || targetSig.endsWith(candidateSig) || candidateSig.endsWith(targetSig);
+  }
+
+  function observationSupportsTargetPath(targetPath, observations) {
+    return (observations.reads || []).some((read) => evidencePathMatches(targetPath, read.path))
+      || (observations.searches || []).some((search) => (search.paths || []).some((path) => evidencePathMatches(targetPath, path)));
+  }
+
+  function mutationToolRequiresEvidence(toolName) {
+    return toolName === "patch_file" || toolName === "apply_diff";
+  }
+
+  function mutationTargetPath(toolName, toolArgs) {
+    if (!mutationToolRequiresEvidence(toolName)) return "";
+    try {
+      const args = JSON.parse(String(toolArgs || "{}"));
+      return String(args.path || "").trim();
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function validateEvidenceBlock(block, toolName, toolArgs, observations, contract) {
+    if (!block || !Array.isArray(block.targetFiles) || !block.targetFiles.length) return evidenceMissingTargetFilesMessage(contract);
+    if (!String(block.evidence || "").trim()) return evidenceMissingEvidenceMessage(contract);
+    if (!String(block.openQuestions || "").trim()) return evidenceMissingOpenQuestionsMessage(contract);
+    if (!String(block.nextProbe || "").trim()) return evidenceMissingNextProbeMessage(contract);
+    if (!mutationToolRequiresEvidence(toolName)) return "";
+    const targetPath = mutationTargetPath(toolName, toolArgs);
+    if (!targetPath) return evidenceUnresolvedPathMessage(contract);
+    if (!block.targetFiles.some((path) => evidencePathMatches(path, targetPath))) {
+      return evidenceTargetMismatchMessage(contract, targetPath);
+    }
+    if (!observationSupportsTargetPath(targetPath, observations)) {
+      return evidenceMissingObservationMessage(contract, targetPath);
+    }
+    return "";
+  }
+
+  function buildEvidenceGatePrompt(toolName, toolArgs, observations, assumptionLedger) {
+    const targetPath = mutationTargetPath(toolName, toolArgs) || "<path>";
+    const lines = [
+      "[Evidence Gate]",
+      `You are about to mutate an existing file via ${toolName}.`,
+      `Target path: ${targetPath}`,
+      "",
+      "Before this mutation, emit exactly:",
+      "<evidence>",
+      "target_files: 1) <exact target path>",
+      "target_symbols: 1) <symbol or area>",
+      "evidence: <what previous read/search proved>",
+      "open_questions: <what is still uncertain or `none`>",
+      "next_probe: <exact next action or edit target>",
+      "</evidence>",
+      "",
+      "Rules:",
+      "- `target_files` must include the actual file you are about to change.",
+      "- Base the block on real prior read/search evidence from this session.",
+      "- If the target is not yet supported by evidence, do NOT mutate; call one diagnostic tool instead.",
+      "- After the <evidence> block, call exactly one tool.",
+    ];
+    if (observations && Array.isArray(observations.reads) && observations.reads.length) {
+      lines.push("", "[Observed reads]");
+      observations.reads.slice(-3).forEach((read) => lines.push(`- ${read.command} -> ${read.path}`));
+    }
+    if (observations && Array.isArray(observations.searches) && observations.searches.length) {
+      lines.push("[Observed searches]");
+      observations.searches.slice(-3).forEach((search) => {
+        const pathSummary = Array.isArray(search.paths) && search.paths.length ? search.paths.slice(0, 3).join(", ") : "(no paths)";
+        lines.push(`- ${search.command} -> hits=${Number(search.hitCount) || 0} paths=${pathSummary}`);
+      });
+    }
+    const refuted = assumptionLedger && Array.isArray(assumptionLedger.entries)
+      ? assumptionLedger.entries.filter((entry) => entry.status === "refuted").slice(0, 2)
+      : [];
+    if (refuted.length) {
+      lines.push("[Refuted assumptions]");
+      refuted.forEach((entry) => lines.push(`- ${entry.text}`));
+    }
+    return lines.join("\n");
+  }
+
+  function makeAssumptionLedger() {
+    return { entries: [] };
+  }
+
+  function rememberUnknownAssumption(ledger, assumption) {
+    const text = String(assumption || "").trim().replace(/\s+/g, " ");
+    if (!text) return;
+    const sig = normalizeScratchEntry(text);
+    if (!sig) return;
+    const existing = ledger.entries.find((entry) => normalizeScratchEntry(entry.text) === sig);
+    if (existing) {
+      if (existing.status === "unknown") existing.text = text;
+      return;
+    }
+    ledger.entries.push({ text, status: "unknown", evidence: "" });
+    while (ledger.entries.length > 8) ledger.entries.shift();
+  }
+
+  function syncAssumptionLedgerToPlan(ledger, plan) {
+    const assumptions = parseAssumptionItems(plan && plan.assumptions);
+    assumptions.forEach((assumption) => rememberUnknownAssumption(ledger, assumption));
+    ledger.entries = ledger.entries.filter((entry) => {
+      if (entry.status === "refuted") return true;
+      const sig = normalizeScratchEntry(entry.text);
+      return assumptions.some((assumption) => normalizeScratchEntry(assumption) === sig);
+    });
+  }
+
+  function markRefutedAssumption(ledger, assumption, evidence) {
+    const text = String(assumption || "").trim().replace(/\s+/g, " ");
+    if (!text) return;
+    const sig = normalizeScratchEntry(text);
+    const evidenceText = String(evidence || "").trim().replace(/\s+/g, " ");
+    const existing = ledger.entries.find((entry) => normalizeScratchEntry(entry.text) === sig);
+    if (existing) {
+      existing.status = "refuted";
+      existing.text = text;
+      existing.evidence = evidenceText;
+      return;
+    }
+    ledger.entries.push({ text, status: "refuted", evidence: evidenceText });
+    while (ledger.entries.length > 8) ledger.entries.shift();
+  }
+
+  function refreshAssumptionConfirmations(ledger, observations, knownGoodVerificationCommands) {
+    const support = [
+      ...(observations && Array.isArray(observations.reads) ? observations.reads.map((read) => `${read.path} ${read.command}`) : []),
+      ...(observations && Array.isArray(observations.searches) ? observations.searches.map((search) => `${search.pattern} ${(search.paths || []).join(" ")}`) : []),
+      ...(Array.isArray(knownGoodVerificationCommands) ? knownGoodVerificationCommands : []),
+    ];
+    ledger.entries.forEach((entry) => {
+      if (entry.status !== "unknown") return;
+      const assumptionSig = normalizeScratchEntry(entry.text);
+      const assumptionTokens = keywordTokens(entry.text);
+      let best = { score: 0, text: "" };
+      support.forEach((candidate) => {
+        const candidateSig = normalizeScratchEntry(candidate);
+        let score = tokenOverlapScore(assumptionTokens, keywordTokens(candidate));
+        if (assumptionSig && candidateSig && (candidateSig.includes(assumptionSig) || assumptionSig.includes(candidateSig))) {
+          score = Math.max(score, 0.9);
+        }
+        if (score > best.score) best = { score, text: String(candidate || "").trim().replace(/\s+/g, " ") };
+      });
+      if (best.score >= 0.72) {
+        entry.status = "confirmed";
+        entry.evidence = best.text;
+      }
+    });
+  }
+
+  function buildAssumptionLedgerPrompt(ledger) {
+    if (!ledger || !Array.isArray(ledger.entries) || !ledger.entries.length) return "";
+    const sections = [
+      ["Open assumptions", "unknown"],
+      ["Confirmed assumptions", "confirmed"],
+      ["Refuted assumptions", "refuted"],
+    ];
+    const lines = ["[Assumption Ledger]"];
+    let wrote = false;
+    sections.forEach(([title, status]) => {
+      const items = ledger.entries.filter((entry) => entry.status === status);
+      if (!items.length) return;
+      wrote = true;
+      lines.push(`${title}:`);
+      items.forEach((entry) => {
+        lines.push(`- [${entry.status}] ${entry.text}${entry.evidence ? ` — ${entry.evidence}` : ""}`);
+      });
+    });
+    if (!wrote) return "";
+    lines.push("Do not rely on refuted assumptions. Prefer probes that convert open assumptions into confirmed facts.");
+    return lines.join("\n");
+  }
+
+  function refutedAssumptionConflict(ledger, think, toolName, toolArgs, contract) {
+    if (!ledger || !Array.isArray(ledger.entries)) return "";
+    let probe = `${String(think && think.goal || "")} ${String(think && think.next || "")}`.trim();
+    if (toolName === "exec") {
+      try {
+        const args = JSON.parse(String(toolArgs || "{}"));
+        probe += " " + String(args.command || "").trim();
+      } catch (_) {}
+    } else {
+      const path = mutationTargetPath(toolName, toolArgs);
+      if (path) probe += " " + path;
+    }
+    const probeSig = normalizeScratchEntry(probe);
+    const probeTokens = keywordTokens(probe);
+    for (const entry of ledger.entries.filter((item) => item.status === "refuted")) {
+      const assumptionSig = normalizeScratchEntry(entry.text);
+      const overlap = tokenOverlapScore(keywordTokens(entry.text), probeTokens);
+      const execRetry = toolName === "exec" && overlap >= 0.5;
+      if ((assumptionSig && probeSig && (probeSig.includes(assumptionSig) || assumptionSig.includes(probeSig)))
+        || overlap >= 0.75
+        || execRetry) {
+        return assumptionRefutedReuseMessage(
+          contract,
+          entry.text,
+          entry.evidence ? ` (${entry.evidence})` : "",
+        );
+      }
+    }
+    return "";
+  }
+
+  function lastValidPlanFromMessages(messages, contract, taskContract, instructionResolver) {
+    const items = Array.isArray(messages) ? messages : [];
+    for (let i = items.length - 1; i >= 0; i--) {
+      const msg = items[i];
+      if (!msg || msg.role !== "assistant") continue;
+      const plan = parsePlanBlock(msg.content, contract);
+      if (!plan) continue;
+      if (validatePlanBlock(contract, plan)) continue;
+      if (validatePlanAgainstTaskContract(plan, taskContract, contract)) continue;
+      if (validatePlanAgainstInstructionResolver(plan, instructionResolver, contract)) continue;
+      return plan;
+    }
+    return null;
+  }
+
+  function restoreKnownVerificationCommandsFromMessages(messages, contract) {
+    const pending = new Map();
+    const commands = [];
+    const remember = (command) => {
+      const value = String(command || "").trim().replace(/\s+/g, " ");
+      const sig = normalizeScratchEntry(value);
+      if (!sig) return;
+      const idx = commands.findIndex((item) => normalizeScratchEntry(item) === sig);
+      if (idx >= 0) commands.splice(idx, 1);
+      commands.push(value);
+      while (commands.length > 6) commands.shift();
+    };
+    for (const msg of Array.isArray(messages) ? messages : []) {
+      if (msg && msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
+        msg.tool_calls.forEach((tc) => {
+          const id = String(tc && tc.id || "").trim();
+          const fn = tc && tc.function && typeof tc.function === "object" ? tc.function : null;
+          if (!id || String(fn && fn.name || "") !== "exec") return;
+          let args = {};
+          try { args = JSON.parse(String(fn && fn.arguments || "{}")); } catch (_) { args = {}; }
+          pending.set(id, String(args.command || "").trim());
+        });
+        continue;
+      }
+      if (!msg || msg.role !== "tool") continue;
+      const toolCallId = String(msg.tool_call_id || "").trim();
+      if (!toolCallId || !pending.has(toolCallId)) continue;
+      const command = pending.get(toolCallId);
+      pending.delete(toolCallId);
+      if (!toolContentSucceeded(msg.content)) continue;
+      if (isVerificationCommand(command, contract)) remember(command);
+    }
+    return commands;
+  }
+
+  function rebuildAssumptionLedgerFromMessages(messages, contract, taskContract, instructionResolver, knownGoodVerificationCommands) {
+    const ledger = makeAssumptionLedger();
+    const items = Array.isArray(messages) ? messages : [];
+    items.forEach((msg) => {
+      if (!msg || msg.role !== "assistant") return;
+      const plan = parsePlanBlock(msg.content, contract);
+      if (
+        plan
+        && !validatePlanBlock(contract, plan)
+        && !validatePlanAgainstTaskContract(plan, taskContract, contract)
+        && !validatePlanAgainstInstructionResolver(plan, instructionResolver, contract)
+      ) {
+        syncAssumptionLedgerToPlan(ledger, plan);
+      }
+      const reflect = parseReflectionBlock(msg.content, contract);
+      if (reflect && String(reflect.wrongAssumption || "").trim()) {
+        markRefutedAssumption(ledger, reflect.wrongAssumption, reflect.nextMinimalAction);
+      }
+    });
+    refreshAssumptionConfirmations(ledger, collectObservationEvidence(items), knownGoodVerificationCommands);
+    return ledger;
+  }
+
   function isVerificationCommand(command, contract) {
     return Boolean(verificationLevelForCommand(command, contract));
   }
 
-  // Renders message content with <think>…</think>, <reflect>…</reflect>, and <impact>…</impact> blocks dimmed separately.
+  // Renders message content with scratch blocks dimmed separately.
   function renderWithThink(text, execRes, onRun, onOpen) {
-    const re = /<(think|reflect|impact)>([\s\S]*?)<\/\1>/gi;
+    const re = /<(think|reflect|impact|evidence)>([\s\S]*?)<\/\1>/gi;
     const parts = [];
     let last = 0;
     let k = 0;
@@ -4677,6 +5592,18 @@
         tests: { attempts: 0, ok: false },
         build: { attempts: 0, ok: false },
       };
+      const rootUserText = (() => {
+        const prior = (Array.isArray(history) ? history : []).find((msg) => msg && msg.role === "user" && String(msg.content || "").trim());
+        return String(prior && prior.content || text || "").trim();
+      })();
+      const rootReadOnly = isRootReadOnlyObservationTask(rootUserText);
+      const governorContract = await getGovernorContract();
+      const taskContract = deriveTaskContract(rootUserText, rootReadOnly, governorContract);
+      const instructionResolver = buildInstructionResolver(
+        taskContract && taskContract.taskSummary,
+        rootReadOnly,
+        hasProjectRulesContext(history, governorContract),
+      );
 
       const truncTool = (s, max) => {
         const t = String(s || "").trim();
@@ -4691,18 +5618,18 @@
         return `[…truncated — ${lines} lines total, last ${max} chars shown]\n` + t.slice(-max);
       };
 
-      const isPrunableToolSuccess = (content) => { 
-        const s = String(content || "").trimStart(); 
-        if (s.startsWith("OK (exit_code: 0)")) return true;           // exec success 
-        if (/^OK: (wrote|patched) '/.test(s)) return true;            // write_file / patch_file 
-        if (s.startsWith("OK: applied ")) return true;               // apply_diff 
-        if (s.startsWith("OK write_file")) return true;              // GUI write_file wrapper 
-        if (/^\[.+\] \(\d+ lines?,/.test(s)) return true;             // read_file header 
-        if (s.startsWith("[search_files:")) return true;               // search_files header 
-        if (s.startsWith("[list_dir:")) return true;                 // list_dir header 
-        if (s.startsWith("[glob:") || s.startsWith("[glob]")) return true; // glob header 
-        return false; 
-      }; 
+      const isPrunableToolSuccess = (content) => {
+        const s = String(content || "").trimStart();
+        if (s.startsWith("OK (exit_code: 0)")) return true;           // exec success
+        if (/^OK: (wrote|patched) '/.test(s)) return true;            // write_file / patch_file
+        if (s.startsWith("OK: applied ")) return true;               // apply_diff
+        if (s.startsWith("OK write_file")) return true;              // GUI write_file wrapper
+        if (/^\[.+\] \(\d+ lines?,/.test(s)) return true;             // read_file header
+        if (s.startsWith("[search_files:")) return true;               // search_files header
+        if (s.startsWith("[list_dir:")) return true;                 // list_dir header
+        if (s.startsWith("[glob:") || s.startsWith("[glob]")) return true; // glob header
+        return false;
+      };
 
       const pruneToolMessages = (msgs) => {
         const toolIdxs = msgs.reduce((acc, m, i) => m.role === "tool" ? [...acc, i] : acc, []);
@@ -4726,45 +5653,45 @@
       const threadRootNorm = threadRoot ? normalizePathSep(String(threadRoot)).replace(/\/+$/g, "") : "";
       let curWorkdir = safeWorkdir(threadWorkdir);
 
-      const cwdNow = () => resolvedCwd(config.toolRoot, threadId, curWorkdir); 
-      const cwdLabelNow = () => { 
-        const c = cwdNow(); 
-        return c ? String(c) : "(workspace root)"; 
-      }; 
- 
-      // Resolve a relative path under the current tool_root+workdir into a workspace-relative path. 
-      // This keeps file tools aligned with exec's cwd (prevents accidental repo-root edits). 
-      const joinUnderCwd = (relPath) => { 
-        const base0 = cwdNow(); 
-        const base = base0 ? normalizePathSep(String(base0)).replace(/\/+$/g, "") : ""; 
-        let rel = normalizePathSep(String(relPath || "")).replace(/^[\\/]+/g, ""); 
-        rel = rel.replace(/^\.\//, ""); 
-        if (!base) return rel; 
-        if (!rel || rel === ".") return base; 
-        const bl = base.toLowerCase(); 
-        const rl = rel.toLowerCase(); 
-        if (rl === bl || rl.startsWith(bl + "/")) return rel; 
-        return base + "/" + rel; 
-      }; 
- 
-      const rewriteToolPath = (text, fullPath, relPath) => { 
-        const s = String(text || ""); 
-        const full = String(fullPath || ""); 
-        const rel = String(relPath || ""); 
-        if (!s || !full || !rel) return s; 
-        if (s.startsWith("[" + full + "]")) { 
-          return "[" + rel + "]" + s.slice(("[" + full + "]").length); 
-        } 
-        return s.replaceAll("'" + full + "'", "'" + rel + "'"); 
-      }; 
- 
-      // Minimal read-cache for safe overwrite: the model must call read_file before overwriting an existing file. 
-      const fileReadSet = new Set(); // fullPath -> true 
- 
-      const setWorkdir = (nextWorkdir) => { 
-        const safe = safeWorkdir(nextWorkdir); 
-        if (safe === curWorkdir) return; 
-        curWorkdir = safe; 
+      const cwdNow = () => resolvedCwd(config.toolRoot, threadId, curWorkdir);
+      const cwdLabelNow = () => {
+        const c = cwdNow();
+        return c ? String(c) : "(workspace root)";
+      };
+
+      // Resolve a relative path under the current tool_root+workdir into a workspace-relative path.
+      // This keeps file tools aligned with exec's cwd (prevents accidental repo-root edits).
+      const joinUnderCwd = (relPath) => {
+        const base0 = cwdNow();
+        const base = base0 ? normalizePathSep(String(base0)).replace(/\/+$/g, "") : "";
+        let rel = normalizePathSep(String(relPath || "")).replace(/^[\\/]+/g, "");
+        rel = rel.replace(/^\.\//, "");
+        if (!base) return rel;
+        if (!rel || rel === ".") return base;
+        const bl = base.toLowerCase();
+        const rl = rel.toLowerCase();
+        if (rl === bl || rl.startsWith(bl + "/")) return rel;
+        return base + "/" + rel;
+      };
+
+      const rewriteToolPath = (text, fullPath, relPath) => {
+        const s = String(text || "");
+        const full = String(fullPath || "");
+        const rel = String(relPath || "");
+        if (!s || !full || !rel) return s;
+        if (s.startsWith("[" + full + "]")) {
+          return "[" + rel + "]" + s.slice(("[" + full + "]").length);
+        }
+        return s.replaceAll("'" + full + "'", "'" + rel + "'");
+      };
+
+      // Minimal read-cache for safe overwrite: the model must call read_file before overwriting an existing file.
+      const fileReadSet = new Set(); // fullPath -> true
+
+      const setWorkdir = (nextWorkdir) => {
+        const safe = safeWorkdir(nextWorkdir);
+        if (safe === curWorkdir) return;
+        curWorkdir = safe;
         // Persist to thread state so subsequent manual runs start in the right directory.
         setThreadState((s) => ({
           ...s,
@@ -5167,7 +6094,7 @@
       // This is intentionally small (planning/executing/verifying/recovery/done) to keep it robust across models.
       let agentState = "planning";
       let activePlan = null;
-      const knownGoodVerificationCommands = [];
+      const knownGoodVerificationCommands = restoreKnownVerificationCommandsFromMessages(history, governorContract);
       let fileToolConsecutiveFailures = 0;
       let reflectionRequired = "";
       let impactRequired = "";
@@ -5186,6 +6113,13 @@
       const requireImpact = (reason) => {
         impactRequired = String(reason || "successful mutation requires impact check").trim();
       };
+      let assumptionLedger = rebuildAssumptionLedgerFromMessages(
+        history,
+        governorContract,
+        taskContract,
+        instructionResolver,
+        knownGoodVerificationCommands,
+      );
 
       // Short-term memory: keep a compact summary of recent tool actions so the model can avoid repeats.
       const recentRuns = [];
@@ -5300,7 +6234,6 @@
         return "";
       };
 
-      const governorContract = await getGovernorContract();
       const sharedToolNames = toolNamesCsv(governorContract);
       const WANTS_REPO_GOAL = textMatchesVerificationTerms(text, verificationTerms(governorContract, "goal_repo_terms"));
       const WANTS_TEST_GOAL = textMatchesVerificationTerms(text, verificationTerms(governorContract, "goal_test_terms"));
@@ -5311,9 +6244,12 @@
         `Working directory (tool_root): ${cwdLabelNow()}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "0. NEVER create a git repo inside another git repo. If you see 'embedded git repository' warnings, STOP and relocate to a clean directory under tool_root.",
-        `1. ALWAYS use tools to act. Available tools: ${sharedToolNames}. NEVER just show code.`, 
-        "   PRIORITY: 1) read_file  2) list_dir  3) search_files/glob  4) patch_file/apply_diff  5) write_file  6) exec  7) done", 
-        "   Use read_file before editing. Use patch_file/apply_diff for edits. Use list_dir/search_files/glob to discover structure quickly.", 
+        `1. ALWAYS use tools to act. Available tools: ${sharedToolNames}. NEVER just show code.`,
+        "   PRIORITY: 1) read_file  2) list_dir  3) search_files/glob  4) patch_file/apply_diff  5) write_file  6) exec  7) done",
+        "   Use read_file before editing. Use patch_file/apply_diff for edits. Use list_dir/search_files/glob to discover structure quickly.",
+        `   ${contractMessage(governorContract, "instruction_resolver_scratchpad_rule")}`,
+        "   Before patch_file/apply_diff on an existing file, emit an <evidence> block with target_files, target_symbols, evidence, open_questions, and next_probe.",
+        "   If evidence is weak or missing, do NOT mutate yet; call one diagnostic tool instead.",
         "   Fallback (if tool calls are not supported): output ONE ```powershell``` code block containing ONLY commands (no `$ ` or `PS>` prompts).",
         "2. Use PowerShell syntax ONLY (cmd.exe is NOT used):",
         "   - Create directory tree: New-Item -ItemType Directory -Force -Path 'a/b/c'",
@@ -5322,7 +6258,7 @@
         "   - Append to file: Add-Content -Path 'file.txt' -Value 'more' -Encoding UTF8",
         "   - Git (new repo): New-Item -ItemType Directory -Force -Path 'MyRepo'; cd 'MyRepo'; git init; git add .; git commit -m 'init'",
         "   - NEVER use mkdir -p, touch, cat >, or any Unix syntax.",
-        "3. Execute ALL steps immediately via tools. Do NOT ask for permission or confirmation.", 
+        "3. Execute ALL steps immediately via tools. Do NOT ask for permission or confirmation.",
         "4. After each exec call, read the output and continue until the task is 100% complete.",
         "5. When the task is complete, call done with summary + acceptance coverage + verification evidence.",
       ].join("\n") : [
@@ -5330,16 +6266,19 @@
         `Working directory (tool_root): ${cwdLabelNow()}. Always create new projects under this directory. Do NOT cd to parent directories.`,
         "CRITICAL RULES — follow these without exception:",
         "0. NEVER create a git repo inside another git repo. If you see 'embedded git repository' warnings, STOP and relocate to a clean directory under tool_root.",
-        `1. ALWAYS use tools to act. Available tools: ${sharedToolNames}. NEVER just show code.`, 
-        "   PRIORITY: 1) read_file  2) list_dir  3) search_files/glob  4) patch_file/apply_diff  5) write_file  6) exec  7) done", 
-        "   Use read_file before editing. Use patch_file/apply_diff for edits. Use list_dir/search_files/glob to discover structure quickly.", 
+        `1. ALWAYS use tools to act. Available tools: ${sharedToolNames}. NEVER just show code.`,
+        "   PRIORITY: 1) read_file  2) list_dir  3) search_files/glob  4) patch_file/apply_diff  5) write_file  6) exec  7) done",
+        "   Use read_file before editing. Use patch_file/apply_diff for edits. Use list_dir/search_files/glob to discover structure quickly.",
+        `   ${contractMessage(governorContract, "instruction_resolver_scratchpad_rule")}`,
+        "   Before patch_file/apply_diff on an existing file, emit an <evidence> block with target_files, target_symbols, evidence, open_questions, and next_probe.",
+        "   If evidence is weak or missing, do NOT mutate yet; call one diagnostic tool instead.",
         "   Fallback (if tool calls are not supported): output ONE ```bash``` code block containing ONLY commands (no `$ ` prompts).",
         "2. Use Unix shell commands:",
         "   - Create directory: mkdir -p path/to/dir",
         "   - Write file: printf '%s' 'content' > file.txt   OR   python3 -c \"open('f','w').write('...')\"",
         "   - Multi-line file: use a heredoc via python3 or printf with \\n",
         "   - Git: git init, git add ., git commit -m 'init'",
-        "3. Execute ALL steps immediately via tools. Do NOT ask for permission or confirmation.", 
+        "3. Execute ALL steps immediately via tools. Do NOT ask for permission or confirmation.",
         "4. After each exec call, read the output and continue until the task is 100% complete.",
         "5. When the task is complete, call done with summary + acceptance coverage + verification evidence.",
       ].join("\n");
@@ -5413,11 +6352,11 @@
         },
       };
 
-      const searchFilesTool = { 
-        type: "function", 
-        function: { 
-          name: "search_files", 
-          description: "Search file contents for a literal text pattern (like grep -rn). Returns matching lines with file path and line number. Use to find where a function/symbol is defined or used.", 
+      const searchFilesTool = {
+        type: "function",
+        function: {
+          name: "search_files",
+          description: "Search file contents for a literal text pattern (like grep -rn). Returns matching lines with file path and line number. Use to find where a function/symbol is defined or used.",
           parameters: {
             type: "object",
             properties: {
@@ -5427,30 +6366,30 @@
             },
             required: ["pattern"],
           },
-        }, 
-      }; 
- 
-      const listDirTool = { 
-        type: "function", 
-        function: { 
-          name: "list_dir", 
-          description: "List a directory (non-recursive) under tool_root. Use to quickly understand repo structure before searching or editing.", 
-          parameters: { 
-            type: "object", 
-            properties: { 
-              dir: { type: "string", description: "Directory path relative to tool_root (default: tool_root itself)" }, 
-              max_entries: { type: "number", description: "Max entries to return (default: 200)" }, 
-              include_hidden: { type: "boolean", description: "Include hidden files (default: false)" }, 
-            }, 
-            required: [], 
-          }, 
-        }, 
-      }; 
- 
-      const globTool = { 
-        type: "function", 
-        function: { 
-          name: "glob", 
+        },
+      };
+
+      const listDirTool = {
+        type: "function",
+        function: {
+          name: "list_dir",
+          description: "List a directory (non-recursive) under tool_root. Use to quickly understand repo structure before searching or editing.",
+          parameters: {
+            type: "object",
+            properties: {
+              dir: { type: "string", description: "Directory path relative to tool_root (default: tool_root itself)" },
+              max_entries: { type: "number", description: "Max entries to return (default: 200)" },
+              include_hidden: { type: "boolean", description: "Include hidden files (default: false)" },
+            },
+            required: [],
+          },
+        },
+      };
+
+      const globTool = {
+        type: "function",
+        function: {
+          name: "glob",
           description: "Find files by name/path pattern. Supports * (single dir), ** (any depth), ? (single char). Examples: '**/*.rs', 'src/*.ts'. Returns sorted relative paths. Prefer over exec+find/ls.",
           parameters: {
             type: "object",
@@ -5523,6 +6462,15 @@
         ...history,
         { role: "user", content: text },
       ];
+      activePlan = lastValidPlanFromMessages(messages, governorContract, taskContract, instructionResolver);
+      if (activePlan) {
+        syncAssumptionLedgerToPlan(assumptionLedger, activePlan);
+        refreshAssumptionConfirmations(
+          assumptionLedger,
+          collectObservationEvidence(messages),
+          knownGoodVerificationCommands,
+        );
+      }
 
       let display = "";
       let awaitingApproval = false;
@@ -5885,8 +6833,17 @@
           ].join("\n");
           govHint = govHint ? (govHint + "\n\n" + cp) : cp;
         }
+        refreshAssumptionConfirmations(
+          assumptionLedger,
+          collectObservationEvidence(messages),
+          knownGoodVerificationCommands,
+        );
         const sysExtras = [];
         sysExtras.push(`[Agent state]\nstate: ${agentState}`);
+        sysExtras.push(buildInstructionResolverPrompt(instructionResolver, activePlan, governorContract));
+        sysExtras.push(buildTaskContractPrompt(taskContract, activePlan, governorContract));
+        const assumptionPrompt = buildAssumptionLedgerPrompt(assumptionLedger);
+        if (assumptionPrompt) sysExtras.push(assumptionPrompt);
         if (reflectionRequired) {
           sysExtras.push(buildReflectionPrompt(
             reflectionRequired,
@@ -5923,7 +6880,7 @@
           if (display) display += "\n\n";
            streamResult = await streamChatTools({
              messages,
-            tools: [execTool, writeFileTool, readFileTool, patchFileTool, applyDiffTool, searchFilesTool, listDirTool, globTool, doneTool], 
+            tools: [execTool, writeFileTool, readFileTool, patchFileTool, applyDiffTool, searchFilesTool, listDirTool, globTool, doneTool],
              model: String(reqCfg.codeModel || reqCfg.model || ""),
              base_url: String(reqCfg.baseUrl || ""),
              api_key: resolvedKey || undefined,
@@ -5948,13 +6905,29 @@
         const { text: asstText, finishReason, toolCalls: asstToolCalls } = streamResult;
         const parsedPlanForTurn = parsePlanBlock(asstText, governorContract);
         const planValidationError = parsedPlanForTurn ? validatePlanBlock(governorContract, parsedPlanForTurn) : "";
+        const taskContractPlanError =
+          parsedPlanForTurn && !planValidationError
+            ? validatePlanAgainstTaskContract(parsedPlanForTurn, taskContract, governorContract)
+            : "";
+        const instructionPlanError =
+          parsedPlanForTurn && !planValidationError && !taskContractPlanError
+            ? validatePlanAgainstInstructionResolver(parsedPlanForTurn, instructionResolver, governorContract)
+            : "";
         const parsedThinkForTurn = parseThinkBlock(asstText, governorContract);
-        if (parsedPlanForTurn && !planValidationError) activePlan = parsedPlanForTurn;
+        if (parsedPlanForTurn && !planValidationError && !taskContractPlanError && !instructionPlanError) {
+          activePlan = parsedPlanForTurn;
+          syncAssumptionLedgerToPlan(assumptionLedger, activePlan);
+          refreshAssumptionConfirmations(
+            assumptionLedger,
+            collectObservationEvidence(messages),
+            knownGoodVerificationCommands,
+          );
+        }
 
         // Append assistant turn to conversation history (OpenAI format).
         const asstMsg = { role: "assistant", content: asstText || null };
-        if (asstToolCalls.length > 0) asstMsg.tool_calls = asstToolCalls; 
-        messages.push(asstMsg); 
+        if (asstToolCalls.length > 0) asstMsg.tool_calls = asstToolCalls;
+        messages.push(asstMsg);
 
         const blockCurrentToolCalls = (block) => {
           agentState = "recovery";
@@ -5978,17 +6951,20 @@
           display += (display ? "\n\n" : "") + "[GOVERNOR BLOCK]\n" + block;
           flush();
         };
- 
-        if (finishReason === "tool_calls" && asstToolCalls.length > 0) { 
-          if (parsedPlanForTurn && planValidationError) {
-            const block = invalidPlanMessage(governorContract, planValidationError);
+
+        if (finishReason === "tool_calls" && asstToolCalls.length > 0) {
+          if (parsedPlanForTurn && (planValidationError || taskContractPlanError || instructionPlanError)) {
+            const block = invalidPlanMessage(
+              governorContract,
+              planValidationError || taskContractPlanError || instructionPlanError,
+            );
             blockCurrentToolCalls(block);
             continue;
           }
-          if (!activePlan) { 
+          if (!activePlan) {
             const block = missingPlanMessage(governorContract);
             blockCurrentToolCalls(block);
-            continue; 
+            continue;
           }
 
           if (asstToolCalls.length > 1) {
@@ -6027,6 +7003,18 @@
             display += (display ? "\n\n" : "") + `[reflect] goal_delta=${reflect.goalDelta} strategy=${reflect.strategyChange} next=${reflect.nextMinimalAction}`;
             flush();
             reflectionRequired = "";
+            if (String(reflect.wrongAssumption || "").trim()) {
+              markRefutedAssumption(
+                assumptionLedger,
+                reflect.wrongAssumption,
+                reflect.nextMinimalAction,
+              );
+            }
+            refreshAssumptionConfirmations(
+              assumptionLedger,
+              collectObservationEvidence(messages),
+              knownGoodVerificationCommands,
+            );
             if (reflect.strategyChange === "abandon") {
               governor.pendingHint = [
                 "Strategy abandoned.",
@@ -6063,7 +7051,10 @@
             impactRequired = "";
           }
 
-          const candidatePlan = parsedPlanForTurn && !planValidationError ? parsedPlanForTurn : activePlan;
+          const candidatePlan =
+            parsedPlanForTurn && !planValidationError && !taskContractPlanError && !instructionPlanError
+              ? parsedPlanForTurn
+              : activePlan;
           const actualToolCall = asstToolCalls[0];
           const actualToolName = actualToolCall && actualToolCall.function ? String(actualToolCall.function.name || "").trim() : "";
           const actualToolArgs = actualToolCall && actualToolCall.function ? String(actualToolCall.function.arguments || "") : "";
@@ -6086,12 +7077,72 @@
             blockCurrentToolCalls(block);
             continue;
           }
- 
+
+          const assumptionConflict = refutedAssumptionConflict(
+            assumptionLedger,
+            parsedThinkForTurn,
+            actualToolName,
+            actualToolArgs,
+            governorContract,
+          );
+          if (assumptionConflict) {
+            const block = `[Assumption Ledger] ${assumptionConflict}\nGather new evidence or choose a different next action before retrying.`;
+            blockCurrentToolCalls(block);
+            continue;
+          }
+
+          const resolverConflict = instructionResolverToolConflict(
+            instructionResolver,
+            actualToolName,
+            actualToolArgs,
+            governorContract,
+          );
+          if (resolverConflict) {
+            blockCurrentToolCalls(resolverConflict);
+            continue;
+          }
+
+          if (mutationToolRequiresEvidence(actualToolName)) {
+            const observations = collectObservationEvidence(messages);
+            const evidenceBlock = parseEvidenceBlock(asstText, governorContract);
+            if (!evidenceBlock) {
+              const block = buildEvidenceGatePrompt(
+                actualToolName,
+                actualToolArgs,
+                observations,
+                assumptionLedger,
+              );
+              blockCurrentToolCalls(block);
+              continue;
+            }
+            const evidenceError = validateEvidenceBlock(
+              evidenceBlock,
+              actualToolName,
+              actualToolArgs,
+              observations,
+              governorContract,
+            );
+            if (evidenceError) {
+              const block = [
+                evidenceInvalidMessage(governorContract, evidenceError),
+                "",
+                buildEvidenceGatePrompt(
+                  actualToolName,
+                  actualToolArgs,
+                  observations,
+                  assumptionLedger,
+                ),
+              ].join("\n");
+              blockCurrentToolCalls(block);
+              continue;
+            }
+          }
+
           let doneNow = false;
-          for (const tc of asstToolCalls) { 
-            if (ac.signal.aborted) break; 
-            if (tc.type !== "function" || !tc.function || !tc.function.name) continue; 
- 
+          for (const tc of asstToolCalls) {
+            if (ac.signal.aborted) break;
+            if (tc.type !== "function" || !tc.function || !tc.function.name) continue;
+
             const toolName = String(tc.function.name || "").trim();
 
             if (toolName === "done") {
@@ -6384,39 +7435,39 @@
                   continue;
                 }
 
-                const fullPath = joinUnderCwd(path0); 
- 
-                // Safe overwrite guard: require an explicit read_file before overwriting an existing file. 
-                try { 
-                  const st = await postJson("/api/stat_path", { path: fullPath }, ac.signal); 
-                  const exists = !!(st && st.exists); 
-                  if (exists && !fileReadSet.has(fullPath)) { 
-                    toolResult = [ 
-                      "GOVERNOR BLOCKED", 
-                      "Refusing to overwrite an existing file that was not read in this session.", 
-                      "Required: call read_file on the target path first, then re-issue write_file.", 
-                      "path: " + String(path0 || fullPath), 
-                    ].join("\n");  
-                    pushRecentRun({ kind: "write_file", status: "FAIL", ok: false, path: path0 || fullPath, note: "blocked: not read before overwrite" });  
-                    messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });  
-                    agentState = "recovery";  
-                    governor.pendingHint = toolResult; 
+                const fullPath = joinUnderCwd(path0);
+
+                // Safe overwrite guard: require an explicit read_file before overwriting an existing file.
+                try {
+                  const st = await postJson("/api/stat_path", { path: fullPath }, ac.signal);
+                  const exists = !!(st && st.exists);
+                  if (exists && !fileReadSet.has(fullPath)) {
+                    toolResult = [
+                      "GOVERNOR BLOCKED",
+                      "Refusing to overwrite an existing file that was not read in this session.",
+                      "Required: call read_file on the target path first, then re-issue write_file.",
+                      "path: " + String(path0 || fullPath),
+                    ].join("\n");
+                    pushRecentRun({ kind: "write_file", status: "FAIL", ok: false, path: path0 || fullPath, note: "blocked: not read before overwrite" });
+                    messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                    agentState = "recovery";
+                    governor.pendingHint = toolResult;
                     fileToolConsecutiveFailures += 1;
                     requireReflection(
                       fileToolConsecutiveFailures >= 2
                         ? `file tool failures repeated ${fileToolConsecutiveFailures} times`
                         : "write_file blocked before overwrite"
                     );
-                    continue; 
-                  } 
-                } catch (_) { 
-                  // If stat fails, do not block the write; the server will still enforce path safety. 
-                } 
- 
-                if (config.requireEditApproval) { 
-                  const q = await postJson("/api/queue_edit", { 
-                    action: "write_file", 
-                    path: fullPath, 
+                    continue;
+                  }
+                } catch (_) {
+                  // If stat fails, do not block the write; the server will still enforce path safety.
+                }
+
+                if (config.requireEditApproval) {
+                  const q = await postJson("/api/queue_edit", {
+                    action: "write_file",
+                    path: fullPath,
                     content,
                   }, ac.signal);
                   const aid = String((q && q.approval_id) || "");
@@ -6429,16 +7480,16 @@
                   awaitingApproval = true;
                   break;
                 }
- 
-                const wr = await postJson("/api/write_file", { path: fullPath, content }, ac.signal); 
-                toolResult = `OK write_file\nbytes_written: ${wr && wr.bytes_written != null ? wr.bytes_written : content.length}`; 
-                fileReadSet.add(fullPath); 
+
+                const wr = await postJson("/api/write_file", { path: fullPath, content }, ac.signal);
+                toolResult = `OK write_file\nbytes_written: ${wr && wr.bytes_written != null ? wr.bytes_written : content.length}`;
+                fileReadSet.add(fullPath);
                 fileToolConsecutiveFailures = 0;
                 requireImpact(`write_file succeeded: ${path0 || fullPath}`);
-                pushRecentRun({ kind: "write_file", status: "OK", path: path0 || fullPath, note: `bytes=${wr && wr.bytes_written != null ? wr.bytes_written : content.length}` }); 
-                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult }); 
-              } catch (e2) { 
-                toolResult = `error: ${prettyErr(e2)}`; 
+                pushRecentRun({ kind: "write_file", status: "OK", path: path0 || fullPath, note: `bytes=${wr && wr.bytes_written != null ? wr.bytes_written : content.length}` });
+                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              } catch (e2) {
+                toolResult = `error: ${prettyErr(e2)}`;
                 pushRecentRun({ kind: "write_file", status: "FAIL", ok: false, path: path0 || "(missing)", note: clip(prettyErr(e2), 120) });
                 fileToolConsecutiveFailures += 1;
                 requireReflection(
@@ -6457,100 +7508,100 @@
               let args;
               try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
               const path0 = String(args.path || "").trim();
-              display += (display ? "\n\n" : "") + `📄 read_file: ${path0}`; 
-              flush(); 
-              let toolResult; 
-              try { 
-                const fullPath = joinUnderCwd(path0); 
-                const res = await postJson("/api/read_file", { path: fullPath }, ac.signal); 
-                const raw = res && res.content ? res.content : `ERROR: empty response`; 
-                toolResult = rewriteToolPath(raw, fullPath, path0); 
-                if (res && res.content) fileReadSet.add(fullPath); 
-              } catch (e2) { 
-                toolResult = `ERROR reading '${path0}': ${prettyErr(e2)}`; 
-              } 
-              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult }); 
-              flush(); 
-              continue; 
-            } 
- 
-            if (toolName === "list_dir") { 
-              let args; 
-              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; } 
-              const dir0raw = String(args.dir || "").trim(); 
-              const dir0 = (dir0raw === "." || dir0raw === "./") ? "" : dir0raw; 
-              const maxEntries0 = Number(args.max_entries || args.maxEntries || 0) || 0; 
-              const max_entries = Math.max(0, Math.min(500, Math.round(maxEntries0))); 
-              const include_hidden = !!(args.include_hidden || args.includeHidden); 
-              const shown = dir0 ? dir0 : "."; 
-              display += (display ? "\n\n" : "") + `📁 list_dir: ${shown}`; 
-              flush(); 
-              let toolResult; 
-              try { 
-                const fullDir = joinUnderCwd(dir0); 
-                const res = await postJson("/api/list_dir", { dir: fullDir, max_entries, include_hidden }, ac.signal); 
-                const raw = res && res.output ? res.output : `ERROR: empty response`; 
-                toolResult = String(raw || "") 
-                  .replace(`[list_dir: '${fullDir}'`, `[list_dir: '${shown}'`) 
-                  .trim(); 
-              } catch (e2) { 
-                toolResult = `ERROR listing '${shown}': ${prettyErr(e2)}`; 
-              } 
-              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult }); 
-              flush(); 
-              continue; 
-            } 
- 
-            if (toolName === "patch_file") { 
-              let args; 
-              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; } 
-              const path0 = String(args.path || "").trim(); 
+              display += (display ? "\n\n" : "") + `📄 read_file: ${path0}`;
+              flush();
+              let toolResult;
+              try {
+                const fullPath = joinUnderCwd(path0);
+                const res = await postJson("/api/read_file", { path: fullPath }, ac.signal);
+                const raw = res && res.content ? res.content : `ERROR: empty response`;
+                toolResult = rewriteToolPath(raw, fullPath, path0);
+                if (res && res.content) fileReadSet.add(fullPath);
+              } catch (e2) {
+                toolResult = `ERROR reading '${path0}': ${prettyErr(e2)}`;
+              }
+              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              flush();
+              continue;
+            }
+
+            if (toolName === "list_dir") {
+              let args;
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+              const dir0raw = String(args.dir || "").trim();
+              const dir0 = (dir0raw === "." || dir0raw === "./") ? "" : dir0raw;
+              const maxEntries0 = Number(args.max_entries || args.maxEntries || 0) || 0;
+              const max_entries = Math.max(0, Math.min(500, Math.round(maxEntries0)));
+              const include_hidden = !!(args.include_hidden || args.includeHidden);
+              const shown = dir0 ? dir0 : ".";
+              display += (display ? "\n\n" : "") + `📁 list_dir: ${shown}`;
+              flush();
+              let toolResult;
+              try {
+                const fullDir = joinUnderCwd(dir0);
+                const res = await postJson("/api/list_dir", { dir: fullDir, max_entries, include_hidden }, ac.signal);
+                const raw = res && res.output ? res.output : `ERROR: empty response`;
+                toolResult = String(raw || "")
+                  .replace(`[list_dir: '${fullDir}'`, `[list_dir: '${shown}'`)
+                  .trim();
+              } catch (e2) {
+                toolResult = `ERROR listing '${shown}': ${prettyErr(e2)}`;
+              }
+              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              flush();
+              continue;
+            }
+
+            if (toolName === "patch_file") {
+              let args;
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+              const path0 = String(args.path || "").trim();
               const search = String(args.search || "");
               const replace = String(args.replace || "");
-              display += (display ? "\n\n" : "") + `✎ patch_file: ${path0}`; 
-              flush(); 
-              let toolResult; 
-              try { 
-                const fullPath = joinUnderCwd(path0); 
-                const res = await postJson("/api/patch_file", { path: fullPath, search, replace }, ac.signal); 
-                const raw = res && res.message ? res.message : "OK: patched"; 
-                toolResult = rewriteToolPath(raw, fullPath, path0); 
+              display += (display ? "\n\n" : "") + `✎ patch_file: ${path0}`;
+              flush();
+              let toolResult;
+              try {
+                const fullPath = joinUnderCwd(path0);
+                const res = await postJson("/api/patch_file", { path: fullPath, search, replace }, ac.signal);
+                const raw = res && res.message ? res.message : "OK: patched";
+                toolResult = rewriteToolPath(raw, fullPath, path0);
                 fileToolConsecutiveFailures = 0;
                 requireImpact(`patch_file succeeded: ${path0}`);
-                pushRecentRun({ kind: "patch_file", status: "OK", path: path0, note: firstDigestLine(toolResult) || "" }); 
-              } catch (e2) { 
-                toolResult = `ERROR patching '${path0}': ${prettyErr(e2)}`; 
+                pushRecentRun({ kind: "patch_file", status: "OK", path: path0, note: firstDigestLine(toolResult) || "" });
+              } catch (e2) {
+                toolResult = `ERROR patching '${path0}': ${prettyErr(e2)}`;
                 fileToolConsecutiveFailures += 1;
                 requireReflection(
                   fileToolConsecutiveFailures >= 2
                     ? `file tool failures repeated ${fileToolConsecutiveFailures} times`
                     : firstDigestLine(toolResult) || "patch_file failed"
                 );
-                pushRecentRun({ kind: "patch_file", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) }); 
-              } 
+                pushRecentRun({ kind: "patch_file", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) });
+              }
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               flush();
               continue;
             }
 
             if (toolName === "search_files") {
-              let args; 
-              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; } 
-              const pattern = String(args.pattern || "").trim(); 
-              const dir0raw = String(args.dir || ""); 
-              const dir0 = (dir0raw === "." || dir0raw === "./") ? "" : dir0raw; 
-              const ci = !!args.case_insensitive; 
-              const shown = dir0 ? dir0 : "."; 
-              display += (display ? "\n\n" : "") + `🔍 search_files: ${pattern} (dir=${shown})`; 
-              flush(); 
-              let toolResult; 
-              try { 
-                const dir = joinUnderCwd(dir0); 
-                const res = await postJson("/api/search_files", { pattern, dir, case_insensitive: ci }, ac.signal); 
-                toolResult = res && res.output ? res.output : `[search_files] No matches for '${pattern}'`; 
-              } catch (e2) { 
-                toolResult = `ERROR searching '${pattern}': ${prettyErr(e2)}`; 
-              } 
+              let args;
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+              const pattern = String(args.pattern || "").trim();
+              const dir0raw = String(args.dir || "");
+              const dir0 = (dir0raw === "." || dir0raw === "./") ? "" : dir0raw;
+              const ci = !!args.case_insensitive;
+              const shown = dir0 ? dir0 : ".";
+              display += (display ? "\n\n" : "") + `🔍 search_files: ${pattern} (dir=${shown})`;
+              flush();
+              let toolResult;
+              try {
+                const dir = joinUnderCwd(dir0);
+                const res = await postJson("/api/search_files", { pattern, dir, case_insensitive: ci }, ac.signal);
+                toolResult = res && res.output ? res.output : `[search_files] No matches for '${pattern}'`;
+              } catch (e2) {
+                toolResult = `ERROR searching '${pattern}': ${prettyErr(e2)}`;
+              }
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               flush();
               continue;
@@ -6563,49 +7614,49 @@
               const diff = String(args.diff || "");
               const diffChars = diff.length;
               const hunks = (diff.match(/^@@/gm) || []).length;
-              display += (display ? "\n\n" : "") + `⟁ apply_diff: ${path0} (${diffChars} chars, ${hunks} hunks)`; 
-              flush(); 
-              let toolResult; 
-              try { 
-                const fullPath = joinUnderCwd(path0); 
-                const res = await postJson("/api/apply_diff", { path: fullPath, diff }, ac.signal); 
-                const raw = res && res.message ? res.message : "OK: diff applied"; 
-                toolResult = rewriteToolPath(raw, fullPath, path0); 
+              display += (display ? "\n\n" : "") + `⟁ apply_diff: ${path0} (${diffChars} chars, ${hunks} hunks)`;
+              flush();
+              let toolResult;
+              try {
+                const fullPath = joinUnderCwd(path0);
+                const res = await postJson("/api/apply_diff", { path: fullPath, diff }, ac.signal);
+                const raw = res && res.message ? res.message : "OK: diff applied";
+                toolResult = rewriteToolPath(raw, fullPath, path0);
                 fileToolConsecutiveFailures = 0;
                 requireImpact(`apply_diff succeeded: ${path0}`);
-                pushRecentRun({ kind: "apply_diff", status: "OK", path: path0, note: firstDigestLine(toolResult) || "" }); 
-              } catch (e2) { 
-                toolResult = `ERROR applying diff to '${path0}': ${prettyErr(e2)}`; 
+                pushRecentRun({ kind: "apply_diff", status: "OK", path: path0, note: firstDigestLine(toolResult) || "" });
+              } catch (e2) {
+                toolResult = `ERROR applying diff to '${path0}': ${prettyErr(e2)}`;
                 fileToolConsecutiveFailures += 1;
                 requireReflection(
                   fileToolConsecutiveFailures >= 2
                     ? `file tool failures repeated ${fileToolConsecutiveFailures} times`
                     : firstDigestLine(toolResult) || "apply_diff failed"
                 );
-                pushRecentRun({ kind: "apply_diff", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) }); 
-              } 
+                pushRecentRun({ kind: "apply_diff", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) });
+              }
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               flush();
               continue;
             }
 
             if (toolName === "glob") {
-              let args; 
-              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; } 
-              const pattern = String(args.pattern || "").trim(); 
-              const dir0raw = String(args.dir || ""); 
-              const dir0 = (dir0raw === "." || dir0raw === "./") ? "" : dir0raw; 
-              const shown = dir0 ? dir0 : "."; 
-              display += (display ? "\n\n" : "") + `❖ glob: ${pattern} (dir=${shown})`; 
-              flush(); 
-              let toolResult; 
-              try { 
-                const dir = joinUnderCwd(dir0); 
-                const res = await postJson("/api/glob_files", { pattern, dir }, ac.signal); 
-                toolResult = res && res.output ? res.output : `[glob] No files matching '${pattern}'`; 
-              } catch (e2) { 
-                toolResult = `ERROR glob '${pattern}': ${prettyErr(e2)}`; 
-              } 
+              let args;
+              try { args = JSON.parse(tc.function.arguments || "{}"); } catch (_) { args = {}; }
+              const pattern = String(args.pattern || "").trim();
+              const dir0raw = String(args.dir || "");
+              const dir0 = (dir0raw === "." || dir0raw === "./") ? "" : dir0raw;
+              const shown = dir0 ? dir0 : ".";
+              display += (display ? "\n\n" : "") + `❖ glob: ${pattern} (dir=${shown})`;
+              flush();
+              let toolResult;
+              try {
+                const dir = joinUnderCwd(dir0);
+                const res = await postJson("/api/glob_files", { pattern, dir }, ac.signal);
+                toolResult = res && res.output ? res.output : `[glob] No files matching '${pattern}'`;
+              } catch (e2) {
+                toolResult = `ERROR glob '${pattern}': ${prettyErr(e2)}`;
+              }
               messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
               flush();
               continue;
@@ -7354,11 +8405,11 @@
         return uiLang;
       })();
       const proposalKeysLine = "Keep proposals block keys in English (title/to_coder/severity/score/phase/impact/cost).";
-      const langLine = outLang === "fr" 
-        ? [ 
-            "Language: French.", 
-            "Langue: français.", 
-            "Write the critique in French.", 
+      const langLine = outLang === "fr"
+        ? [
+            "Language: French.",
+            "Langue: français.",
+            "Write the critique in French.",
             "Écris la critique en français.",
             "Do not write in English.",
             "N'écris pas en anglais.",
@@ -7378,64 +8429,64 @@
               "批評は日本語で書いてください。",
               "Do not write in English.",
               "英語で書かないでください。",
-              proposalKeysLine, 
-              "proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。", 
-            ].join("\n"); 
- 
-      // Localize the intensity guidelines to reduce "Observer stuck in English" bias. 
-      if (outLang === "ja") { 
-        if (intensity === "polite") { 
-          intensityInstr = [ 
-            "強度: polite（丁寧）。建設的かつ前向きに。", 
-            "ただし5軸（正しさ/セキュリティ/信頼性/性能/保守性）で具体的な指摘は必ず入れる。", 
-            "各proposalのto_coderは具体的な1アクションにする。", 
-            "アンチループ: 新規の指摘のみ。新規が無ければ過去の未解決事項を[OPEN]で要約。", 
-          ].join("\n"); 
-        } else if (intensity === "brutal") { 
-          intensityInstr = [ 
-            "強度: brutal（容赦なし）。今夜0時に1万人へ出荷される前提で潰す。", 
-            "必須: 失敗モードを最低2つ（正しさ/データ + 運用リスク）挙げる。", 
-            "必須: 各proposalはto_coder（具体）とimpact（現実的）を含める。", 
-            "禁止: 『良さそう』『検討』などの抽象。具体的欠陥と具体的修正のみ。", 
-            "アンチループ: 既出が未解決ならスコア+10し[ESCALATED]。それ以外は新規のみ。", 
-          ].join("\n"); 
-        } else { 
-          intensityInstr = [ 
-            "強度: critical（批評）。本番マージ前レビューとして扱う。", 
-            "必須: 具体的なバグ/セキュリティ/設計弱点を最低1つ、to_coderで具体修正を書く。", 
-            "観点: 入力検証、未処理エラー、ハードコード、テスト不足。", 
-            "アンチループ: 既出は[UNRESOLVED]と明記して繰り返さない。新規無しなら次の一文だけ: [Observer] No new critique. Loop detected.", 
-          ].join("\n"); 
-        } 
-      } else if (outLang === "fr") { 
-        if (intensity === "polite") { 
-          intensityInstr = [ 
-            "Intensité: polite. Constructif et encourageant.", 
-            "Mais: signale des problèmes concrets sur les 5 axes (exactitude/sécurité/fiabilité/performance/maintenabilité).", 
-            "Chaque proposal doit inclure un message to_coder spécifique et actionnable.", 
-            "Anti-boucle: nouveaux points seulement. Sinon résume les points encore ouverts en [OPEN].", 
-          ].join("\n"); 
-        } else if (intensity === "brutal") { 
-          intensityInstr = [ 
-            "Intensité: brutal. Ça part en prod à minuit pour 10 000 utilisateurs.", 
-            "Obligatoire: au moins 2 modes de panne (un bug exactitude/données + un risque opérationnel).", 
-            "Obligatoire: chaque proposal doit inclure to_coder concret + impact réaliste.", 
-            "Interdit: 'ça a l'air bien', 'on pourrait'. Seulement défauts concrets + fixes concrets.", 
-            "Anti-boucle: si non résolu, +10 score et tag [ESCALATED]. Sinon nouveaux points uniquement.", 
-          ].join("\n"); 
-        } else { 
-          intensityInstr = [ 
-            "Intensité: critical. Revue pré-merge pour un service de prod.", 
-            "Obligatoire: au moins 1 bug/risque sécu/faiblesse d'archi avec un to_coder concret.", 
-            "Vérifie: validation d'entrées, erreurs non gérées, valeurs en dur, manque de tests.", 
-            "Anti-boucle: si déjà mentionné, marque [UNRESOLVED] et passe à autre chose. Pas de nouveau signal → réponds exactement: [Observer] No new critique. Loop detected.", 
-          ].join("\n"); 
-        } 
-      } 
+              proposalKeysLine,
+              "proposalsブロックのキー(title/to_coder/severity/score/phase/impact/cost)は英語のままにしてください。",
+            ].join("\n");
 
-      // Lightweight proposal memory: provide the Observer with a compact list of recent proposals and approvals 
-      // so it can avoid repeating the same template critique and can mark items UNRESOLVED/ESCALATED accurately. 
-      const priorProposalsSummary = (() => { 
+      // Localize the intensity guidelines to reduce "Observer stuck in English" bias.
+      if (outLang === "ja") {
+        if (intensity === "polite") {
+          intensityInstr = [
+            "強度: polite（丁寧）。建設的かつ前向きに。",
+            "ただし5軸（正しさ/セキュリティ/信頼性/性能/保守性）で具体的な指摘は必ず入れる。",
+            "各proposalのto_coderは具体的な1アクションにする。",
+            "アンチループ: 新規の指摘のみ。新規が無ければ過去の未解決事項を[OPEN]で要約。",
+          ].join("\n");
+        } else if (intensity === "brutal") {
+          intensityInstr = [
+            "強度: brutal（容赦なし）。今夜0時に1万人へ出荷される前提で潰す。",
+            "必須: 失敗モードを最低2つ（正しさ/データ + 運用リスク）挙げる。",
+            "必須: 各proposalはto_coder（具体）とimpact（現実的）を含める。",
+            "禁止: 『良さそう』『検討』などの抽象。具体的欠陥と具体的修正のみ。",
+            "アンチループ: 既出が未解決ならスコア+10し[ESCALATED]。それ以外は新規のみ。",
+          ].join("\n");
+        } else {
+          intensityInstr = [
+            "強度: critical（批評）。本番マージ前レビューとして扱う。",
+            "必須: 具体的なバグ/セキュリティ/設計弱点を最低1つ、to_coderで具体修正を書く。",
+            "観点: 入力検証、未処理エラー、ハードコード、テスト不足。",
+            "アンチループ: 既出は[UNRESOLVED]と明記して繰り返さない。新規無しなら次の一文だけ: [Observer] No new critique. Loop detected.",
+          ].join("\n");
+        }
+      } else if (outLang === "fr") {
+        if (intensity === "polite") {
+          intensityInstr = [
+            "Intensité: polite. Constructif et encourageant.",
+            "Mais: signale des problèmes concrets sur les 5 axes (exactitude/sécurité/fiabilité/performance/maintenabilité).",
+            "Chaque proposal doit inclure un message to_coder spécifique et actionnable.",
+            "Anti-boucle: nouveaux points seulement. Sinon résume les points encore ouverts en [OPEN].",
+          ].join("\n");
+        } else if (intensity === "brutal") {
+          intensityInstr = [
+            "Intensité: brutal. Ça part en prod à minuit pour 10 000 utilisateurs.",
+            "Obligatoire: au moins 2 modes de panne (un bug exactitude/données + un risque opérationnel).",
+            "Obligatoire: chaque proposal doit inclure to_coder concret + impact réaliste.",
+            "Interdit: 'ça a l'air bien', 'on pourrait'. Seulement défauts concrets + fixes concrets.",
+            "Anti-boucle: si non résolu, +10 score et tag [ESCALATED]. Sinon nouveaux points uniquement.",
+          ].join("\n");
+        } else {
+          intensityInstr = [
+            "Intensité: critical. Revue pré-merge pour un service de prod.",
+            "Obligatoire: au moins 1 bug/risque sécu/faiblesse d'archi avec un to_coder concret.",
+            "Vérifie: validation d'entrées, erreurs non gérées, valeurs en dur, manque de tests.",
+            "Anti-boucle: si déjà mentionné, marque [UNRESOLVED] et passe à autre chose. Pas de nouveau signal → réponds exactement: [Observer] No new critique. Loop detected.",
+          ].join("\n");
+        }
+      }
+
+      // Lightweight proposal memory: provide the Observer with a compact list of recent proposals and approvals
+      // so it can avoid repeating the same template critique and can mark items UNRESOLVED/ESCALATED accurately.
+      const priorProposalsSummary = (() => {
         try {
           const normTitle = (s) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
           const approved = new Set();

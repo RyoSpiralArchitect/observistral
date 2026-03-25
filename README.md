@@ -201,6 +201,10 @@ OBSTRAL also injects a compact `[Recent runs]` memory (commands + `write_file` /
 
 It also rebuilds a compact `[Working Memory]` from session messages: confirmed facts, completed steps, and known-good verification commands. That gives resumed runs positive memory, not just failure memory.
 
+For code edits, the Coder now also carries three extra guardrails: an `[Evidence Gate]` that forces a short `<evidence>` block before `patch_file` / `apply_diff` on an existing file, a `[Task Contract]` derived from the root request so plans stay anchored to the actual task and verification floor, and an `[Assumption Ledger]` that tracks open / confirmed / refuted assumptions and blocks reusing refuted ones without new evidence. The TUI and Web GUI now enforce the same three layers.
+
+The TUI and Web GUI Coder runtimes also inject an `[Instruction Resolver]` that makes the chain of command explicit: root/runtime safety > system/task contract > project rules > user request > execution scratchpad. `<plan>` / `<think>` / `<evidence>` / `<reflect>` / `<impact>` are treated as execution notes, never as authority. The authority order, prompt scaffolding, read-only conflict wording, and diagnostic exec classification now come from the shared governor contract in both runtimes.
+
 After every successful mutation, the Coder is also forced to emit a short `<impact>` block before the next tool call, stating what changed and which acceptance criterion actually moved. The runtime now checks that `progress:` points to a real current plan step or acceptance criterion.
 The TUI and Web GUI now both enforce the same `reflect` / `impact` runtime gates, so failed or stalled runs must self-correct explicitly before the next tool call.
 

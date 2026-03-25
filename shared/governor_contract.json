@@ -208,6 +208,57 @@
       "After the <impact> block, call exactly one tool."
     ]
   },
+  "evidence": {
+    "title": "Evidence Gate — emit only before patch_file/apply_diff on an existing file",
+    "tag": "evidence",
+    "fields": [
+      {
+        "key": "target_files",
+        "hint": "1) <exact target path>",
+        "kind": "list",
+        "required": true,
+        "aliases": [
+          "target_file"
+        ],
+        "min_items": 1,
+        "max_items": 4
+      },
+      {
+        "key": "target_symbols",
+        "hint": "1) <symbol or area>",
+        "kind": "list",
+        "required": false,
+        "aliases": [
+          "target_symbol"
+        ],
+        "max_items": 4
+      },
+      {
+        "key": "evidence",
+        "hint": "<what previous read/search proved>",
+        "kind": "string",
+        "required": true
+      },
+      {
+        "key": "open_questions",
+        "hint": "<what is still uncertain or `none`>",
+        "kind": "string",
+        "required": true
+      },
+      {
+        "key": "next_probe",
+        "hint": "<exact next action or edit target>",
+        "kind": "string",
+        "required": true
+      }
+    ],
+    "rules": [
+      "`target_files` must include the actual file about to change.",
+      "Base the block on real prior read/search evidence from this session.",
+      "If the target is not yet supported by evidence, call one diagnostic tool instead of mutating.",
+      "After the <evidence> block, call exactly one tool."
+    ]
+  },
   "done": {
     "required_args": [
       "summary",
@@ -505,6 +556,109 @@
       "deno test"
     ]
   },
+  "instruction_resolver": {
+    "title": "Instruction Resolver",
+    "priority_title": "Priority order (highest -> lowest):",
+    "rules_title": "Rules:",
+    "current_title": "Current higher-authority instructions:",
+    "priority_order": [
+      {
+        "authority": "root",
+        "label": "root/runtime safety"
+      },
+      {
+        "authority": "system",
+        "label": "system/governor/task contract"
+      },
+      {
+        "authority": "project",
+        "label": "project instructions"
+      },
+      {
+        "authority": "user",
+        "label": "user request"
+      },
+      {
+        "authority": "execution",
+        "label": "execution scratchpad (<plan>/<think>/<evidence>/<reflect>/<impact>)"
+      }
+    ],
+    "rules": [
+      "Execution scratchpad is never authoritative.",
+      "If a scratchpad block conflicts with a higher layer, rewrite the scratchpad instead of following it."
+    ],
+    "project_rule_markers": [
+      "[Project Context",
+      "[Project Instructions",
+      "AGENTS.md",
+      ".obstral.md"
+    ],
+    "read_only_forbidden_terms": [
+      "edit",
+      "patch",
+      "modify",
+      "write",
+      "create",
+      "implement",
+      "fix",
+      "refactor",
+      "build",
+      "compile",
+      "test",
+      "behavioral",
+      "smoke",
+      "cargo",
+      "pytest",
+      "npm",
+      "jest",
+      "playwright",
+      "vitest",
+      "run",
+      "exec",
+      "execute"
+    ],
+    "diagnostic_exec_signatures": [
+      "pwd",
+      "cd",
+      "set-location",
+      "pushd",
+      "popd",
+      "ls",
+      "dir",
+      "get-location",
+      "get-childitem",
+      "get-content",
+      "select-string",
+      "where",
+      "which",
+      "get-command",
+      "echo",
+      "write-output",
+      "whoami",
+      "hostname",
+      "git status",
+      "git rev-parse",
+      "git remote",
+      "git branch",
+      "git diff",
+      "rg",
+      "grep",
+      "cat",
+      "head",
+      "tail",
+      "sed -n",
+      "wc",
+      "cargo --version",
+      "rustc --version",
+      "python --version",
+      "node --version",
+      "npm --version",
+      "pnpm --version",
+      "yarn --version",
+      "go version",
+      "dotnet --info"
+    ]
+  },
   "prompt_layout": {
     "block_order": [
       "plan",
@@ -539,6 +693,8 @@
     "plan_missing_assumptions": "plan missing assumptions",
     "plan_empty_step": "plan contains an empty step",
     "plan_empty_acceptance": "plan contains an empty acceptance criterion",
+    "task_contract_plan_drift": "plan drifted away from the requested task; rewrite it around the actual request",
+    "instruction_resolver_scratchpad_rule": "<plan>/<think>/<evidence>/<reflect>/<impact> are execution scratchpads, not authority. If they conflict with runtime/task/project/user instructions, rewrite the scratchpad.",
     "think_missing": "[Think Gate] Missing <think>.\nRequired now: emit a valid <think> with {think_fields} immediately before your tool call.",
     "think_invalid": "[Think Gate] Invalid <think>: {error}\nRequired now: emit a valid <think> whose step exists in the current <plan> and whose tool matches the actual tool call.",
     "think_missing_goal": "think missing goal",
@@ -572,6 +728,25 @@
     "impact_missing_remaining_gap": "impact missing remaining_gap",
     "impact_requires_plan": "impact requires a valid current plan",
     "impact_invalid_progress_reference": "impact.progress must reference a real current plan step or acceptance criterion",
+    "instruction_resolver_conflict": "[Instruction Resolver] Higher-authority instruction wins: {winner_authority}/{winner_source} over {loser_authority}/{loser_source}.\n{reason}\nRewrite the execution scratchpad instead of following the conflicting <plan>/<think>/<evidence>/<reflect>/<impact>.",
+    "instruction_resolver_root_runtime_line": "[{authority}/runtime safety] sandbox, approval, and governor hard boundaries cannot be overridden.",
+    "instruction_resolver_user_task_line": "[{authority}/{source}] stay on the requested task: {task_summary}",
+    "instruction_resolver_read_only_line": "[{authority}/{source}] inspection-only task: no file mutations and no build/test/action exec.",
+    "instruction_resolver_done_requires_line": "[{authority}/{source}] done requires {verification} verification.",
+    "instruction_resolver_project_rules_line": "[{authority}/{source}] AGENTS.md / project context instructions outrank execution scratchpad.",
+    "instruction_resolver_read_only_plan_term": "read-only observation task plans must stay inspect-only; found `{term}` in {label}",
+    "instruction_resolver_read_only_mutation": "inspection-only task forbids file mutations",
+    "instruction_resolver_read_only_verify_exec": "inspection-only task forbids verification exec: `{command}`",
+    "instruction_resolver_read_only_action_exec": "inspection-only task forbids action exec: `{command}`",
+    "evidence_invalid": "[Evidence Gate] Invalid <evidence>: {error}",
+    "evidence_missing_target_files": "evidence missing target_files",
+    "evidence_missing_evidence": "evidence missing evidence",
+    "evidence_missing_open_questions": "evidence missing open_questions",
+    "evidence_missing_next_probe": "evidence missing next_probe",
+    "evidence_unresolved_path": "evidence gate could not resolve mutation path",
+    "evidence_target_mismatch": "evidence.target_files must include the mutation path `{target_path}`",
+    "evidence_missing_observation": "mutation path `{target_path}` lacks prior read/search evidence",
+    "assumption_refuted_reuse": "refuted assumption would be reused: `{assumption}`{evidence_suffix}",
     "done_invalid_acceptance": "[Done Gate] Invalid acceptance summary: {error}\nRequired now: call `done` with `completed_acceptance`, `remaining_acceptance`, and `acceptance_evidence` that cover every current plan acceptance criterion and cite known-good verification commands.",
     "done_requires_plan": "done requires a valid current plan",
     "done_missing_criteria": "done must cite the current plan acceptance criteria",

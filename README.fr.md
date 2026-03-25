@@ -180,6 +180,10 @@ OBSTRAL injecte aussi une memoire compacte `[Recent runs]` (commandes + `write_f
 
 Il reconstruit aussi une `[Working Memory]` compacte a partir des messages de session : faits confirmes, etapes terminees et commandes de verification deja valides. Un resume repart donc d'un contexte verifie, pas seulement d'une memoire des echecs.
 
+Pour les edits de code, le Coder applique maintenant trois garde-fous supplementaires : un `[Evidence Gate]` qui impose un court bloc `<evidence>` avant `patch_file` / `apply_diff` sur un fichier existant, un `[Task Contract]` derive de la demande racine pour garder le plan aligne sur la vraie tache et le niveau minimal de verification, et un `[Assumption Ledger]` qui suit les hypotheses ouvertes / confirmees / refutees et bloque la reutilisation d'une hypothese refutee sans nouvelle preuve. Le TUI et la Web GUI appliquent maintenant ces trois couches de la meme maniere.
+
+Les runtimes Coder du TUI et de la Web GUI ajoutent aussi un `[Instruction Resolver]` qui rend explicite la chaine de priorite : `root/runtime safety > system/task contract > project rules > user request > execution scratchpad`. Les blocs `<plan>` / `<think>` / `<evidence>` / `<reflect>` / `<impact>` sont traites comme des notes d'execution, jamais comme une autorite. L'ordre d'autorite, l'ossature du prompt, les messages de conflit read-only et la classification des commandes diagnostiques viennent maintenant du governor contract partage dans les deux runtimes.
+
 Apres chaque mutation reussie, le Coder doit aussi emettre un court bloc `<impact>` avant le prochain appel d'outil, pour dire ce qui a reellement change et quel critere d'acceptation a avance. Le runtime verifie maintenant que `progress:` pointe vers une vraie etape du plan ou un vrai critere d'acceptation courant.
 Le TUI et la Web GUI appliquent maintenant les memes gates runtime `reflect` / `impact` : apres un echec ou un blocage, l'agent doit expliciter sa correction avant le prochain appel d'outil.
 

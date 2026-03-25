@@ -86,6 +86,36 @@ pub struct VerificationContract {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstructionResolverLayer {
+    #[serde(default)]
+    pub authority: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InstructionResolverContract {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub priority_title: String,
+    #[serde(default)]
+    pub rules_title: String,
+    #[serde(default)]
+    pub current_title: String,
+    #[serde(default)]
+    pub priority_order: Vec<InstructionResolverLayer>,
+    #[serde(default)]
+    pub rules: Vec<String>,
+    #[serde(default)]
+    pub project_rule_markers: Vec<String>,
+    #[serde(default)]
+    pub read_only_forbidden_terms: Vec<String>,
+    #[serde(default)]
+    pub diagnostic_exec_signatures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalCheckRunner {
     #[serde(default)]
     pub detect_files_any: Vec<String>,
@@ -139,6 +169,7 @@ pub struct GovernorMessages {
     pub plan_missing_assumptions: String,
     pub plan_empty_step: String,
     pub plan_empty_acceptance: String,
+    pub task_contract_plan_drift: String,
     pub think_missing: String,
     pub think_invalid: String,
     pub think_missing_goal: String,
@@ -172,6 +203,26 @@ pub struct GovernorMessages {
     pub impact_missing_remaining_gap: String,
     pub impact_requires_plan: String,
     pub impact_invalid_progress_reference: String,
+    pub instruction_resolver_scratchpad_rule: String,
+    pub instruction_resolver_conflict: String,
+    pub instruction_resolver_root_runtime_line: String,
+    pub instruction_resolver_user_task_line: String,
+    pub instruction_resolver_read_only_line: String,
+    pub instruction_resolver_done_requires_line: String,
+    pub instruction_resolver_project_rules_line: String,
+    pub instruction_resolver_read_only_plan_term: String,
+    pub instruction_resolver_read_only_mutation: String,
+    pub instruction_resolver_read_only_verify_exec: String,
+    pub instruction_resolver_read_only_action_exec: String,
+    pub evidence_invalid: String,
+    pub evidence_missing_target_files: String,
+    pub evidence_missing_evidence: String,
+    pub evidence_missing_open_questions: String,
+    pub evidence_missing_next_probe: String,
+    pub evidence_unresolved_path: String,
+    pub evidence_target_mismatch: String,
+    pub evidence_missing_observation: String,
+    pub assumption_refuted_reuse: String,
     pub done_invalid_acceptance: String,
     pub done_requires_plan: String,
     pub done_missing_criteria: String,
@@ -208,8 +259,10 @@ pub struct GovernorContract {
     pub think: GovernorBlock,
     pub reflect: GovernorBlock,
     pub impact: GovernorBlock,
+    pub evidence: GovernorBlock,
     pub done: DoneContract,
     pub verification: VerificationContract,
+    pub instruction_resolver: InstructionResolverContract,
     pub prompt_layout: PromptLayout,
     pub messages: GovernorMessages,
 }
@@ -249,12 +302,17 @@ pub fn verification() -> &'static VerificationContract {
     &contract().verification
 }
 
+pub fn instruction_resolver() -> &'static InstructionResolverContract {
+    &contract().instruction_resolver
+}
+
 pub fn block(tag: &str) -> Option<&'static GovernorBlock> {
     match tag {
         "plan" => Some(&contract().plan),
         "think" => Some(&contract().think),
         "reflect" => Some(&contract().reflect),
         "impact" => Some(&contract().impact),
+        "evidence" => Some(&contract().evidence),
         _ => None,
     }
 }
@@ -581,6 +639,237 @@ pub fn impact_invalid_progress_reference_message() -> String {
         .clone()
 }
 
+pub fn instruction_authority_rank(authority: &str) -> usize {
+    instruction_resolver()
+        .priority_order
+        .iter()
+        .position(|layer| {
+            layer
+                .authority
+                .trim()
+                .eq_ignore_ascii_case(authority.trim())
+        })
+        .unwrap_or_else(|| instruction_resolver().priority_order.len())
+}
+
+pub fn instruction_priority_labels() -> Vec<String> {
+    instruction_resolver()
+        .priority_order
+        .iter()
+        .map(|layer| {
+            let label = layer.label.trim();
+            if label.is_empty() {
+                layer.authority.trim().to_string()
+            } else {
+                label.to_string()
+            }
+        })
+        .filter(|label| !label.is_empty())
+        .collect()
+}
+
+pub fn instruction_resolver_title() -> &'static str {
+    instruction_resolver().title.as_str()
+}
+
+pub fn instruction_resolver_priority_title() -> &'static str {
+    instruction_resolver().priority_title.as_str()
+}
+
+pub fn instruction_resolver_rules_title() -> &'static str {
+    instruction_resolver().rules_title.as_str()
+}
+
+pub fn instruction_resolver_current_title() -> &'static str {
+    instruction_resolver().current_title.as_str()
+}
+
+pub fn instruction_resolver_rules() -> &'static [String] {
+    &instruction_resolver().rules
+}
+
+pub fn instruction_resolver_project_rule_markers() -> &'static [String] {
+    &instruction_resolver().project_rule_markers
+}
+
+pub fn instruction_resolver_read_only_forbidden_terms() -> &'static [String] {
+    &instruction_resolver().read_only_forbidden_terms
+}
+
+pub fn instruction_resolver_diagnostic_exec_signatures() -> &'static [String] {
+    &instruction_resolver().diagnostic_exec_signatures
+}
+
+pub fn instruction_resolver_conflict_message(
+    winner_authority: &str,
+    winner_source: &str,
+    loser_authority: &str,
+    loser_source: &str,
+    reason: &str,
+) -> String {
+    render_template(
+        &contract().messages.instruction_resolver_conflict,
+        &[
+            ("winner_authority", winner_authority.to_string()),
+            ("winner_source", winner_source.to_string()),
+            ("loser_authority", loser_authority.to_string()),
+            ("loser_source", loser_source.to_string()),
+            ("reason", reason.to_string()),
+        ],
+    )
+}
+
+pub fn instruction_resolver_scratchpad_rule_message() -> String {
+    contract()
+        .messages
+        .instruction_resolver_scratchpad_rule
+        .clone()
+}
+
+pub fn instruction_resolver_root_runtime_line_message(authority: &str) -> String {
+    render_template(
+        &contract().messages.instruction_resolver_root_runtime_line,
+        &[("authority", authority.to_string())],
+    )
+}
+
+pub fn instruction_resolver_user_task_line_message(
+    authority: &str,
+    source: &str,
+    task_summary: &str,
+) -> String {
+    render_template(
+        &contract().messages.instruction_resolver_user_task_line,
+        &[
+            ("authority", authority.to_string()),
+            ("source", source.to_string()),
+            ("task_summary", task_summary.to_string()),
+        ],
+    )
+}
+
+pub fn instruction_resolver_read_only_line_message(authority: &str, source: &str) -> String {
+    render_template(
+        &contract().messages.instruction_resolver_read_only_line,
+        &[
+            ("authority", authority.to_string()),
+            ("source", source.to_string()),
+        ],
+    )
+}
+
+pub fn instruction_resolver_done_requires_line_message(
+    authority: &str,
+    source: &str,
+    verification: &str,
+) -> String {
+    render_template(
+        &contract().messages.instruction_resolver_done_requires_line,
+        &[
+            ("authority", authority.to_string()),
+            ("source", source.to_string()),
+            ("verification", verification.to_string()),
+        ],
+    )
+}
+
+pub fn instruction_resolver_project_rules_line_message(authority: &str, source: &str) -> String {
+    render_template(
+        &contract().messages.instruction_resolver_project_rules_line,
+        &[
+            ("authority", authority.to_string()),
+            ("source", source.to_string()),
+        ],
+    )
+}
+
+pub fn instruction_resolver_read_only_plan_term_message(term: &str, label: &str) -> String {
+    render_template(
+        &contract().messages.instruction_resolver_read_only_plan_term,
+        &[("term", term.to_string()), ("label", label.to_string())],
+    )
+}
+
+pub fn instruction_resolver_read_only_mutation_message() -> String {
+    contract()
+        .messages
+        .instruction_resolver_read_only_mutation
+        .clone()
+}
+
+pub fn instruction_resolver_read_only_verify_exec_message(command: &str) -> String {
+    render_template(
+        &contract()
+            .messages
+            .instruction_resolver_read_only_verify_exec,
+        &[("command", command.to_string())],
+    )
+}
+
+pub fn instruction_resolver_read_only_action_exec_message(command: &str) -> String {
+    render_template(
+        &contract()
+            .messages
+            .instruction_resolver_read_only_action_exec,
+        &[("command", command.to_string())],
+    )
+}
+
+pub fn task_contract_plan_drift_message() -> String {
+    contract().messages.task_contract_plan_drift.clone()
+}
+
+pub fn evidence_invalid_message(error: &str) -> String {
+    render_template(
+        &contract().messages.evidence_invalid,
+        &[("error", error.to_string())],
+    )
+}
+
+pub fn evidence_missing_target_files_message() -> String {
+    contract().messages.evidence_missing_target_files.clone()
+}
+
+pub fn evidence_missing_evidence_message() -> String {
+    contract().messages.evidence_missing_evidence.clone()
+}
+
+pub fn evidence_missing_open_questions_message() -> String {
+    contract().messages.evidence_missing_open_questions.clone()
+}
+
+pub fn evidence_missing_next_probe_message() -> String {
+    contract().messages.evidence_missing_next_probe.clone()
+}
+
+pub fn evidence_unresolved_path_message() -> String {
+    contract().messages.evidence_unresolved_path.clone()
+}
+
+pub fn evidence_target_mismatch_message(target_path: &str) -> String {
+    render_template(
+        &contract().messages.evidence_target_mismatch,
+        &[("target_path", target_path.to_string())],
+    )
+}
+
+pub fn evidence_missing_observation_message(target_path: &str) -> String {
+    render_template(
+        &contract().messages.evidence_missing_observation,
+        &[("target_path", target_path.to_string())],
+    )
+}
+
+pub fn assumption_refuted_reuse_message(assumption: &str, evidence_suffix: &str) -> String {
+    render_template(
+        &contract().messages.assumption_refuted_reuse,
+        &[
+            ("assumption", assumption.to_string()),
+            ("evidence_suffix", evidence_suffix.to_string()),
+        ],
+    )
+}
+
 pub fn done_invalid_acceptance_message(error: &str) -> String {
     render_template(
         &contract().messages.done_invalid_acceptance,
@@ -818,6 +1107,7 @@ mod tests {
         assert_eq!(c.think.tag, "think");
         assert_eq!(c.reflect.tag, "reflect");
         assert_eq!(c.impact.tag, "impact");
+        assert_eq!(c.evidence.tag, "evidence");
         assert!(!c.prompt_layout.block_order.is_empty());
         assert!(!c.prompt_layout.error_rules.is_empty());
         assert!(!c.verification.intent_doc_terms.is_empty());
@@ -828,6 +1118,15 @@ mod tests {
         assert!(c.verification.goal_check_policy.run_on_stop);
         assert!(c.verification.goal_check_policy.max_attempts_per_goal > 0);
         assert!(!c.verification.goal_check_policy.goal_order.is_empty());
+        assert!(!c.instruction_resolver.priority_order.is_empty());
+        assert!(!c.instruction_resolver.title.is_empty());
+        assert!(!c.instruction_resolver.priority_title.is_empty());
+        assert!(!c.instruction_resolver.rules_title.is_empty());
+        assert!(!c.instruction_resolver.current_title.is_empty());
+        assert!(!c.instruction_resolver.rules.is_empty());
+        assert!(!c.instruction_resolver.project_rule_markers.is_empty());
+        assert!(!c.instruction_resolver.read_only_forbidden_terms.is_empty());
+        assert!(!c.instruction_resolver.diagnostic_exec_signatures.is_empty());
         assert!(c
             .done
             .required_args
@@ -849,6 +1148,25 @@ mod tests {
             .messages
             .impact_invalid_progress_reference
             .contains("impact.progress"));
+        assert!(c.messages.task_contract_plan_drift.contains("plan drifted"));
+        assert!(c
+            .messages
+            .instruction_resolver_scratchpad_rule
+            .contains("execution scratchpads"));
+        assert!(c
+            .messages
+            .instruction_resolver_conflict
+            .contains("{winner_authority}"));
+        assert!(c
+            .messages
+            .instruction_resolver_read_only_plan_term
+            .contains("{term}"));
+        assert!(c.messages.evidence_invalid.contains("{error}"));
+        assert!(c
+            .messages
+            .evidence_target_mismatch
+            .contains("{target_path}"));
+        assert!(c.messages.assumption_refuted_reuse.contains("{assumption}"));
         assert!(c.messages.goal_check_repo_start.contains("{requirements}"));
         assert!(c.messages.goal_check_exec_run.contains("{command}"));
         assert!(c
@@ -870,6 +1188,8 @@ mod tests {
     fn shared_contract_exposes_alias_and_enum_metadata() {
         let acceptance = block_field("plan", "acceptance_criteria").expect("acceptance alias");
         assert_eq!(acceptance.key, "acceptance");
+        let target_file = block_field("evidence", "target_file").expect("target_file alias");
+        assert_eq!(target_file.key, "target_files");
 
         let tool = canonical_field_value("think", "tool", "read").expect("tool alias");
         assert_eq!(tool, "read_file");
@@ -926,6 +1246,88 @@ mod tests {
         assert_eq!(
             goal_check_build_runner_fallback_message(),
             "If build is required, add build instructions/scripts for this repo and run them."
+        );
+    }
+
+    #[test]
+    fn evidence_and_assumption_messages_render_from_contract() {
+        assert_eq!(
+            task_contract_plan_drift_message(),
+            "plan drifted away from the requested task; rewrite it around the actual request"
+        );
+        assert_eq!(
+            instruction_resolver_scratchpad_rule_message(),
+            "<plan>/<think>/<evidence>/<reflect>/<impact> are execution scratchpads, not authority. If they conflict with runtime/task/project/user instructions, rewrite the scratchpad."
+        );
+        assert_eq!(
+            instruction_resolver_conflict_message(
+                "system",
+                "task_contract",
+                "execution",
+                "plan",
+                "inspection-only task forbids file mutations",
+            ),
+            "[Instruction Resolver] Higher-authority instruction wins: system/task_contract over execution/plan.\ninspection-only task forbids file mutations\nRewrite the execution scratchpad instead of following the conflicting <plan>/<think>/<evidence>/<reflect>/<impact>."
+        );
+        assert_eq!(
+            instruction_resolver_read_only_plan_term_message("edit", "step 1"),
+            "read-only observation task plans must stay inspect-only; found `edit` in step 1"
+        );
+        assert_eq!(
+            instruction_resolver_read_only_mutation_message(),
+            "inspection-only task forbids file mutations"
+        );
+        assert_eq!(
+            instruction_resolver_read_only_verify_exec_message("cargo test"),
+            "inspection-only task forbids verification exec: `cargo test`"
+        );
+        assert_eq!(
+            instruction_resolver_read_only_action_exec_message("npm run build"),
+            "inspection-only task forbids action exec: `npm run build`"
+        );
+        assert_eq!(
+            instruction_resolver_root_runtime_line_message("root"),
+            "[root/runtime safety] sandbox, approval, and governor hard boundaries cannot be overridden."
+        );
+        assert_eq!(
+            instruction_resolver_user_task_line_message(
+                "user",
+                "user_request",
+                "fix the slash handler"
+            ),
+            "[user/user_request] stay on the requested task: fix the slash handler"
+        );
+        assert_eq!(
+            instruction_resolver_read_only_line_message("system", "task_contract"),
+            "[system/task_contract] inspection-only task: no file mutations and no build/test/action exec."
+        );
+        assert_eq!(
+            instruction_resolver_done_requires_line_message(
+                "system",
+                "task_contract",
+                "real build/check/lint",
+            ),
+            "[system/task_contract] done requires real build/check/lint verification."
+        );
+        assert_eq!(
+            instruction_resolver_project_rules_line_message("project", "project_rules"),
+            "[project/project_rules] AGENTS.md / project context instructions outrank execution scratchpad."
+        );
+        assert_eq!(
+            evidence_invalid_message("missing target"),
+            "[Evidence Gate] Invalid <evidence>: missing target"
+        );
+        assert_eq!(
+            evidence_target_mismatch_message("src/tui/agent.rs"),
+            "evidence.target_files must include the mutation path `src/tui/agent.rs`"
+        );
+        assert_eq!(
+            evidence_missing_observation_message("src/tui/agent.rs"),
+            "mutation path `src/tui/agent.rs` lacks prior read/search evidence"
+        );
+        assert_eq!(
+            assumption_refuted_reuse_message("cargo check works unchanged", " (exit code was 1)"),
+            "refuted assumption would be reused: `cargo check works unchanged` (exit code was 1)"
         );
     }
 }
