@@ -47,6 +47,7 @@ pub struct AgenticStartState {
     pub messages: Vec<serde_json::Value>,
     pub checkpoint: Option<String>,
     pub cur_cwd: Option<String>,
+    pub observation_cache: Option<crate::agent_session::ObservationCache>,
     pub create_checkpoint: bool,
 }
 
@@ -55,6 +56,7 @@ pub struct AgenticEndState {
     pub messages: Vec<serde_json::Value>,
     pub checkpoint: Option<String>,
     pub cur_cwd: Option<String>,
+    pub observation_cache: Option<crate::agent_session::ObservationCache>,
 }
 
 async fn autosave_best_effort(
@@ -74,6 +76,15 @@ async fn autosave_best_effort(
     let _ = tx
         .send(StreamToken::Delta(format!("\n[autosave] WARN: {warn}\n")))
         .await;
+}
+
+fn sync_observation_cache_autosave(
+    autosaver: &Option<Arc<crate::agent_session::SessionAutoSaver>>,
+    evidence: &ObservationEvidence,
+) {
+    if let Some(saver) = autosaver {
+        saver.set_observation_cache(Some(evidence.to_session_cache()));
+    }
 }
 
 async fn emit_telemetry_event(
@@ -1028,6 +1039,11 @@ pub const DEFAULT_MAX_ITERS: usize = 12;
 const MAX_STDOUT_CHARS: usize = 1500;
 const MAX_STDERR_CHARS: usize = 600;
 const KEEP_RECENT_TOOL_TURNS: usize = 4;
+const KEEP_RECENT_ASSISTANT_TURNS: usize = 6;
+const SUCCESS_TOOL_HISTORY_MAX_LINES: usize = 10;
+const SUCCESS_TOOL_HISTORY_MAX_CHARS: usize = 1200;
+const KEEP_RECENT_MESSAGE_WINDOW: usize = 24;
+const MAX_CONTEXT_MESSAGES: usize = 48;
 const TOKEN_BUDGET_WARN_TOKENS: usize = 9000;
 
 /// Marker appended to every exec call so we can persist working directory across tool runs.
@@ -1374,8 +1390,7 @@ Plan enforcement:\n\
   - Every tool call MUST map to a step in your <plan>. If not, update <plan> first.\n\
   - Your <plan> MUST include explicit `acceptance:` criteria. Verification must satisfy them.\n\
   - __INSTRUCTION_RESOLVER_SCRATCHPAD_RULE__\n\
-  - Before patch_file/apply_diff on an existing file, emit an <evidence> block naming the target file, concrete read/search evidence, remaining uncertainty, and the next probe/edit.\n\
-  - If evidence is weak or missing, do NOT mutate yet; use one diagnostic tool instead.\n\
+  - For existing-file mutation, emit <evidence> first; if evidence is weak, inspect instead of mutating.\n\
 \n\
 Choose the right tool:\n\
   Quick directory listing  → list_dir      (structure discovery, low token)\n\
@@ -1746,8 +1761,103 @@ fn is_prunable_tool_result(content: &str) -> bool {
         // write_file / patch_file success
         || c.starts_with("OK: wrote '")
         || c.starts_with("OK: patched '")
+        || c.starts_with("OK: applied ")
         // read_file success — header starts with "[path] (N lines"
         || (c.starts_with('[') && c.contains("] (") && c.contains(" lines,"))
+        || c.starts_with("[search_files:")
+        || c.starts_with("[list_dir:")
+        || c.starts_with("[glob")
+}
+
+fn push_unique_tool_line(
+    out: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+    line: &str,
+) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let compact = compact_one_line(trimmed, 220);
+    if seen.insert(compact.clone()) {
+        out.push(compact);
+    }
+}
+
+fn compact_success_tool_result_for_history(tool_name: &str, content: &str) -> String {
+    if matches!(tool_name, "read_file") {
+        return content.to_string();
+    }
+    if content.len() <= SUCCESS_TOOL_HISTORY_MAX_CHARS
+        && content.lines().count() <= SUCCESS_TOOL_HISTORY_MAX_LINES
+    {
+        return content.to_string();
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return content.to_string();
+    }
+
+    let mut kept = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    push_unique_tool_line(&mut kept, &mut seen, lines[0]);
+
+    if tool_name == "exec" {
+        for line in lines.iter().skip(1).take(3) {
+            push_unique_tool_line(&mut kept, &mut seen, line);
+        }
+    }
+
+    let marker_patterns = [
+        "[auto-test]",
+        "[hash]",
+        "PASSED (exit 0)",
+        "FAILED (exit ",
+        "✓ auto-verify",
+        "✗ auto-verify",
+        "test result:",
+        "Finished ",
+        "running ",
+        "cwd:",
+        "cwd_after:",
+    ];
+    for line in &lines {
+        let trimmed = line.trim();
+        if marker_patterns.iter().any(|pat| trimmed.contains(pat)) {
+            push_unique_tool_line(&mut kept, &mut seen, trimmed);
+        }
+        if kept.len() >= SUCCESS_TOOL_HISTORY_MAX_LINES {
+            break;
+        }
+    }
+
+    let fill_from = match tool_name {
+        "search_files" | "list_dir" | "glob" => 1,
+        "write_file" | "patch_file" | "apply_diff" => 1,
+        _ => 2,
+    };
+    for line in lines.iter().skip(fill_from) {
+        push_unique_tool_line(&mut kept, &mut seen, line);
+        if kept.len() >= SUCCESS_TOOL_HISTORY_MAX_LINES {
+            break;
+        }
+    }
+
+    let kept_lines = kept.len();
+    let total_lines = lines.len();
+    if kept_lines < total_lines {
+        kept.insert(
+            1.min(kept.len()),
+            format!(
+                "[history digest — kept {}/{} lines, {} chars]",
+                kept_lines,
+                total_lines,
+                content.len()
+            ),
+        );
+    }
+    kept.join("\n")
 }
 
 /// Collapse tool result messages older than KEEP_RECENT_TOOL_TURNS to a
@@ -1781,6 +1891,232 @@ fn prune_old_tool_results(messages: &mut Vec<serde_json::Value>) {
             }
         }
     }
+}
+
+fn assistant_message_is_compactable(msg: &serde_json::Value) -> bool {
+    if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+        return false;
+    }
+    let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("[DONE]")
+        || trimmed.contains("[error]")
+        || trimmed.contains("GOVERNOR BLOCKED")
+    {
+        return false;
+    }
+    msg.get("tool_calls")
+        .and_then(|v| v.as_array())
+        .map(|items| !items.is_empty())
+        .unwrap_or(false)
+        || parse_plan_block(trimmed).is_some()
+        || parse_think_block(trimmed).is_some()
+        || parse_reflection_block(trimmed).is_some()
+        || parse_impact_block(trimmed).is_some()
+        || parse_evidence_block(trimmed).is_some()
+}
+
+fn summarize_assistant_message(msg: &serde_json::Value) -> Option<String> {
+    let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(plan) = parse_plan_block(trimmed) {
+        parts.push(format!(
+            "plan goal={} steps={} acceptance={}",
+            compact_one_line(plan.goal.as_str(), 90),
+            plan.steps.len(),
+            plan.acceptance_criteria.len()
+        ));
+    }
+    if let Some(think) = parse_think_block(trimmed) {
+        parts.push(format!(
+            "think step={} tool={} next={}",
+            think.step,
+            compact_one_line(think.tool.as_str(), 24),
+            compact_one_line(think.next.as_str(), 90)
+        ));
+    }
+    if let Some(reflect) = parse_reflection_block(trimmed) {
+        parts.push(format!(
+            "reflect delta={} strategy={} next={}",
+            reflect.goal_delta.as_str(),
+            reflect.strategy_change.as_str(),
+            compact_one_line(reflect.next_minimal_action.as_str(), 90)
+        ));
+    }
+    if let Some(impact) = parse_impact_block(trimmed) {
+        parts.push(format!(
+            "impact progress={} gap={}",
+            compact_one_line(impact.progress.as_str(), 90),
+            compact_one_line(impact.remaining_gap.as_str(), 90)
+        ));
+    }
+    if let Some(evidence) = parse_evidence_block(trimmed) {
+        parts.push(format!(
+            "evidence files={} next_probe={}",
+            evidence.target_files.len(),
+            compact_one_line(evidence.next_probe.as_str(), 90)
+        ));
+    }
+    if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+        let names = tool_calls
+            .iter()
+            .filter_map(|tc| {
+                tc.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            parts.push(format!("tools={}", names.join(",")));
+        }
+    }
+    if parts.is_empty() {
+        parts.push(compact_one_line(trimmed, 140));
+    }
+    Some(format!(
+        "[assistant-summary] {} [compacted]",
+        parts.join(" | ")
+    ))
+}
+
+fn prune_old_assistant_messages(messages: &mut Vec<serde_json::Value>) {
+    let assistant_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, msg)| msg.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+        .map(|(idx, _)| idx)
+        .collect();
+
+    if assistant_indices.len() <= KEEP_RECENT_ASSISTANT_TURNS {
+        return;
+    }
+
+    let prune_count = assistant_indices.len() - KEEP_RECENT_ASSISTANT_TURNS;
+    for &idx in assistant_indices.iter().take(prune_count) {
+        if !assistant_message_is_compactable(&messages[idx]) {
+            continue;
+        }
+        let Some(summary) = summarize_assistant_message(&messages[idx]) else {
+            continue;
+        };
+        messages[idx]["content"] = serde_json::Value::String(summary);
+    }
+}
+
+fn assistant_message_has_observation_tool_call(msg: &serde_json::Value) -> bool {
+    msg.get("tool_calls")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items.iter().any(|tc| {
+                tc.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(|name| matches!(name, "read_file" | "search_files" | "list_dir" | "glob"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn tool_message_is_drop_safe(msg: &serde_json::Value) -> bool {
+    let content = msg
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim_start();
+    content.starts_with("OK (exit_code: 0)")
+        || content.starts_with("OK: wrote '")
+        || content.starts_with("OK: patched '")
+        || content.starts_with("OK: applied ")
+        || content.starts_with("OK write_file")
+}
+
+fn prune_message_window(messages: &mut Vec<serde_json::Value>) {
+    if messages.len() <= MAX_CONTEXT_MESSAGES {
+        return;
+    }
+
+    let mut protected = std::collections::HashSet::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(role, "assistant" | "tool") {
+            protected.insert(idx);
+        }
+    }
+    for idx in messages.len().saturating_sub(KEEP_RECENT_MESSAGE_WINDOW)..messages.len() {
+        protected.insert(idx);
+    }
+    let anchor_checks: &[fn(&str) -> bool] = &[
+        |content| parse_plan_block(content).is_some(),
+        |content| parse_think_block(content).is_some(),
+        |content| parse_reflection_block(content).is_some(),
+        |content| parse_impact_block(content).is_some(),
+        |content| parse_evidence_block(content).is_some(),
+    ];
+    for check in anchor_checks {
+        for idx in (0..messages.len()).rev() {
+            let msg = &messages[idx];
+            if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+                continue;
+            }
+            let content = msg
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if check(content) {
+                protected.insert(idx);
+                break;
+            }
+        }
+    }
+
+    let mut removable = Vec::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        if protected.contains(&idx) {
+            continue;
+        }
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let drop_safe = match role {
+            "assistant" => {
+                !assistant_message_has_observation_tool_call(msg)
+                    && assistant_message_is_compactable(msg)
+            }
+            "tool" => tool_message_is_drop_safe(msg),
+            _ => false,
+        };
+        if drop_safe {
+            removable.push(idx);
+        }
+    }
+
+    let over = messages.len().saturating_sub(MAX_CONTEXT_MESSAGES);
+    if over == 0 || removable.is_empty() {
+        return;
+    }
+
+    let drop_indices: std::collections::HashSet<usize> = removable.into_iter().take(over).collect();
+    if drop_indices.is_empty() {
+        return;
+    }
+
+    let mut compacted = Vec::with_capacity(messages.len() - drop_indices.len());
+    for (idx, msg) in messages.iter().enumerate() {
+        if !drop_indices.contains(&idx) {
+            compacted.push(msg.clone());
+        }
+    }
+    *messages = compacted;
 }
 
 // ── Error classification ──────────────────────────────────────────────────────
@@ -2186,6 +2522,10 @@ impl GoalCheckTracker {
             "build" => Some(&mut self.build),
             _ => None,
         }
+    }
+
+    fn any_attempted(&self) -> bool {
+        self.repo.attempts > 0 || self.tests.attempts > 0 || self.build.attempts > 0
     }
 }
 
@@ -3533,6 +3873,172 @@ fn build_working_memory_prompt(mem: &WorkingMemory) -> Option<String> {
     Some(out)
 }
 
+fn render_cached_prompt(slot: &mut Option<u64>, full: String, compact: String) -> String {
+    let digest = hash_text(full.as_str());
+    let unchanged = slot.replace(digest) == Some(digest);
+    if unchanged {
+        compact
+    } else {
+        full
+    }
+}
+
+fn build_instruction_resolver_compact_prompt(
+    resolver: &InstructionResolver,
+    required_verification: VerificationLevel,
+) -> String {
+    let full = resolver.prompt(required_verification);
+    [
+        "[Instruction Resolver cache]".to_string(),
+        format!("hash: {}", fmt_hash(hash_text(full.as_str()))),
+        "- order: root > system > project > user > execution".to_string(),
+        format!(
+            "- task: {}",
+            compact_one_line(resolver.user_task_summary(), 120)
+        ),
+        format!(
+            "- read_only: {}",
+            if resolver.root_read_only { "yes" } else { "no" }
+        ),
+        format!(
+            "- project_rules: {}",
+            if resolver.project_rules_active {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+        format!("- verification_floor: {}", required_verification.as_str()),
+    ]
+    .join("\n")
+}
+
+fn build_task_contract_compact_prompt(
+    contract: &TaskContract,
+    active_plan: Option<&PlanBlock>,
+    required_verification: VerificationLevel,
+) -> String {
+    let full = build_task_contract_prompt(contract, active_plan, required_verification);
+    let mut lines = vec![
+        "[Task Contract cache]".to_string(),
+        format!("hash: {}", fmt_hash(hash_text(full.as_str()))),
+        format!(
+            "- task: {}",
+            compact_one_line(contract.task_summary.as_str(), 120)
+        ),
+        format!(
+            "- hard_constraints: {} non_goals: {} output_shape: {}",
+            contract.hard_constraints.len(),
+            contract.non_goals.len(),
+            contract.output_shape.len()
+        ),
+        format!("- verification_floor: {}", required_verification.as_str()),
+    ];
+    if let Some(first) = contract.hard_constraints.first() {
+        lines.push(format!(
+            "- key_constraint: {}",
+            compact_one_line(first, 120)
+        ));
+    }
+    if let Some(plan) = active_plan {
+        lines.push(format!(
+            "- acceptance_items: {}",
+            plan.acceptance_criteria.len()
+        ));
+    }
+    lines.join("\n")
+}
+
+fn build_working_memory_compact_prompt(mem: &WorkingMemory) -> Option<String> {
+    let full = build_working_memory_prompt(mem)?;
+    let mut lines = vec![
+        "[Working Memory cache]".to_string(),
+        format!("hash: {}", fmt_hash(hash_text(full.as_str()))),
+        format!(
+            "- facts: {} completed_steps: {} verifications: {}",
+            mem.facts.len(),
+            mem.completed_steps.len(),
+            mem.successful_verifications.len()
+        ),
+    ];
+    if let Some(strategy) = mem.chosen_strategy.as_deref() {
+        lines.push(format!("- strategy: {}", compact_one_line(strategy, 120)));
+    }
+    if !mem.completed_steps.is_empty() {
+        let recent = mem
+            .completed_steps
+            .iter()
+            .rev()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>();
+        lines.push(format!(
+            "- recent_steps: {}",
+            recent.into_iter().rev().collect::<Vec<_>>().join(" | ")
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+fn build_assumption_ledger_compact_prompt(ledger: &AssumptionLedger) -> Option<String> {
+    let full = build_assumption_ledger_prompt(ledger)?;
+    let open = ledger
+        .entries
+        .iter()
+        .filter(|entry| entry.status == AssumptionStatus::Unknown)
+        .count();
+    let confirmed = ledger
+        .entries
+        .iter()
+        .filter(|entry| entry.status == AssumptionStatus::Confirmed)
+        .count();
+    let refuted = ledger
+        .entries
+        .iter()
+        .filter(|entry| entry.status == AssumptionStatus::Refuted)
+        .collect::<Vec<_>>();
+    let mut lines = vec![
+        "[Assumption Ledger cache]".to_string(),
+        format!("hash: {}", fmt_hash(hash_text(full.as_str()))),
+        format!(
+            "- open: {open} confirmed: {confirmed} refuted: {}",
+            refuted.len()
+        ),
+    ];
+    for entry in refuted.iter().rev().take(2).rev() {
+        lines.push(format!(
+            "- refuted: {}",
+            compact_one_line(entry.text.as_str(), 120)
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+fn build_verification_requirement_compact_prompt(
+    level: VerificationLevel,
+    test_cmd: Option<&str>,
+    plan: Option<&PlanBlock>,
+) -> String {
+    let full = verification_requirement_note(level, test_cmd, plan);
+    [
+        "[Verification Requirement cache]".to_string(),
+        format!("hash: {}", fmt_hash(hash_text(full.as_str()))),
+        format!("- required: {}", level.as_str()),
+        format!(
+            "- hint: {}",
+            compact_one_line(verification_requirement_hint(level, test_cmd).as_str(), 140)
+        ),
+        format!(
+            "- acceptance_items: {}",
+            plan.map(|p| p.acceptance_criteria.len()).unwrap_or(0)
+        ),
+    ]
+    .join(
+        "
+",
+    )
+}
+
 fn derive_task_contract(
     root_user_text: &str,
     root_read_only: bool,
@@ -3870,6 +4376,127 @@ struct ObservationReadEvidence {
 struct ObservationEvidence {
     searches: Vec<ObservationSearchEvidence>,
     reads: Vec<ObservationReadEvidence>,
+}
+
+impl ObservationEvidence {
+    fn remember_read(&mut self, command: &str, path: &str) {
+        let command = compact_one_line(command.trim(), 200);
+        let path = compact_one_line(path.trim(), 160);
+        if command == "-" || path == "-" {
+            return;
+        }
+        let sig = format!(
+            "{}|{}",
+            normalize_memory_entry(command.as_str()),
+            normalize_memory_entry(path.as_str())
+        );
+        if sig.trim().is_empty() {
+            return;
+        }
+        if let Some(pos) = self.reads.iter().position(|item| {
+            format!(
+                "{}|{}",
+                normalize_memory_entry(item.command.as_str()),
+                normalize_memory_entry(item.path.as_str())
+            ) == sig
+        }) {
+            self.reads.remove(pos);
+        }
+        self.reads.push(ObservationReadEvidence { command, path });
+        if self.reads.len() > 8 {
+            self.reads.remove(0);
+        }
+    }
+
+    fn remember_search(
+        &mut self,
+        command: &str,
+        pattern: &str,
+        hit_count: usize,
+        paths: &[String],
+    ) {
+        let command = compact_one_line(command.trim(), 200);
+        let pattern = compact_one_line(pattern.trim(), 120);
+        if command == "-" || pattern == "-" {
+            return;
+        }
+        let mut compact_paths = Vec::new();
+        for path in paths.iter().take(8) {
+            remember_recent_unique(&mut compact_paths, path.as_str(), 8, 160);
+        }
+        let sig = format!(
+            "{}|{}",
+            normalize_memory_entry(command.as_str()),
+            normalize_memory_entry(pattern.as_str())
+        );
+        if let Some(pos) = self.searches.iter().position(|item| {
+            format!(
+                "{}|{}",
+                normalize_memory_entry(item.command.as_str()),
+                normalize_memory_entry(item.pattern.as_str())
+            ) == sig
+        }) {
+            self.searches.remove(pos);
+        }
+        self.searches.push(ObservationSearchEvidence {
+            command,
+            pattern,
+            hit_count,
+            paths: compact_paths,
+        });
+        if self.searches.len() > 8 {
+            self.searches.remove(0);
+        }
+    }
+
+    fn merge_session_cache(&mut self, cache: Option<&crate::agent_session::ObservationCache>) {
+        let Some(cache) = cache else {
+            return;
+        };
+        for read in &cache.reads {
+            self.remember_read(read.command.as_str(), read.path.as_str());
+        }
+        for search in &cache.searches {
+            self.remember_search(
+                search.command.as_str(),
+                search.pattern.as_str(),
+                search.hit_count,
+                search.paths.as_slice(),
+            );
+        }
+    }
+
+    fn to_session_cache(&self) -> crate::agent_session::ObservationCache {
+        crate::agent_session::ObservationCache {
+            reads: self
+                .reads
+                .iter()
+                .map(|read| crate::agent_session::ObservationReadCache {
+                    command: read.command.clone(),
+                    path: read.path.clone(),
+                })
+                .collect(),
+            searches: self
+                .searches
+                .iter()
+                .map(|search| crate::agent_session::ObservationSearchCache {
+                    command: search.command.clone(),
+                    pattern: search.pattern.clone(),
+                    hit_count: search.hit_count,
+                    paths: search.paths.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct StablePromptCache {
+    resolver_hash: Option<u64>,
+    task_contract_hash: Option<u64>,
+    working_memory_hash: Option<u64>,
+    assumption_ledger_hash: Option<u64>,
+    verification_hash: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -4321,15 +4948,15 @@ fn build_read_only_evidence_scores(
 fn build_read_only_completion_hint(
     root_user_text: &str,
     plan: &PlanBlock,
+    evidence: &ObservationEvidence,
     messages: &[serde_json::Value],
     working_mem: &WorkingMemory,
 ) -> Option<String> {
-    let evidence = collect_observation_evidence(messages);
     if evidence.reads.is_empty() {
         return None;
     }
 
-    let scores = build_read_only_evidence_scores(root_user_text, plan, &evidence);
+    let scores = build_read_only_evidence_scores(root_user_text, plan, evidence);
     let strong: Vec<&CriterionEvidenceScore> =
         scores.iter().filter(|score| score.total >= 0.85).collect();
     let medium_or_better = scores.iter().filter(|score| score.total >= 0.60).count();
@@ -6441,6 +7068,19 @@ fn verification_requirement_note(
     out
 }
 
+fn should_emit_verification_requirement_prompt(
+    state: AgentState,
+    recovery: &RecoveryGovernor,
+    last_mutation_step: Option<usize>,
+    last_verify_ok_step: Option<usize>,
+    goal_checks: &GoalCheckTracker,
+) -> bool {
+    state == AgentState::Verifying
+        || recovery.stage == Some(RecoveryStage::Verify)
+        || last_mutation_step.unwrap_or(0) > last_verify_ok_step.unwrap_or(0)
+        || goal_checks.any_attempted()
+}
+
 fn classify_verify_level(command: &str, test_cmd: Option<&str>) -> Option<VerificationLevel> {
     let c = command_sig(command);
     if c.is_empty() {
@@ -7741,6 +8381,7 @@ pub async fn run_agentic(
         messages: messages_json,
         checkpoint: None,
         cur_cwd: None,
+        observation_cache: None,
         create_checkpoint: true,
     };
     run_agentic_json(
@@ -7875,6 +8516,10 @@ Fix: use --provider openai-compatible (or --provider mistral).",
         assumption_ledger.sync_to_plan(plan);
     }
     assumption_ledger.refresh_confirmations(&working_mem);
+    let mut observation_evidence = collect_observation_evidence(&messages);
+    observation_evidence.merge_session_cache(start.observation_cache.as_ref());
+    sync_observation_cache_autosave(&autosaver, &observation_evidence);
+    let mut prompt_cache = StablePromptCache::default();
     // Rebuild loop governor memory from the existing session so resuming runs doesn't
     // repeat the same failures from scratch.
     let mut mem = FailureMemory::from_recent_messages(&messages);
@@ -8039,6 +8684,8 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
     for iter in 0..max_iters {
         // ── Prune old tool results before sending to save context tokens ───
         prune_old_tool_results(&mut messages);
+        prune_old_assistant_messages(&mut messages);
+        prune_message_window(&mut messages);
         emit_telemetry_event(
             &tx,
             "agent_iter",
@@ -8189,31 +8836,57 @@ This is the LAST model call for this run.\n\
             msgs_for_call.push(json!({"role":"system","content": note}));
         }
 
+        let resolver_prompt = instruction_resolver.prompt(required_verification);
         msgs_for_call.push(json!({
             "role": "system",
-            "content": instruction_resolver.prompt(required_verification),
+            "content": render_cached_prompt(
+                &mut prompt_cache.resolver_hash,
+                resolver_prompt,
+                build_instruction_resolver_compact_prompt(
+                    &instruction_resolver,
+                    required_verification,
+                ),
+            ),
         }));
 
+        let task_prompt =
+            build_task_contract_prompt(&task_contract, active_plan.as_ref(), required_verification);
         msgs_for_call.push(json!({
             "role": "system",
-            "content": build_task_contract_prompt(
-                &task_contract,
-                active_plan.as_ref(),
-                required_verification
+            "content": render_cached_prompt(
+                &mut prompt_cache.task_contract_hash,
+                task_prompt,
+                build_task_contract_compact_prompt(
+                    &task_contract,
+                    active_plan.as_ref(),
+                    required_verification,
+                ),
             ),
         }));
 
         if let Some(memory_prompt) = build_working_memory_prompt(&working_mem) {
+            let compact_prompt = build_working_memory_compact_prompt(&working_mem)
+                .unwrap_or_else(|| memory_prompt.clone());
             msgs_for_call.push(json!({
                 "role": "system",
-                "content": memory_prompt,
+                "content": render_cached_prompt(
+                    &mut prompt_cache.working_memory_hash,
+                    memory_prompt,
+                    compact_prompt,
+                ),
             }));
         }
 
         if let Some(ledger_prompt) = build_assumption_ledger_prompt(&assumption_ledger) {
+            let compact_prompt = build_assumption_ledger_compact_prompt(&assumption_ledger)
+                .unwrap_or_else(|| ledger_prompt.clone());
             msgs_for_call.push(json!({
                 "role": "system",
-                "content": ledger_prompt,
+                "content": render_cached_prompt(
+                    &mut prompt_cache.assumption_ledger_hash,
+                    ledger_prompt,
+                    compact_prompt,
+                ),
             }));
         }
 
@@ -8235,14 +8908,31 @@ This is the LAST model call for this run.\n\
             }));
         }
 
-        msgs_for_call.push(json!({
-            "role": "system",
-            "content": verification_requirement_note(
+        if should_emit_verification_requirement_prompt(
+            state,
+            &recovery,
+            last_mutation_step,
+            last_verify_ok_step,
+            &goal_checks,
+        ) {
+            let verification_prompt = verification_requirement_note(
                 required_verification,
                 test_cmd.as_deref(),
-                active_plan.as_ref()
-            ),
-        }));
+                active_plan.as_ref(),
+            );
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": render_cached_prompt(
+                    &mut prompt_cache.verification_hash,
+                    verification_prompt,
+                    build_verification_requirement_compact_prompt(
+                        required_verification,
+                        test_cmd.as_deref(),
+                        active_plan.as_ref(),
+                    ),
+                ),
+            }));
+        }
 
         if let Some(reason) = impact_required.as_ref() {
             msgs_for_call.push(json!({
@@ -8871,7 +9561,7 @@ Execute only the new minimal action: {}",
             }
 
             if mutation_tool_requires_evidence(tc) {
-                let observations = collect_observation_evidence(&messages);
+                let observations = &observation_evidence;
                 let evidence_block = match parse_evidence_block(&assistant_text) {
                     Some(block) => block,
                     None => {
@@ -10241,7 +10931,6 @@ Required now: {}",
             let read_only_scores = if root_read_only {
                 done_plan
                     .map(|plan| {
-                        let observation_evidence = collect_observation_evidence(&messages);
                         build_read_only_evidence_scores(
                             &root_user_text,
                             plan,
@@ -10614,16 +11303,22 @@ Required now: {}",
                     Some(format!("apply_diff:{}", normalize_for_signature(&path)));
             }
 
+            let history_result = if is_error {
+                result.clone()
+            } else {
+                compact_success_tool_result_for_history("apply_diff", &result)
+            };
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": result,
+                "content": history_result,
             }));
             if !is_error && root_read_only && pending_system_hint.is_none() {
                 if let Some(plan) = active_plan.as_ref() {
                     pending_system_hint = build_read_only_completion_hint(
                         &root_user_text,
                         plan,
+                        &observation_evidence,
                         &messages,
                         &working_mem,
                     );
@@ -10733,16 +11428,22 @@ Required now: {}",
                 assumption_ledger.refresh_confirmations(&working_mem);
             }
 
+            let history_result = if is_error {
+                result.clone()
+            } else {
+                compact_success_tool_result_for_history("list_dir", &result)
+            };
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": result,
+                "content": history_result,
             }));
             if !is_error && root_read_only && pending_system_hint.is_none() {
                 if let Some(plan) = active_plan.as_ref() {
                     pending_system_hint = build_read_only_completion_hint(
                         &root_user_text,
                         plan,
+                        &observation_evidence,
                         &messages,
                         &working_mem,
                     );
@@ -10841,10 +11542,15 @@ Required now: {}",
                 assumption_ledger.refresh_confirmations(&working_mem);
             }
 
+            let history_result = if is_error {
+                result.clone()
+            } else {
+                compact_success_tool_result_for_history("glob", &result)
+            };
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": result,
+                "content": history_result,
             }));
             autosave_best_effort(
                 &autosaver,
@@ -10948,13 +11654,27 @@ Required now: {}",
                     next_action_for_turn,
                     test_cmd.as_deref(),
                 );
+                let command = canonicalize_tool_call_command("search_files", tc.arguments.as_str())
+                    .unwrap_or_else(|| format!("search_files(pattern={pattern}, dir={dir})"));
+                observation_evidence.remember_search(
+                    command.as_str(),
+                    pattern.as_str(),
+                    parse_search_hit_count(result.as_str()),
+                    parse_search_result_paths(result.as_str()).as_slice(),
+                );
+                sync_observation_cache_autosave(&autosaver, &observation_evidence);
                 assumption_ledger.refresh_confirmations(&working_mem);
             }
 
+            let history_result = if is_error {
+                result.clone()
+            } else {
+                compact_success_tool_result_for_history("search_files", &result)
+            };
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": result,
+                "content": history_result,
             }));
             autosave_best_effort(
                 &autosaver,
@@ -11307,6 +12027,17 @@ Action required: call read_file(path) first to confirm current contents, then re
                     next_action_for_turn,
                     test_cmd.as_deref(),
                 );
+                if tc.name.as_str() == "read_file" {
+                    let command =
+                        canonicalize_tool_call_command("read_file", tc.arguments.as_str())
+                            .unwrap_or_else(|| {
+                                format!("read_file(path={})", compact_one_line(path.as_str(), 160))
+                            });
+                    let observed_path = parse_read_file_result_path(result.as_str())
+                        .unwrap_or_else(|| compact_one_line(path.as_str(), 160));
+                    observation_evidence.remember_read(command.as_str(), observed_path.as_str());
+                    sync_observation_cache_autosave(&autosaver, &observation_evidence);
+                }
                 assumption_ledger.refresh_confirmations(&working_mem);
                 if matches!(tc.name.as_str(), "write_file" | "patch_file") {
                     let path_level = verification_level_for_mutation_path(path.as_str());
@@ -11352,10 +12083,15 @@ Action required: call read_file(path) first to confirm current contents, then re
             }
 
             // Append tool result to conversation.
+            let history_result = if is_error {
+                result.clone()
+            } else {
+                compact_success_tool_result_for_history(tc.name.as_str(), &result)
+            };
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": result,
+                "content": history_result,
             }));
             autosave_best_effort(
                 &autosaver,
@@ -11718,10 +12454,15 @@ This is blocked to prevent nested-repo / accidental repo-root modifications.\n\n
         let _ = tx.send(StreamToken::Delta(result_label)).await;
 
         // ── Append tool result (with tool_call_id preserved) ───────────────
+        let history_tool_output = if effective_exit_code == 0 {
+            compact_success_tool_result_for_history("exec", &tool_output)
+        } else {
+            tool_output.clone()
+        };
         messages.push(json!({
             "role": "tool",
             "tool_call_id": tc.id,
-            "content": tool_output.clone(),
+            "content": history_tool_output,
         }));
         last_exec_step = Some(this_step);
         autosave_best_effort(
@@ -11906,6 +12647,7 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
         messages,
         checkpoint,
         cur_cwd,
+        observation_cache: Some(observation_evidence.to_session_cache()),
     })
 }
 
@@ -12403,9 +13145,11 @@ remaining_gap: still need to run cargo test\n\
             }),
         ];
 
+        let evidence = collect_observation_evidence(&messages);
         let hint = build_read_only_completion_hint(
             "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
             &plan,
+            &evidence,
             &messages,
             &WorkingMemory::default(),
         )
@@ -12450,6 +13194,15 @@ remaining_gap: still need to run cargo test\n\
         );
         assert!(hint.contains("think` is not a real tool call"));
         assert!(hint.contains("search_files(pattern=\"/realize\", dir=\"src\")"));
+    }
+
+    #[test]
+    fn compact_success_tool_result_for_history_keeps_exec_signal() {
+        let content = "OK (exit_code: 0)\nduration_ms: 150\ncwd: /tmp/demo\nstdout:\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\n[auto-test] ✓ PASSED (exit 0)\nfinished";
+        let compact = compact_success_tool_result_for_history("exec", content);
+        assert!(compact.contains("OK (exit_code: 0)"));
+        assert!(compact.contains("[history digest"));
+        assert!(compact.contains("[auto-test]"));
     }
 
     #[test]
@@ -13049,6 +13802,45 @@ verify: exit code is zero\n\
     }
 
     #[test]
+    fn verification_requirement_prompt_is_idle_when_no_verify_pressure() {
+        let recovery = RecoveryGovernor::default();
+        let goal_checks = GoalCheckTracker::default();
+        assert!(!should_emit_verification_requirement_prompt(
+            AgentState::Planning,
+            &recovery,
+            Some(2),
+            Some(2),
+            &goal_checks,
+        ));
+    }
+
+    #[test]
+    fn verification_requirement_prompt_activates_for_pending_verify_or_goal_checks() {
+        let recovery = RecoveryGovernor::default();
+        let goal_checks = GoalCheckTracker {
+            tests: GoalCheckStatus {
+                attempts: 1,
+                ok: false,
+            },
+            ..GoalCheckTracker::default()
+        };
+        assert!(should_emit_verification_requirement_prompt(
+            AgentState::Planning,
+            &recovery,
+            Some(3),
+            Some(2),
+            &GoalCheckTracker::default(),
+        ));
+        assert!(should_emit_verification_requirement_prompt(
+            AgentState::Planning,
+            &recovery,
+            Some(2),
+            Some(2),
+            &goal_checks,
+        ));
+    }
+
+    #[test]
     fn goal_check_runner_command_uses_shared_catalog() {
         let td = tempfile::tempdir().expect("tempdir");
         std::fs::write(
@@ -13475,5 +14267,153 @@ next_probe: patch the recovery branch in run_agentic_json\n\
         let msg = refuted_assumption_conflict(&ledger, &think, &tc)
             .expect("refuted assumption should conflict");
         assert!(msg.contains("cargo check works unchanged"));
+    }
+
+    #[test]
+    fn render_cached_prompt_uses_compact_after_unchanged_full_prompt() {
+        let mut slot = None;
+        let full = "[Task Contract]
+- task: tighten token usage"
+            .to_string();
+        let compact = "[Task Contract cache]
+hash: deadbeef"
+            .to_string();
+
+        assert_eq!(
+            render_cached_prompt(&mut slot, full.clone(), compact.clone()),
+            full
+        );
+        assert_eq!(
+            render_cached_prompt(&mut slot, full.clone(), compact.clone()),
+            compact
+        );
+        assert_eq!(
+            render_cached_prompt(
+                &mut slot,
+                "[Task Contract]
+- task: changed"
+                    .to_string(),
+                compact,
+            ),
+            "[Task Contract]
+- task: changed"
+        );
+    }
+
+    #[test]
+    fn prune_old_assistant_messages_compacts_stale_structured_turns() {
+        let mut messages = Vec::new();
+        for idx in 0..(KEEP_RECENT_ASSISTANT_TURNS + 1) {
+            messages.push(json!({
+                "role": "assistant",
+                "content": format!(
+                    "<plan>
+goal: inspect token flow {idx}
+steps: 1) inspect
+acceptance: 1) token flow understood
+risks: drift
+assumptions: cache exists
+</plan>"
+                )
+            }));
+        }
+
+        let original_last = messages
+            .last()
+            .and_then(|msg| msg["content"].as_str())
+            .unwrap()
+            .to_string();
+        prune_old_assistant_messages(&mut messages);
+
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("[assistant-summary]"));
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|msg| msg["content"].as_str())
+                .unwrap_or(""),
+            original_last
+        );
+    }
+
+    #[test]
+    fn prune_message_window_drops_old_exec_turns_but_keeps_observation_turns() {
+        let mut messages = vec![
+            json!({"role":"system","content":"base"}),
+            json!({"role":"user","content":"inspect and then fix"}),
+        ];
+
+        for idx in 0..20 {
+            messages.push(json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": format!("exec_{idx}"),
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "arguments": format!("{{\"command\":\"cargo check #{idx}\"}}")
+                    }
+                }]
+            }));
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("exec_{idx}"),
+                "content": format!("OK (exit_code: 0)\nstdout:\nrun {idx}")
+            }));
+        }
+
+        messages.push(json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "obs_search",
+                "type": "function",
+                "function": {
+                    "name": "search_files",
+                    "arguments": "{\"pattern\":\"reflect\",\"dir\":\"src\"}"
+                }
+            }]
+        }));
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": "obs_search",
+            "content": "[search_files: 'reflect' — 1 match(es)]\nsrc/tui/agent.rs:1: reflect"
+        }));
+
+        for idx in 20..26 {
+            messages.push(json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": format!("tail_exec_{idx}"),
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "arguments": format!("{{\"command\":\"cargo test #{idx}\"}}")
+                    }
+                }]
+            }));
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("tail_exec_{idx}"),
+                "content": format!("OK (exit_code: 0)\nstdout:\ntail {idx}")
+            }));
+        }
+
+        let before = messages.len();
+        prune_message_window(&mut messages);
+
+        assert!(messages.len() < before);
+        assert!(messages.len() <= MAX_CONTEXT_MESSAGES);
+        assert!(messages.iter().any(|msg| {
+            msg["tool_call_id"].as_str() == Some("obs_search")
+                && msg["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("[search_files:")
+        }));
+        assert!(!messages
+            .iter()
+            .any(|msg| { msg["tool_call_id"].as_str() == Some("exec_0") }));
     }
 }

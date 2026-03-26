@@ -910,6 +910,7 @@ async fn run_agent_with_behavior(
     let mut start_messages_json: Option<Vec<serde_json::Value>> = None;
     let mut start_checkpoint: Option<String> = None;
     let mut start_cwd: Option<String> = None;
+    let mut start_observation_cache: Option<crate::agent_session::ObservationCache> = None;
     let mut create_checkpoint = true;
     let mut resuming = false;
 
@@ -931,6 +932,7 @@ async fn run_agent_with_behavior(
             );
             start_checkpoint = sess.checkpoint.clone();
             start_cwd = sess.cur_cwd.clone();
+            start_observation_cache = sess.observation_cache.clone();
             create_checkpoint = sess.checkpoint.is_none();
             start_messages_json = Some(std::mem::take(&mut sess.messages));
             loaded_session = Some(sess);
@@ -1188,6 +1190,7 @@ async fn run_agent_with_behavior(
             messages: messages_json.clone(),
             checkpoint: checkpoint.clone(),
             cur_cwd: cur_cwd.clone(),
+            observation_cache: start_observation_cache.clone(),
             create_checkpoint: create_checkpoint_round,
         };
         create_checkpoint_round = false;
@@ -1319,6 +1322,7 @@ async fn run_agent_with_behavior(
         messages_json = end_state.messages;
         cur_cwd = end_state.cur_cwd;
         checkpoint = checkpoint.or(end_state.checkpoint);
+        start_observation_cache = end_state.observation_cache;
         if let Some(ref tw) = trace {
             let last_reflection =
                 crate::agent_session::last_reflection_summary_from_messages(&messages_json);
@@ -1426,6 +1430,7 @@ For each proposal you address, verify with commands/tests. When finished, call d
             tool_root.clone(),
             checkpoint.clone(),
             cur_cwd.clone(),
+            start_observation_cache.clone(),
             messages_json.clone(),
         );
         if let Some(ref loaded) = loaded_session {

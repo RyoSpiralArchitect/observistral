@@ -136,7 +136,11 @@
       splitHint: "Drag to resize. Double-click to reset.",
       metaDiagnose: "Meta diagnose",
       metaBadge: "META",
+      nextActionBadge: "NEXT",
       whyFail: "Why did this fail?",
+      suggestNext: "Suggest next step",
+      nextActionRunning: "Observer is suggesting the next step…",
+      nextActionMissingTarget: "No stuck/failing coder message found.",
       metaDiagnoseRunning: "Running meta diagnosis…",
       metaDiagnoseMissingTarget: "No failed message found to diagnose.",
       metaDiagnoseBadTarget: "Target message not found.",
@@ -273,7 +277,11 @@
       reject: "却下",
       metaDiagnose: "メタ診断",
       metaBadge: "META",
+      nextActionBadge: "NEXT",
       whyFail: "Why did this fail?",
+      suggestNext: "次の一手",
+      nextActionRunning: "Observerが次の一手を提案中…",
+      nextActionMissingTarget: "煮詰まり・失敗状態のCoderメッセージが見つかりません。",
       metaDiagnoseRunning: "メタ診断を実行中…",
       metaDiagnoseMissingTarget: "診断対象の失敗メッセージが見つかりません。",
       metaDiagnoseBadTarget: "対象メッセージが見つかりません。",
@@ -411,6 +419,10 @@
       metaDiagnose: "Meta diagnose",
       metaBadge: "META",
       whyFail: "Pourquoi cet échec ?",
+      nextActionBadge: "NEXT",
+      suggestNext: "Suggérer la suite",
+      nextActionRunning: "L'observer propose la prochaine action…",
+      nextActionMissingTarget: "Aucun message codeur bloqué/en échec trouvé.",
       metaDiagnoseRunning: "Diagnostic méta en cours…",
       metaDiagnoseMissingTarget: "Aucun message d'échec à diagnostiquer.",
       metaDiagnoseBadTarget: "Message cible introuvable.",
@@ -711,6 +723,7 @@
       messages: [],
       tasks: [],
       coderMem: { cmdStats: [] },
+      coderObsEvidence: { reads: [], searches: [] },
       observerMem: { proposal_counts: {} },
     };
   }
@@ -1515,6 +1528,25 @@
   function goalCheckMaxAttempts(contract) {
     const n = Number(goalCheckPolicy(contract).max_attempts_per_goal);
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : 3;
+  }
+
+  function goalCheckAttemptsMade(goalChecks) {
+    const state = goalChecks && typeof goalChecks === "object" ? goalChecks : {};
+    return ["repo", "tests", "build"].some((key) => Number(state[key] && state[key].attempts) > 0);
+  }
+
+  function shouldShowGoalCheckContext(agentState, goalChecks, governor, impactRequired) {
+    const pending = String(governor && governor.pendingDiag || "").trim().toLowerCase();
+    return agentState === "verifying"
+      || Boolean(String(impactRequired || "").trim())
+      || goalCheckAttemptsMade(goalChecks)
+      || /\b(goal_check|verify|verification|test|build)\b/.test(pending);
+  }
+
+  function shouldShowRecentRunsContext(agentState, goalChecks, governor, reflectionRequired, impactRequired) {
+    return agentState === "recovery"
+      || shouldShowGoalCheckContext(agentState, goalChecks, governor, impactRequired)
+      || Boolean(String(reflectionRequired || "").trim());
   }
 
   function goalCheckOrder(contract) {
@@ -2948,6 +2980,57 @@
     return true;
   }
 
+  function sanitizeObservationEvidence(value) {
+    const src = value && typeof value === "object" ? value : {};
+    const reads = Array.isArray(src.reads) ? src.reads : [];
+    const searches = Array.isArray(src.searches) ? src.searches : [];
+    return {
+      reads: reads
+        .filter((item) => item && typeof item === "object")
+        .map((item) => ({
+          command: String(item.command || "").trim().replace(/\s+/g, " ").slice(0, 200),
+          path: String(item.path || "").trim().replace(/\s+/g, " ").slice(0, 160),
+        }))
+        .filter((item) => item.command && item.path)
+        .slice(-8),
+      searches: searches
+        .filter((item) => item && typeof item === "object")
+        .map((item) => ({
+          command: String(item.command || "").trim().replace(/\s+/g, " ").slice(0, 200),
+          pattern: String(item.pattern || "").trim().replace(/\s+/g, " ").slice(0, 120),
+          hitCount: Math.max(0, Math.min(9999, Number(item.hitCount) || 0)),
+          paths: (Array.isArray(item.paths) ? item.paths : [])
+            .map((path) => String(path || "").trim().replace(/\s+/g, " ").slice(0, 160))
+            .filter(Boolean)
+            .slice(0, 8),
+        }))
+        .filter((item) => item.command && item.pattern)
+        .slice(-8),
+    };
+  }
+
+  function mergeObservationEvidence(base, extra) {
+    const merged = sanitizeObservationEvidence(base);
+    const more = sanitizeObservationEvidence(extra);
+    const pushRead = (entry) => {
+      const sig = `${normalizeScratchEntry(entry.command)}|${normalizeScratchEntry(entry.path)}`;
+      const idx = merged.reads.findIndex((item) => `${normalizeScratchEntry(item.command)}|${normalizeScratchEntry(item.path)}` === sig);
+      if (idx >= 0) merged.reads.splice(idx, 1);
+      merged.reads.push(entry);
+      while (merged.reads.length > 8) merged.reads.shift();
+    };
+    const pushSearch = (entry) => {
+      const sig = `${normalizeScratchEntry(entry.command)}|${normalizeScratchEntry(entry.pattern)}`;
+      const idx = merged.searches.findIndex((item) => `${normalizeScratchEntry(item.command)}|${normalizeScratchEntry(item.pattern)}` === sig);
+      if (idx >= 0) merged.searches.splice(idx, 1);
+      merged.searches.push(entry);
+      while (merged.searches.length > 8) merged.searches.shift();
+    };
+    more.reads.forEach(pushRead);
+    more.searches.forEach(pushSearch);
+    return merged;
+  }
+
   function collectObservationEvidence(messages) {
     const pending = new Map();
     const evidence = { reads: [], searches: [] };
@@ -3381,6 +3464,7 @@
   }
 
   const META_DIAGNOSE_KIND = "meta_diagnose";
+  const OBSERVER_NEXT_ACTION_KIND = "observer_next_action";
   const META_FIX_LAYERS = Object.freeze([
     "guideline",
     "instruction",
@@ -3471,6 +3555,52 @@
 
   function parseMetaDiagnosis(text) {
     return parseMetaDiagnosisResult(text).diagnosis;
+  }
+
+  function parseObserverNextAction(text) {
+    const raw = String(text || "").replace(/\r\n/g, "\n").trim();
+    if (!raw) return null;
+    const headingRe = /^---\s*([a-z_]+)\s*---\s*$/gim;
+    const matches = [];
+    let match;
+    while ((match = headingRe.exec(raw)) !== null) {
+      matches.push({
+        key: String(match[1] || "").trim().toLowerCase(),
+        bodyStart: headingRe.lastIndex,
+        matchIndex: match.index,
+      });
+    }
+    if (!matches.length) return null;
+    const sections = {};
+    matches.forEach((item, idx) => {
+      const next = matches[idx + 1];
+      const end = next ? next.matchIndex : raw.length;
+      sections[item.key] = raw.slice(item.bodyStart, end).trim();
+    });
+    const nextActions = String(sections.next_actions || "")
+      .split("\n")
+      .map((line) => line.match(/^\s*\d+[).:\-]\s+(.+)\s*$/))
+      .filter(Boolean)
+      .map((m) => String(m[1] || "").trim())
+      .filter(Boolean)
+      .slice(0, 3);
+    const parsed = {
+      blocker: String(sections.blocker || "").trim(),
+      nextActions,
+      quickestCheck: String(sections.quickest_check || "").trim(),
+      whyThisFirst: String(sections.why_this_first || "").trim(),
+      fallback: String(sections.fallback || "").trim(),
+    };
+    if (
+      !parsed.blocker
+      && !parsed.nextActions.length
+      && !parsed.quickestCheck
+      && !parsed.whyThisFirst
+      && !parsed.fallback
+    ) {
+      return null;
+    }
+    return parsed;
   }
 
   // ╔══════════════════════════════════════════════════════════╗
@@ -3644,6 +3774,7 @@
               .slice(0, 60);
             return { cmdStats };
           })(),
+          coderObsEvidence: sanitizeObservationEvidence(t.coderObsEvidence),
           observerMem: (() => {
             const m = t.observerMem && typeof t.observerMem === "object" ? t.observerMem : null;
             const pc0 = (m && m.proposal_counts && typeof m.proposal_counts === "object") ? m.proposal_counts : {};
@@ -3702,6 +3833,7 @@
     const abortObserverRef = useRef(null);
     const loopRef = useRef({ lastChecked: "", depth: 0 });
     const lastAutoObserveMsgRef = useRef(null);
+    const lastObserverNextActionRef = useRef(null);
     const saveTimer = useRef(null);
     const coderBodyRef = useRef(null);
     const observerBodyRef = useRef(null);
@@ -3798,6 +3930,7 @@
     useEffect(() => {
       loopRef.current = { lastChecked: "", depth: 0 };
       lastAutoObserveMsgRef.current = null;
+      lastObserverNextActionRef.current = null;
       setLoopInfo({ active: false, score: 0, depth: 0 });
     }, [threadState.activeId]);
 
@@ -3827,6 +3960,24 @@
 
       setLoopInfo({ active: detected, score: maxSim, depth });
     }, [threadState]);
+
+    // Auto next-action assist: when the latest completed Coder reply is failure-like,
+    // ask the Observer for the next concrete move instead of another broad critique.
+    useEffect(() => {
+      if (!activeThread) return;
+      if (sendingObserver || sendingCoder || metaBusy) return;
+      const target = findLatestObserverNextActionTarget();
+      if (!target) return;
+      const key = `${String(activeThread.id || "")}:${String(target.id || "")}`;
+      if (lastObserverNextActionRef.current === key) return;
+      lastObserverNextActionRef.current = key;
+      lastAutoObserveMsgRef.current = key;
+      const reasonHint = detectMetaFailureKind(target.content) || "stuck_or_failure";
+      const timer = setTimeout(() => {
+        runObserverNextActionAssist(`msg:${target.id}`, reasonHint);
+      }, 500);
+      return () => clearTimeout(timer);
+    }, [threadState, sendingCoder, sendingObserver, metaBusy]);
 
     // Auto-observe: fire Observer automatically when Coder finishes a response.
     useEffect(() => {
@@ -4415,6 +4566,64 @@
       );
     };
 
+    const renderObserverNextActionCard = (assist) => {
+      if (!assist) return null;
+      const nextActions = Array.isArray(assist.nextActions) ? assist.nextActions : [];
+      return e(
+        "div",
+        { className: "next-action-card" },
+        e(
+          "div",
+          { className: "next-action-head" },
+          e("span", { className: "pill next-action-pill" }, tr(lang, "nextActionBadge"))
+        ),
+        assist.blocker
+          ? e(
+              "div",
+              { className: "next-action-section" },
+              e("div", { className: "meta-label" }, "blocker"),
+              e("div", { className: "next-action-text" }, assist.blocker)
+            )
+          : null,
+        nextActions.length
+          ? e(
+              "div",
+              { className: "next-action-section" },
+              e("div", { className: "meta-label" }, "next_actions"),
+              e(
+                "ol",
+                { className: "next-action-list" },
+                nextActions.map((item, idx) => e("li", { key: `next-${idx}` }, item))
+              )
+            )
+          : null,
+        assist.quickestCheck
+          ? e(
+              "div",
+              { className: "next-action-section" },
+              e("div", { className: "meta-label" }, "quickest_check"),
+              e("div", { className: "next-action-text mono" }, assist.quickestCheck)
+            )
+          : null,
+        assist.whyThisFirst
+          ? e(
+              "div",
+              { className: "next-action-section" },
+              e("div", { className: "meta-label" }, "why_this_first"),
+              e("div", { className: "next-action-text" }, assist.whyThisFirst)
+            )
+          : null,
+        assist.fallback
+          ? e(
+              "div",
+              { className: "next-action-section" },
+              e("div", { className: "meta-label" }, "fallback"),
+              e("div", { className: "next-action-text" }, assist.fallback)
+            )
+          : null
+      );
+    };
+
     const renderMetaViewer = () => {
       const needle = String(metaArtifactThreadFilter || "").trim().toLowerCase();
       const items = metaArtifacts.filter((item) => {
@@ -4615,6 +4824,9 @@
       const metaDiagnosis = (!m.streaming && pane === "observer" && isMetaDiagnoseMessage(m) && m.role === "assistant")
         ? parseMetaDiagnosis(s)
         : null;
+      const nextActionAssist = (!m.streaming && pane === "observer" && isObserverNextActionMessage(m) && m.role === "assistant")
+        ? parseObserverNextAction(s)
+        : null;
       const streamingNode = e("span", null,
         s || e("span", { className: "thinking" }, tr(lang, "streaming")),
         e("span", { className: "cursor-blink" }, "▊")
@@ -4622,6 +4834,10 @@
       // File chips: shown below completed Coder assistant messages when open_file is supported.
       const isCoderAsst = !m.streaming && m.role === "assistant" && m.pane !== "observer" && m.pane !== "chat";
       const canMetaDiagnose = isFailedCoderMessage(m);
+      const canSuggestNext = isFailedCoderMessage(m);
+      const observerSpecialBadge = pane === "observer" && isMetaDiagnoseMessage(m)
+        ? tr(lang, "metaBadge")
+        : (pane === "observer" && isObserverNextActionMessage(m) ? tr(lang, "nextActionBadge") : "");
       const fileChips = (canOpen && isCoderAsst) ? extractPathHints(s, 10) : [];
       return e(
         "div",
@@ -4633,7 +4849,7 @@
           e(
             "div",
             { className: "msg-meta" },
-            e("div", { className: "who" }, whoLabel(m, lang)),
+            e("div", { className: "who" }, whoLabel(m, lang), observerSpecialBadge ? ` · ${observerSpecialBadge}` : ""),
             m.ts ? e("span", { className: "msg-ts" }, relativeTime(m.ts, lang)) : null,
             e("div", { className: "mini" },
               isLong && e("button", {
@@ -4657,6 +4873,12 @@
                 disabled: metaBusy || sendingObserver,
                 onClick: () => runMetaDiagnose(`msg:${m.id}`),
               }, tr(lang, "whyFail")) : null,
+              canSuggestNext ? e("button", {
+                className: "pill-btn",
+                type: "button",
+                disabled: sendingObserver,
+                onClick: () => runObserverNextActionAssist(`msg:${m.id}`, detectMetaFailureKind(m.content)),
+              }, tr(lang, "suggestNext")) : null,
               e("button", {
                 className: copiedId === m.id ? "copied" : "",
                 onClick: () => copyText(m.content || "", m.id),
@@ -4696,6 +4918,8 @@
               ? streamingNode
               : metaDiagnosis
                 ? renderMetaDiagnosisCard(metaDiagnosis)
+                : nextActionAssist
+                  ? renderObserverNextActionCard(nextActionAssist)
                 : renderWithThink(
                     s,
                     execResults[m.id] || {},
@@ -4810,8 +5034,14 @@
     const isMetaDiagnoseMessage = (m) =>
       String(m && m.metaKind ? m.metaKind : "").trim().toLowerCase() === META_DIAGNOSE_KIND;
 
+    const isObserverNextActionMessage = (m) =>
+      String(m && m.metaKind ? m.metaKind : "").trim().toLowerCase() === OBSERVER_NEXT_ACTION_KIND;
+
+    const isObserverSpecialMessage = (m) =>
+      isMetaDiagnoseMessage(m) || isObserverNextActionMessage(m);
+
     const observerConversationMessages = () =>
-      paneMessages("observer").filter((m) => !isMetaDiagnoseMessage(m));
+      paneMessages("observer").filter((m) => !isObserverSpecialMessage(m));
 
     const metaDigestText = (text, maxChars, maxLines) => {
       let out = String(text || "")
@@ -4840,7 +5070,7 @@
     };
 
     const metaFailurePattern = (text) =>
-      /(?:\bFAILED\b|\[error\]|\[stop\]|REJECTED BY USER|sandbox breach|stderr:|error:|fatal:|traceback|exception|⚠ The command failed|invalid self-reflection|missing valid <plan>|Missing <think>|\[goal_check\]\s+The task is NOT complete yet|Tests are failing|Build is failing)/i.test(
+      /(?:\bFAILED\b|\[error\]|\[stop\]|REJECTED BY USER|sandbox breach|stderr:|error:|fatal:|traceback|exception|⚠ The command failed|invalid self-reflection|missing valid <plan>|Missing <think>|GOVERNOR BLOCK|\[goal_check\]\s+The task is NOT complete yet|Tests are failing|Build is failing)/i.test(
         String(text || "")
       );
 
@@ -4850,6 +5080,7 @@
     const detectMetaFailureKind = (text) => {
       const s = String(text || "").toLowerCase();
       if (!s.trim()) return "unclear";
+      if (s.includes("governor block")) return "unclear";
       if (loopInfo && Number(loopInfo.depth) > 0 && (s.includes("loop") || s.includes("repeated") || s.includes("same"))) {
         return "loop";
       }
@@ -5079,6 +5310,45 @@
       ].join("\n");
     };
 
+    const buildObserverNextActionPrompt = (packet, reasonHint) => {
+      const langName = lang === "fr" ? "French" : lang === "en" ? "English" : "Japanese";
+      const reason = String(reasonHint || packet && packet.failure_kind || "stuck_or_failure").trim();
+      return [
+        "This is intervention mode, not critique.",
+        "Tool calls, code changes, and diff application are forbidden.",
+        "Your task is to help the Coder take the next concrete step only.",
+        `Write explanations in ${langName}. Keep the section headers below in English exactly as written.`,
+        "",
+        "Required output format:",
+        "--- blocker ---",
+        "<1-2 sentences>",
+        "--- next_actions ---",
+        "1. <best next concrete action>",
+        "2. <backup action>",
+        "3. <last resort action>",
+        "--- quickest_check ---",
+        "<one command, file, or symbol to inspect first>",
+        "--- why_this_first ---",
+        "<one sentence>",
+        "--- fallback ---",
+        "<one sentence if the first action fails>",
+        "",
+        "Rules:",
+        "- Prefer small, local, reversible actions.",
+        "- Mention exact files, commands, or symbols when possible.",
+        "- If the blocker is repo code, say so directly.",
+        "- If the blocker is instruction/harness/tooling, say so directly.",
+        "- Do not broaden into a full review.",
+        "- If evidence is weak, make quickest_check purely diagnostic.",
+        "",
+        `reason_hint: ${reason}`,
+        "stuck packet:",
+        "<packet>",
+        JSON.stringify(packet, null, 2),
+        "</packet>",
+      ].join("\n");
+    };
+
     const metaConfigDigest = (packet, obsProvider, obsModel) => {
       const seed = JSON.stringify({
         thread_id: packet && packet.thread_id || "",
@@ -5116,6 +5386,18 @@
 
     const currentMetaArtifactRoot = () =>
       resolvedThreadRoot(config.toolRoot, activeThread && activeThread.id) || "";
+
+    const findLatestObserverNextActionTarget = () => {
+      const coderMsgs = paneMessages("coder");
+      for (let i = coderMsgs.length - 1; i >= 0; i--) {
+        const msg = coderMsgs[i];
+        if (!msg || msg.role !== "assistant" || msg.streaming) continue;
+        const content = String(msg.content || "").trim();
+        if (!content) continue;
+        return isFailedCoderMessage(msg) ? msg : null;
+      }
+      return null;
+    };
 
     const loadMetaArtifactDetail = async (root, name) => {
       const artifactName = String(name || "").trim();
@@ -5328,6 +5610,97 @@
         return;
       }
       await runMetaDiagnoseForPacket(packet);
+    };
+
+    const runObserverNextActionAssistForPacket = async (packet, reasonHint) => {
+      if (!activeThread || !packet || typeof packet !== "object") return;
+      if (sendingObserver || metaBusy) return;
+      const threadId = activeThread.id;
+      const obsProvider = String(config.observerProvider || "").trim() || config.provider;
+      const obsBaseUrl = String(config.observerBaseUrl || "").trim() || config.baseUrl;
+      const obsModel = String(config.observerModel || "").trim() || (config.chatModel || config.model);
+      const obsKey = String(observerApiKey || "").trim() || String(chatApiKey || "").trim() || String(codeApiKey || "").trim();
+      const prompt = buildObserverNextActionPrompt(packet, reasonHint);
+      const targetLabel = `[NEXT-ACTION] target=${packet.target_message_id} kind=${packet.failure_kind}`;
+      const userMsg = {
+        id: uid(),
+        pane: "observer",
+        role: "user",
+        content: targetLabel,
+        ts: Date.now(),
+        metaKind: OBSERVER_NEXT_ACTION_KIND,
+        metaTargetId: packet.target_message_id,
+      };
+      const asstId = uid();
+      const asstMsg = {
+        id: asstId,
+        pane: "observer",
+        role: "assistant",
+        content: "",
+        ts: Date.now(),
+        streaming: true,
+        metaKind: OBSERVER_NEXT_ACTION_KIND,
+        metaTargetId: packet.target_message_id,
+      };
+      setThreadState((s) => ({
+        ...s,
+        threads: s.threads.map((t) => (
+          t.id === threadId
+            ? { ...t, updatedAt: Date.now(), messages: [...(t.messages || []), userMsg, asstMsg] }
+            : t
+        )),
+      }));
+      setObserverSubTab("analysis");
+      setSendingObserver(true);
+      showToast(tr(lang, "nextActionRunning"), "info");
+      requestAnimationFrame(() => scrollBottom(observerBodyRef));
+      const ac = new AbortController();
+      abortObserverRef.current = ac;
+      const obsCfg = {
+        ...config,
+        mode: config.observerMode,
+        persona: config.observerPersona,
+        cot: "off",
+        autonomy: "off",
+        provider: obsProvider,
+        baseUrl: obsBaseUrl,
+        model: obsModel,
+        chatModel: obsModel,
+        codeModel: obsModel,
+      };
+      const reqBody = buildReq(obsCfg, obsKey, [], prompt, null);
+      reqBody.lang = String(lang || "ja").trim().toLowerCase();
+      reqBody.force_tools = false;
+      reqBody.temperature = 0.2;
+      reqBody.max_tokens = 1200;
+      try {
+        const j = await postJson("/api/chat", reqBody, ac.signal);
+        const text = String((j && j.content) || "").trim() || "[Observer] No concrete next action.";
+        setMsg(threadId, asstId, text, observerBodyRef);
+      } catch (err) {
+        const msg = prettyErr(err);
+        setMsg(
+          threadId,
+          asstId,
+          ac.signal.aborted ? `[${tr(lang, "stop")}]` : `[${tr(lang, "error")}] ${msg}`,
+          observerBodyRef
+        );
+      } finally {
+        setSendingObserver(false);
+        if (abortObserverRef.current === ac) abortObserverRef.current = null;
+      }
+    };
+
+    const runObserverNextActionAssist = async (selector, reasonHint) => {
+      if (!activeThread) return;
+      let targetSpec = String(selector || "").trim();
+      if (!targetSpec || normalizeScratchEntry(targetSpec) === "last-fail") targetSpec = "last-fail";
+      const packet = await buildMetaFailurePacket(targetSpec);
+      if (!packet) {
+        showToast(tr(lang, "nextActionMissingTarget"), "error");
+        return;
+      }
+      await runObserverNextActionAssistForPacket(packet, reasonHint);
     };
 
     const rerunMetaDiagnoseFromArtifact = async (detail) => {
@@ -6179,6 +6552,297 @@
         }
       };
 
+      const stableHashHex = (text) => fnv1a64(String(text || "").trimEnd()).toString(16).padStart(16, "0");
+      const promptCache = {
+        project: "",
+        resolver: "",
+        task: "",
+        assumption: "",
+        verify: "",
+        acceptance: "",
+        knownVerify: "",
+        recentRuns: "",
+      };
+      const renderCachedPrompt = (key, full, compact) => {
+        const digest = stableHashHex(full);
+        const unchanged = promptCache[key] === digest;
+        promptCache[key] = digest;
+        return unchanged ? compact : full;
+      };
+      const buildProjectContextCompactPrompt = () => {
+        if (!projectScan || !String(projectScan.context_text || "").trim()) return "";
+        return [
+          "[Project Context cache]",
+          `hash: ${stableHashHex(projectScan.context_text)}`,
+          `- stack: ${String(projectScan.stack_label || (Array.isArray(projectScan.stack) ? projectScan.stack.join(", ") : "unknown"))}`,
+          `- git: branch=${String(projectScan.git_branch || "-")} modified=${Number(projectScan.git_modified) || 0} untracked=${Number(projectScan.git_untracked) || 0}`,
+        ].join("\n");
+      };
+      const buildInstructionResolverCompactPrompt = () => {
+        const verificationFloor = inferTaskVerificationFloor(instructionResolver && instructionResolver.taskSummary, activePlan, governorContract);
+        const full = buildInstructionResolverPrompt(instructionResolver, activePlan, governorContract);
+        return [
+          "[Instruction Resolver cache]",
+          `hash: ${stableHashHex(full)}`,
+          "- order: root > system > project > user > execution",
+          `- task: ${clip(String(instructionResolver && instructionResolver.taskSummary || "complete the requested task"), 120)}`,
+          `- read_only: ${instructionResolver && instructionResolver.rootReadOnly ? "yes" : "no"}`,
+          `- project_rules: ${instructionResolver && instructionResolver.projectRulesActive ? "yes" : "no"}`,
+          `- verification_floor: ${verificationFloor}`,
+        ].join("\n");
+      };
+      const buildTaskContractCompactPrompt = () => {
+        const verificationFloor = inferTaskVerificationFloor(taskContract && taskContract.taskSummary, activePlan, governorContract);
+        const full = buildTaskContractPrompt(taskContract, activePlan, governorContract);
+        const firstConstraint = Array.isArray(taskContract && taskContract.hardConstraints) && taskContract.hardConstraints.length
+          ? clip(String(taskContract.hardConstraints[0] || ""), 120)
+          : "";
+        const lines = [
+          "[Task Contract cache]",
+          `hash: ${stableHashHex(full)}`,
+          `- task: ${clip(String(taskContract && taskContract.taskSummary || "complete the requested task"), 120)}`,
+          `- hard_constraints: ${Array.isArray(taskContract && taskContract.hardConstraints) ? taskContract.hardConstraints.length : 0} non_goals: ${Array.isArray(taskContract && taskContract.nonGoals) ? taskContract.nonGoals.length : 0} output_shape: ${Array.isArray(taskContract && taskContract.outputShape) ? taskContract.outputShape.length : 0}`,
+          `- verification_floor: ${verificationFloor}`,
+        ];
+        if (firstConstraint) lines.push(`- key_constraint: ${firstConstraint}`);
+        if (activePlan && Array.isArray(activePlan.acceptanceCriteria)) {
+          lines.push(`- acceptance_items: ${activePlan.acceptanceCriteria.length}`);
+        }
+        return lines.join("\n");
+      };
+      const buildAssumptionLedgerCompactPrompt = () => {
+        const full = buildAssumptionLedgerPrompt(assumptionLedger);
+        if (!full) return "";
+        const entries = Array.isArray(assumptionLedger && assumptionLedger.entries) ? assumptionLedger.entries : [];
+        const open = entries.filter((entry) => entry.status === "unknown").length;
+        const confirmed = entries.filter((entry) => entry.status === "confirmed").length;
+        const refuted = entries.filter((entry) => entry.status === "refuted");
+        const lines = [
+          "[Assumption Ledger cache]",
+          `hash: ${stableHashHex(full)}`,
+          `- open: ${open} confirmed: ${confirmed} refuted: ${refuted.length}`,
+        ];
+        refuted.slice(-2).forEach((entry) => lines.push(`- refuted: ${clip(String(entry.text || ""), 120)}`));
+        return lines.join("\n");
+      };
+      const buildAcceptanceCompactPrompt = () => {
+        if (!activePlan || !Array.isArray(activePlan.acceptanceCriteria) || !activePlan.acceptanceCriteria.length) return "";
+        const full = ["[Current acceptance criteria]", ...activePlan.acceptanceCriteria.map((criterion, idx) => `- acceptance ${idx + 1}: ${criterion}`)].join("\n");
+        const lines = [
+          "[Current acceptance cache]",
+          `hash: ${stableHashHex(full)}`,
+          `- items: ${activePlan.acceptanceCriteria.length}`,
+        ];
+        activePlan.acceptanceCriteria.slice(0, 2).forEach((criterion, idx) => {
+          lines.push(`- acceptance ${idx + 1}: ${clip(String(criterion || ""), 120)}`);
+        });
+        return lines.join("\n");
+      };
+      const buildKnownVerificationCompactPrompt = () => {
+        if (!knownGoodVerificationCommands.length) return "";
+        const full = ["[Known-good verification commands]", ...knownGoodVerificationCommands.map((cmd) => `- ${cmd}`)].join("\n");
+        return [
+          "[Known-good verification cache]",
+          `hash: ${stableHashHex(full)}`,
+          `- count: ${knownGoodVerificationCommands.length}`,
+          ...knownGoodVerificationCommands.slice(-2).map((cmd) => `- ${clip(String(cmd || ""), 140)}`),
+        ].join("\n");
+      };
+      const buildRecentRunsCompactPrompt = () => {
+        const full = formatRecentRuns();
+        if (!full) return "";
+        const lines = full.split("\n").slice(1).filter(Boolean);
+        return [
+          "[Recent runs cache]",
+          `hash: ${stableHashHex(full)}`,
+          `- count: ${lines.length}`,
+          ...lines.slice(-2),
+        ].join("\n");
+      };
+      const compactSuccessToolResultForHistory = (toolName, content) => {
+        const name = String(toolName || "").trim();
+        const text = String(content || "");
+        if (name === "read_file") return text;
+        const lines = text.split("\n");
+        if (text.length <= 1200 && lines.length <= 10) return text;
+        const kept = [];
+        const seen = new Set();
+        const pushLine = (line) => {
+          const trimmed = String(line || "").trim();
+          if (!trimmed) return;
+          const compact = clip(trimmed, 220);
+          if (seen.has(compact)) return;
+          seen.add(compact);
+          kept.push(compact);
+        };
+        pushLine(lines[0] || "");
+        if (name === "exec") {
+          lines.slice(1, 4).forEach(pushLine);
+        }
+        const markers = [
+          "[auto-test]",
+          "[hash]",
+          "PASSED (exit 0)",
+          "FAILED (exit ",
+          "✓ auto-verify",
+          "✗ auto-verify",
+          "test result:",
+          "Finished ",
+          "running ",
+          "cwd:",
+          "cwd_after:",
+        ];
+        for (const line of lines) {
+          const trimmed = String(line || "").trim();
+          if (markers.some((marker) => trimmed.includes(marker))) pushLine(trimmed);
+          if (kept.length >= 10) break;
+        }
+        const fillFrom = /^(search_files|list_dir|glob|write_file|patch_file|apply_diff)$/.test(name) ? 1 : 2;
+        for (const line of lines.slice(fillFrom)) {
+          pushLine(line);
+          if (kept.length >= 10) break;
+        }
+        if (kept.length < lines.filter((line) => String(line || "").trim()).length) {
+          kept.splice(Math.min(1, kept.length), 0, `[history digest — kept ${kept.length}/${lines.length} lines, ${text.length} chars]`);
+        }
+        return kept.join("\n");
+      };
+      const rememberObservationRead = (command, path) => {
+        const cmd = String(command || "").trim();
+        const target = String(path || "").trim();
+        if (!cmd || !target) return;
+        const sig = `${normalizeScratchEntry(cmd)}|${normalizeScratchEntry(target)}`;
+        const reads = Array.isArray(observationEvidence.reads) ? observationEvidence.reads : [];
+        const idx = reads.findIndex((item) => `${normalizeScratchEntry(item.command)}|${normalizeScratchEntry(item.path)}` === sig);
+        if (idx >= 0) reads.splice(idx, 1);
+        reads.push({ command: cmd, path: target });
+        while (reads.length > 8) reads.shift();
+        observationEvidence.reads = reads;
+        if (typeof persistObservationEvidence === "function") persistObservationEvidence();
+      };
+      const rememberObservationSearch = (command, pattern, hitCount, paths) => {
+        const cmd = String(command || "").trim();
+        const patt = String(pattern || "").trim();
+        if (!cmd || !patt) return;
+        const pathList = Array.isArray(paths) ? paths.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 8) : [];
+        const sig = `${normalizeScratchEntry(cmd)}|${normalizeScratchEntry(patt)}`;
+        const searches = Array.isArray(observationEvidence.searches) ? observationEvidence.searches : [];
+        const idx = searches.findIndex((item) => `${normalizeScratchEntry(item.command)}|${normalizeScratchEntry(item.pattern)}` === sig);
+        if (idx >= 0) searches.splice(idx, 1);
+        searches.push({ command: cmd, pattern: patt, hitCount: Number(hitCount) || 0, paths: pathList });
+        while (searches.length > 8) searches.shift();
+        observationEvidence.searches = searches;
+        if (typeof persistObservationEvidence === "function") persistObservationEvidence();
+      };
+      const assistantMessageCompactable = (msg) => {
+        if (!msg || msg.role !== "assistant") return false;
+        const content = String(msg.content || "").trim();
+        if (!content) return false;
+        if (content.startsWith("[DONE]") || content.includes("[error]") || content.includes("GOVERNOR BLOCKED")) return false;
+        return (Array.isArray(msg.tool_calls) && msg.tool_calls.length)
+          || !!parsePlanBlock(content, governorContract)
+          || !!parseThinkBlock(content, governorContract)
+          || !!parseReflectionBlock(content, governorContract)
+          || !!parseImpactBlock(content, governorContract)
+          || !!parseEvidenceBlock(content, governorContract);
+      };
+      const summarizeAssistantMessage = (msg) => {
+        const content = String(msg && msg.content || "").trim();
+        if (!content) return "";
+        const parts = [];
+        const plan = parsePlanBlock(content, governorContract);
+        if (plan) parts.push(`plan goal=${clip(String(plan.goal || ""), 90)} steps=${Array.isArray(plan.steps) ? plan.steps.length : 0} acceptance=${Array.isArray(plan.acceptanceCriteria) ? plan.acceptanceCriteria.length : 0}`);
+        const think = parseThinkBlock(content, governorContract);
+        if (think) parts.push(`think step=${Number(think.step) || 0} tool=${clip(String(think.tool || ""), 24)} next=${clip(String(think.next || ""), 90)}`);
+        const reflect = parseReflectionBlock(content, governorContract);
+        if (reflect) parts.push(`reflect delta=${reflect.goalDelta} strategy=${reflect.strategyChange} next=${clip(String(reflect.nextMinimalAction || ""), 90)}`);
+        const impact = parseImpactBlock(content, governorContract);
+        if (impact) parts.push(`impact progress=${clip(String(impact.progress || ""), 90)} gap=${clip(String(impact.remainingGap || ""), 90)}`);
+        const evidence = parseEvidenceBlock(content, governorContract);
+        if (evidence) parts.push(`evidence files=${Array.isArray(evidence.targetFiles) ? evidence.targetFiles.length : 0} next_probe=${clip(String(evidence.nextProbe || ""), 90)}`);
+        if (Array.isArray(msg && msg.tool_calls) && msg.tool_calls.length) {
+          const names = msg.tool_calls.map((tc) => String(tc && tc.function && tc.function.name || "").trim()).filter(Boolean);
+          if (names.length) parts.push(`tools=${names.join(",")}`);
+        }
+        if (!parts.length) parts.push(clip(content, 140));
+        return `[assistant-summary] ${parts.join(" | ")} [compacted]`;
+      };
+      const pruneAssistantMessages = (msgs) => {
+        const KEEP_ASSISTANT_TURNS = longrun ? 6 : 4;
+        const assistantIdxs = msgs.reduce((acc, msg, idx) => msg && msg.role === "assistant" ? [...acc, idx] : acc, []);
+        if (assistantIdxs.length <= KEEP_ASSISTANT_TURNS) return;
+        const toPrune = assistantIdxs.slice(0, assistantIdxs.length - KEEP_ASSISTANT_TURNS);
+        toPrune.forEach((idx) => {
+          if (!assistantMessageCompactable(msgs[idx])) return;
+          const summary = summarizeAssistantMessage(msgs[idx]);
+          if (!summary) return;
+          msgs[idx] = { ...msgs[idx], content: summary };
+        });
+      };
+      const assistantMessageHasObservationToolCall = (msg) => {
+        const calls = Array.isArray(msg && msg.tool_calls) ? msg.tool_calls : [];
+        return calls.some((tc) => {
+          const name = String(tc && tc.function && tc.function.name || "").trim();
+          return /^(read_file|search_files|list_dir|glob)$/.test(name);
+        });
+      };
+      const toolMessageDropSafe = (msg) => {
+        const content = String(msg && msg.content || "").trimStart();
+        return /^OK \(exit_code: 0\)/.test(content)
+          || /^OK: wrote '/.test(content)
+          || /^OK: patched '/.test(content)
+          || /^OK: applied /.test(content)
+          || /^OK write_file/.test(content);
+      };
+      const pruneMessageWindow = (msgs) => {
+        const MAX_CONTEXT_MESSAGES = longrun ? 48 : 32;
+        const KEEP_RECENT_MESSAGE_WINDOW = longrun ? 24 : 16;
+        if (msgs.length <= MAX_CONTEXT_MESSAGES) return;
+        const protectedIdx = new Set();
+        msgs.forEach((msg, idx) => {
+          const role = String(msg && msg.role || "");
+          if (role !== "assistant" && role !== "tool") protectedIdx.add(idx);
+        });
+        for (let idx = Math.max(0, msgs.length - KEEP_RECENT_MESSAGE_WINDOW); idx < msgs.length; idx++) {
+          protectedIdx.add(idx);
+        }
+        const anchorChecks = [
+          (content) => !!parsePlanBlock(content, governorContract),
+          (content) => !!parseThinkBlock(content, governorContract),
+          (content) => !!parseReflectionBlock(content, governorContract),
+          (content) => !!parseImpactBlock(content, governorContract),
+          (content) => !!parseEvidenceBlock(content, governorContract),
+        ];
+        anchorChecks.forEach((check) => {
+          for (let idx = msgs.length - 1; idx >= 0; idx--) {
+            const msg = msgs[idx];
+            if (!msg || msg.role !== "assistant") continue;
+            const content = String(msg.content || "").trim();
+            if (!content || !check(content)) continue;
+            protectedIdx.add(idx);
+            break;
+          }
+        });
+        const removable = [];
+        msgs.forEach((msg, idx) => {
+          if (protectedIdx.has(idx)) return;
+          const role = String(msg && msg.role || "");
+          if (role === "assistant") {
+            if (!assistantMessageHasObservationToolCall(msg) && assistantMessageCompactable(msg)) removable.push(idx);
+            return;
+          }
+          if (role === "tool" && toolMessageDropSafe(msg)) removable.push(idx);
+        });
+        const over = msgs.length - MAX_CONTEXT_MESSAGES;
+        if (over <= 0 || !removable.length) return;
+        const dropIdx = new Set(removable.slice(0, over));
+        const next = [];
+        msgs.forEach((msg, idx) => {
+          if (!dropIdx.has(idx)) next.push(msg);
+        });
+        msgs.splice(0, msgs.length, ...next);
+      };
+
       const deriveGovernorHint = (stderr, stdout) => {
         const sErr = String(stderr || "");
         const sOut = String(stdout || "");
@@ -6248,8 +6912,7 @@
         "   PRIORITY: 1) read_file  2) list_dir  3) search_files/glob  4) patch_file/apply_diff  5) write_file  6) exec  7) done",
         "   Use read_file before editing. Use patch_file/apply_diff for edits. Use list_dir/search_files/glob to discover structure quickly.",
         `   ${contractMessage(governorContract, "instruction_resolver_scratchpad_rule")}`,
-        "   Before patch_file/apply_diff on an existing file, emit an <evidence> block with target_files, target_symbols, evidence, open_questions, and next_probe.",
-        "   If evidence is weak or missing, do NOT mutate yet; call one diagnostic tool instead.",
+        "   For existing-file mutation, emit <evidence> first; if evidence is weak, inspect instead of mutating.",
         "   Fallback (if tool calls are not supported): output ONE ```powershell``` code block containing ONLY commands (no `$ ` or `PS>` prompts).",
         "2. Use PowerShell syntax ONLY (cmd.exe is NOT used):",
         "   - Create directory tree: New-Item -ItemType Directory -Force -Path 'a/b/c'",
@@ -6270,8 +6933,7 @@
         "   PRIORITY: 1) read_file  2) list_dir  3) search_files/glob  4) patch_file/apply_diff  5) write_file  6) exec  7) done",
         "   Use read_file before editing. Use patch_file/apply_diff for edits. Use list_dir/search_files/glob to discover structure quickly.",
         `   ${contractMessage(governorContract, "instruction_resolver_scratchpad_rule")}`,
-        "   Before patch_file/apply_diff on an existing file, emit an <evidence> block with target_files, target_symbols, evidence, open_questions, and next_probe.",
-        "   If evidence is weak or missing, do NOT mutate yet; call one diagnostic tool instead.",
+        "   For existing-file mutation, emit <evidence> first; if evidence is weak, inspect instead of mutating.",
         "   Fallback (if tool calls are not supported): output ONE ```bash``` code block containing ONLY commands (no `$ ` prompts).",
         "2. Use Unix shell commands:",
         "   - Create directory: mkdir -p path/to/dir",
@@ -6462,12 +7124,28 @@
         ...history,
         { role: "user", content: text },
       ];
+      const observationEvidence = mergeObservationEvidence(
+        activeThread && activeThread.coderObsEvidence,
+        collectObservationEvidence(messages),
+      );
+      const persistObservationEvidence = () => {
+        const snapshot = sanitizeObservationEvidence(observationEvidence);
+        setThreadState((s) => ({
+          ...s,
+          threads: s.threads.map((t) => (
+            t.id === threadId
+              ? { ...t, updatedAt: Date.now(), coderObsEvidence: snapshot }
+              : t
+          )),
+        }));
+      };
+      persistObservationEvidence();
       activePlan = lastValidPlanFromMessages(messages, governorContract, taskContract, instructionResolver);
       if (activePlan) {
         syncAssumptionLedgerToPlan(assumptionLedger, activePlan);
         refreshAssumptionConfirmations(
           assumptionLedger,
-          collectObservationEvidence(messages),
+          observationEvidence,
           knownGoodVerificationCommands,
         );
       }
@@ -6754,6 +7432,8 @@
       for (let iter = 0; iter < MAX_ITERS; iter++) {
         if (ac.signal.aborted) break;
         pruneToolMessages(messages);
+        pruneAssistantMessages(messages);
+        pruneMessageWindow(messages);
 
         // Auto diagnostics (outer-loop): when the governor detects a loop threshold crossing,
         // gather a small context bundle so the model can change strategy with real state.
@@ -6835,18 +7515,41 @@
         }
         refreshAssumptionConfirmations(
           assumptionLedger,
-          collectObservationEvidence(messages),
+          observationEvidence,
           knownGoodVerificationCommands,
         );
         const sysExtras = [];
-        sysExtras.push(`[Agent state]\nstate: ${agentState}`);
+        const goalCheckContextActive = shouldShowGoalCheckContext(
+          agentState,
+          goalChecks,
+          governor,
+          impactRequired,
+        );
+        const recentRunsActive = shouldShowRecentRunsContext(
+          agentState,
+          goalChecks,
+          governor,
+          reflectionRequired,
+          impactRequired,
+        );
+        sysExtras.push(`[Agent state]
+state: ${agentState}`);
         if (projectScan && String(projectScan.context_text || "").trim()) {
-          sysExtras.push(String(projectScan.context_text).trim());
+          const fullProject = String(projectScan.context_text).trim();
+          sysExtras.push(renderCachedPrompt("project", fullProject, buildProjectContextCompactPrompt() || fullProject));
         }
-        sysExtras.push(buildInstructionResolverPrompt(instructionResolver, activePlan, governorContract));
-        sysExtras.push(buildTaskContractPrompt(taskContract, activePlan, governorContract));
+        {
+          const fullResolver = buildInstructionResolverPrompt(instructionResolver, activePlan, governorContract);
+          sysExtras.push(renderCachedPrompt("resolver", fullResolver, buildInstructionResolverCompactPrompt()));
+        }
+        {
+          const fullTask = buildTaskContractPrompt(taskContract, activePlan, governorContract);
+          sysExtras.push(renderCachedPrompt("task", fullTask, buildTaskContractCompactPrompt()));
+        }
         const assumptionPrompt = buildAssumptionLedgerPrompt(assumptionLedger);
-        if (assumptionPrompt) sysExtras.push(assumptionPrompt);
+        if (assumptionPrompt) {
+          sysExtras.push(renderCachedPrompt("assumption", assumptionPrompt, buildAssumptionLedgerCompactPrompt() || assumptionPrompt));
+        }
         if (reflectionRequired) {
           sysExtras.push(buildReflectionPrompt(
             reflectionRequired,
@@ -6858,18 +7561,22 @@
         if (impactRequired) {
           sysExtras.push(buildImpactPrompt(impactRequired, activePlan));
         }
-        if (activePlan && Array.isArray(activePlan.acceptanceCriteria) && activePlan.acceptanceCriteria.length) {
-          const planLines = ["[Current acceptance criteria]"];
+        if (goalCheckContextActive && activePlan && Array.isArray(activePlan.acceptanceCriteria) && activePlan.acceptanceCriteria.length) {
+          const fullAcceptance = ["[Current acceptance criteria]"];
           activePlan.acceptanceCriteria.forEach((criterion, idx) => {
-            planLines.push(`- acceptance ${idx + 1}: ${criterion}`);
+            fullAcceptance.push(`- acceptance ${idx + 1}: ${criterion}`);
           });
-          sysExtras.push(planLines.join("\n"));
+          const fullText = fullAcceptance.join("\n");
+          sysExtras.push(renderCachedPrompt("acceptance", fullText, buildAcceptanceCompactPrompt() || fullText));
         }
-        if (knownGoodVerificationCommands.length) {
-          sysExtras.push(["[Known-good verification commands]", ...knownGoodVerificationCommands.map((cmd) => `- ${cmd}`)].join("\n"));
+        if (goalCheckContextActive && knownGoodVerificationCommands.length) {
+          const fullKnown = ["[Known-good verification commands]", ...knownGoodVerificationCommands.map((cmd) => `- ${cmd}`)].join("\n");
+          sysExtras.push(renderCachedPrompt("knownVerify", fullKnown, buildKnownVerificationCompactPrompt() || fullKnown));
         }
         const recentTxt = formatRecentRuns();
-        if (recentTxt) sysExtras.push(recentTxt);
+        if (recentRunsActive && recentTxt) {
+          sysExtras.push(renderCachedPrompt("recentRuns", recentTxt, buildRecentRunsCompactPrompt() || recentTxt));
+        }
         if (govHint) sysExtras.push("[Governor]\n" + govHint);
         messages[0] = {
           role: "system",
@@ -6922,7 +7629,7 @@
           syncAssumptionLedgerToPlan(assumptionLedger, activePlan);
           refreshAssumptionConfirmations(
             assumptionLedger,
-            collectObservationEvidence(messages),
+            observationEvidence,
             knownGoodVerificationCommands,
           );
         }
@@ -7015,7 +7722,7 @@
             }
             refreshAssumptionConfirmations(
               assumptionLedger,
-              collectObservationEvidence(messages),
+              observationEvidence,
               knownGoodVerificationCommands,
             );
             if (reflect.strategyChange === "abandon") {
@@ -7106,7 +7813,7 @@
           }
 
           if (mutationToolRequiresEvidence(actualToolName)) {
-            const observations = collectObservationEvidence(messages);
+            const observations = observationEvidence;
             const evidenceBlock = parseEvidenceBlock(asstText, governorContract);
             if (!evidenceBlock) {
               const block = buildEvidenceGatePrompt(
@@ -7389,7 +8096,13 @@
               }
               flush();
 
-              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              messages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: /^OK \(exit_code: 0\)/.test(String(toolResult || ""))
+                  ? compactSuccessToolResultForHistory("exec", toolResult)
+                  : toolResult,
+              });
               continue;
             }
 
@@ -7490,7 +8203,11 @@
                 fileToolConsecutiveFailures = 0;
                 requireImpact(`write_file succeeded: ${path0 || fullPath}`);
                 pushRecentRun({ kind: "write_file", status: "OK", path: path0 || fullPath, note: `bytes=${wr && wr.bytes_written != null ? wr.bytes_written : content.length}` });
-                messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+                messages.push({
+                  role: "tool",
+                  tool_call_id: tc.id,
+                  content: compactSuccessToolResultForHistory("write_file", toolResult),
+                });
               } catch (e2) {
                 toolResult = `error: ${prettyErr(e2)}`;
                 pushRecentRun({ kind: "write_file", status: "FAIL", ok: false, path: path0 || "(missing)", note: clip(prettyErr(e2), 120) });
@@ -7519,11 +8236,20 @@
                 const res = await postJson("/api/read_file", { path: fullPath }, ac.signal);
                 const raw = res && res.content ? res.content : `ERROR: empty response`;
                 toolResult = rewriteToolPath(raw, fullPath, path0);
-                if (res && res.content) fileReadSet.add(fullPath);
+                if (res && res.content) {
+                  fileReadSet.add(fullPath);
+                  rememberObservationRead(`read_file(path=${path0})`, path0 || parseReadFileResultPath(toolResult));
+                }
               } catch (e2) {
                 toolResult = `ERROR reading '${path0}': ${prettyErr(e2)}`;
               }
-              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              messages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: /^ERROR /.test(String(toolResult || ""))
+                  ? toolResult
+                  : compactSuccessToolResultForHistory("read_file", toolResult),
+              });
               flush();
               continue;
             }
@@ -7550,7 +8276,13 @@
               } catch (e2) {
                 toolResult = `ERROR listing '${shown}': ${prettyErr(e2)}`;
               }
-              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              messages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: /^ERROR /.test(String(toolResult || ""))
+                  ? toolResult
+                  : compactSuccessToolResultForHistory("list_dir", toolResult),
+              });
               flush();
               continue;
             }
@@ -7582,7 +8314,13 @@
                 );
                 pushRecentRun({ kind: "patch_file", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) });
               }
-              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              messages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: /^ERROR /.test(String(toolResult || ""))
+                  ? toolResult
+                  : compactSuccessToolResultForHistory("patch_file", toolResult),
+              });
               flush();
               continue;
             }
@@ -7602,10 +8340,22 @@
                 const dir = joinUnderCwd(dir0);
                 const res = await postJson("/api/search_files", { pattern, dir, case_insensitive: ci }, ac.signal);
                 toolResult = res && res.output ? res.output : `[search_files] No matches for '${pattern}'`;
+                rememberObservationSearch(
+                  `search_files(pattern=${pattern}, dir=${shown})`,
+                  pattern,
+                  parseSearchHitCount(toolResult),
+                  parseSearchResultPaths(toolResult),
+                );
               } catch (e2) {
                 toolResult = `ERROR searching '${pattern}': ${prettyErr(e2)}`;
               }
-              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              messages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: /^ERROR /.test(String(toolResult || ""))
+                  ? toolResult
+                  : compactSuccessToolResultForHistory("search_files", toolResult),
+              });
               flush();
               continue;
             }
@@ -7638,7 +8388,13 @@
                 );
                 pushRecentRun({ kind: "apply_diff", status: "FAIL", ok: false, path: path0, note: clip(prettyErr(e2), 120) });
               }
-              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              messages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: /^ERROR /.test(String(toolResult || ""))
+                  ? toolResult
+                  : compactSuccessToolResultForHistory("apply_diff", toolResult),
+              });
               flush();
               continue;
             }
@@ -7660,7 +8416,13 @@
               } catch (e2) {
                 toolResult = `ERROR glob '${pattern}': ${prettyErr(e2)}`;
               }
-              messages.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+              messages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: /^ERROR /.test(String(toolResult || ""))
+                  ? toolResult
+                  : compactSuccessToolResultForHistory("glob", toolResult),
+              });
               flush();
               continue;
             }

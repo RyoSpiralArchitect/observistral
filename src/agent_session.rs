@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -11,6 +12,26 @@ pub struct LastReflectionSummary {
     pub wrong_assumption: Option<String>,
     pub strategy_change: Option<String>,
     pub next_minimal_action: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct ObservationReadCache {
+    pub command: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct ObservationSearchCache {
+    pub command: String,
+    pub pattern: String,
+    pub hit_count: usize,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct ObservationCache {
+    pub reads: Vec<ObservationReadCache>,
+    pub searches: Vec<ObservationSearchCache>,
 }
 
 fn extract_tag_block<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
@@ -109,6 +130,9 @@ pub struct AgentSession {
     #[serde(default)]
     pub recent_reflections: Vec<LastReflectionSummary>,
 
+    #[serde(default)]
+    pub observation_cache: Option<ObservationCache>,
+
     /// OpenAI-compatible message array (includes tool_calls + tool_call_id).
     pub messages: Vec<serde_json::Value>,
 }
@@ -121,6 +145,7 @@ impl AgentSession {
         tool_root: Option<String>,
         checkpoint: Option<String>,
         cur_cwd: Option<String>,
+        observation_cache: Option<ObservationCache>,
         messages: Vec<serde_json::Value>,
     ) -> Self {
         let now = now_ms();
@@ -135,6 +160,7 @@ impl AgentSession {
             cur_cwd,
             last_reflection,
             recent_reflections,
+            observation_cache,
             messages,
         }
     }
@@ -310,6 +336,7 @@ struct SaveKey {
     messages_len: usize,
     checkpoint: Option<String>,
     cur_cwd: Option<String>,
+    observation_cache_hash: u64,
 }
 
 #[derive(Serialize)]
@@ -322,6 +349,7 @@ struct AgentSessionSnapshot<'a> {
     cur_cwd: Option<&'a str>,
     last_reflection: Option<LastReflectionSummary>,
     recent_reflections: Vec<LastReflectionSummary>,
+    observation_cache: Option<&'a ObservationCache>,
     messages: &'a [serde_json::Value],
 }
 
@@ -332,6 +360,7 @@ struct AgentSessionSnapshot<'a> {
 pub struct SessionAutoSaver {
     path: PathBuf,
     created_at_ms: u128,
+    observation_cache: Mutex<Option<ObservationCache>>,
     last_saved: Mutex<SaveKey>,
     warned: AtomicBool,
 }
@@ -342,9 +371,18 @@ impl SessionAutoSaver {
         Self {
             path,
             created_at_ms,
+            observation_cache: Mutex::new(existing.and_then(|s| s.observation_cache.clone())),
             last_saved: Mutex::new(SaveKey::default()),
             warned: AtomicBool::new(false),
         }
+    }
+
+    pub fn set_observation_cache(&self, cache: Option<ObservationCache>) {
+        let mut slot = self
+            .observation_cache
+            .lock()
+            .expect("SessionAutoSaver observation_cache poisoned");
+        *slot = cache;
     }
 
     pub fn save_or_error(
@@ -386,10 +424,18 @@ impl SessionAutoSaver {
         messages: &[serde_json::Value],
         skip_if_unchanged: bool,
     ) -> Result<bool> {
+        let observation_cache = self
+            .observation_cache
+            .lock()
+            .expect("SessionAutoSaver observation_cache poisoned")
+            .clone();
+        let mut observation_hasher = std::collections::hash_map::DefaultHasher::new();
+        observation_cache.hash(&mut observation_hasher);
         let key = SaveKey {
             messages_len: messages.len(),
             checkpoint: checkpoint.map(|s| s.to_string()),
             cur_cwd: cur_cwd.map(|s| s.to_string()),
+            observation_cache_hash: observation_hasher.finish(),
         };
         {
             let last = self
@@ -415,6 +461,7 @@ impl SessionAutoSaver {
             cur_cwd,
             last_reflection: last_reflection_summary_from_messages(messages),
             recent_reflections: recent_reflection_summaries_from_messages(messages, 3),
+            observation_cache: observation_cache.as_ref(),
             messages,
         };
         let json = serde_json::to_string_pretty(&snap).context("failed to serialize session")?;
@@ -460,11 +507,81 @@ mod tests {
             None,
             None,
             None,
+            None,
             vec![json!({"role":"user","content":"hi"})],
         );
         AgentSession::save_atomic(&path, &sess).expect("save_atomic");
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("\"messages\""));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn session_roundtrip_preserves_observation_cache() {
+        let path = unique_path("obstral-session-obs", "json");
+        let sess = AgentSession::new(
+            Some("/tmp/demo".to_string()),
+            Some("abc123".to_string()),
+            Some("src".to_string()),
+            Some(ObservationCache {
+                reads: vec![ObservationReadCache {
+                    command: "read_file(path=src/main.rs)".to_string(),
+                    path: "src/main.rs".to_string(),
+                }],
+                searches: vec![ObservationSearchCache {
+                    command: "search_files(pattern=reflect, dir=src)".to_string(),
+                    pattern: "reflect".to_string(),
+                    hit_count: 3,
+                    paths: vec!["src/tui/agent.rs".to_string()],
+                }],
+            }),
+            vec![json!({"role":"user","content":"hi"})],
+        );
+        AgentSession::save_atomic(&path, &sess).expect("save_atomic");
+        let loaded = AgentSession::load(&path).expect("load");
+        assert_eq!(
+            loaded
+                .observation_cache
+                .as_ref()
+                .and_then(|cache| cache.reads.first())
+                .map(|read| read.path.as_str()),
+            Some("src/main.rs")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn autosaver_rewrites_when_observation_cache_changes() {
+        let path = unique_path("obstral-session-autosave", "json");
+        let existing = AgentSession::new(
+            None,
+            None,
+            None,
+            Some(ObservationCache::default()),
+            vec![json!({"role":"user","content":"hi"})],
+        );
+        let saver = SessionAutoSaver::new(path.clone(), Some(&existing));
+        saver
+            .save_or_error(None, None, None, &existing.messages)
+            .expect("save first");
+        saver.set_observation_cache(Some(ObservationCache {
+            reads: vec![ObservationReadCache {
+                command: "read_file(path=README.md)".to_string(),
+                path: "README.md".to_string(),
+            }],
+            searches: Vec::new(),
+        }));
+        assert!(saver
+            .save_best_effort(None, None, None, &existing.messages)
+            .is_none());
+        let loaded = AgentSession::load(&path).expect("load");
+        assert_eq!(
+            loaded
+                .observation_cache
+                .as_ref()
+                .map(|cache| cache.reads.len()),
+            Some(1)
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

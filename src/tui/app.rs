@@ -212,6 +212,11 @@ pub struct App {
     /// True while the current Observer response is a `/meta-diagnose` run.
     /// Used to suppress auto-fix / loop-rewrite behaviors on diagnostic JSON.
     pub observer_meta_mode: bool,
+    /// True while the current Observer response is a next-action assist run.
+    /// Used to suppress auto-fix so suggestions are not fed back as critiques.
+    pub observer_next_action_mode: bool,
+    /// Dedup key for auto-triggered next-action assists.
+    pub last_auto_next_action_sig: Option<String>,
 
     /// Background task planning state (Chat -> TaskRouter -> Tasks tab).
     pub planning_tasks: bool,
@@ -273,6 +278,8 @@ impl App {
             observer_lang_retry_budget: 0,
             observer_lang_pending: None,
             observer_meta_mode: false,
+            observer_next_action_mode: false,
+            last_auto_next_action_sig: None,
             planning_tasks: false,
             tasks: Vec::new(),
             tasks_cursor: 0,

@@ -1516,6 +1516,48 @@ pre[class*="language-"] {
   padding: 4px 0;
 }
 
+.next-action-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 0;
+}
+
+.next-action-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.next-action-pill {
+  color: #93c5fd;
+  border-color: rgba(147, 197, 253, 0.45);
+  background: rgba(147, 197, 253, 0.12);
+}
+
+.next-action-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.next-action-text {
+  font-size: 13px;
+  line-height: 1.55;
+  color: rgba(255,255,255,0.92);
+}
+
+.next-action-list {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: rgba(255,255,255,0.92);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
 .meta-diag-head,
 .meta-cause-head {
   display: flex;

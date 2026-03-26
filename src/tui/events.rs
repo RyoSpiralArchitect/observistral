@@ -760,6 +760,7 @@ pub async fn run_event_loop(
             AppEvent::TaskPlanError(e) => handle_task_plan_error(e, app),
             AppEvent::Tick => {
                 app.tick_count = app.tick_count.wrapping_add(1);
+                maybe_auto_next_action_assist(app, &observer_tx).await;
                 maybe_auto_observe(app, &observer_tx).await;
                 maybe_observer_lang_retry(app, &observer_tx).await;
                 maybe_observer_loop_retry(app, &observer_tx).await;
@@ -961,6 +962,7 @@ async fn handle_key(
                     handle.abort();
                 }
                 app.observer_meta_mode = false;
+                app.observer_next_action_mode = false;
                 app.ignore_observer_tokens = true;
                 app.observer.finish_stream();
                 app.observer.push_tool("(ストリーミング停止)".to_string());
@@ -1115,6 +1117,11 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
                 app.observer_meta_mode = false;
                 return;
             }
+            let next_action_mode = app.observer_next_action_mode;
+            if next_action_mode {
+                app.observer_next_action_mode = false;
+                return;
+            }
             // A — auto-fix pipeline: queue the review text for Coder on next Tick.
             if app.auto_fix_mode && !app.coder.streaming {
                 if let Some(review) = app
@@ -1196,6 +1203,7 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
         }
         StreamToken::Error(e) => {
             app.observer_meta_mode = false;
+            app.observer_next_action_mode = false;
             app.observer.push_tool(format!("ERROR: {e}"));
             app.observer.finish_stream();
         }
@@ -1605,6 +1613,7 @@ fn meta_failure_like(text: &str) -> bool {
         || s.contains("exception")
         || s.contains("rejected by user")
         || s.contains("sandbox breach")
+        || s.contains("governor block")
         || s.contains("missing valid <plan>")
         || s.contains("missing <think>")
         || s.contains("[goal_check]")
@@ -1903,6 +1912,51 @@ failure packet:\n\
     )
 }
 
+fn build_tui_next_action_prompt(
+    packet: &serde_json::Value,
+    lang: &str,
+    reason_hint: &str,
+) -> String {
+    let lang_name = match lang {
+        "fr" => "French",
+        "en" => "English",
+        _ => "Japanese",
+    };
+    let reason = reason_hint.trim();
+    format!(
+        "This is intervention mode, not critique.\n\
+Tool calls, code changes, and diff application are forbidden.\n\
+Your task is to help the Coder take the next concrete step only.\n\
+Write explanations in {lang_name}. Keep the section headers below in English exactly as written.\n\n\
+Required output format:\n\
+--- blocker ---\n\
+<1-2 sentences>\n\
+--- next_actions ---\n\
+1. <best next concrete action>\n\
+2. <backup action>\n\
+3. <last resort action>\n\
+--- quickest_check ---\n\
+<one command, file, or symbol to inspect first>\n\
+--- why_this_first ---\n\
+<one sentence>\n\
+--- fallback ---\n\
+<one sentence if the first action fails>\n\n\
+Rules:\n\
+- Prefer small, local, reversible actions.\n\
+- Mention exact files, commands, or symbols when possible.\n\
+- If the blocker is repo code, say so directly.\n\
+- If the blocker is instruction/harness/tooling, say so directly.\n\
+- Do not broaden into a full review.\n\
+- If evidence is weak, make quickest_check purely diagnostic.\n\n\
+reason_hint: {reason}\n\
+stuck packet:\n\
+<packet>\n\
+{}\n\
+</packet>",
+        serde_json::to_string_pretty(packet).unwrap_or_else(|_| "{}".to_string())
+    )
+}
+
 async fn send_meta_diagnose(app: &mut App, tx: &mpsc::Sender<StreamToken>, selector: &str) {
     app.right_tab = RightTab::Observer;
     app.observer.scroll = 0;
@@ -2052,12 +2106,159 @@ async fn send_meta_diagnose(app: &mut App, tx: &mpsc::Sender<StreamToken>, selec
     app.observer_task = Some(handle);
 }
 
+fn latest_tui_next_action_target(app: &App) -> Option<(usize, String)> {
+    let (idx, msg) = app.coder.messages.iter().enumerate().rev().find(|(_, m)| {
+        matches!(m.role, Role::Assistant) && m.complete && !m.content.trim().is_empty()
+    })?;
+    if !meta_failure_like(&msg.content) {
+        return None;
+    }
+    let failure_kind = meta_failure_kind(&msg.content);
+    let reason = if let Some(governor) = app.coder_governor.as_ref() {
+        let stage = governor
+            .recovery_stage
+            .clone()
+            .unwrap_or_else(|| "diagnose".to_string());
+        format!(
+            "{failure_kind}; recovery_stage={stage}; same_error_repeats={}; same_command_repeats={}",
+            governor.same_error_repeats, governor.same_command_repeats
+        )
+    } else {
+        failure_kind.to_string()
+    };
+    Some((idx, reason))
+}
+
+async fn send_next_action_assist(
+    app: &mut App,
+    tx: &mpsc::Sender<StreamToken>,
+    selector: &str,
+    reason_hint: &str,
+) {
+    app.right_tab = RightTab::Observer;
+    app.observer.scroll = 0;
+    let packet = match build_tui_meta_failure_packet_for_selector(app, selector) {
+        Ok(packet) => packet,
+        Err(msg) => {
+            app.observer.push_tool(msg);
+            return;
+        }
+    };
+    let target_id = packet
+        .get("target_message_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("coder");
+    let failure_kind = packet
+        .get("failure_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unclear");
+    let prompt = build_tui_next_action_prompt(&packet, app.lang.as_str(), reason_hint);
+    let label = format!("[NEXT-ACTION] target={target_id} kind={failure_kind}");
+
+    if let Some(handle) = app.observer_task.take() {
+        handle.abort();
+    }
+
+    app.observer_meta_mode = false;
+    app.observer_next_action_mode = true;
+    app.ignore_observer_tokens = false;
+    app.observer_loop_retry_budget = 0;
+    app.observer_loop_pending = None;
+    app.observer_lang_retry_budget = 1;
+    app.observer_lang_pending = None;
+    app.observer.push_user(label);
+    app.observer.streaming = true;
+    app.observer
+        .messages
+        .push(Message::new_streaming(Role::Assistant));
+
+    let cfg = {
+        let mut cfg = app.observer_cfg.clone();
+        cfg.temperature = 0.2;
+        cfg.max_tokens = cfg.max_tokens.min(1200);
+        cfg
+    };
+    let tx = tx.clone();
+    let lang = app.lang.clone();
+    let handle = tokio::spawn(async move {
+        use crate::config::ProviderKind;
+        use crate::streaming::{stream_anthropic, stream_openai_compat};
+        let client = reqwest::Client::new();
+        let system = format!(
+            "You are Observer in next-action assist mode.\n\
+Do not perform a broad critique.\n\
+Focus only on the next concrete step.\n\n\
+[Language]\n{}",
+            language_instruction(Some(&lang), &cfg.mode)
+        );
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: system,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: prompt,
+            },
+        ];
+        let result = match cfg.provider {
+            ProviderKind::Anthropic => stream_anthropic(&client, &cfg, &messages, tx.clone()).await,
+            ProviderKind::Hf => {
+                let provider = providers::build_provider(client.clone(), &cfg);
+                let req = ChatRequest {
+                    messages: messages.clone(),
+                    temperature: Some(0.2),
+                    max_tokens: Some(cfg.max_tokens),
+                    metadata: None,
+                };
+                match provider.chat(&req).await {
+                    Ok(resp) => {
+                        fake_stream_text(&tx, &resp.content).await;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            _ => stream_openai_compat(&client, &cfg, &messages, None, tx.clone()).await,
+        };
+        if let Err(e) = result {
+            let prefix = match lang.as_str() {
+                "fr" => "Observer next-action failed",
+                "en" => "Observer next-action failed",
+                _ => "Observer next-action failed",
+            };
+            let _ = tx.send(StreamToken::Error(format!("{prefix}: {e}"))).await;
+        }
+    });
+    app.observer_task = Some(handle);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ProviderKind, RunConfig};
+    use crate::modes::Mode;
 
     fn msg(role: Role, content: &str) -> Message {
         Message::new_complete(role, content.to_string())
+    }
+
+    fn test_cfg(mode: Mode) -> RunConfig {
+        RunConfig {
+            provider: ProviderKind::OpenAiCompatible,
+            model: "test-model".to_string(),
+            chat_model: "test-model".to_string(),
+            code_model: "test-model".to_string(),
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            mode,
+            persona: "default".to_string(),
+            temperature: 0.2,
+            max_tokens: 1024,
+            timeout_seconds: 30,
+            hf_device: "cpu".to_string(),
+            hf_local_only: false,
+        }
     }
 
     #[test]
@@ -2091,6 +2292,46 @@ mod tests {
             2
         );
         assert!(resolve_tui_meta_target(&messages, "msg:coder-1").is_err());
+    }
+
+    #[test]
+    fn latest_next_action_target_picks_recent_failure() {
+        let mut app = App::new(
+            test_cfg(Mode::Jikkyo),
+            test_cfg(Mode::Observer),
+            test_cfg(Mode::Chat),
+            None,
+            None,
+            false,
+            "en".to_string(),
+            None,
+        );
+        app.coder.messages = vec![
+            msg(Role::Assistant, "all good"),
+            msg(Role::Assistant, "[GOVERNOR BLOCK]\nMissing <think>"),
+        ];
+        let target = latest_tui_next_action_target(&app).expect("should detect stuck message");
+        assert_eq!(target.0, 1);
+        assert!(target.1.contains("tool_error"));
+    }
+
+    #[test]
+    fn latest_next_action_target_ignores_non_failure_tail() {
+        let mut app = App::new(
+            test_cfg(Mode::Jikkyo),
+            test_cfg(Mode::Observer),
+            test_cfg(Mode::Chat),
+            None,
+            None,
+            false,
+            "en".to_string(),
+            None,
+        );
+        app.coder.messages = vec![
+            msg(Role::Assistant, "[error] failed once"),
+            msg(Role::Assistant, "done"),
+        ];
+        assert!(latest_tui_next_action_target(&app).is_none());
     }
 }
 
@@ -2129,6 +2370,7 @@ async fn send_observer_message(
     }
 
     app.observer_meta_mode = false;
+    app.observer_next_action_mode = false;
     app.observer.scroll = 0;
     app.ignore_observer_tokens = false;
     // Each new Observer send gets a single anti-loop retry budget.
@@ -2626,6 +2868,23 @@ async fn dispatch_selected_task(
         TaskTarget::Coder => send_coder_with_text(app, coder_tx, msg).await,
         TaskTarget::Observer => send_observer_message(app, observer_tx, Some(msg)).await,
     }
+}
+
+async fn maybe_auto_next_action_assist(app: &mut App, observer_tx: &mpsc::Sender<StreamToken>) {
+    if app.observer.streaming || app.coder.streaming {
+        return;
+    }
+    let Some((idx, reason_hint)) = latest_tui_next_action_target(app) else {
+        return;
+    };
+    let sig = format!("coder-{idx}:{reason_hint}");
+    if app.last_auto_next_action_sig.as_deref() == Some(sig.as_str()) {
+        return;
+    }
+    app.last_auto_next_action_sig = Some(sig);
+    app.last_auto_obs_idx = Some(idx);
+    let selector = format!("msg:coder-{idx}");
+    send_next_action_assist(app, observer_tx, &selector, &reason_hint).await;
 }
 
 async fn maybe_auto_observe(app: &mut App, observer_tx: &mpsc::Sender<StreamToken>) {
