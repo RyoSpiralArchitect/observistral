@@ -5033,7 +5033,7 @@ fn build_read_only_iteration_cap_final_answer(
     let known_commands = collect_known_acceptance_commands(messages, working_mem);
     let mut completed_rows: Vec<(usize, String)> = scores
         .iter()
-        .filter(|score| score.total >= 0.85)
+        .filter(|score| score.total >= 0.70)
         .filter_map(|score| {
             let command = score.suggested_commands.iter().find_map(|cmd| {
                 resolve_known_acceptance_command(cmd.as_str(), &known_commands)

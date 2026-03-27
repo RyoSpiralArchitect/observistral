@@ -5,6 +5,7 @@ use crate::config::RunConfig;
 use crate::streaming::{GovernorState, RealizeState};
 
 use super::agent::RealizePreset;
+use super::intent::IntentAnchor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -191,6 +192,8 @@ pub struct App {
     pub coder_realize_preset: RealizePreset,
     /// Latest realize-on-demand status snapshot for the Coder.
     pub coder_realize_state: Option<RealizeState>,
+    /// Latest normalized user intent anchor for the Coder.
+    pub coder_intent_anchor: Option<IntentAnchor>,
 
     /// Running task handles used for Ctrl+K cancellation.
     pub coder_task: Option<JoinHandle<()>>,
@@ -274,6 +277,7 @@ impl App {
             coder_governor: None,
             coder_realize_preset: RealizePreset::tui_default(),
             coder_realize_state: None,
+            coder_intent_anchor: None,
             coder_task: None,
             observer_task: None,
             chat_task: None,

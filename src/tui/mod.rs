@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod app;
 pub mod events;
+pub mod intent;
 pub mod prefs;
 pub mod ui;
 

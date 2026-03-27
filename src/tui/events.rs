@@ -19,6 +19,7 @@ use crate::types::{ChatMessage, ChatRequest};
 
 use super::agent;
 use super::app::{App, Focus, Message, RightTab, Role, Task, TaskPhase, TaskTarget};
+use super::intent;
 use super::prefs;
 
 // ── Clipboard ─────────────────────────────────────────────────────────────────
@@ -1660,6 +1661,21 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
             .map(|p| p.to_string_lossy().into_owned())
     });
 
+    let intent_update = intent::normalize_intent_update(&text, app.coder_intent_anchor.as_ref());
+    let intent_anchor =
+        intent::apply_intent_update(app.coder_intent_anchor.as_ref(), intent_update, &text);
+    let intent_anchor_message = intent::render_intent_anchor(&intent_anchor);
+    if intent_anchor.requires_human_confirmation {
+        app.coder.push_tool(
+            "[intent] ambiguous update detected; keeping current scope until clarified."
+                .to_string(),
+        );
+    } else if intent_anchor.last_update_no_op {
+        app.coder
+            .push_tool("[intent] continue update preserved current scope.".to_string());
+    }
+    app.coder_intent_anchor = Some(intent_anchor.clone());
+
     // Expand @file references: read files and collect system messages to inject.
     let at_refs = parse_at_refs(&text);
     let mut at_ref_messages: Vec<ChatMessage> = Vec::new();
@@ -1701,6 +1717,10 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
         role: "system".to_string(),
         content: system,
     }];
+    messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: intent_anchor_message,
+    });
     let hist_len = history.len();
     for m in history.iter().take(hist_len.saturating_sub(1)) {
         messages.push(m.clone());
