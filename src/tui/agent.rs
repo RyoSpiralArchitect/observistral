@@ -5693,6 +5693,11 @@ fn parse_tag_fields(body: &str) -> Vec<(String, String)> {
         return nested;
     }
 
+    let bracketed = parse_bracket_quoted_fields(body);
+    if !bracketed.is_empty() {
+        return bracketed;
+    }
+
     let mut out: Vec<(String, String)> = Vec::new();
     let mut current_key: Option<String> = None;
     let mut current_value = String::new();
@@ -5718,6 +5723,104 @@ fn parse_tag_fields(body: &str) -> Vec<(String, String)> {
 
     if let Some(key) = current_key {
         out.push((key, current_value.trim().to_string()));
+    }
+
+    out
+}
+
+fn canonical_loose_tag_key(raw_key: &str) -> Option<String> {
+    const FIELDS: &[&str] = &[
+        "next_minimal_action",
+        "wrong_assumption",
+        "strategy_change",
+        "acceptance",
+        "assumptions",
+        "last_outcome",
+        "remaining_gap",
+        "goal_delta",
+        "progress",
+        "changed",
+        "verify",
+        "reason",
+        "steps",
+        "risks",
+        "doubt",
+        "goal",
+        "step",
+        "tool",
+        "risk",
+        "next",
+    ];
+
+    let key = raw_key.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+    for field in FIELDS {
+        if key == *field || key.ends_with(field) {
+            return Some((*field).to_string());
+        }
+    }
+    None
+}
+
+fn parse_bracket_quoted_fields(body: &str) -> Vec<(String, String)> {
+    let normalized = body.replace("\r\n", "\n").replace('\n', " ");
+    let chars: Vec<char> = normalized.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        while i < chars.len() && !(chars[i].is_ascii_alphabetic() || chars[i] == '_') {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let start = i;
+        while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        let raw_key: String = chars[start..i].iter().collect();
+        let Some(key) = canonical_loose_tag_key(&raw_key) else {
+            continue;
+        };
+
+        while i < chars.len() && chars[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 >= chars.len() || chars[i] != '[' || chars[i + 1] != '"' {
+            continue;
+        }
+        i += 2;
+
+        let mut value = String::new();
+        let mut escaped = false;
+        while i < chars.len() {
+            let ch = chars[i];
+            if escaped {
+                value.push(ch);
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if ch == '"' && i + 1 < chars.len() && chars[i + 1] == ']' {
+                i += 2;
+                break;
+            }
+            value.push(ch);
+            i += 1;
+        }
+
+        let value = compact_one_line(value.trim(), 300);
+        if !value.is_empty() {
+            out.push((key, value));
+        }
     }
 
     out
@@ -13221,6 +13324,16 @@ remaining_gap: still need to run cargo test\n\
         );
         assert!(hint.contains("think` is not a real tool call"));
         assert!(hint.contains("search_files(pattern=\"/realize\", dir=\"src\")"));
+    }
+
+    #[test]
+    fn parse_think_block_accepts_bracketed_mistral_fields() {
+        let text = "<think>\ntruegoal[\"confirm /realize handler context\"]step[\"2: inspect matching file\"]tool[\"read_file\"]risk[\"false positive match\"]doubt[\"handler may be elsewhere\"]next[\"read src/tui/events.rs\"]verify[\"see the match arm\"]</think>";
+        let think = parse_think_block(text).expect("think block");
+        assert_eq!(think.goal, "confirm /realize handler context");
+        assert_eq!(think.step, 2);
+        assert_eq!(think.tool, "read_file");
+        assert_eq!(think.next, "read src/tui/events.rs");
     }
 
     #[test]
