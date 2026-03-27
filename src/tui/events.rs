@@ -139,13 +139,8 @@ fn pane_label(pane: PaneId) -> &'static str {
     }
 }
 
-fn api_key_env_hint(provider: &crate::config::ProviderKind) -> &'static str {
-    match provider {
-        crate::config::ProviderKind::OpenAiCompatible => "OBS_API_KEY or OPENAI_API_KEY",
-        crate::config::ProviderKind::Mistral => "MISTRAL_API_KEY or OBS_API_KEY",
-        crate::config::ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
-        crate::config::ProviderKind::Hf => "(none; hf/local does not use an API key)",
-    }
+fn api_key_env_hint(cfg: &crate::config::RunConfig) -> &'static str {
+    crate::config::provider_preset_for_run(cfg).api_key_env_hint()
 }
 
 fn pane_key_status(label: &str, cfg: &crate::config::RunConfig) -> String {
@@ -159,12 +154,13 @@ fn pane_key_status(label: &str, cfg: &crate::config::RunConfig) -> String {
     } else {
         "not-needed"
     };
+    let preset = crate::config::provider_preset_for_run(cfg);
     format!(
         "- {label}: provider={}  model={}  key={}  env={}",
-        cfg.provider,
+        preset.label(),
         cfg.model,
         key_state,
-        api_key_env_hint(&cfg.provider)
+        api_key_env_hint(cfg)
     )
 }
 
@@ -227,14 +223,11 @@ fn active_inline_picker(app: &App, pane: PaneId) -> Option<InlinePicker> {
 
 fn inline_picker_items(app: &App, pane: PaneId, picker: InlinePicker) -> Vec<String> {
     match picker {
-        InlinePicker::Provider => crate::config::supported_providers()
+        InlinePicker::Provider => crate::config::provider_preset_keys(pane == PaneId::Coder)
             .into_iter()
-            .filter(|name| {
-                pane != PaneId::Coder || *name == "openai-compatible" || *name == "mistral"
-            })
             .map(str::to_string)
             .collect(),
-        InlinePicker::Model => crate::config::representative_models(&pane_cfg(app, pane).provider)
+        InlinePicker::Model => crate::config::representative_models_for_run(pane_cfg(app, pane))
             .iter()
             .map(|s| s.to_string())
             .collect(),
@@ -290,17 +283,10 @@ fn apply_inline_picker(app: &mut App, pane: PaneId) -> bool {
             handled
         }
         InlinePicker::Model => {
-            let current_provider = pane_cfg(app, pane).provider.clone();
             let selected_model = items[selected].clone();
             if selected_model == "other" {
                 set_pane_input_text(app, pane, "/model ");
                 pane_mut(app, pane).picker_index = 0;
-                return true;
-            }
-            if current_provider.key().is_empty() {
-                pane_mut(app, pane).push_tool(
-                    "Select a provider first with /provider before choosing a model.".to_string(),
-                );
                 return true;
             }
             let cmd = format!("/model {selected_model}");
@@ -318,7 +304,7 @@ fn validate_pane_ready(app: &App, pane: PaneId) -> Option<String> {
         return Some(format!(
             "missing API key for {}. Run /keys and set {}.",
             pane_label(pane),
-            api_key_env_hint(&cfg.provider)
+            api_key_env_hint(cfg)
         ));
     }
     if cfg.model.trim().is_empty() {
@@ -353,7 +339,10 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
 
     match cmd_lc.as_str() {
         "/provider" => {
-            use crate::config::{supported_providers, PartialConfig, ProviderKind, RunConfig};
+            use crate::config::{
+                parse_provider_preset, provider_preset_for_run, provider_preset_keys,
+                PartialConfig, ProviderKind, ProviderPreset, RunConfig,
+            };
 
             fn partial_from_run_config(cfg: &RunConfig) -> PartialConfig {
                 PartialConfig {
@@ -374,15 +363,23 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                 }
             }
 
-            fn resolve_with_provider(
+            fn resolve_with_provider_preset(
                 cfg: &RunConfig,
-                provider: ProviderKind,
+                preset: ProviderPreset,
             ) -> anyhow::Result<RunConfig> {
                 let mut partial = partial_from_run_config(cfg);
-                partial.provider = Some(provider);
-                // Reset cross-provider fields to safe defaults + env keys.
+                partial.provider = Some(preset.provider_kind());
                 partial.api_key = None;
-                partial.base_url = Some(String::new());
+                partial.base_url = Some(
+                    preset
+                        .default_base_url()
+                        .map(str::to_string)
+                        .or_else(|| {
+                            (cfg.provider == ProviderKind::OpenAiCompatible)
+                                .then(|| cfg.base_url.clone())
+                        })
+                        .unwrap_or_default(),
+                );
                 partial.model = Some(String::new());
                 partial.chat_model = Some(String::new());
                 partial.code_model = Some(String::new());
@@ -396,32 +393,33 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
             };
 
             if arg.is_empty() {
+                let preset = provider_preset_for_run(cur);
                 push!(format!(
-                    "provider: {}  base_url: {}  model: {}  (type `/provider` then use Up/Down+Enter to pick)",
-                    cur.provider, cur.base_url, cur.model
+                    "provider: {} ({})  base_url: {}  model: {}  (type `/provider` then use Up/Down+Enter to pick)",
+                    preset.label(), preset.key(), cur.base_url, cur.model
                 ));
                 return true;
             }
 
-            let p = match arg.trim().parse::<ProviderKind>() {
-                Ok(p) => p,
-                Err(_) => {
-                    let values = supported_providers().join("|");
+            let preset = match parse_provider_preset(arg.trim()) {
+                Some(preset) => preset,
+                None => {
+                    let values = provider_preset_keys(pane == PaneId::Coder).join("|");
                     push!(format!("usage: /provider <{values}>"));
                     return true;
                 }
             };
 
-            if pane == PaneId::Coder && matches!(p, ProviderKind::Anthropic | ProviderKind::Hf) {
+            if pane == PaneId::Coder && !preset.coder_supported() {
                 push!(
-                    "Coder requires a tool-calling provider: openai-compatible or mistral. (Use Chat/Observer for anthropic/hf.)"
+                    "Coder requires a tool-calling preset: openai, gemini, anthropic-compat, or mistral. (Use Chat/Observer for anthropic/hf.)"
                         .to_string()
                 );
                 return true;
             }
 
             let cur_clone = cur.clone();
-            match resolve_with_provider(&cur_clone, p.clone()) {
+            match resolve_with_provider_preset(&cur_clone, preset) {
                 Ok(new_cfg) => {
                     match pane {
                         PaneId::Coder => app.coder_cfg = new_cfg,
@@ -430,11 +428,18 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                     }
                     match save_current_tui_prefs(app) {
                         Ok(path) => push!(format!(
-                            "{:?} provider <- {p}  [saved {}]",
+                            "{:?} provider <- {} ({})  [saved {}]",
                             pane,
+                            preset.label(),
+                            preset.key(),
                             path.display()
                         )),
-                        Err(e) => push!(format!("{:?} provider <- {p}  [save_warn: {e}]", pane)),
+                        Err(e) => push!(format!(
+                            "{:?} provider <- {} ({})  [save_warn: {e}]",
+                            pane,
+                            preset.label(),
+                            preset.key()
+                        )),
                     }
                 }
                 Err(e) => push!(format!("error: {e}")),
@@ -711,7 +716,9 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                 "- obstral tui --chat-api-key <key>".to_string(),
                 String::new(),
                 "Environment variables:".to_string(),
-                "- OpenAI-compatible: OBS_API_KEY or OPENAI_API_KEY".to_string(),
+                "- OpenAI: OPENAI_API_KEY or OBS_API_KEY".to_string(),
+                "- Google Gemini: GEMINI_API_KEY or GOOGLE_API_KEY".to_string(),
+                "- Anthropic-compatible: ANTHROPIC_API_KEY".to_string(),
                 "- Mistral: MISTRAL_API_KEY or OBS_API_KEY".to_string(),
                 "- Anthropic: ANTHROPIC_API_KEY".to_string(),
                 "- HF local: no key required".to_string(),
@@ -729,7 +736,7 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
             ) && app.coder_cfg.api_key.is_none()
             {
                 lines.push(
-                    "Note: openai-compatible can also target local OpenAI-style endpoints; those may not require a key."
+                    "Note: custom OpenAI-style local endpoints may not require a key, but hosted presets do."
                         .to_string(),
                 );
             }
@@ -947,7 +954,7 @@ test_cmd: {test_cmd}
 /lang <ja|en|fr>    set UI + prompt language\n\
 /tab <name>         switch right pane (observer|chat|tasks|next)\n\
 /keys               show API key status and setup help\n\
-/model              exact `/model` opens provider-aware model picker\n\
+/model              exact `/model` opens vendor-aware model picker\n\
 /realize <mode>     set coder latent-plan mode (off|low|mid|high)\n\
 /root <path>        set tool_root\n\
 /find <text>        filter history\n\
@@ -2574,7 +2581,7 @@ mod tests {
             chat_model: "test-model".to_string(),
             code_model: "test-model".to_string(),
             api_key: None,
-            base_url: "http://localhost".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
             mode,
             persona: "default".to_string(),
             temperature: 0.2,
@@ -2723,6 +2730,50 @@ mod tests {
         );
         let msg = validate_pane_ready(&app, PaneId::Coder).expect("missing key should block");
         assert!(msg.contains("missing API key"));
+    }
+
+    #[test]
+    fn slash_provider_accepts_gemini_preset() {
+        let mut app = App::new(
+            test_cfg(Mode::Jikkyo),
+            test_cfg(Mode::Observer),
+            test_cfg(Mode::Chat),
+            None,
+            Some(isolated_prefs_root()),
+            false,
+            "en".to_string(),
+            None,
+        );
+        assert!(handle_slash_command(
+            "/provider gemini",
+            &mut app,
+            PaneId::Coder
+        ));
+        assert_eq!(
+            app.coder_cfg.base_url,
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+    }
+
+    #[test]
+    fn slash_provider_blocks_native_anthropic_for_coder() {
+        let mut app = App::new(
+            test_cfg(Mode::Jikkyo),
+            test_cfg(Mode::Observer),
+            test_cfg(Mode::Chat),
+            None,
+            Some(isolated_prefs_root()),
+            false,
+            "en".to_string(),
+            None,
+        );
+        assert!(handle_slash_command(
+            "/provider anthropic",
+            &mut app,
+            PaneId::Coder
+        ));
+        let last = app.coder.messages.last().expect("tool message");
+        assert!(last.content.contains("tool-calling preset"));
     }
 }
 

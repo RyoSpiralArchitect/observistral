@@ -6,7 +6,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::config::{representative_models, supported_providers, ProviderKind};
+use crate::config::{
+    provider_preset_for_run, provider_preset_keys, representative_models_for_run, ProviderKind,
+    RunConfig,
+};
 
 use super::app::{App, Focus, Message, RightTab, Role, TaskPhase, TaskTarget};
 
@@ -89,14 +92,14 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let c_m = truncate_model(&app.coder_cfg.model, 20);
-    let c_p = provider_abbrev(&app.coder_cfg.provider);
+    let c_p = provider_abbrev(&app.coder_cfg);
     let c_mode = truncate_model(app.coder_cfg.mode.label(), 8);
     let (right_label, right_model, right_provider, right_mode, right_spin, tabs_badge, right_brand) =
         match app.right_tab {
             RightTab::Observer => (
                 "OBS",
                 truncate_model(&app.observer_cfg.model, 20),
-                provider_abbrev(&app.observer_cfg.provider),
+                provider_abbrev(&app.observer_cfg),
                 truncate_model(app.observer_cfg.mode.label(), 8),
                 if app.observer.streaming {
                     format!(" {}", spinner_char(app.tick_count))
@@ -109,7 +112,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             RightTab::Chat => (
                 "CHAT",
                 truncate_model(&app.chat_cfg.model, 20),
-                provider_abbrev(&app.chat_cfg.provider),
+                provider_abbrev(&app.chat_cfg),
                 truncate_model(app.chat_cfg.mode.label(), 8),
                 if app.chat.streaming {
                     format!(" {}", spinner_char(app.tick_count))
@@ -235,12 +238,15 @@ fn truncate_model(name: &str, max: usize) -> String {
     }
 }
 
-fn provider_abbrev(p: &ProviderKind) -> &'static str {
-    match p {
-        ProviderKind::OpenAiCompatible => "oai",
-        ProviderKind::Mistral => "mis",
-        ProviderKind::Anthropic => "ant",
-        ProviderKind::Hf => "hf",
+fn provider_abbrev(cfg: &RunConfig) -> &'static str {
+    match provider_preset_for_run(cfg) {
+        crate::config::ProviderPreset::OpenAi => "oai",
+        crate::config::ProviderPreset::Gemini => "gem",
+        crate::config::ProviderPreset::AnthropicCompat => "cla",
+        crate::config::ProviderPreset::OpenAiCompatibleCustom => "oac",
+        crate::config::ProviderPreset::Mistral => "mis",
+        crate::config::ProviderPreset::Anthropic => "ant",
+        crate::config::ProviderPreset::HfLocal => "hf",
     }
 }
 
@@ -337,9 +343,9 @@ fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView,
         PaneView::Chat => (&app.chat, ACCENT, "CHAT"),
     };
     let prov = match view {
-        PaneView::Coder => provider_abbrev(&app.coder_cfg.provider),
-        PaneView::Observer => provider_abbrev(&app.observer_cfg.provider),
-        PaneView::Chat => provider_abbrev(&app.chat_cfg.provider),
+        PaneView::Coder => provider_abbrev(&app.coder_cfg),
+        PaneView::Observer => provider_abbrev(&app.observer_cfg),
+        PaneView::Chat => provider_abbrev(&app.chat_cfg),
     };
     let (mode, persona) = match view {
         PaneView::Coder => (app.coder_cfg.mode.label(), app.coder_cfg.persona.as_str()),
@@ -737,8 +743,9 @@ fn render_welcome(frame: &mut Frame, area: Rect, app: &App, view: PaneView) {
         "API key: not required for hf/local"
     };
     let provider_line = format!(
-        "Provider: {}  Model: {}  Mode: {}",
-        cfg.provider,
+        "Provider: {} ({})  Model: {}  Mode: {}",
+        provider_preset_for_run(cfg).label(),
+        provider_abbrev(cfg),
         cfg.model,
         cfg.mode.label()
     );
@@ -1689,15 +1696,14 @@ fn picker_items(app: &App, kind: ActivePicker) -> Vec<String> {
     match kind {
         ActivePicker::Provider => {
             let allow_all = !matches!(app.focus, Focus::Coder);
-            supported_providers()
+            provider_preset_keys(!allow_all)
                 .into_iter()
-                .filter(|name| allow_all || *name == "openai-compatible" || *name == "mistral")
                 .map(str::to_string)
                 .collect()
         }
         ActivePicker::Model => {
             let cfg = active_run_config(app);
-            representative_models(&cfg.provider)
+            representative_models_for_run(cfg)
                 .iter()
                 .map(|s| s.to_string())
                 .collect()
@@ -1712,7 +1718,10 @@ fn render_picker_input(frame: &mut Frame, area: Rect, app: &App, kind: ActivePic
     let mut lines = Vec::new();
     let header = match kind {
         ActivePicker::Provider => "  Select provider".to_string(),
-        ActivePicker::Model => format!("  Select model for {}", active_run_config(app).provider),
+        ActivePicker::Model => format!(
+            "  Select model for {}",
+            provider_preset_for_run(active_run_config(app)).label()
+        ),
     };
     lines.push(Line::from(Span::styled(
         header,

@@ -360,7 +360,7 @@ TUI のデフォルト:
 - 右ペインは `Chat` で開く。`Ctrl+R` または `/tab observer|chat|tasks` で切り替え。
 - `/keys` で、各ペインが必要とする API キーの env var / CLI flag を確認できる。
 - composer で `/` を打つと、軽い slash command picker が出る。
-- exact `/provider` と `/model` では、`↑/↓` と `Enter` で選ぶ picker が開く。`/model` は現在の provider に応じた代表モデルと `other` を出す。
+- exact `/provider` と `/model` では、`↑/↓` と `Enter` で選ぶ picker が開く。`/provider` は `openai` / `gemini` / `anthropic-compat` / `mistral` / `anthropic` / `hf` の vendor preset を出し、`/model` は選択中 preset に応じた代表モデルと `other` を出す。
 - 必須の API キーや model が欠けているペインでは、送信は走らず警告だけ出る。
 
 **Headless Coder（CLI）**

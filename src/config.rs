@@ -54,30 +54,214 @@ pub fn supported_providers() -> Vec<&'static str> {
     vec!["openai-compatible", "mistral", "anthropic", "hf"]
 }
 
-pub fn representative_models(provider: &ProviderKind) -> &'static [&'static str] {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderPreset {
+    OpenAi,
+    Gemini,
+    AnthropicCompat,
+    OpenAiCompatibleCustom,
+    Mistral,
+    Anthropic,
+    HfLocal,
+}
+
+impl ProviderPreset {
+    pub fn key(self) -> &'static str {
+        match self {
+            ProviderPreset::OpenAi => "openai",
+            ProviderPreset::Gemini => "gemini",
+            ProviderPreset::AnthropicCompat => "anthropic-compat",
+            ProviderPreset::OpenAiCompatibleCustom => "openai-compatible",
+            ProviderPreset::Mistral => "mistral",
+            ProviderPreset::Anthropic => "anthropic",
+            ProviderPreset::HfLocal => "hf",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ProviderPreset::OpenAi => "OpenAI",
+            ProviderPreset::Gemini => "Google Gemini",
+            ProviderPreset::AnthropicCompat => "Anthropic (OpenAI-compatible)",
+            ProviderPreset::OpenAiCompatibleCustom => "OpenAI-compatible (custom)",
+            ProviderPreset::Mistral => "Mistral",
+            ProviderPreset::Anthropic => "Anthropic",
+            ProviderPreset::HfLocal => "HF local",
+        }
+    }
+
+    pub fn provider_kind(self) -> ProviderKind {
+        match self {
+            ProviderPreset::OpenAi
+            | ProviderPreset::Gemini
+            | ProviderPreset::AnthropicCompat
+            | ProviderPreset::OpenAiCompatibleCustom => ProviderKind::OpenAiCompatible,
+            ProviderPreset::Mistral => ProviderKind::Mistral,
+            ProviderPreset::Anthropic => ProviderKind::Anthropic,
+            ProviderPreset::HfLocal => ProviderKind::Hf,
+        }
+    }
+
+    pub fn default_base_url(self) -> Option<&'static str> {
+        match self {
+            ProviderPreset::OpenAi => Some("https://api.openai.com/v1"),
+            ProviderPreset::Gemini => {
+                Some("https://generativelanguage.googleapis.com/v1beta/openai")
+            }
+            ProviderPreset::AnthropicCompat => Some("https://api.anthropic.com/v1"),
+            ProviderPreset::OpenAiCompatibleCustom => None,
+            ProviderPreset::Mistral => Some("https://api.mistral.ai/v1"),
+            ProviderPreset::Anthropic => Some("https://api.anthropic.com/v1"),
+            ProviderPreset::HfLocal => Some("http://localhost"),
+        }
+    }
+
+    pub fn api_key_env_hint(self) -> &'static str {
+        match self {
+            ProviderPreset::OpenAi => "OPENAI_API_KEY or OBS_API_KEY",
+            ProviderPreset::Gemini => "GEMINI_API_KEY or GOOGLE_API_KEY",
+            ProviderPreset::AnthropicCompat | ProviderPreset::Anthropic => "ANTHROPIC_API_KEY",
+            ProviderPreset::OpenAiCompatibleCustom => {
+                "provider-specific key (or OBS_API_KEY for OpenAI-style endpoints)"
+            }
+            ProviderPreset::Mistral => "MISTRAL_API_KEY or OBS_API_KEY",
+            ProviderPreset::HfLocal => "(none; hf/local does not use an API key)",
+        }
+    }
+
+    pub fn coder_supported(self) -> bool {
+        matches!(
+            self,
+            ProviderPreset::OpenAi
+                | ProviderPreset::Gemini
+                | ProviderPreset::AnthropicCompat
+                | ProviderPreset::Mistral
+                | ProviderPreset::OpenAiCompatibleCustom
+        )
+    }
+
+    pub fn representative_models(self) -> &'static [&'static str] {
+        match self {
+            ProviderPreset::OpenAi => &[
+                "gpt-5-mini",
+                "gpt-5",
+                "gpt-4.1-mini",
+                "gpt-4.1",
+                "gpt-4o-mini",
+                "other",
+            ],
+            ProviderPreset::Gemini => &[
+                "gemini-2.5-flash",
+                "gemini-2.5-pro",
+                "gemini-2.5-flash-lite",
+                "gemini-2.0-flash",
+                "other",
+            ],
+            ProviderPreset::AnthropicCompat | ProviderPreset::Anthropic => &[
+                "claude-sonnet-4-6",
+                "claude-haiku-4-5",
+                "claude-opus-4-6",
+                "claude-sonnet-4-5",
+                "other",
+            ],
+            ProviderPreset::OpenAiCompatibleCustom => &[
+                "gpt-5-mini",
+                "gemini-2.5-flash",
+                "claude-sonnet-4-6",
+                "other",
+            ],
+            ProviderPreset::Mistral => &[
+                "devstral-small-latest",
+                "codestral-latest",
+                "devstral-medium-latest",
+                "mistral-small-latest",
+                "other",
+            ],
+            ProviderPreset::HfLocal => &["local", "other"],
+        }
+    }
+
+    pub fn default_model(self, vibe: bool) -> &'static str {
+        match self {
+            ProviderPreset::OpenAi => "gpt-5-mini",
+            ProviderPreset::Gemini => "gemini-2.5-flash",
+            ProviderPreset::AnthropicCompat | ProviderPreset::Anthropic => "claude-sonnet-4-6",
+            ProviderPreset::OpenAiCompatibleCustom => "gpt-5-mini",
+            ProviderPreset::Mistral => {
+                if vibe {
+                    "devstral-small-latest"
+                } else {
+                    "mistral-small-latest"
+                }
+            }
+            ProviderPreset::HfLocal => "local",
+        }
+    }
+}
+
+pub fn supported_provider_presets(coder_only: bool) -> Vec<ProviderPreset> {
+    [
+        ProviderPreset::OpenAi,
+        ProviderPreset::Gemini,
+        ProviderPreset::AnthropicCompat,
+        ProviderPreset::Mistral,
+        ProviderPreset::Anthropic,
+        ProviderPreset::HfLocal,
+    ]
+    .into_iter()
+    .filter(|preset| !coder_only || preset.coder_supported())
+    .collect()
+}
+
+pub fn provider_preset_keys(coder_only: bool) -> Vec<&'static str> {
+    supported_provider_presets(coder_only)
+        .into_iter()
+        .map(ProviderPreset::key)
+        .collect()
+}
+
+pub fn parse_provider_preset(s: &str) -> Option<ProviderPreset> {
+    match normalize_provider(s).as_str() {
+        "openai" => Some(ProviderPreset::OpenAi),
+        "gemini" | "google" | "google-gemini" => Some(ProviderPreset::Gemini),
+        "anthropic-compat" | "claude-compat" | "anthropic_openai" => {
+            Some(ProviderPreset::AnthropicCompat)
+        }
+        "openai-compatible" | "openai-compat" | "openai_compat" => {
+            Some(ProviderPreset::OpenAiCompatibleCustom)
+        }
+        "mistral" => Some(ProviderPreset::Mistral),
+        "anthropic" | "claude" => Some(ProviderPreset::Anthropic),
+        "hf" | "huggingface" | "hf-local" => Some(ProviderPreset::HfLocal),
+        _ => None,
+    }
+}
+
+pub fn provider_preset_for_run(cfg: &RunConfig) -> ProviderPreset {
+    detect_provider_preset(&cfg.provider, &cfg.base_url)
+}
+
+pub fn representative_models_for_run(cfg: &RunConfig) -> &'static [&'static str] {
+    provider_preset_for_run(cfg).representative_models()
+}
+
+fn detect_provider_preset(provider: &ProviderKind, base_url: &str) -> ProviderPreset {
     match provider {
-        ProviderKind::OpenAiCompatible => &[
-            "gpt-4o-mini",
-            "gpt-4.1-mini",
-            "gpt-4.1",
-            "gpt-5-mini",
-            "other",
-        ],
-        ProviderKind::Mistral => &[
-            "mistral-small-latest",
-            "codestral-latest",
-            "mistral-medium-latest",
-            "ministral-8b-latest",
-            "other",
-        ],
-        ProviderKind::Anthropic => &[
-            "claude-3-5-sonnet-latest",
-            "claude-3-5-haiku-latest",
-            "claude-3-7-sonnet-latest",
-            "claude-3-opus-latest",
-            "other",
-        ],
-        ProviderKind::Hf => &["local", "other"],
+        ProviderKind::Mistral => ProviderPreset::Mistral,
+        ProviderKind::Anthropic => ProviderPreset::Anthropic,
+        ProviderKind::Hf => ProviderPreset::HfLocal,
+        ProviderKind::OpenAiCompatible => {
+            let base = base_url.trim().to_ascii_lowercase();
+            if base.contains("generativelanguage.googleapis.com") {
+                ProviderPreset::Gemini
+            } else if base.contains("anthropic.com") {
+                ProviderPreset::AnthropicCompat
+            } else if base.contains("api.openai.com") {
+                ProviderPreset::OpenAi
+            } else {
+                ProviderPreset::OpenAiCompatibleCustom
+            }
+        }
     }
 }
 
@@ -187,6 +371,9 @@ impl PartialConfig {
             ProviderKind::Mistral
         } else if env_trimmed("ANTHROPIC_API_KEY").is_some() {
             ProviderKind::Anthropic
+        } else if env_trimmed("GEMINI_API_KEY").is_some() || env_trimmed("GOOGLE_API_KEY").is_some()
+        {
+            ProviderKind::OpenAiCompatible
         } else if env_trimmed("OPENAI_API_KEY").is_some() || env_trimmed("OBS_API_KEY").is_some() {
             ProviderKind::OpenAiCompatible
         } else {
@@ -199,13 +386,20 @@ impl PartialConfig {
             self.mode.unwrap_or(Mode::Kabeuchi)
         };
 
+        let base_url = match self.base_url {
+            Some(u) if !u.trim().is_empty() => u,
+            _ => default_base_url(&provider).to_string(),
+        };
+        let base_url = base_url.trim().trim_end_matches('/').to_string();
+        validate_base_url(&base_url).context("invalid --base-url")?;
+
         let persona_in = self.persona.unwrap_or_else(|| "default".to_string());
         let persona_def = personas::resolve_persona(&persona_in).context("invalid persona")?;
         let persona = persona_def.key.to_string();
 
         let base_model = match self.model {
             Some(m) if !m.trim().is_empty() => m,
-            _ => default_model(&provider, self.vibe).to_string(),
+            _ => default_model(&provider, &base_url, self.vibe).to_string(),
         };
 
         let chat_model = match self.chat_model {
@@ -223,13 +417,6 @@ impl PartialConfig {
         } else {
             chat_model.clone()
         };
-
-        let base_url = match self.base_url {
-            Some(u) if !u.trim().is_empty() => u,
-            _ => default_base_url(&provider).to_string(),
-        };
-        let base_url = base_url.trim().trim_end_matches('/').to_string();
-        validate_base_url(&base_url).context("invalid --base-url")?;
 
         if provider == ProviderKind::OpenAiCompatible {
             if let Ok(url) = Url::parse(&base_url) {
@@ -268,7 +455,7 @@ impl PartialConfig {
                     Some(k)
                 }
             })
-            .or_else(|| resolve_api_key_from_env(&provider));
+            .or_else(|| resolve_api_key_from_env(&provider, &base_url));
 
         match provider {
             ProviderKind::Mistral if api_key.is_none() => {
@@ -314,19 +501,8 @@ fn default_base_url(provider: &ProviderKind) -> &'static str {
     }
 }
 
-fn default_model(provider: &ProviderKind, vibe: bool) -> &'static str {
-    match provider {
-        ProviderKind::OpenAiCompatible => "gpt-4o-mini",
-        ProviderKind::Mistral => {
-            if vibe {
-                "codestral-latest"
-            } else {
-                "mistral-small-latest"
-            }
-        }
-        ProviderKind::Anthropic => "claude-3-5-sonnet-latest",
-        ProviderKind::Hf => "local",
-    }
+fn default_model(provider: &ProviderKind, base_url: &str, vibe: bool) -> &'static str {
+    detect_provider_preset(provider, base_url).default_model(vibe)
 }
 
 fn validate_base_url(base_url: &str) -> Result<()> {
@@ -364,12 +540,93 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
-fn resolve_api_key_from_env(provider: &ProviderKind) -> Option<String> {
+fn resolve_api_key_from_env(provider: &ProviderKind, base_url: &str) -> Option<String> {
     let get = |k: &str| env_trimmed(k);
-    match provider {
-        ProviderKind::OpenAiCompatible => get("OBS_API_KEY").or_else(|| get("OPENAI_API_KEY")),
-        ProviderKind::Mistral => get("MISTRAL_API_KEY").or_else(|| get("OBS_API_KEY")),
-        ProviderKind::Anthropic => get("ANTHROPIC_API_KEY"),
-        ProviderKind::Hf => None,
+    match detect_provider_preset(provider, base_url) {
+        ProviderPreset::OpenAi => get("OBS_API_KEY").or_else(|| get("OPENAI_API_KEY")),
+        ProviderPreset::Gemini => get("GEMINI_API_KEY").or_else(|| get("GOOGLE_API_KEY")),
+        ProviderPreset::AnthropicCompat | ProviderPreset::Anthropic => get("ANTHROPIC_API_KEY"),
+        ProviderPreset::OpenAiCompatibleCustom => get("OBS_API_KEY")
+            .or_else(|| get("OPENAI_API_KEY"))
+            .or_else(|| get("GEMINI_API_KEY"))
+            .or_else(|| get("GOOGLE_API_KEY"))
+            .or_else(|| get("ANTHROPIC_API_KEY")),
+        ProviderPreset::Mistral => get("MISTRAL_API_KEY").or_else(|| get("OBS_API_KEY")),
+        ProviderPreset::HfLocal => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var(key).ok();
+        match value {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        let out = f();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        out
+    }
+
+    #[test]
+    fn detects_gemini_openai_compat_preset_from_base_url() {
+        let cfg = RunConfig {
+            provider: ProviderKind::OpenAiCompatible,
+            model: "gemini-2.5-flash".to_string(),
+            chat_model: "gemini-2.5-flash".to_string(),
+            code_model: "gemini-2.5-flash".to_string(),
+            api_key: Some("x".to_string()),
+            base_url: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+            mode: Mode::Chat,
+            persona: "default".to_string(),
+            temperature: 0.2,
+            max_tokens: 256,
+            timeout_seconds: 30,
+            hf_device: "auto".to_string(),
+            hf_local_only: false,
+        };
+        assert_eq!(provider_preset_for_run(&cfg), ProviderPreset::Gemini);
+        assert_eq!(representative_models_for_run(&cfg)[0], "gemini-2.5-flash");
+    }
+
+    #[test]
+    fn default_model_uses_vendor_specific_openai_compat_target() {
+        assert_eq!(
+            default_model(
+                &ProviderKind::OpenAiCompatible,
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                false,
+            ),
+            "gemini-2.5-flash"
+        );
+        assert_eq!(
+            default_model(
+                &ProviderKind::OpenAiCompatible,
+                "https://api.openai.com/v1",
+                false
+            ),
+            "gpt-5-mini"
+        );
+    }
+
+    #[test]
+    fn resolve_api_key_uses_vendor_specific_env_for_gemini() {
+        with_env_var("GEMINI_API_KEY", Some("gem-test"), || {
+            with_env_var("GOOGLE_API_KEY", None, || {
+                with_env_var("OPENAI_API_KEY", None, || {
+                    let key = resolve_api_key_from_env(
+                        &ProviderKind::OpenAiCompatible,
+                        "https://generativelanguage.googleapis.com/v1beta/openai",
+                    );
+                    assert_eq!(key.as_deref(), Some("gem-test"));
+                })
+            })
+        });
     }
 }

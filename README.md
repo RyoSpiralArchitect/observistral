@@ -381,7 +381,7 @@ TUI defaults:
 - The right pane opens on `Chat`; use `Ctrl+R` or `/tab observer|chat|tasks` to switch tabs.
 - Run `/keys` to see which API key env var or CLI flag each pane expects.
 - Typing `/` in the composer shows a lightweight slash-command picker.
-- Typing exact `/provider` or `/model` opens an arrow-key picker (`Up/Down`, `Enter` to apply). `/model` shows representative models for the current provider plus `other`.
+- Typing exact `/provider` or `/model` opens an arrow-key picker (`Up/Down`, `Enter` to apply). `/provider` now exposes vendor presets such as `openai`, `gemini`, `anthropic-compat`, `mistral`, `anthropic`, and `hf`; `/model` follows the selected preset and still offers `other` for manual entry.
 - If a pane is missing a required API key or model, send is blocked and the TUI shows a warning instead of running.
 
 **Headless Coder (CLI)**
@@ -529,7 +529,7 @@ OBSTRAL supports these providers today:
 
 Notes:
 - The Coder agent loop (`obstral agent`, TUI Coder, Web agentic mode) requires an OpenAI-compatible **Chat Completions** API with tool calling (`tools` / `tool_calls`) → use `openai-compatible` or `mistral`.
-- `openai-compatible` means the OpenAI Chat Completions API (`/v1/chat/completions`) with Bearer auth. Point `--base-url` / `OBS_BASE_URL` at your endpoint (include the trailing `/v1`).
+- `openai-compatible` means the OpenAI Chat Completions API (`/v1/chat/completions`) with Bearer auth. In the TUI, the provider picker offers concrete hosted presets (`openai`, `gemini`, `anthropic-compat`) and sets the matching `base_url` + default model for you.
 - You can list built-ins with `obstral list providers` / `obstral list modes` / `obstral list personas`.
 
 Set a different model per role: fast model for Coder iteration, powerful model for Observer analysis. In the TUI you can also split providers per pane (Coder still must be `openai-compatible`/`mistral`): `obstral tui --observer-provider anthropic --observer-model claude-3-5-sonnet-latest`. Common gotchas: `401` (bad key), `429` (rate limit), `max_tokens` vs `max_completion_tokens` mismatch.

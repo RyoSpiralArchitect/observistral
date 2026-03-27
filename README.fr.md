@@ -360,7 +360,7 @@ Comportement par defaut du TUI :
 - Le panneau de droite s'ouvre sur `Chat`; utilisez `Ctrl+R` ou `/tab observer|chat|tasks` pour changer d'onglet.
 - Lancez `/keys` pour voir quelle variable d'environnement ou option CLI chaque panneau attend pour la cle API.
 - Taper `/` dans le composeur affiche un petit picker de commandes slash.
-- Taper exactement `/provider` ou `/model` ouvre un picker au clavier (`↑/↓`, `Enter`). `/model` propose des modeles representatifs selon le provider courant, plus `other`.
+- Taper exactement `/provider` ou `/model` ouvre un picker au clavier (`↑/↓`, `Enter`). `/provider` propose des presets fournisseur (`openai`, `gemini`, `anthropic-compat`, `mistral`, `anthropic`, `hf`) et `/model` suit le preset courant, avec `other` pour une saisie manuelle.
 - Si un panneau n'a pas la cle API requise ou n'a pas de modele, l'envoi est bloque et le TUI affiche un avertissement.
 
 **Coder headless (CLI)**
