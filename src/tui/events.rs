@@ -630,12 +630,16 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
         }
         "/temp" | "/temperature" => {
             if arg.is_empty() {
-                let t = match pane {
-                    PaneId::Coder => app.coder_cfg.temperature,
-                    PaneId::Observer => app.observer_cfg.temperature,
-                    PaneId::Chat => app.chat_cfg.temperature,
+                let cfg = match pane {
+                    PaneId::Coder => &app.coder_cfg,
+                    PaneId::Observer => &app.observer_cfg,
+                    PaneId::Chat => &app.chat_cfg,
                 };
-                push!(format!("temperature: {t:.2}"));
+                let mut msg = format!("temperature: {:.2}", cfg.temperature);
+                if !crate::config::should_send_temperature_for_run(cfg) {
+                    msg.push_str("  (ignored by this GPT-5 OpenAI-compatible endpoint)");
+                }
+                push!(msg);
             } else if let Ok(t0) = arg.parse::<f64>() {
                 let t = t0.clamp(0.0, 2.0);
                 match pane {
@@ -643,9 +647,22 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                     PaneId::Observer => app.observer_cfg.temperature = t,
                     PaneId::Chat => app.chat_cfg.temperature = t,
                 }
+                let cfg = match pane {
+                    PaneId::Coder => &app.coder_cfg,
+                    PaneId::Observer => &app.observer_cfg,
+                    PaneId::Chat => &app.chat_cfg,
+                };
+                let suffix = if !crate::config::should_send_temperature_for_run(cfg) {
+                    "  [note: ignored by this GPT-5 OpenAI-compatible endpoint]"
+                } else {
+                    ""
+                };
                 match save_current_tui_prefs(app) {
-                    Ok(path) => push!(format!("temperature <- {t:.2}  [saved {}]", path.display())),
-                    Err(e) => push!(format!("temperature <- {t:.2}  [save_warn: {e}]")),
+                    Ok(path) => push!(format!(
+                        "temperature <- {t:.2}{suffix}  [saved {}]",
+                        path.display()
+                    )),
+                    Err(e) => push!(format!("temperature <- {t:.2}{suffix}  [save_warn: {e}]")),
                 }
             } else {
                 push!("usage: /temp 0.0-2.0".to_string());

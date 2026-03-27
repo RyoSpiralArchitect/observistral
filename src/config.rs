@@ -245,6 +245,22 @@ pub fn representative_models_for_run(cfg: &RunConfig) -> &'static [&'static str]
     provider_preset_for_run(cfg).representative_models()
 }
 
+pub fn should_send_temperature(provider: &ProviderKind, base_url: &str, model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    match detect_provider_preset(provider, base_url) {
+        // GPT-5 family commonly rejects explicit temperature on OpenAI-compatible APIs,
+        // including first-party OpenAI and custom/proxied OpenAI-compatible gateways.
+        ProviderPreset::OpenAi | ProviderPreset::OpenAiCompatibleCustom => {
+            !model.starts_with("gpt-5")
+        }
+        _ => true,
+    }
+}
+
+pub fn should_send_temperature_for_run(cfg: &RunConfig) -> bool {
+    should_send_temperature(&cfg.provider, &cfg.base_url, &cfg.model)
+}
+
 fn detect_provider_preset(provider: &ProviderKind, base_url: &str) -> ProviderPreset {
     match provider {
         ProviderKind::Mistral => ProviderPreset::Mistral,
@@ -628,5 +644,29 @@ mod tests {
                 })
             })
         });
+    }
+
+    #[test]
+    fn openai_gpt5_omits_temperature() {
+        assert!(!should_send_temperature(
+            &ProviderKind::OpenAiCompatible,
+            "https://api.openai.com/v1",
+            "gpt-5-mini",
+        ));
+        assert!(!should_send_temperature(
+            &ProviderKind::OpenAiCompatible,
+            "https://azure.example.net/openai/v1",
+            "gpt-5",
+        ));
+        assert!(should_send_temperature(
+            &ProviderKind::OpenAiCompatible,
+            "https://api.openai.com/v1",
+            "gpt-4.1-mini",
+        ));
+        assert!(should_send_temperature(
+            &ProviderKind::OpenAiCompatible,
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "gemini-2.5-flash",
+        ));
     }
 }

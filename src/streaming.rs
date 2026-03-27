@@ -191,6 +191,14 @@ fn swap_max_tokens_to_max_completion_tokens(payload: &mut serde_json::Value) {
     }
 }
 
+fn apply_temperature_compat(payload: &mut serde_json::Value, cfg: &RunConfig) {
+    if !crate::config::should_send_temperature_for_run(cfg) {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("temperature");
+        }
+    }
+}
+
 fn prompt_from_json_messages(messages: &[serde_json::Value]) -> String {
     // Minimal adapter used only when a provider rejects /chat/completions.
     // This keeps TUI + server streaming usable even for completion-only models.
@@ -329,6 +337,7 @@ pub async fn stream_openai_compat_json(
         "max_tokens": cfg.max_tokens,
         "stream": true,
     });
+    apply_temperature_compat(&mut payload, cfg);
 
     if let Some(t) = tools {
         payload["tools"] = t.clone();
@@ -460,6 +469,7 @@ pub async fn stream_openai_compat_json(
             "max_tokens": cfg.max_tokens,
             "stream": true,
         });
+        apply_temperature_compat(&mut comp_payload, cfg);
 
         // No tools on completions endpoint.
         let mut attempt: usize = 0;

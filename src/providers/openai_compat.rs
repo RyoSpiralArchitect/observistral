@@ -172,14 +172,29 @@ fn extract_completion_text(data: &Value) -> Option<String> {
         .or_else(|| extract_chat_content(data))
 }
 
+fn maybe_insert_temperature(payload: &mut Value, base_url: &str, model: &str, temperature: f64) {
+    if crate::config::should_send_temperature(
+        &crate::config::ProviderKind::OpenAiCompatible,
+        base_url,
+        model,
+    ) {
+        payload["temperature"] = json!(temperature);
+    }
+}
+
 #[async_trait]
 impl ChatProvider for OpenAICompatibleProvider {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
         let mut payload = json!({
             "model": self.model,
             "messages": to_openai_messages(&request.messages),
-            "temperature": request.temperature.unwrap_or(0.4),
         });
+        maybe_insert_temperature(
+            &mut payload,
+            &self.base_url,
+            &self.model,
+            request.temperature.unwrap_or(0.4),
+        );
         if let Some(max_tokens) = request.max_tokens {
             payload["max_tokens"] = json!(max_tokens);
         }
@@ -251,8 +266,13 @@ impl ChatProvider for OpenAICompatibleProvider {
             let mut comp_payload = json!({
                 "model": self.model,
                 "prompt": to_completions_prompt(&request.messages),
-                "temperature": request.temperature.unwrap_or(0.4),
             });
+            maybe_insert_temperature(
+                &mut comp_payload,
+                &self.base_url,
+                &self.model,
+                request.temperature.unwrap_or(0.4),
+            );
             if let Some(max_tokens) = request.max_tokens {
                 comp_payload["max_tokens"] = json!(max_tokens);
             }
@@ -460,5 +480,30 @@ mod tests {
             resp.content
         );
         mock2.assert();
+    }
+
+    #[test]
+    fn maybe_insert_temperature_skips_openai_gpt5_family() {
+        let mut payload = serde_json::json!({
+            "model": "gpt-5-mini",
+            "messages": []
+        });
+        maybe_insert_temperature(&mut payload, "https://api.openai.com/v1", "gpt-5-mini", 0.4);
+        assert!(payload.get("temperature").is_none());
+    }
+
+    #[test]
+    fn maybe_insert_temperature_skips_custom_openai_compat_gpt5_family() {
+        let mut payload = serde_json::json!({
+            "model": "gpt-5",
+            "messages": []
+        });
+        maybe_insert_temperature(
+            &mut payload,
+            "https://proxy.example.internal/v1",
+            "gpt-5",
+            0.4,
+        );
+        assert!(payload.get("temperature").is_none());
     }
 }

@@ -175,6 +175,14 @@ fn swap_max_tokens_to_max_completion_tokens(payload: &mut serde_json::Value) {
     }
 }
 
+fn apply_openai_temperature_compat(payload: &mut serde_json::Value, base_url: &str, model: &str) {
+    if !crate::config::should_send_temperature(&ProviderKind::OpenAiCompatible, base_url, model) {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("temperature");
+        }
+    }
+}
+
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
@@ -531,6 +539,7 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
         "temperature": req.temperature.unwrap_or(0.7),
         "max_tokens": req.max_tokens.unwrap_or(4096),
     });
+    apply_openai_temperature_compat(&mut payload, &base_url, &req.model);
 
     if let Some(tools) = &req.tools {
         if !tools.is_empty() {
@@ -704,6 +713,7 @@ async fn api_chat_tools(stream: &mut TcpStream, state: AppState, body: &[u8]) ->
             "temperature": req.temperature.unwrap_or(0.7),
             "max_tokens": req.max_tokens.unwrap_or(4096),
         });
+        apply_openai_temperature_compat(&mut comp_payload, &base_url, &req.model);
         let mut http_req = state
             .client
             .post(&url)
@@ -1003,6 +1013,7 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
         "max_tokens": req.max_tokens.unwrap_or(4096),
         "stream": true,
     });
+    apply_openai_temperature_compat(&mut payload, &base_url, &req.model);
 
     if let Some(tools) = &req.tools {
         if !tools.is_empty() {
@@ -1136,6 +1147,7 @@ async fn api_chat_tools_stream(stream: &mut TcpStream, state: AppState, body: &[
             "max_tokens": req.max_tokens.unwrap_or(4096),
             "stream": true,
         });
+        apply_openai_temperature_compat(&mut comp_payload, &base_url, &req.model);
 
         let mut http_req = state
             .client
@@ -3837,6 +3849,8 @@ async fn stream_openai_compat(
     }
     messages.push(json!({"role":"user","content":user_text}));
 
+    let base_url = cfg.base_url.trim_end_matches('/').to_string();
+
     let payload = json!({
         "model": cfg.model,
         "messages": messages.clone(),
@@ -3844,13 +3858,13 @@ async fn stream_openai_compat(
         "max_tokens": cfg.max_tokens,
         "stream": true,
     });
+    let mut payload = payload;
+    apply_openai_temperature_compat(&mut payload, &base_url, &cfg.model);
 
     let provider_label = match cfg.provider {
         ProviderKind::Mistral => "Mistral",
         _ => "OpenAI-compatible",
     };
-
-    let base_url = cfg.base_url.trim_end_matches('/').to_string();
     let mut last_err: Option<anyhow::Error> = None;
     let mut want_completions = false;
     let mut resp: Option<reqwest::Response> = None;
@@ -3932,6 +3946,7 @@ async fn stream_openai_compat(
             "max_tokens": cfg.max_tokens,
             "stream": true,
         });
+        apply_openai_temperature_compat(&mut comp_payload, &base_url, &cfg.model);
         let mut req = client
             .post(&url)
             .header("Content-Type", "application/json")

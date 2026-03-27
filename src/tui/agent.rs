@@ -5212,6 +5212,24 @@ Do NOT emit a `think` tool_call again."
     )
 }
 
+fn build_read_only_plan_rewrite_hint(root_user_text: &str) -> String {
+    let slash = first_slash_literal(root_user_text).unwrap_or_else(|| "/realize".to_string());
+    format!(
+        "[Read-only plan rewrite]\n\
+Use a strictly inspect-only plan. Do NOT mention cargo test, build, smoke test, behavioral verification, or exec.\n\
+Use this shape in your next assistant turn:\n\
+<plan>\n\
+goal: Locate where `{slash}` is handled in the TUI and report the file path.\n\
+steps: 1) search_files(pattern=\"{slash}\", dir=\"src\") 2) if needed search_files(pattern=\"realize\", dir=\"src\") 3) read_file(path=\"<matching file>\") to confirm the handler branch 4) call done once the file path and code context are confirmed\n\
+acceptance: 1) the file path handling `{slash}` is identified 2) the handler branch is confirmed by read_file\n\
+risks: 1) the command may be matched without the leading slash 2) the handler may live outside the obvious TUI file\n\
+assumptions: 1) observation tools are sufficient 2) no edits or behavioral verification are required\n\
+</plan>\n\
+Then emit <think> and call ONE tool immediately after it.\n\
+Suggested next tool: search_files(pattern=\"{slash}\", dir=\"src\")"
+    )
+}
+
 fn parse_leading_ordinal(reference: &str) -> Option<usize> {
     let trimmed = reference.trim_start();
     let digits_len = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
@@ -9888,6 +9906,8 @@ Execute only the new minimal action: {}",
                             block.push_str(
                                 "\nRewrite any build/test step into an inspection step. Example: replace `run cargo test` with `read the matching file and confirm the command branch`.",
                             );
+                            block.push_str("\n\n");
+                            block.push_str(&build_read_only_plan_rewrite_hint(&root_user_text));
                         }
                         let _ = tx
                             .send(StreamToken::Delta(format!(
@@ -13194,6 +13214,17 @@ remaining_gap: still need to run cargo test\n\
         );
         assert!(hint.contains("think` is not a real tool call"));
         assert!(hint.contains("search_files(pattern=\"/realize\", dir=\"src\")"));
+    }
+
+    #[test]
+    fn build_read_only_plan_rewrite_hint_is_inspect_only() {
+        let hint = build_read_only_plan_rewrite_hint(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+        );
+        assert!(hint.contains("search_files(pattern=\"/realize\", dir=\"src\")"));
+        assert!(hint.contains("call done once the file path and code context are confirmed"));
+        assert!(hint.contains("Do NOT mention cargo test"));
+        assert!(hint.contains("strictly inspect-only plan"));
     }
 
     #[test]
