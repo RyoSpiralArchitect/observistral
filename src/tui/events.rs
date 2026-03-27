@@ -131,6 +131,204 @@ fn load_tui_prefs_into_app(app: &mut App) -> anyhow::Result<Option<agent::Realiz
     Ok(preset)
 }
 
+fn pane_label(pane: PaneId) -> &'static str {
+    match pane {
+        PaneId::Coder => "coder",
+        PaneId::Observer => "observer",
+        PaneId::Chat => "chat",
+    }
+}
+
+fn api_key_env_hint(provider: &crate::config::ProviderKind) -> &'static str {
+    match provider {
+        crate::config::ProviderKind::OpenAiCompatible => "OBS_API_KEY or OPENAI_API_KEY",
+        crate::config::ProviderKind::Mistral => "MISTRAL_API_KEY or OBS_API_KEY",
+        crate::config::ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
+        crate::config::ProviderKind::Hf => "(none; hf/local does not use an API key)",
+    }
+}
+
+fn pane_key_status(label: &str, cfg: &crate::config::RunConfig) -> String {
+    let needs_key = !matches!(cfg.provider, crate::config::ProviderKind::Hf);
+    let key_state = if needs_key {
+        if cfg.api_key.is_some() {
+            "set"
+        } else {
+            "missing"
+        }
+    } else {
+        "not-needed"
+    };
+    format!(
+        "- {label}: provider={}  model={}  key={}  env={}",
+        cfg.provider,
+        cfg.model,
+        key_state,
+        api_key_env_hint(&cfg.provider)
+    )
+}
+
+fn right_tab_label(tab: RightTab) -> &'static str {
+    match tab {
+        RightTab::Observer => "observer",
+        RightTab::Chat => "chat",
+        RightTab::Tasks => "tasks",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlinePicker {
+    Provider,
+    Model,
+}
+
+fn focused_pane_id(app: &App) -> PaneId {
+    match app.focus {
+        Focus::Coder => PaneId::Coder,
+        Focus::Right => match app.right_tab {
+            RightTab::Observer => PaneId::Observer,
+            RightTab::Chat => PaneId::Chat,
+            RightTab::Tasks => PaneId::Observer,
+        },
+    }
+}
+
+fn pane_input_text(app: &App, pane: PaneId) -> String {
+    match pane {
+        PaneId::Coder => app.coder.textarea.lines().join("\n"),
+        PaneId::Observer => app.observer.textarea.lines().join("\n"),
+        PaneId::Chat => app.chat.textarea.lines().join("\n"),
+    }
+}
+
+fn pane_cfg<'a>(app: &'a App, pane: PaneId) -> &'a crate::config::RunConfig {
+    match pane {
+        PaneId::Coder => &app.coder_cfg,
+        PaneId::Observer => &app.observer_cfg,
+        PaneId::Chat => &app.chat_cfg,
+    }
+}
+
+fn pane_mut<'a>(app: &'a mut App, pane: PaneId) -> &'a mut super::app::Pane {
+    match pane {
+        PaneId::Coder => &mut app.coder,
+        PaneId::Observer => &mut app.observer,
+        PaneId::Chat => &mut app.chat,
+    }
+}
+
+fn active_inline_picker(app: &App, pane: PaneId) -> Option<InlinePicker> {
+    match pane_input_text(app, pane).trim() {
+        "/provider" => Some(InlinePicker::Provider),
+        "/model" => Some(InlinePicker::Model),
+        _ => None,
+    }
+}
+
+fn inline_picker_items(app: &App, pane: PaneId, picker: InlinePicker) -> Vec<String> {
+    match picker {
+        InlinePicker::Provider => crate::config::supported_providers()
+            .into_iter()
+            .filter(|name| {
+                pane != PaneId::Coder || *name == "openai-compatible" || *name == "mistral"
+            })
+            .map(str::to_string)
+            .collect(),
+        InlinePicker::Model => crate::config::representative_models(&pane_cfg(app, pane).provider)
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
+fn adjust_inline_picker(app: &mut App, pane: PaneId, delta: isize) -> bool {
+    let Some(picker) = active_inline_picker(app, pane) else {
+        return false;
+    };
+    let items = inline_picker_items(app, pane, picker);
+    if items.is_empty() {
+        return false;
+    }
+    let pane = pane_mut(app, pane);
+    let max = items.len().saturating_sub(1);
+    let next = if delta.is_negative() {
+        pane.picker_index.saturating_sub(delta.unsigned_abs())
+    } else {
+        (pane.picker_index + delta as usize).min(max)
+    };
+    pane.picker_index = next;
+    true
+}
+
+fn set_pane_input_text(app: &mut App, pane: PaneId, text: &str) {
+    let pane = pane_mut(app, pane);
+    pane.textarea = tui_textarea::TextArea::default();
+    if !text.is_empty() {
+        pane.textarea.insert_str(text);
+    }
+    pane.welcome_dismissed = true;
+}
+
+fn apply_inline_picker(app: &mut App, pane: PaneId) -> bool {
+    let Some(picker) = active_inline_picker(app, pane) else {
+        return false;
+    };
+    let items = inline_picker_items(app, pane, picker);
+    if items.is_empty() {
+        return false;
+    }
+    let selected = {
+        let pane_ref = pane_mut(app, pane);
+        pane_ref.picker_index.min(items.len().saturating_sub(1))
+    };
+    match picker {
+        InlinePicker::Provider => {
+            let cmd = format!("/provider {}", items[selected]);
+            let handled = handle_slash_command(&cmd, app, pane);
+            set_pane_input_text(app, pane, "");
+            pane_mut(app, pane).picker_index = 0;
+            handled
+        }
+        InlinePicker::Model => {
+            let current_provider = pane_cfg(app, pane).provider.clone();
+            let selected_model = items[selected].clone();
+            if selected_model == "other" {
+                set_pane_input_text(app, pane, "/model ");
+                pane_mut(app, pane).picker_index = 0;
+                return true;
+            }
+            if current_provider.key().is_empty() {
+                pane_mut(app, pane).push_tool(
+                    "Select a provider first with /provider before choosing a model.".to_string(),
+                );
+                return true;
+            }
+            let cmd = format!("/model {selected_model}");
+            let handled = handle_slash_command(&cmd, app, pane);
+            set_pane_input_text(app, pane, "");
+            pane_mut(app, pane).picker_index = 0;
+            handled
+        }
+    }
+}
+
+fn validate_pane_ready(app: &App, pane: PaneId) -> Option<String> {
+    let cfg = pane_cfg(app, pane);
+    if !matches!(cfg.provider, crate::config::ProviderKind::Hf) && cfg.api_key.is_none() {
+        return Some(format!(
+            "missing API key for {}. Run /keys and set {}.",
+            pane_label(pane),
+            api_key_env_hint(&cfg.provider)
+        ));
+    }
+    if cfg.model.trim().is_empty() {
+        return Some(
+            "model is missing. Choose one with /model after selecting the provider.".to_string(),
+        );
+    }
+    None
+}
+
 /// Returns true if `text` was a slash command (caller should NOT send to AI).
 fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
     if !text.starts_with('/') {
@@ -199,7 +397,7 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
 
             if arg.is_empty() {
                 push!(format!(
-                    "provider: {}  base_url: {}  model: {}",
+                    "provider: {}  base_url: {}  model: {}  (type `/provider` then use Up/Down+Enter to pick)",
                     cur.provider, cur.base_url, cur.model
                 ));
                 return true;
@@ -344,7 +542,9 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                     PaneId::Observer => app.observer_cfg.model.clone(),
                     PaneId::Chat => app.chat_cfg.model.clone(),
                 };
-                push!(format!("model: {m}"));
+                push!(format!(
+                    "model: {m}  (type `/model` then use Up/Down+Enter to pick, or `/model <name>` to enter manually)"
+                ));
             } else {
                 match pane {
                     PaneId::Coder => {
@@ -461,6 +661,79 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                     push!("usage: /lang ja|en|fr".to_string());
                 }
             }
+        }
+        "/tab" => {
+            if arg.is_empty() {
+                push!(format!(
+                    "right tab: {}  (usage: /tab <observer|chat|tasks|next>)",
+                    right_tab_label(app.right_tab)
+                ));
+            } else {
+                let next = match arg.trim().to_ascii_lowercase().as_str() {
+                    "observer" | "obs" => Some(RightTab::Observer),
+                    "chat" => Some(RightTab::Chat),
+                    "tasks" | "task" => Some(RightTab::Tasks),
+                    "next" => {
+                        app.cycle_right_tab();
+                        None
+                    }
+                    _ => {
+                        push!("usage: /tab <observer|chat|tasks|next>".to_string());
+                        return true;
+                    }
+                };
+                if let Some(tab) = next {
+                    app.right_tab = tab;
+                }
+                match save_current_tui_prefs(app) {
+                    Ok(path) => push!(format!(
+                        "right tab <- {}  [saved {}]",
+                        right_tab_label(app.right_tab),
+                        path.display()
+                    )),
+                    Err(e) => push!(format!(
+                        "right tab <- {}  [save_warn: {e}]",
+                        right_tab_label(app.right_tab)
+                    )),
+                }
+            }
+        }
+        "/keys" => {
+            let mut lines = vec![
+                "API key setup".to_string(),
+                pane_key_status("coder", &app.coder_cfg),
+                pane_key_status("observer", &app.observer_cfg),
+                pane_key_status("chat", &app.chat_cfg),
+                String::new(),
+                "CLI flags:".to_string(),
+                "- obstral tui --api-key <key>".to_string(),
+                "- obstral tui --observer-api-key <key>".to_string(),
+                "- obstral tui --chat-api-key <key>".to_string(),
+                String::new(),
+                "Environment variables:".to_string(),
+                "- OpenAI-compatible: OBS_API_KEY or OPENAI_API_KEY".to_string(),
+                "- Mistral: MISTRAL_API_KEY or OBS_API_KEY".to_string(),
+                "- Anthropic: ANTHROPIC_API_KEY".to_string(),
+                "- HF local: no key required".to_string(),
+                String::new(),
+                format!(
+                    "Current pane: {}  right tab: {}",
+                    pane_label(pane),
+                    right_tab_label(app.right_tab)
+                ),
+                "Tip: use /provider first, then /keys to confirm the right env var.".to_string(),
+            ];
+            if matches!(
+                app.coder_cfg.provider,
+                crate::config::ProviderKind::OpenAiCompatible
+            ) && app.coder_cfg.api_key.is_none()
+            {
+                lines.push(
+                    "Note: openai-compatible can also target local OpenAI-style endpoints; those may not require a key."
+                        .to_string(),
+                );
+            }
+            push!(lines.join("\n"));
         }
         "/realize" => {
             if arg.is_empty() {
@@ -666,21 +939,24 @@ test_cmd: {test_cmd}
             push!(
                 "pane-scoped & persisted: /provider /base_url /mode /model /persona /temp\n\
 /model <name>       set model\n\
-/provider <name>    set provider (or show)\n\
+/provider <name>    set provider (or show current; exact `/provider` opens picker)\n\
 /base_url <url>     set base_url (or show; use `default` to reset)\n\
 /persona <name>     set persona\n\
 /mode <name>        set mode\n\
 /temp <0.0-2.0>     set temperature\n\
-/lang <ja|en|fr>    set language\n\
+/lang <ja|en|fr>    set UI + prompt language\n\
+/tab <name>         switch right pane (observer|chat|tasks|next)\n\
+/keys               show API key status and setup help\n\
+/model              exact `/model` opens provider-aware model picker\n\
 /realize <mode>     set coder latent-plan mode (off|low|mid|high)\n\
 /root <path>        set tool_root\n\
 /find <text>        filter history\n\
 /meta-diagnose [...] send coder failure to Observer\n\
-/autofix            toggle Observer→Coder auto-fix pipeline\n\
+/autofix            toggle Observer->Coder auto-fix pipeline\n\
 /diff               show session diff from git checkpoint\n\
 /init               generate .obstral.md template\n\
 /rollback           restore git checkpoint from session start\n\
-Ctrl+R              cycle right tab\n"
+Ctrl+R              cycle right pane tab\n"
                     .to_string()
             );
         }
@@ -800,12 +1076,13 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
 
     // The layout produced by ui::render:
     //   row 0-1    → header (2 rows)
-    //   row 2..h-4 → body panes
-    //   row h-3..h → input box (3 rows)
+    //   row 2..h-5 → body panes
+    //   row h-5..h-1 → input + footer
     // Horizontal: left 55 % = Coder, right 45 % = Right tab (Observer/Chat/Tasks).
     let coder_w = (term_w as u32 * 55 / 100) as u16;
     let body_start: u16 = 2;
-    let body_end: u16 = term_h.saturating_sub(3);
+    let body_end: u16 = term_h.saturating_sub(5);
+    let input_start: u16 = term_h.saturating_sub(5);
 
     match mouse.kind {
         // Scroll wheel: scroll whichever pane the cursor is over.
@@ -849,6 +1126,41 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 } else {
                     Focus::Right
                 };
+                if mouse.column >= coder_w && mouse.row == body_start {
+                    let right_width = term_w.saturating_sub(coder_w).max(1);
+                    let rel = mouse.column.saturating_sub(coder_w);
+                    let third = (right_width / 3).max(1);
+                    app.right_tab = if rel < third {
+                        RightTab::Observer
+                    } else if rel < third.saturating_mul(2) {
+                        RightTab::Chat
+                    } else {
+                        RightTab::Tasks
+                    };
+                    let _ = save_current_tui_prefs(app);
+                }
+                match app.focus {
+                    Focus::Coder => app.coder.welcome_dismissed = true,
+                    Focus::Right => match app.right_tab {
+                        RightTab::Observer => app.observer.welcome_dismissed = true,
+                        RightTab::Chat => app.chat.welcome_dismissed = true,
+                        RightTab::Tasks => {}
+                    },
+                }
+            } else if mouse.row >= input_start {
+                app.focus = if mouse.column < coder_w {
+                    Focus::Coder
+                } else {
+                    Focus::Right
+                };
+                match app.focus {
+                    Focus::Coder => app.coder.welcome_dismissed = true,
+                    Focus::Right => match app.right_tab {
+                        RightTab::Observer => app.observer.welcome_dismissed = true,
+                        RightTab::Chat => app.chat.welcome_dismissed = true,
+                        RightTab::Tasks => {}
+                    },
+                }
             }
         }
 
@@ -874,6 +1186,7 @@ async fn handle_key(
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let active_pane = focused_pane_id(app);
 
     match key.code {
         // Quit
@@ -909,10 +1222,10 @@ async fn handle_key(
             if let Some(text) = content {
                 if copy_to_clipboard(&text) {
                     app.focused_pane_mut()
-                        .push_tool("✓ クリップボードにコピー".to_string());
+                        .push_tool("copied to clipboard".to_string());
                 } else {
                     app.focused_pane_mut().push_tool(
-                        "✗ クリップボードにコピー失敗（macOS: pbcopy / Linux: wl-copy|xclip|xsel）"
+                        "clipboard copy failed (macOS: pbcopy / Linux: wl-copy|xclip|xsel)"
                             .to_string(),
                     );
                 }
@@ -955,7 +1268,7 @@ async fn handle_key(
                 }
                 app.ignore_coder_tokens = true;
                 app.coder.finish_stream();
-                app.coder.push_tool("(ストリーミング停止)".to_string());
+                app.coder.push_tool("(stream canceled)".to_string());
             }
             Focus::Right => {
                 if let Some(handle) = app.observer_task.take() {
@@ -965,7 +1278,7 @@ async fn handle_key(
                 app.observer_next_action_mode = false;
                 app.ignore_observer_tokens = true;
                 app.observer.finish_stream();
-                app.observer.push_tool("(ストリーミング停止)".to_string());
+                app.observer.push_tool("(stream canceled)".to_string());
             }
         },
 
@@ -1005,6 +1318,8 @@ async fn handle_key(
         }
 
         // Tasks selection
+        KeyCode::Up if adjust_inline_picker(app, active_pane, -1) => {}
+        KeyCode::Down if adjust_inline_picker(app, active_pane, 1) => {}
         KeyCode::Up if app.focus == Focus::Right && app.right_tab == RightTab::Tasks => {
             app.tasks_cursor = app.tasks_cursor.saturating_sub(1);
         }
@@ -1020,6 +1335,7 @@ async fn handle_key(
         }
 
         // Send message
+        KeyCode::Enter if !shift && apply_inline_picker(app, active_pane) => {}
         KeyCode::Enter if !shift => match app.focus {
             Focus::Coder => send_coder_message(app, coder_tx).await,
             Focus::Right => match app.right_tab {
@@ -1042,13 +1358,16 @@ async fn handle_key(
         // Pass everything else to tui-textarea
         _ => match app.focus {
             Focus::Coder => {
+                app.coder.welcome_dismissed = true;
                 app.coder.textarea.input(key);
             }
             Focus::Right => match app.right_tab {
                 RightTab::Observer => {
+                    app.observer.welcome_dismissed = true;
                     app.observer.textarea.input(key);
                 }
                 RightTab::Chat => {
+                    app.chat.welcome_dismissed = true;
                     app.chat.textarea.input(key);
                 }
                 RightTab::Tasks => {}
@@ -1292,6 +1611,10 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
 
     // Handle slash commands before sending to AI.
     if handle_slash_command(&text, app, PaneId::Coder) {
+        return;
+    }
+    if let Some(problem) = validate_pane_ready(app, PaneId::Coder) {
+        app.coder.push_tool(problem);
         return;
     }
 
@@ -2238,6 +2561,7 @@ mod tests {
     use super::*;
     use crate::config::{ProviderKind, RunConfig};
     use crate::modes::Mode;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn msg(role: Role, content: &str) -> Message {
         Message::new_complete(role, content.to_string())
@@ -2259,6 +2583,17 @@ mod tests {
             hf_device: "cpu".to_string(),
             hf_local_only: false,
         }
+    }
+
+    fn isolated_prefs_root() -> String {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("obstral_tui_events_{stamp}"))
+            .display()
+            .to_string()
     }
 
     #[test]
@@ -2301,7 +2636,7 @@ mod tests {
             test_cfg(Mode::Observer),
             test_cfg(Mode::Chat),
             None,
-            None,
+            Some(isolated_prefs_root()),
             false,
             "en".to_string(),
             None,
@@ -2322,7 +2657,7 @@ mod tests {
             test_cfg(Mode::Observer),
             test_cfg(Mode::Chat),
             None,
-            None,
+            Some(isolated_prefs_root()),
             false,
             "en".to_string(),
             None,
@@ -2332,6 +2667,62 @@ mod tests {
             msg(Role::Assistant, "done"),
         ];
         assert!(latest_tui_next_action_target(&app).is_none());
+    }
+
+    #[test]
+    fn slash_tab_switches_right_pane() {
+        let mut app = App::new(
+            test_cfg(Mode::Jikkyo),
+            test_cfg(Mode::Observer),
+            test_cfg(Mode::Chat),
+            None,
+            Some(isolated_prefs_root()),
+            false,
+            "en".to_string(),
+            None,
+        );
+        assert!(handle_slash_command(
+            "/tab observer",
+            &mut app,
+            PaneId::Coder
+        ));
+        assert_eq!(app.right_tab, RightTab::Observer);
+        assert!(handle_slash_command("/tab chat", &mut app, PaneId::Coder));
+        assert_eq!(app.right_tab, RightTab::Chat);
+    }
+
+    #[test]
+    fn slash_keys_reports_env_hint() {
+        let mut app = App::new(
+            test_cfg(Mode::Jikkyo),
+            test_cfg(Mode::Observer),
+            test_cfg(Mode::Chat),
+            None,
+            Some(isolated_prefs_root()),
+            false,
+            "en".to_string(),
+            None,
+        );
+        assert!(handle_slash_command("/keys", &mut app, PaneId::Coder));
+        let last = app.coder.messages.last().expect("tool message");
+        assert!(last.content.contains("OPENAI_API_KEY"));
+        assert!(last.content.contains("observer"));
+    }
+
+    #[test]
+    fn validate_pane_ready_requires_key() {
+        let app = App::new(
+            test_cfg(Mode::Jikkyo),
+            test_cfg(Mode::Observer),
+            test_cfg(Mode::Chat),
+            None,
+            Some(isolated_prefs_root()),
+            false,
+            "en".to_string(),
+            None,
+        );
+        let msg = validate_pane_ready(&app, PaneId::Coder).expect("missing key should block");
+        assert!(msg.contains("missing API key"));
     }
 }
 
@@ -2355,6 +2746,10 @@ async fn send_observer_message(
             // Handle slash commands before sending to AI.
             if handle_slash_command(&t, app, PaneId::Observer) {
                 app.observer.textarea = tui_textarea::TextArea::default();
+                return;
+            }
+            if let Some(problem) = validate_pane_ready(app, PaneId::Observer) {
+                app.observer.push_tool(problem);
                 return;
             }
             app.observer.textarea = tui_textarea::TextArea::default();
@@ -2630,6 +3025,10 @@ async fn send_chat_message(
     // Handle slash commands before sending to AI.
     if handle_slash_command(&text, app, PaneId::Chat) {
         app.chat.textarea = tui_textarea::TextArea::default();
+        return;
+    }
+    if let Some(problem) = validate_pane_ready(app, PaneId::Chat) {
+        app.chat.push_tool(problem);
         return;
     }
 

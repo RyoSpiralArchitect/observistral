@@ -49,7 +49,7 @@ pub struct TuiArgs {
     pub chat_api_key: Option<String>,
 
     /// UI / response language hint (ja/en/fr).
-    #[arg(long, default_value = "ja")]
+    #[arg(long, default_value = "en")]
     pub lang: String,
 
     /// Working directory for exec tool calls.
@@ -84,8 +84,11 @@ fn default_tui_tool_root() -> String {
 
 pub async fn run(args: TuiArgs, partial_cfg: PartialConfig) -> Result<()> {
     // Resolve the Coder config from the shared partial config.
-    let coder_cfg = partial_cfg
-        .clone()
+    let mut coder_partial = partial_cfg.clone();
+    if coder_partial.mode.is_none() {
+        coder_partial.mode = Some(Mode::Vibe);
+    }
+    let coder_cfg = coder_partial
         .resolve()
         .context("failed to resolve coder config")?;
 

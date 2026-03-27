@@ -85,6 +85,10 @@ pub struct Pane {
     pub streaming: bool,
     /// Optional local filter for history readability (slash command: /find).
     pub find_query: String,
+    /// Hide the first-run welcome text once the pane has been used or clicked.
+    pub welcome_dismissed: bool,
+    /// Shared cursor for lightweight slash pickers.
+    pub picker_index: usize,
 }
 
 impl Pane {
@@ -95,6 +99,8 @@ impl Pane {
             scroll: 0,
             streaming: false,
             find_query: String::new(),
+            welcome_dismissed: false,
+            picker_index: 0,
         }
     }
 
@@ -120,6 +126,7 @@ impl Pane {
     }
 
     pub fn push_user(&mut self, text: String) {
+        self.welcome_dismissed = true;
         self.messages.push(Message::new_complete(Role::User, text));
     }
 
@@ -236,17 +243,17 @@ impl App {
         coder_max_iters: Option<usize>,
     ) -> Self {
         let l = lang.trim().to_ascii_lowercase();
-        let lang = if l == "en" || l == "fr" {
+        let lang = if l == "en" || l == "fr" || l == "ja" {
             l
         } else {
-            "ja".to_string()
+            "en".to_string()
         };
         Self {
             coder: Pane::new(),
             observer: Pane::new(),
             chat: Pane::new(),
             focus: Focus::Coder,
-            right_tab: RightTab::Observer,
+            right_tab: RightTab::Chat,
             lang,
             auto_observe,
             last_auto_obs_idx: None,

@@ -54,6 +54,33 @@ pub fn supported_providers() -> Vec<&'static str> {
     vec!["openai-compatible", "mistral", "anthropic", "hf"]
 }
 
+pub fn representative_models(provider: &ProviderKind) -> &'static [&'static str] {
+    match provider {
+        ProviderKind::OpenAiCompatible => &[
+            "gpt-4o-mini",
+            "gpt-4.1-mini",
+            "gpt-4.1",
+            "gpt-5-mini",
+            "other",
+        ],
+        ProviderKind::Mistral => &[
+            "mistral-small-latest",
+            "codestral-latest",
+            "mistral-medium-latest",
+            "ministral-8b-latest",
+            "other",
+        ],
+        ProviderKind::Anthropic => &[
+            "claude-3-5-sonnet-latest",
+            "claude-3-5-haiku-latest",
+            "claude-3-7-sonnet-latest",
+            "claude-3-opus-latest",
+            "other",
+        ],
+        ProviderKind::Hf => &["local", "other"],
+    }
+}
+
 pub fn normalize_provider(s: &str) -> String {
     s.trim().to_ascii_lowercase()
 }

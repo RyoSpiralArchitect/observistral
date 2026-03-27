@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::config::ProviderKind;
+use crate::config::{representative_models, supported_providers, ProviderKind};
 
 use super::app::{App, Focus, Message, RightTab, Role, TaskPhase, TaskTarget};
 
@@ -40,6 +40,12 @@ enum PaneView {
     Chat,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActivePicker {
+    Provider,
+    Model,
+}
+
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
@@ -48,13 +54,15 @@ pub fn render(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(2), // header (2 rows)
             Constraint::Min(1),
-            Constraint::Length(3), // input box
+            Constraint::Length(4), // input box
+            Constraint::Length(1), // footer shortcuts
         ])
         .split(area);
 
     render_header(frame, vert[0], app);
     render_body(frame, vert[1], app);
     render_input(frame, vert[2], app);
+    render_footer(frame, vert[3], app);
 }
 
 // ── Header ────────────────────────────────────────────────────────────────────
@@ -74,11 +82,6 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         String::new()
     };
-    let o_spin = if app.observer.streaming {
-        format!(" {}", spinner_char(app.tick_count))
-    } else {
-        String::new()
-    };
     let iter = if app.coder_iter > 0 {
         iter_progress(app.coder_iter)
     } else {
@@ -86,15 +89,57 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let c_m = truncate_model(&app.coder_cfg.model, 20);
-    let o_m = truncate_model(&app.observer_cfg.model, 20);
     let c_p = provider_abbrev(&app.coder_cfg.provider);
-    let o_p = provider_abbrev(&app.observer_cfg.provider);
     let c_mode = truncate_model(app.coder_cfg.mode.label(), 8);
-    let o_mode = truncate_model(app.observer_cfg.mode.label(), 8);
-    let right_tab = match app.right_tab {
-        RightTab::Observer => "OBS",
-        RightTab::Chat => "CHAT",
-        RightTab::Tasks => "TASKS",
+    let (right_label, right_model, right_provider, right_mode, right_spin, tabs_badge, right_brand) =
+        match app.right_tab {
+            RightTab::Observer => (
+                "OBS",
+                truncate_model(&app.observer_cfg.model, 20),
+                provider_abbrev(&app.observer_cfg.provider),
+                truncate_model(app.observer_cfg.mode.label(), 8),
+                if app.observer.streaming {
+                    format!(" {}", spinner_char(app.tick_count))
+                } else {
+                    String::new()
+                },
+                "TABS:[OBS] CHAT TASKS".to_string(),
+                OBS_MAG,
+            ),
+            RightTab::Chat => (
+                "CHAT",
+                truncate_model(&app.chat_cfg.model, 20),
+                provider_abbrev(&app.chat_cfg.provider),
+                truncate_model(app.chat_cfg.mode.label(), 8),
+                if app.chat.streaming {
+                    format!(" {}", spinner_char(app.tick_count))
+                } else {
+                    String::new()
+                },
+                "TABS: OBS [CHAT] TASKS".to_string(),
+                ACCENT,
+            ),
+            RightTab::Tasks => (
+                "TASKS",
+                format!("{} items", app.tasks.len()),
+                "---",
+                "read-only".to_string(),
+                if app.planning_tasks {
+                    format!(" {}", spinner_char(app.tick_count))
+                } else {
+                    String::new()
+                },
+                "TABS: OBS CHAT [TASKS]".to_string(),
+                WARN,
+            ),
+        };
+    let key_badge = if active_key_missing(app) {
+        Span::styled(
+            "  KEYS?",
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("")
     };
 
     let row1 = Line::from(vec![
@@ -113,13 +158,33 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(format!("@{c_p}"), Style::default().fg(MUTED)),
         Span::styled(format!(" ·{c_mode}"), Style::default().fg(MUTED)),
         Span::styled(iter, Style::default().fg(ACCENT)),
-        Span::styled("  │  O: ", Style::default().fg(MUTED)),
+        Span::styled("  │  R: ", Style::default().fg(MUTED)),
         Span::styled(
-            format!("{o_m}{o_spin}"),
-            Style::default().fg(OBS_MAG).add_modifier(Modifier::BOLD),
+            format!("{right_label} "),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("@{o_p}"), Style::default().fg(MUTED)),
-        Span::styled(format!(" ·{o_mode}"), Style::default().fg(MUTED)),
+        Span::styled(
+            format!("{right_model}{right_spin}"),
+            Style::default()
+                .fg(right_brand)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if right_provider == "---" {
+                String::new()
+            } else {
+                format!("@{right_provider}")
+            },
+            Style::default().fg(MUTED),
+        ),
+        Span::styled(
+            if right_mode.is_empty() {
+                String::new()
+            } else {
+                format!(" ·{right_mode}")
+            },
+            Style::default().fg(MUTED),
+        ),
         if app.auto_observe {
             Span::styled(
                 "  ◉ AUTO",
@@ -136,11 +201,12 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             Span::raw("")
         },
+        key_badge,
         Span::styled(
             format!("  LANG: {}", app.lang.to_ascii_uppercase()),
             Style::default().fg(MUTED),
         ),
-        Span::styled(format!("  TAB:{right_tab}"), Style::default().fg(MUTED)),
+        Span::styled(format!("  {tabs_badge}"), Style::default().fg(MUTED)),
         Span::styled(
             app.project_stack_label
                 .as_deref()
@@ -151,7 +217,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     ]);
 
     let row2 = Line::from(Span::styled(
-        "  Tab=切替  Ctrl+A=自動  Ctrl+K=停止  Ctrl+O=実況  Ctrl+L=クリア  Ctrl+C=終了",
+        "  Tab=focus  Ctrl+R=right tab  Ctrl+A=auto  Ctrl+K=cancel  Ctrl+O=review  /=commands  /help=all",
         Style::default().fg(MUTED),
     ));
 
@@ -176,6 +242,22 @@ fn provider_abbrev(p: &ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "ant",
         ProviderKind::Hf => "hf",
     }
+}
+
+fn active_key_missing(app: &App) -> bool {
+    let cfg = match app.focus {
+        Focus::Coder => &app.coder_cfg,
+        Focus::Right => match app.right_tab {
+            RightTab::Observer => &app.observer_cfg,
+            RightTab::Chat => &app.chat_cfg,
+            RightTab::Tasks => return false,
+        },
+    };
+    provider_requires_key(&cfg.provider) && cfg.api_key.is_none()
+}
+
+fn provider_requires_key(provider: &ProviderKind) -> bool {
+    !matches!(provider, ProviderKind::Hf)
 }
 
 // ── Body: two-pane split ──────────────────────────────────────────────────────
@@ -205,17 +287,47 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App) {
     );
 
     let right_focused = app.focus == Focus::Right;
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(horiz[1]);
+    render_right_tab_bar(frame, right[0], app, right_focused);
     match app.right_tab {
         RightTab::Observer => {
-            render_message_pane(frame, horiz[1], app, PaneView::Observer, right_focused);
+            render_message_pane(frame, right[1], app, PaneView::Observer, right_focused);
         }
         RightTab::Chat => {
-            render_message_pane(frame, horiz[1], app, PaneView::Chat, right_focused);
+            render_message_pane(frame, right[1], app, PaneView::Chat, right_focused);
         }
         RightTab::Tasks => {
-            render_tasks_pane(frame, horiz[1], app, right_focused);
+            render_tasks_pane(frame, right[1], app, right_focused);
         }
     }
+}
+
+fn render_right_tab_bar(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
+    let style_for = |tab: RightTab, color: Color| {
+        if app.right_tab == tab {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else if focused {
+            Style::default().fg(TEXT_BODY)
+        } else {
+            Style::default().fg(MUTED)
+        }
+    };
+    let line = Line::from(vec![
+        Span::styled("  Right Pane ", Style::default().fg(MUTED)),
+        Span::styled("[Observer]", style_for(RightTab::Observer, OBS_MAG)),
+        Span::raw("  "),
+        Span::styled("[Chat]", style_for(RightTab::Chat, ACCENT)),
+        Span::raw("  "),
+        Span::styled("[Tasks]", style_for(RightTab::Tasks, WARN)),
+        Span::styled("   Ctrl+R or /tab", Style::default().fg(MUTED)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(BG_DARK)),
+        area,
+    );
 }
 
 fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView, focused: bool) {
@@ -374,8 +486,9 @@ fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView,
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if pane.messages.is_empty() {
-        render_welcome(frame, inner, view);
+    let input_is_empty = pane.textarea.lines().join("\n").trim().is_empty();
+    if pane.messages.is_empty() && !pane.welcome_dismissed && input_is_empty {
+        render_welcome(frame, inner, app, view);
         return;
     }
 
@@ -394,7 +507,7 @@ fn render_message_pane(frame: &mut Frame, area: Rect, app: &App, view: PaneView,
 
     if messages_view.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  (一致なし)  /find <text> でフィルタ, /find で解除",
+            "  (no matches)  /find <text> filters, /find clears",
             Style::default().fg(MUTED),
         )));
         lines.push(Line::default());
@@ -572,27 +685,63 @@ fn key_row(key: &'static str, desc: &'static str) -> Line<'static> {
     ])
 }
 
-fn render_welcome(frame: &mut Frame, area: Rect, view: PaneView) {
-    let (brand, heading, hint1, hint2) = match view {
+fn render_welcome(frame: &mut Frame, area: Rect, app: &App, view: PaneView) {
+    let (brand, heading, hint1, hint2, cfg, extra, quick_start) = match view {
         PaneView::Coder => (
             CODER_BLUE,
             " ◈ CODER",
-            "タスクを入力して Enter で送信",
-            "例: \"maze game を作って\"",
+            "Describe the coding task, then press Enter.",
+            "Chat lives on the right pane by default. Use Ctrl+R or /tab observer|chat|tasks.",
+            &app.coder_cfg,
+            "Coder defaults to a coding-first mode in the TUI.",
+            [
+                "1) Run /keys if your provider needs an API key",
+                "2) Type the task here and press Enter",
+                "3) Use Ctrl+R for Chat / Observer / Tasks",
+            ],
         ),
         PaneView::Observer => (
             OBS_MAG,
             " ◈ OBSERVER",
-            "質問を入力して Enter で送信",
-            "Ctrl+O でコーダーの最新出力をレビュー",
+            "Ask for critique, diagnosis, or the next step, then press Enter.",
+            "Ctrl+O reviews the latest Coder output. /meta-diagnose inspects failures.",
+            &app.observer_cfg,
+            "Observer is best for critique, not execution.",
+            [
+                "1) Use Ctrl+O to review the latest Coder output",
+                "2) Ask for critique, diagnosis, or next steps",
+                "3) Use /meta-diagnose for a failed Coder message",
+            ],
         ),
         PaneView::Chat => (
             ACCENT,
-            " CHAT",
-            "Use Chat for brainstorming. Enter to send.",
-            "Ctrl+R cycles right tab (Observer/Chat/Tasks).",
+            " ◈ CHAT",
+            "Use Chat for brainstorming or quick questions, then press Enter.",
+            "Ctrl+R cycles Observer / Chat / Tasks on the right pane.",
+            &app.chat_cfg,
+            "Chat does not execute tools.",
+            [
+                "1) Use Chat for brainstorming or clarification",
+                "2) Move to Coder when you want execution",
+                "3) Use /tab observer|tasks to inspect the runtime",
+            ],
         ),
     };
+    let api_status = if provider_requires_key(&cfg.provider) {
+        if cfg.api_key.is_some() {
+            "API key: set"
+        } else {
+            "API key: missing — run /keys for env vars and CLI flags"
+        }
+    } else {
+        "API key: not required for hf/local"
+    };
+    let provider_line = format!(
+        "Provider: {}  Model: {}  Mode: {}",
+        cfg.provider,
+        cfg.model,
+        cfg.mode.label()
+    );
 
     let mut lines = vec![
         Line::from(Span::styled(
@@ -602,20 +751,38 @@ fn render_welcome(frame: &mut Frame, area: Rect, view: PaneView) {
         Line::default(),
         Line::from(Span::styled(hint1, Style::default().fg(TEXT_BODY))),
         Line::from(Span::styled(hint2, Style::default().fg(MUTED))),
+        Line::from(Span::styled(provider_line, Style::default().fg(MUTED))),
+        Line::from(Span::styled(api_status, Style::default().fg(WARN))),
+        Line::from(Span::styled(extra, Style::default().fg(MUTED))),
+        Line::default(),
+        Line::from(Span::styled(
+            "Quick start",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
         Line::default(),
     ];
+    for step in quick_start {
+        lines.push(Line::from(Span::styled(
+            format!("  {step}"),
+            Style::default().fg(TEXT_BODY),
+        )));
+    }
+    lines.push(Line::default());
 
     for (key, desc) in [
-        ("Tab", "フォーカス切り替え"),
-        ("Enter", "送信"),
-        ("Shift+Enter", "改行"),
-        ("Ctrl+K", "ストリーミング停止"),
-        ("Ctrl+L", "履歴クリア"),
-        ("Ctrl+A", "自動実況 ON/OFF"),
-        ("Ctrl+O", "Observer 手動トリガー"),
-        ("PageUp/Down", "スクロール"),
-        ("End", "最下部へ"),
-        ("Ctrl+C / Esc", "終了"),
+        ("Tab", "switch focus"),
+        ("Ctrl+R", "switch right pane tab"),
+        ("/", "show slash command suggestions"),
+        ("/keys", "show API key setup and pane status"),
+        ("Enter", "send"),
+        ("Shift+Enter", "newline"),
+        ("Ctrl+K", "cancel streaming"),
+        ("Ctrl+L", "clear current pane"),
+        ("Ctrl+A", "toggle auto-observe"),
+        ("Ctrl+O", "send latest Coder output to Observer"),
+        ("PageUp/Down", "scroll"),
+        ("End", "jump to bottom"),
+        ("Ctrl+C / Esc", "quit"),
     ] {
         lines.push(key_row(key, desc));
     }
@@ -1389,12 +1556,23 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         },
     };
 
+    let input_text = current_input_text(app);
+    let active_picker = active_picker(&input_text);
+    let slash_items = if active_picker.is_none() {
+        slash_suggestions(&input_text)
+    } else {
+        None
+    };
     let hint = if is_streaming {
         "Ctrl+K=cancel"
     } else if read_only {
         "Enter=dispatch  Space=done  Ctrl+R=tab"
+    } else if active_picker.is_some() {
+        "Up/Down=select  Enter=apply"
+    } else if slash_items.is_some() {
+        "Enter=run command"
     } else {
-        "Enter=send  Shift+Enter=newline"
+        "Enter=send  Shift+Enter=newline  /=commands"
     };
 
     let title = Line::from(vec![
@@ -1410,7 +1588,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(" "),
     ]);
 
-    let border_color = if is_streaming { WARN } else { brand };
+    let border_color = border_color(is_streaming, brand);
 
     let block = Block::default()
         .title(title)
@@ -1450,13 +1628,225 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         return;
     }
+    if let Some(kind) = active_picker {
+        render_picker_input(frame, inner, app, kind);
+        return;
+    }
+    if let Some(items) = slash_items {
+        let inner_split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
+        let line = Line::from(vec![
+            Span::styled("  Commands ", Style::default().fg(MUTED)),
+            Span::styled(items.join("  "), Style::default().fg(ACCENT)),
+        ]);
+        frame.render_widget(Paragraph::new(line), inner_split[0]);
+        render_active_textarea(frame, inner_split[1], app);
+        return;
+    }
+    if input_text.trim().is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  {}", input_placeholder(app)),
+                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            ))),
+            inner,
+        );
+        return;
+    }
+    render_active_textarea(frame, inner, app);
+}
 
+fn border_color(is_streaming: bool, brand: Color) -> Color {
+    if is_streaming {
+        WARN
+    } else {
+        brand
+    }
+}
+
+fn current_input_text(app: &App) -> String {
     match app.focus {
-        Focus::Coder => frame.render_widget(&app.coder.textarea, inner),
+        Focus::Coder => app.coder.textarea.lines().join("\n"),
         Focus::Right => match app.right_tab {
-            RightTab::Observer => frame.render_widget(&app.observer.textarea, inner),
-            RightTab::Chat => frame.render_widget(&app.chat.textarea, inner),
+            RightTab::Observer => app.observer.textarea.lines().join("\n"),
+            RightTab::Chat => app.chat.textarea.lines().join("\n"),
+            RightTab::Tasks => String::new(),
+        },
+    }
+}
+
+fn active_picker(input: &str) -> Option<ActivePicker> {
+    match input.trim() {
+        "/provider" => Some(ActivePicker::Provider),
+        "/model" => Some(ActivePicker::Model),
+        _ => None,
+    }
+}
+
+fn picker_items(app: &App, kind: ActivePicker) -> Vec<String> {
+    match kind {
+        ActivePicker::Provider => {
+            let allow_all = !matches!(app.focus, Focus::Coder);
+            supported_providers()
+                .into_iter()
+                .filter(|name| allow_all || *name == "openai-compatible" || *name == "mistral")
+                .map(str::to_string)
+                .collect()
+        }
+        ActivePicker::Model => {
+            let cfg = active_run_config(app);
+            representative_models(&cfg.provider)
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        }
+    }
+}
+
+fn render_picker_input(frame: &mut Frame, area: Rect, app: &App, kind: ActivePicker) {
+    let items = picker_items(app, kind);
+    let pane = active_pane(app);
+    let selected = pane.picker_index.min(items.len().saturating_sub(1));
+    let mut lines = Vec::new();
+    let header = match kind {
+        ActivePicker::Provider => "  Select provider".to_string(),
+        ActivePicker::Model => format!("  Select model for {}", active_run_config(app).provider),
+    };
+    lines.push(Line::from(Span::styled(
+        header,
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    )));
+    for (idx, item) in items
+        .iter()
+        .take(area.height.saturating_sub(1) as usize)
+        .enumerate()
+    {
+        let prefix = if idx == selected { "›" } else { " " };
+        let style = if idx == selected {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT_BODY)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {prefix} {item}"),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn slash_suggestions(input: &str) -> Option<Vec<&'static str>> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let cmd = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("/")
+        .to_ascii_lowercase();
+    let commands = [
+        "/help",
+        "/keys",
+        "/tab",
+        "/provider",
+        "/base_url",
+        "/model",
+        "/mode",
+        "/persona",
+        "/temp",
+        "/lang",
+        "/root",
+        "/find",
+        "/meta-diagnose",
+        "/autofix",
+        "/diff",
+        "/init",
+        "/rollback",
+    ];
+    let mut matches: Vec<&str> = commands
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.starts_with(&cmd))
+        .collect();
+    if matches.is_empty() {
+        matches = commands.into_iter().take(6).collect();
+    }
+    if matches.len() > 6 {
+        matches.truncate(6);
+    }
+    Some(matches)
+}
+
+fn render_active_textarea(frame: &mut Frame, area: Rect, app: &App) {
+    match app.focus {
+        Focus::Coder => frame.render_widget(&app.coder.textarea, area),
+        Focus::Right => match app.right_tab {
+            RightTab::Observer => frame.render_widget(&app.observer.textarea, area),
+            RightTab::Chat => frame.render_widget(&app.chat.textarea, area),
             RightTab::Tasks => {}
         },
+    }
+}
+
+fn active_pane(app: &App) -> &super::app::Pane {
+    match app.focus {
+        Focus::Coder => &app.coder,
+        Focus::Right => match app.right_tab {
+            RightTab::Observer => &app.observer,
+            RightTab::Chat => &app.chat,
+            RightTab::Tasks => &app.observer,
+        },
+    }
+}
+
+fn active_run_config(app: &App) -> &crate::config::RunConfig {
+    match app.focus {
+        Focus::Coder => &app.coder_cfg,
+        Focus::Right => match app.right_tab {
+            RightTab::Observer => &app.observer_cfg,
+            RightTab::Chat => &app.chat_cfg,
+            RightTab::Tasks => &app.observer_cfg,
+        },
+    }
+}
+
+fn input_placeholder(app: &App) -> &'static str {
+    match app.focus {
+        Focus::Coder => "Describe the coding task…",
+        Focus::Right => match app.right_tab {
+            RightTab::Observer => "Ask for critique, diagnosis, or /meta-diagnose…",
+            RightTab::Chat => "Ask a question or brainstorm…",
+            RightTab::Tasks => "",
+        },
+    }
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let current = match app.focus {
+        Focus::Coder => "Coder",
+        Focus::Right => match app.right_tab {
+            RightTab::Observer => "Observer",
+            RightTab::Chat => "Chat",
+            RightTab::Tasks => "Tasks",
+        },
     };
+    let line = Line::from(vec![
+        Span::styled("  Focus:", Style::default().fg(MUTED)),
+        Span::styled(
+            format!(" {current}"),
+            Style::default().fg(TEXT_BODY).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ·  Tab focus", Style::default().fg(MUTED)),
+        Span::styled("  ·  Ctrl+R tabs", Style::default().fg(MUTED)),
+        Span::styled("  ·  / help", Style::default().fg(MUTED)),
+        Span::styled("  ·  /keys", Style::default().fg(MUTED)),
+        Span::styled("  ·  /tab", Style::default().fg(MUTED)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(BG_DARK)),
+        area,
+    );
 }

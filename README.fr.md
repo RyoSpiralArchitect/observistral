@@ -355,6 +355,14 @@ Dans l'UI Web : Settings → choisir Provider/Model/Base URL → coller la cle A
 bash ./scripts/run-tui.sh
 ```
 
+Comportement par defaut du TUI :
+- La langue de l'UI demarre en anglais (`/lang ja|en|fr` pour changer en cours de session).
+- Le panneau de droite s'ouvre sur `Chat`; utilisez `Ctrl+R` ou `/tab observer|chat|tasks` pour changer d'onglet.
+- Lancez `/keys` pour voir quelle variable d'environnement ou option CLI chaque panneau attend pour la cle API.
+- Taper `/` dans le composeur affiche un petit picker de commandes slash.
+- Taper exactement `/provider` ou `/model` ouvre un picker au clavier (`↑/↓`, `Enter`). `/model` propose des modeles representatifs selon le provider courant, plus `other`.
+- Si un panneau n'a pas la cle API requise ou n'a pas de modele, l'envoi est bloque et le TUI affiche un avertissement.
+
 **Coder headless (CLI)**
 Installer `obstral` (optionnel) :
 - Windows (PowerShell) : `.\scripts\install.ps1`
@@ -481,12 +489,15 @@ Dans l'UI Web, deux aides optionnelles :
 | Commande | Effet |
 |---|---|
 | `/model <nom>` | Changer de modele en cours de session |
-| `/provider <nom>` | Changer le provider en cours (ou afficher) |
+| `/provider <nom>` | Changer le provider en cours (ou afficher ; exact `/provider` ouvre le picker) |
 | `/base_url <url>` | Changer le base_url en cours (ou afficher ; `default` pour reinitialiser) |
 | `/persona <cle>` | Changer le persona du Coder |
 | `/temp <0.0–2.0>` | Ajuster la temperature |
+| `/mode <nom>` | Changer le mode du panneau courant |
 | `/root <chemin>` | Modifier le tool_root pour les envois suivants |
 | `/lang ja\|en\|fr` | Changer la langue de l'UI et des prompts |
+| `/tab <observer\|chat\|tasks\|next>` | Changer explicitement le panneau de droite |
+| `/keys` | Afficher l'etat des cles API par panneau et l'aide de configuration |
 | `/find <requete>` | Filtrer les messages dans le panneau courant |
 | `/meta-diagnose [last-fail\|msg:coder-<index>]` | Envoyer un echec Coder cible a l'Observer pour un diagnostic JSON-only |
 | `/help` | Afficher toutes les commandes |

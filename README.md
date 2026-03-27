@@ -376,6 +376,14 @@ In the Web UI: open Settings → choose Provider/Model/Base URL → paste API ke
 bash ./scripts/run-tui.sh
 ```
 
+TUI defaults:
+- UI language starts in English (`/lang ja|en|fr` changes it mid-session).
+- The right pane opens on `Chat`; use `Ctrl+R` or `/tab observer|chat|tasks` to switch tabs.
+- Run `/keys` to see which API key env var or CLI flag each pane expects.
+- Typing `/` in the composer shows a lightweight slash-command picker.
+- Typing exact `/provider` or `/model` opens an arrow-key picker (`Up/Down`, `Enter` to apply). `/model` shows representative models for the current provider plus `other`.
+- If a pane is missing a required API key or model, send is blocked and the TUI shows a warning instead of running.
+
 **Headless Coder (CLI)**
 Install `obstral` (optional):
 - Windows (PowerShell): `.\scripts\install.ps1`
@@ -551,7 +559,7 @@ In the Web UI, Chat has two optional helpers:
 | Command | Effect |
 |---|---|
 | `/model <name>` | Switch the current pane's model mid-session |
-| `/provider <name>` | Switch the current pane's provider mid-session (or show current) |
+| `/provider <name>` | Switch the current pane's provider mid-session (or show current; exact `/provider` opens picker) |
 | `/base_url <url>` | Switch the current pane's base_url mid-session (or show; use `default` to reset) |
 | `/mode <name>` | Switch the current pane's mode |
 | `/persona <key>` | Switch the current pane's persona |
@@ -559,6 +567,8 @@ In the Web UI, Chat has two optional helpers:
 | `/realize <off\|low\|mid\|high>` | Set the Coder's realize-on-demand strength and persist it under `.obstral/tui_prefs.json` (`mid` default in TUI) |
 | `/root <path>` | Change tool_root for subsequent sends |
 | `/lang ja\|en\|fr` | Switch UI + prompt language |
+| `/tab <observer\|chat\|tasks\|next>` | Switch the right-side pane explicitly |
+| `/keys` | Show per-pane API key status and setup help |
 | `/autofix` | Toggle Observer → Coder auto-fix forwarding |
 | `/find <query>` | Filter messages in the current pane |
 | `/meta-diagnose [last-fail\|msg:coder-<index>]` | Send a selected Coder failure to Observer for JSON-only diagnosis |
