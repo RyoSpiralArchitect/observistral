@@ -5006,6 +5006,8 @@ You already have enough observation evidence to call done directly now.\n",
     }
     out.push_str(
         "If your plan includes meta constraints like `no files modified`, keep them in remaining_acceptance instead of blocking done.\n\
+Next assistant turn: emit a <think> block with `tool: done`, then call `done` immediately.\n\
+If you cite handler confirmation, prefer the successful `read_file(...)` command over another search.\n\
 Final answer must include the file path.",
     );
     Some(out)
@@ -11333,15 +11335,17 @@ Required now: {}",
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
-            if !is_error && root_read_only && pending_system_hint.is_none() {
+            if !is_error && root_read_only {
                 if let Some(plan) = active_plan.as_ref() {
-                    pending_system_hint = build_read_only_completion_hint(
+                    if let Some(hint) = build_read_only_completion_hint(
                         &root_user_text,
                         plan,
                         &observation_evidence,
                         &messages,
                         &working_mem,
-                    );
+                    ) {
+                        pending_system_hint = Some(hint);
+                    }
                 }
             }
             autosave_best_effort(
@@ -11458,15 +11462,17 @@ Required now: {}",
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
-            if !is_error && root_read_only && pending_system_hint.is_none() {
+            if !is_error && root_read_only {
                 if let Some(plan) = active_plan.as_ref() {
-                    pending_system_hint = build_read_only_completion_hint(
+                    if let Some(hint) = build_read_only_completion_hint(
                         &root_user_text,
                         plan,
                         &observation_evidence,
                         &messages,
                         &working_mem,
-                    );
+                    ) {
+                        pending_system_hint = Some(hint);
+                    }
                 }
             }
             autosave_best_effort(
@@ -13176,6 +13182,7 @@ remaining_gap: still need to run cargo test\n\
         .expect("completion hint");
 
         assert!(hint.contains("call done directly now"));
+        assert!(hint.contains("tool: done"));
         assert!(hint.contains("src/tui/events.rs") || hint.contains("read_file"));
     }
 
