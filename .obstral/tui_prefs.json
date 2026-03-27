@@ -1,0 +1,32 @@
+{
+  "coder_realize_preset": "mid",
+  "coder_persona": "default",
+  "ui_lang": "en",
+  "coder": {
+    "provider": "openai-compatible",
+    "mode": "VIBE",
+    "model": "gpt-4o-mini",
+    "base_url": "https://api.openai.com/v1",
+    "persona": "default",
+    "temperature": 0.4
+  },
+  "observer": {
+    "provider": "openai-compatible",
+    "mode": "Observer",
+    "model": "gpt-4o-mini",
+    "base_url": "https://api.openai.com/v1",
+    "persona": "default",
+    "temperature": 0.4
+  },
+  "chat": {
+    "provider": "openai-compatible",
+    "mode": "会話",
+    "model": "gpt-4o-mini",
+    "base_url": "https://api.openai.com/v1",
+    "persona": "default",
+    "temperature": 0.4
+  },
+  "auto_observe": false,
+  "auto_fix_mode": false,
+  "ui_right_tab": "observer"
+}
