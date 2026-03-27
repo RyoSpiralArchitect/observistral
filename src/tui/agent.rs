@@ -5013,6 +5013,91 @@ Final answer must include the file path.",
     Some(out)
 }
 
+fn build_read_only_iteration_cap_final_answer(
+    root_user_text: &str,
+    plan: &PlanBlock,
+    evidence: &ObservationEvidence,
+    messages: &[serde_json::Value],
+    working_mem: &WorkingMemory,
+) -> Option<String> {
+    if evidence.reads.is_empty() {
+        return None;
+    }
+
+    let scores = build_read_only_evidence_scores(root_user_text, plan, evidence);
+    let medium_or_better = scores.iter().filter(|score| score.total >= 0.60).count();
+    if medium_or_better < 2 {
+        return None;
+    }
+
+    let known_commands = collect_known_acceptance_commands(messages, working_mem);
+    let mut completed_rows: Vec<(usize, String)> = scores
+        .iter()
+        .filter(|score| score.total >= 0.85)
+        .filter_map(|score| {
+            let command = score.suggested_commands.iter().find_map(|cmd| {
+                resolve_known_acceptance_command(cmd.as_str(), &known_commands)
+                    .map(|s| s.to_string())
+            })?;
+            Some((score.idx, command))
+        })
+        .collect();
+
+    if completed_rows.is_empty() {
+        return None;
+    }
+
+    completed_rows.sort_by_key(|(idx, _)| *idx);
+    completed_rows.dedup_by_key(|(idx, _)| *idx);
+
+    let best_path = completed_rows
+        .iter()
+        .find_map(|(idx, _)| scores.get(*idx).and_then(|score| score.best_path.clone()))
+        .or_else(|| {
+            scores
+                .iter()
+                .max_by(|a, b| {
+                    a.total
+                        .partial_cmp(&b.total)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .and_then(|score| score.best_path.clone())
+        });
+
+    let summary = if let Some(path) = best_path.as_deref() {
+        if let Some(slash) = first_slash_literal(root_user_text) {
+            format!("Located the `{slash}` slash command handling in `{path}`.")
+        } else {
+            format!("Located the requested implementation in `{path}`.")
+        }
+    } else {
+        "Completed the requested read-only inspection.".to_string()
+    };
+
+    let completed_indices: std::collections::BTreeSet<usize> =
+        completed_rows.iter().map(|(idx, _)| *idx).collect();
+
+    let mut final_text = String::from("[DONE]\n");
+    final_text.push_str(summary.as_str());
+    final_text.push_str("\n\nAcceptance:\n");
+    for (idx, command) in &completed_rows {
+        final_text.push_str("- done: ");
+        final_text.push_str(acceptance_reference_label(plan, *idx).as_str());
+        final_text.push_str(" via `");
+        final_text.push_str(command.as_str());
+        final_text.push_str("`\n");
+    }
+    for idx in 0..plan.acceptance_criteria.len() {
+        if completed_indices.contains(&idx) {
+            continue;
+        }
+        final_text.push_str("- remaining: ");
+        final_text.push_str(acceptance_reference_label(plan, idx).as_str());
+        final_text.push('\n');
+    }
+    Some(final_text)
+}
+
 fn evidence_path_matches(target: &str, candidate: &str) -> bool {
     let target_sig = normalize_memory_entry(target);
     let candidate_sig = normalize_memory_entry(candidate);
@@ -11440,7 +11525,45 @@ Required now: {}",
             }));
             if !is_error && root_read_only {
                 if let Some(plan) = active_plan.as_ref() {
-                    if let Some(hint) = build_read_only_completion_hint(
+                    if iter + 1 == max_iters {
+                        if let Some(final_text) = build_read_only_iteration_cap_final_answer(
+                            &root_user_text,
+                            plan,
+                            &observation_evidence,
+                            &messages,
+                            &working_mem,
+                        ) {
+                            state = AgentState::Done;
+                            messages
+                                .push(json!({"role": "assistant", "content": final_text.clone()}));
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
+                            .await;
+                            let _ = tx
+                                .send(StreamToken::GovernorState(build_governor_state(
+                                    state,
+                                    &recovery,
+                                    &mem,
+                                    file_tool_consec_failures,
+                                    last_mutation_step,
+                                    last_verify_ok_step,
+                                    last_reflection.as_ref(),
+                                )))
+                                .await;
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "\n[agent] iteration cap reached; auto-finalized read-only inspection.\n\n{final_text}\n"
+                                )))
+                                .await;
+                            break;
+                        }
+                    } else if let Some(hint) = build_read_only_completion_hint(
                         &root_user_text,
                         plan,
                         &observation_evidence,
@@ -11567,7 +11690,45 @@ Required now: {}",
             }));
             if !is_error && root_read_only {
                 if let Some(plan) = active_plan.as_ref() {
-                    if let Some(hint) = build_read_only_completion_hint(
+                    if iter + 1 == max_iters {
+                        if let Some(final_text) = build_read_only_iteration_cap_final_answer(
+                            &root_user_text,
+                            plan,
+                            &observation_evidence,
+                            &messages,
+                            &working_mem,
+                        ) {
+                            state = AgentState::Done;
+                            messages
+                                .push(json!({"role": "assistant", "content": final_text.clone()}));
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
+                            .await;
+                            let _ = tx
+                                .send(StreamToken::GovernorState(build_governor_state(
+                                    state,
+                                    &recovery,
+                                    &mem,
+                                    file_tool_consec_failures,
+                                    last_mutation_step,
+                                    last_verify_ok_step,
+                                    last_reflection.as_ref(),
+                                )))
+                                .await;
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "\n[agent] iteration cap reached; auto-finalized read-only inspection.\n\n{final_text}\n"
+                                )))
+                                .await;
+                            break;
+                        }
+                    } else if let Some(hint) = build_read_only_completion_hint(
                         &root_user_text,
                         plan,
                         &observation_evidence,
@@ -11681,6 +11842,57 @@ Required now: {}",
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
+            if !is_error && root_read_only {
+                if let Some(plan) = active_plan.as_ref() {
+                    if iter + 1 == max_iters {
+                        if let Some(final_text) = build_read_only_iteration_cap_final_answer(
+                            &root_user_text,
+                            plan,
+                            &observation_evidence,
+                            &messages,
+                            &working_mem,
+                        ) {
+                            state = AgentState::Done;
+                            messages
+                                .push(json!({"role": "assistant", "content": final_text.clone()}));
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
+                            .await;
+                            let _ = tx
+                                .send(StreamToken::GovernorState(build_governor_state(
+                                    state,
+                                    &recovery,
+                                    &mem,
+                                    file_tool_consec_failures,
+                                    last_mutation_step,
+                                    last_verify_ok_step,
+                                    last_reflection.as_ref(),
+                                )))
+                                .await;
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "\n[agent] iteration cap reached; auto-finalized read-only inspection.\n\n{final_text}\n"
+                                )))
+                                .await;
+                            break;
+                        }
+                    } else if let Some(hint) = build_read_only_completion_hint(
+                        &root_user_text,
+                        plan,
+                        &observation_evidence,
+                        &messages,
+                        &working_mem,
+                    ) {
+                        pending_system_hint = Some(hint);
+                    }
+                }
+            }
             autosave_best_effort(
                 &autosaver,
                 &tx,
@@ -11805,6 +12017,57 @@ Required now: {}",
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
+            if !is_error && root_read_only {
+                if let Some(plan) = active_plan.as_ref() {
+                    if iter + 1 == max_iters {
+                        if let Some(final_text) = build_read_only_iteration_cap_final_answer(
+                            &root_user_text,
+                            plan,
+                            &observation_evidence,
+                            &messages,
+                            &working_mem,
+                        ) {
+                            state = AgentState::Done;
+                            messages
+                                .push(json!({"role": "assistant", "content": final_text.clone()}));
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
+                            .await;
+                            let _ = tx
+                                .send(StreamToken::GovernorState(build_governor_state(
+                                    state,
+                                    &recovery,
+                                    &mem,
+                                    file_tool_consec_failures,
+                                    last_mutation_step,
+                                    last_verify_ok_step,
+                                    last_reflection.as_ref(),
+                                )))
+                                .await;
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "\n[agent] iteration cap reached; auto-finalized read-only inspection.\n\n{final_text}\n"
+                                )))
+                                .await;
+                            break;
+                        }
+                    } else if let Some(hint) = build_read_only_completion_hint(
+                        &root_user_text,
+                        plan,
+                        &observation_evidence,
+                        &messages,
+                        &working_mem,
+                    ) {
+                        pending_system_hint = Some(hint);
+                    }
+                }
+            }
             autosave_best_effort(
                 &autosaver,
                 &tx,
@@ -13287,6 +13550,73 @@ remaining_gap: still need to run cargo test\n\
         assert!(hint.contains("call done directly now"));
         assert!(hint.contains("tool: done"));
         assert!(hint.contains("src/tui/events.rs") || hint.contains("read_file"));
+    }
+
+    #[test]
+    fn build_read_only_iteration_cap_final_answer_includes_path() {
+        let plan = PlanBlock {
+            goal: "Locate the /realize slash command handler in the TUI".to_string(),
+            steps: vec![
+                "search src".to_string(),
+                "read the matching file".to_string(),
+                "confirm the context".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path containing the `/realize` slash command handler is identified."
+                    .to_string(),
+                "The handler logic is confirmed to be part of the TUI component.".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"/realize\",\"dir\":\"src\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: '/realize' — 1 match(es)]\nsrc/tui/events.rs:465:         \"/realize\" => {"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/tui/events.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/tui/events.rs] (2918 lines, 108025 bytes)\nfn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {\n    match cmd_lc.as_str() {\n        \"/realize\" => {"
+            }),
+        ];
+
+        let evidence = collect_observation_evidence(&messages);
+        let final_text = build_read_only_iteration_cap_final_answer(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything. Final answer must include the file path.",
+            &plan,
+            &evidence,
+            &messages,
+            &WorkingMemory::default(),
+        )
+        .expect("final answer");
+
+        assert!(final_text.starts_with("[DONE]"));
+        assert!(final_text.contains("src/tui/events.rs"));
+        assert!(final_text.contains("acceptance 1"));
     }
 
     #[test]
