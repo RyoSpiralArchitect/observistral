@@ -186,6 +186,19 @@ fn push_unique_capped(items: &mut Vec<String>, value: String, cap: usize) {
     }
 }
 
+fn section_or_dash(items: &[String], cap: usize) -> String {
+    if items.is_empty() {
+        "-".to_string()
+    } else {
+        items
+            .iter()
+            .take(cap)
+            .map(|item| compact_line(item, 96))
+            .collect::<Vec<_>>()
+            .join(" ; ")
+    }
+}
+
 pub fn normalize_intent_update(text: &str, prev: Option<&IntentAnchor>) -> IntentUpdate {
     let trimmed = text.trim();
     let low = trimmed.to_ascii_lowercase();
@@ -421,6 +434,7 @@ pub fn render_intent_anchor(anchor: &IntentAnchor) -> String {
     out.push_str(&format!("revision: {}\n", anchor.revision));
     out.push_str(&format!("update_kind: {:?}\n", anchor.last_update_kind));
     out.push_str(&format!("update_no_op: {}\n", anchor.last_update_no_op));
+    out.push_str(&format!("baseline: {}\n", anchor_baseline(anchor)));
     out.push_str(&format!("goal: {}\n", anchor.goal));
     out.push_str(&format!(
         "target: {}\n",
@@ -477,6 +491,21 @@ pub fn render_intent_anchor(anchor: &IntentAnchor) -> String {
     out.push_str("- Treat optimization_hints as modifiers, not a new task.\n");
     out.push_str("- Do not widen into unrelated refactors.\n");
     out
+}
+
+pub fn anchor_baseline(anchor: &IntentAnchor) -> String {
+    format!(
+        "goal: {} | target: {} | constraints: {} | success: {} | opt: {}",
+        compact_line(anchor.goal.as_str(), 120),
+        anchor
+            .target
+            .as_deref()
+            .map(|s| compact_line(s, 96))
+            .unwrap_or_else(|| "-".to_string()),
+        section_or_dash(&anchor.constraints, 3),
+        section_or_dash(&anchor.success_criteria, 3),
+        section_or_dash(&anchor.optimization_hints, 3),
+    )
 }
 
 #[cfg(test)]
@@ -558,5 +587,28 @@ mod tests {
             "but do not widen scope and keep it read-only",
         );
         assert!(!next.constraints.is_empty());
+    }
+
+    #[test]
+    fn anchor_baseline_stays_scoped() {
+        let anchor = IntentAnchor {
+            revision: 2,
+            raw_user_prompt: "make it better".to_string(),
+            goal: "Locate the /realize handler".to_string(),
+            target: Some("src/tui/events.rs".to_string()),
+            constraints: vec!["Do not edit anything".to_string()],
+            success_criteria: vec!["Final answer includes the file path".to_string()],
+            non_goals: Vec::new(),
+            optimization_hints: vec!["improve readability within current scope".to_string()],
+            ambiguity: 0.24,
+            confidence: 0.78,
+            requires_human_confirmation: false,
+            last_update_kind: IntentUpdateKind::VagueModifier,
+            last_update_no_op: false,
+        };
+        let baseline = anchor_baseline(&anchor);
+        assert!(baseline.contains("goal: Locate the /realize handler"));
+        assert!(baseline.contains("target: src/tui/events.rs"));
+        assert!(baseline.contains("opt: improve readability within current scope"));
     }
 }

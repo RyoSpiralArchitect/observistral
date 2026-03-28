@@ -886,12 +886,32 @@ fn latent_plan_summary(plan: &PlanBlock, raw_text: &str, latest_intent: Option<&
     out
 }
 
+fn latest_intent_anchor_baseline(messages: &[serde_json::Value]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        if message["role"].as_str() != Some("system") {
+            return None;
+        }
+        let content = message["content"].as_str()?;
+        if !content.starts_with("[Intent Anchor]") {
+            return None;
+        }
+        content.lines().find_map(|line| {
+            line.strip_prefix("baseline: ")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+        })
+    })
+}
+
 fn build_anchor_baseline(
+    messages: &[serde_json::Value],
     root_user_text: &str,
     active_plan: Option<&PlanBlock>,
     working_mem: &WorkingMemory,
 ) -> String {
-    let mut parts = vec![compact_one_line(root_user_text, 220)];
+    let mut parts = vec![latest_intent_anchor_baseline(messages)
+        .unwrap_or_else(|| compact_one_line(root_user_text, 220))];
     if let Some(plan) = active_plan {
         parts.push(format!(
             "active_goal: {}",
@@ -9919,6 +9939,7 @@ Execute only the new minimal action: {}",
                             latest_intent.as_deref(),
                         );
                         let anchor = build_anchor_baseline(
+                            &messages,
                             &root_user_text,
                             active_plan.as_ref(),
                             &working_mem,
@@ -9972,6 +9993,7 @@ Execute only the new minimal action: {}",
                                 latest_intent.as_deref(),
                             );
                             let anchor = build_anchor_baseline(
+                                &messages,
                                 &root_user_text,
                                 active_plan.as_ref(),
                                 &working_mem,
@@ -14473,6 +14495,37 @@ verify: exit code is zero\n\
         let near = "fix repo map fallback for read_file";
         let far = "compose a critique about unrelated observer prose";
         assert!(cosine_token_distance(anchor, near) < cosine_token_distance(anchor, far));
+    }
+
+    #[test]
+    fn latest_intent_anchor_baseline_reads_system_anchor() {
+        let messages = vec![
+            json!({"role":"system","content":"base system"}),
+            json!({"role":"system","content":"[Intent Anchor]\nrevision: 2\nbaseline: goal: locate slash handler | target: src/tui/events.rs | constraints: do not edit | success: include file path | opt: -\n"}),
+            json!({"role":"user","content":"continue"}),
+        ];
+        assert_eq!(
+            latest_intent_anchor_baseline(&messages).as_deref(),
+            Some(
+                "goal: locate slash handler | target: src/tui/events.rs | constraints: do not edit | success: include file path | opt: -"
+            )
+        );
+    }
+
+    #[test]
+    fn build_anchor_baseline_prefers_intent_anchor_over_root_prompt() {
+        let messages = vec![json!({
+            "role":"system",
+            "content":"[Intent Anchor]\nrevision: 3\nbaseline: goal: stabilize coder loop | target: src/tui/agent.rs | constraints: keep scope narrow | success: preserve user intent | opt: improve readability\n"
+        })];
+        let baseline = build_anchor_baseline(
+            &messages,
+            "something vague like make it better",
+            None,
+            &WorkingMemory::default(),
+        );
+        assert!(baseline.contains("goal: stabilize coder loop"));
+        assert!(!baseline.contains("something vague like make it better"));
     }
 
     #[test]
