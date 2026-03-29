@@ -6915,6 +6915,76 @@ fn validate_think(think: &ThinkBlock, plan: &PlanBlock, tc: &ToolCallData) -> Re
     Ok(())
 }
 
+fn mistral_observation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "search_files" | "list_dir" | "glob" | "done"
+    )
+}
+
+fn synthetic_read_only_observation_plan(root_user_text: &str) -> PlanBlock {
+    let slash = first_slash_literal(root_user_text).unwrap_or_else(|| "/realize".to_string());
+    PlanBlock {
+        goal: format!("Locate where `{slash}` is handled in the TUI and report the file path."),
+        steps: vec![
+            format!("search_files(pattern=\"{slash}\", dir=\"src\")"),
+            "if needed search_files(pattern=\"realize\", dir=\"src\")".to_string(),
+            "read_file(path=\"<matching file>\") to confirm the handler branch".to_string(),
+            "call done once the file path and code context are confirmed".to_string(),
+        ],
+        acceptance_criteria: vec![
+            format!("the file path handling `{slash}` is identified"),
+            "the handler branch is confirmed by read_file".to_string(),
+        ],
+        risks: "the command may be matched without the leading slash; the handler may live outside the obvious TUI file".to_string(),
+        assumptions: "observation tools are sufficient; no edits or behavioral verification are required".to_string(),
+    }
+}
+
+fn repair_mistral_plan_for_tool_turn(
+    parsed_plan: Option<&PlanBlock>,
+    active_plan: Option<&PlanBlock>,
+    tc: &ToolCallData,
+    root_user_text: &str,
+    root_read_only: bool,
+) -> Option<PlanBlock> {
+    if !root_read_only || !mistral_observation_tool(tc.name.as_str()) {
+        return None;
+    }
+    let fallback = synthetic_read_only_observation_plan(root_user_text);
+    let mut repaired = active_plan.cloned().unwrap_or_else(|| fallback.clone());
+    if let Some(parsed) = parsed_plan {
+        if !parsed.goal.trim().is_empty() {
+            repaired.goal = parsed.goal.clone();
+        }
+        if !parsed.steps.is_empty() {
+            repaired.steps = parsed.steps.clone();
+        }
+        if !parsed.acceptance_criteria.is_empty() {
+            repaired.acceptance_criteria = parsed.acceptance_criteria.clone();
+        }
+        if !parsed.risks.trim().is_empty() {
+            repaired.risks = parsed.risks.clone();
+        }
+        if !parsed.assumptions.trim().is_empty() {
+            repaired.assumptions = parsed.assumptions.clone();
+        }
+    }
+    if repaired.steps.len() < plan_field_min_items("steps").unwrap_or(2) {
+        repaired.steps = fallback.steps;
+    }
+    if repaired.acceptance_criteria.len() < plan_field_min_items("acceptance").unwrap_or(1) {
+        repaired.acceptance_criteria = fallback.acceptance_criteria;
+    }
+    if repaired.risks.trim().is_empty() {
+        repaired.risks = fallback.risks;
+    }
+    if repaired.assumptions.trim().is_empty() {
+        repaired.assumptions = fallback.assumptions;
+    }
+    Some(repaired)
+}
+
 fn compat_synthetic_think(tc: &ToolCallData, plan: &PlanBlock) -> ThinkBlock {
     let next = match tc.name.as_str() {
         "exec" => parse_exec_command_from_args(&tc.arguments)
@@ -6966,6 +7036,33 @@ fn compat_synthetic_think(tc: &ToolCallData, plan: &PlanBlock) -> ThinkBlock {
         next,
         verify: "confirm the tool output matches the request".to_string(),
     }
+}
+
+fn select_think_for_tool_turn<'a>(
+    parsed: Option<&'a ThinkBlock>,
+    compat_last: Option<&'a ThinkBlock>,
+    compat_synth: Option<&'a ThinkBlock>,
+    plan: &PlanBlock,
+    tc: &ToolCallData,
+    provider: ProviderKind,
+) -> (Option<&'a ThinkBlock>, bool) {
+    if matches!(provider, ProviderKind::Mistral) {
+        if let Some(think) = parsed.filter(|think| validate_think(think, plan, tc).is_ok()) {
+            return (Some(think), false);
+        }
+        if let Some(think) = compat_synth.filter(|think| validate_think(think, plan, tc).is_ok()) {
+            return (Some(think), true);
+        }
+        if let Some(think) = compat_last.filter(|think| validate_think(think, plan, tc).is_ok()) {
+            return (Some(think), false);
+        }
+        return (
+            parsed.or(compat_synth).or(compat_last),
+            compat_synth.is_some(),
+        );
+    }
+
+    (parsed.or(compat_last).or(compat_synth), false)
 }
 
 fn validate_reflection(
@@ -9525,105 +9622,324 @@ Execute only the new minimal action: {}",
                         &task_contract,
                         &instruction_resolver,
                     ) {
-                        state = AgentState::Recovery;
-                        recovery.stage = Some(RecoveryStage::Diagnose);
-                        let block = governor_contract::invalid_plan_message(&e.to_string());
+                        if matches!(cfg.provider, ProviderKind::Mistral) {
+                            if let Some(repaired) = repair_mistral_plan_for_tool_turn(
+                                Some(plan),
+                                active_plan.as_ref(),
+                                tc,
+                                &root_user_text,
+                                root_read_only,
+                            ) {
+                                if validate_plan_for_task_contract(
+                                    &repaired,
+                                    root_read_only,
+                                    &task_contract,
+                                    &instruction_resolver,
+                                )
+                                .is_ok()
+                                {
+                                    let _ = tx
+                                        .send(StreamToken::Delta(
+                                            "\n[compat] repaired Mistral plan skeleton for observation tool turn\n".to_string(),
+                                        ))
+                                        .await;
+                                    repaired
+                                } else {
+                                    state = AgentState::Recovery;
+                                    recovery.stage = Some(RecoveryStage::Diagnose);
+                                    let block =
+                                        governor_contract::invalid_plan_message(&e.to_string());
 
-                        let _ = tx
-                            .send(StreamToken::Delta(format!(
-                                "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
-                            )))
+                                    let _ = tx
+                                        .send(StreamToken::Delta(format!(
+                                            "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                                        )))
+                                        .await;
+
+                                    push_blocked_tool_exchange(
+                                        &mut messages,
+                                        &assistant_text_clean,
+                                        tc,
+                                        &block,
+                                    );
+                                    autosave_best_effort(
+                                        &autosaver,
+                                        &tx,
+                                        tool_root_abs.as_deref(),
+                                        checkpoint.as_deref(),
+                                        cur_cwd.as_deref(),
+                                        &messages,
+                                    )
+                                    .await;
+
+                                    pending_system_hint = Some(block);
+                                    let _ = tx
+                                        .send(StreamToken::GovernorState(build_governor_state(
+                                            state,
+                                            &recovery,
+                                            &mem,
+                                            file_tool_consec_failures,
+                                            last_mutation_step,
+                                            last_verify_ok_step,
+                                            last_reflection.as_ref(),
+                                        )))
+                                        .await;
+                                    continue;
+                                }
+                            } else {
+                                state = AgentState::Recovery;
+                                recovery.stage = Some(RecoveryStage::Diagnose);
+                                let block = governor_contract::invalid_plan_message(&e.to_string());
+
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                                    )))
+                                    .await;
+
+                                push_blocked_tool_exchange(
+                                    &mut messages,
+                                    &assistant_text_clean,
+                                    tc,
+                                    &block,
+                                );
+                                autosave_best_effort(
+                                    &autosaver,
+                                    &tx,
+                                    tool_root_abs.as_deref(),
+                                    checkpoint.as_deref(),
+                                    cur_cwd.as_deref(),
+                                    &messages,
+                                )
+                                .await;
+
+                                pending_system_hint = Some(block);
+                                let _ = tx
+                                    .send(StreamToken::GovernorState(build_governor_state(
+                                        state,
+                                        &recovery,
+                                        &mem,
+                                        file_tool_consec_failures,
+                                        last_mutation_step,
+                                        last_verify_ok_step,
+                                        last_reflection.as_ref(),
+                                    )))
+                                    .await;
+                                continue;
+                            }
+                        } else {
+                            state = AgentState::Recovery;
+                            recovery.stage = Some(RecoveryStage::Diagnose);
+                            let block = governor_contract::invalid_plan_message(&e.to_string());
+
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                                )))
+                                .await;
+
+                            push_blocked_tool_exchange(
+                                &mut messages,
+                                &assistant_text_clean,
+                                tc,
+                                &block,
+                            );
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
                             .await;
 
-                        push_blocked_tool_exchange(
-                            &mut messages,
-                            &assistant_text_clean,
-                            tc,
-                            &block,
-                        );
-                        autosave_best_effort(
-                            &autosaver,
-                            &tx,
-                            tool_root_abs.as_deref(),
-                            checkpoint.as_deref(),
-                            cur_cwd.as_deref(),
-                            &messages,
-                        )
-                        .await;
-
-                        pending_system_hint = Some(block);
-                        let _ = tx
-                            .send(StreamToken::GovernorState(build_governor_state(
-                                state,
-                                &recovery,
-                                &mem,
-                                file_tool_consec_failures,
-                                last_mutation_step,
-                                last_verify_ok_step,
-                                last_reflection.as_ref(),
-                            )))
-                            .await;
-                        continue;
+                            pending_system_hint = Some(block);
+                            let _ = tx
+                                .send(StreamToken::GovernorState(build_governor_state(
+                                    state,
+                                    &recovery,
+                                    &mem,
+                                    file_tool_consec_failures,
+                                    last_mutation_step,
+                                    last_verify_ok_step,
+                                    last_reflection.as_ref(),
+                                )))
+                                .await;
+                            continue;
+                        }
+                    } else {
+                        plan.clone()
                     }
-                    plan
                 }
                 None => match active_plan.as_ref() {
-                    Some(plan) => plan,
+                    Some(plan) => plan.clone(),
                     None => {
-                        state = AgentState::Recovery;
-                        recovery.stage = Some(RecoveryStage::Diagnose);
-                        let block = governor_contract::missing_plan_message();
+                        if matches!(cfg.provider, ProviderKind::Mistral) {
+                            if let Some(repaired) = repair_mistral_plan_for_tool_turn(
+                                None,
+                                None,
+                                tc,
+                                &root_user_text,
+                                root_read_only,
+                            ) {
+                                if validate_plan_for_task_contract(
+                                    &repaired,
+                                    root_read_only,
+                                    &task_contract,
+                                    &instruction_resolver,
+                                )
+                                .is_ok()
+                                {
+                                    let _ = tx
+                                        .send(StreamToken::Delta(
+                                            "\n[compat] synthesized Mistral read-only observation plan\n".to_string(),
+                                        ))
+                                        .await;
+                                    repaired
+                                } else {
+                                    state = AgentState::Recovery;
+                                    recovery.stage = Some(RecoveryStage::Diagnose);
+                                    let block = governor_contract::missing_plan_message();
 
-                        let _ = tx
-                            .send(StreamToken::Delta(format!(
-                                "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
-                            )))
+                                    let _ = tx
+                                        .send(StreamToken::Delta(format!(
+                                            "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                                        )))
+                                        .await;
+
+                                    push_blocked_tool_exchange(
+                                        &mut messages,
+                                        &assistant_text_clean,
+                                        tc,
+                                        &block,
+                                    );
+                                    autosave_best_effort(
+                                        &autosaver,
+                                        &tx,
+                                        tool_root_abs.as_deref(),
+                                        checkpoint.as_deref(),
+                                        cur_cwd.as_deref(),
+                                        &messages,
+                                    )
+                                    .await;
+
+                                    pending_system_hint = Some(block);
+                                    let _ = tx
+                                        .send(StreamToken::GovernorState(build_governor_state(
+                                            state,
+                                            &recovery,
+                                            &mem,
+                                            file_tool_consec_failures,
+                                            last_mutation_step,
+                                            last_verify_ok_step,
+                                            last_reflection.as_ref(),
+                                        )))
+                                        .await;
+                                    continue;
+                                }
+                            } else {
+                                state = AgentState::Recovery;
+                                recovery.stage = Some(RecoveryStage::Diagnose);
+                                let block = governor_contract::missing_plan_message();
+
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                                    )))
+                                    .await;
+
+                                push_blocked_tool_exchange(
+                                    &mut messages,
+                                    &assistant_text_clean,
+                                    tc,
+                                    &block,
+                                );
+                                autosave_best_effort(
+                                    &autosaver,
+                                    &tx,
+                                    tool_root_abs.as_deref(),
+                                    checkpoint.as_deref(),
+                                    cur_cwd.as_deref(),
+                                    &messages,
+                                )
+                                .await;
+
+                                pending_system_hint = Some(block);
+                                let _ = tx
+                                    .send(StreamToken::GovernorState(build_governor_state(
+                                        state,
+                                        &recovery,
+                                        &mem,
+                                        file_tool_consec_failures,
+                                        last_mutation_step,
+                                        last_verify_ok_step,
+                                        last_reflection.as_ref(),
+                                    )))
+                                    .await;
+                                continue;
+                            }
+                        } else {
+                            state = AgentState::Recovery;
+                            recovery.stage = Some(RecoveryStage::Diagnose);
+                            let block = governor_contract::missing_plan_message();
+
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                                )))
+                                .await;
+
+                            push_blocked_tool_exchange(
+                                &mut messages,
+                                &assistant_text_clean,
+                                tc,
+                                &block,
+                            );
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
                             .await;
 
-                        push_blocked_tool_exchange(
-                            &mut messages,
-                            &assistant_text_clean,
-                            tc,
-                            &block,
-                        );
-                        autosave_best_effort(
-                            &autosaver,
-                            &tx,
-                            tool_root_abs.as_deref(),
-                            checkpoint.as_deref(),
-                            cur_cwd.as_deref(),
-                            &messages,
-                        )
-                        .await;
-
-                        pending_system_hint = Some(block);
-                        let _ = tx
-                            .send(StreamToken::GovernorState(build_governor_state(
-                                state,
-                                &recovery,
-                                &mem,
-                                file_tool_consec_failures,
-                                last_mutation_step,
-                                last_verify_ok_step,
-                                last_reflection.as_ref(),
-                            )))
-                            .await;
-                        continue;
+                            pending_system_hint = Some(block);
+                            let _ = tx
+                                .send(StreamToken::GovernorState(build_governor_state(
+                                    state,
+                                    &recovery,
+                                    &mem,
+                                    file_tool_consec_failures,
+                                    last_mutation_step,
+                                    last_verify_ok_step,
+                                    last_reflection.as_ref(),
+                                )))
+                                .await;
+                            continue;
+                        }
                     }
                 },
             };
 
             let compat_synth_think = if matches!(cfg.provider, ProviderKind::Mistral) {
-                Some(compat_synthetic_think(tc, candidate_plan))
+                Some(compat_synthetic_think(tc, &candidate_plan))
             } else {
                 None
             };
 
-            let think = match parsed_think
-                .as_ref()
-                .or(compat_last_think.as_ref())
-                .or(compat_synth_think.as_ref())
-            {
+            let (think, used_compat_synth) = select_think_for_tool_turn(
+                parsed_think.as_ref(),
+                compat_last_think.as_ref(),
+                compat_synth_think.as_ref(),
+                &candidate_plan,
+                tc,
+                cfg.provider.clone(),
+            );
+
+            let think = match think {
                 Some(think) => think,
                 None => {
                     state = AgentState::Recovery;
@@ -9663,11 +9979,7 @@ Execute only the new minimal action: {}",
                 }
             };
 
-            if parsed_think.is_none()
-                && compat_last_think.is_none()
-                && compat_synth_think.is_some()
-                && matches!(cfg.provider, ProviderKind::Mistral)
-            {
+            if used_compat_synth && matches!(cfg.provider, ProviderKind::Mistral) {
                 let _ = tx
                     .send(StreamToken::Delta(
                         "\n[compat] synthesized think block for Mistral tool turn\n".to_string(),
@@ -9675,7 +9987,7 @@ Execute only the new minimal action: {}",
                     .await;
             }
 
-            if let Err(e) = validate_think(think, candidate_plan, tc) {
+            if let Err(e) = validate_think(think, &candidate_plan, tc) {
                 state = AgentState::Recovery;
                 recovery.stage = Some(RecoveryStage::Diagnose);
                 let block = governor_contract::invalid_think_message(&e.to_string());
@@ -14526,6 +14838,73 @@ verify: exit code is zero\n\
         );
         assert!(baseline.contains("goal: stabilize coder loop"));
         assert!(!baseline.contains("something vague like make it better"));
+    }
+
+    #[test]
+    fn repair_mistral_plan_for_tool_turn_fills_read_only_observation_shape() {
+        let parsed = PlanBlock {
+            goal: "Locate the exact file and context where `/realize` is handled in the TUI."
+                .to_string(),
+            steps: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            risks: "unknown risks; inspect carefully before editing".to_string(),
+            assumptions: "current repo scan reflects the active workspace".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: "{\"path\":\"src/tui/events.rs\"}".to_string(),
+        };
+        let repaired = repair_mistral_plan_for_tool_turn(
+            Some(&parsed),
+            None,
+            &tc,
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            true,
+        )
+        .expect("repaired plan");
+        assert!(repaired.steps.len() >= 2);
+        assert!(!repaired.acceptance_criteria.is_empty());
+        assert!(repaired.goal.contains("/realize"));
+    }
+
+    #[test]
+    fn select_think_for_tool_turn_prefers_synth_over_invalid_last_for_mistral() {
+        let plan = PlanBlock {
+            goal: "Locate the /realize handler".to_string(),
+            steps: vec![
+                "search for /realize".to_string(),
+                "read the matching file".to_string(),
+            ],
+            acceptance_criteria: vec!["report the file path".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "observation tools are sufficient".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_2".to_string(),
+            name: "done".to_string(),
+            arguments: "{\"summary\":\"ok\",\"completed_acceptance\":[],\"remaining_acceptance\":[],\"acceptance_evidence\":[]}".to_string(),
+        };
+        let invalid_last = ThinkBlock {
+            goal: String::new(),
+            step: 1,
+            tool: "done".to_string(),
+            risk: "r".to_string(),
+            doubt: "d".to_string(),
+            next: "finish".to_string(),
+            verify: "confirm".to_string(),
+        };
+        let synth = compat_synthetic_think(&tc, &plan);
+        let (selected, used_synth) = select_think_for_tool_turn(
+            None,
+            Some(&invalid_last),
+            Some(&synth),
+            &plan,
+            &tc,
+            ProviderKind::Mistral,
+        );
+        assert!(used_synth);
+        assert_eq!(selected.expect("selected think").goal, plan.goal);
     }
 
     #[test]
