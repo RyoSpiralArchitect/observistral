@@ -5241,6 +5241,50 @@ If that file is not the handler, only then return to search/glob.",
     Some(out)
 }
 
+fn build_read_only_diagnose_search_hint(root_user_text: &str) -> String {
+    let pattern = first_slash_literal(root_user_text).unwrap_or_else(|| "realize".to_string());
+    format!(
+        "[Read-Only Diagnose Coercion]\n\
+You are stalled in diagnose on a read-only inspection task.\n\
+Do not explain further. Call exactly one observation tool next.\n\
+Preferred next tool:\n\
+search_files(pattern=\"{pattern}\", dir=\"src\")\n\
+If that finds a plausible code file, read it next instead of searching again."
+    )
+}
+
+fn build_read_only_diagnose_coercion_hint(
+    root_user_text: &str,
+    plan: Option<&PlanBlock>,
+    evidence: &ObservationEvidence,
+    messages: &[serde_json::Value],
+    working_mem: &WorkingMemory,
+) -> Option<String> {
+    let fallback_plan;
+    let plan = if let Some(plan) = plan {
+        plan
+    } else {
+        fallback_plan = synthetic_read_only_observation_plan(root_user_text);
+        &fallback_plan
+    };
+
+    if let Some(hint) =
+        build_read_only_completion_hint(root_user_text, plan, evidence, messages, working_mem)
+    {
+        return Some(hint);
+    }
+
+    if let Some(search) = evidence.searches.last() {
+        if let Some(hint) =
+            build_read_only_search_to_read_hint(root_user_text, plan, &search.paths, evidence)
+        {
+            return Some(hint);
+        }
+    }
+
+    Some(build_read_only_diagnose_search_hint(root_user_text))
+}
+
 fn build_read_only_iteration_cap_final_answer(
     root_user_text: &str,
     plan: &PlanBlock,
@@ -9453,6 +9497,7 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
     // Key: canonical path string.  Invalidated on write_file / patch_file success.
     let mut file_cache: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut read_only_diagnose_streak: usize = 0;
 
     let max_iters = max_iters.max(1).min(64);
     for iter in 0..max_iters {
@@ -9500,6 +9545,29 @@ Be concise: prefer tool calls over long explanations. Summarise intermediate res
             reflection_required = Some(format!(
                 "progress checkpoint iter {iter}/{max_iters} (summarize DONE/REMAINING briefly)"
             ));
+        }
+
+        if root_read_only && recovery.stage == Some(RecoveryStage::Diagnose) {
+            read_only_diagnose_streak = read_only_diagnose_streak.saturating_add(1);
+        } else {
+            read_only_diagnose_streak = 0;
+        }
+
+        if root_read_only
+            && read_only_diagnose_streak >= 2
+            && pending_system_hint.is_none()
+            && reflection_required.is_none()
+        {
+            let hint = build_read_only_diagnose_coercion_hint(
+                &root_user_text,
+                active_plan.as_ref(),
+                &observation_evidence,
+                &messages,
+                &working_mem,
+            );
+            if let Some(hint) = hint {
+                pending_system_hint = Some(hint);
+            }
         }
 
         // ── Final iteration handoff ─────────────────────────────────────────
@@ -14569,6 +14637,59 @@ remaining_gap: still need to run cargo test\n\
 
         assert!(hint.contains("read_file(path=\"src/tui/events.rs\")"));
         assert!(hint.contains("plausible code candidate"));
+    }
+
+    #[test]
+    fn build_read_only_diagnose_coercion_hint_starts_with_search_when_no_observation_exists() {
+        let hint = build_read_only_diagnose_coercion_hint(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            None,
+            &ObservationEvidence::default(),
+            &[],
+            &WorkingMemory::default(),
+        )
+        .expect("diagnose coercion hint");
+
+        assert!(hint.contains("search_files(pattern=\"/realize\", dir=\"src\")"));
+    }
+
+    #[test]
+    fn build_read_only_diagnose_coercion_hint_switches_to_read_after_search() {
+        let plan = PlanBlock {
+            goal: "Locate the /realize slash command handler in the TUI".to_string(),
+            steps: vec![
+                "search src".to_string(),
+                "read the matching file".to_string(),
+                "confirm the context".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path containing the `/realize` slash command handler is identified."
+                    .to_string(),
+                "The handler logic is confirmed to be part of the TUI component.".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+        let evidence = ObservationEvidence {
+            searches: vec![ObservationSearchEvidence {
+                command: "search_files(pattern=/realize, dir=src)".to_string(),
+                pattern: "/realize".to_string(),
+                hit_count: 1,
+                paths: vec!["src/tui/events.rs".to_string()],
+            }],
+            reads: vec![],
+        };
+
+        let hint = build_read_only_diagnose_coercion_hint(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            Some(&plan),
+            &evidence,
+            &[],
+            &WorkingMemory::default(),
+        )
+        .expect("diagnose coercion hint");
+
+        assert!(hint.contains("read_file(path=\"src/tui/events.rs\")"));
     }
 
     #[test]
