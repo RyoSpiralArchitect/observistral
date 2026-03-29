@@ -7148,6 +7148,30 @@ fn synthetic_read_only_observation_plan(root_user_text: &str) -> PlanBlock {
     }
 }
 
+fn rescue_read_only_missing_plan_for_tool_turn(
+    messages: &[serde_json::Value],
+    tc: &ToolCallData,
+    root_user_text: &str,
+    root_read_only: bool,
+    provider: ProviderKind,
+) -> Option<PlanBlock> {
+    if !root_read_only || !mistral_observation_tool(tc.name.as_str()) {
+        return None;
+    }
+    let prior_blocks = consecutive_missing_plan_blocks_for_tool(messages, tc);
+    if prior_blocks.saturating_add(1) < 2 {
+        return None;
+    }
+    if matches!(provider, ProviderKind::Mistral) {
+        if let Some(repaired) =
+            repair_mistral_plan_for_tool_turn(None, None, tc, root_user_text, root_read_only)
+        {
+            return Some(repaired);
+        }
+    }
+    Some(synthetic_read_only_observation_plan(root_user_text))
+}
+
 fn repair_mistral_plan_for_tool_turn(
     parsed_plan: Option<&PlanBlock>,
     active_plan: Option<&PlanBlock>,
@@ -7747,6 +7771,68 @@ fn tool_call_action_sig(tc: &ToolCallData) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn blocked_tool_call_signature(name: &str, arguments: &str) -> String {
+    canonicalize_tool_call_command(name, arguments)
+        .unwrap_or_else(|| format!("{name}:{}", normalize_for_signature(arguments)))
+}
+
+fn assistant_blocked_tool_call_signature(msg: &serde_json::Value) -> Option<String> {
+    let tool_calls = msg.get("tool_calls")?.as_array()?;
+    let tc = tool_calls.first()?;
+    let name = tc
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|v| v.as_str())?
+        .trim();
+    let arguments = tc
+        .get("function")
+        .and_then(|f| f.get("arguments"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(blocked_tool_call_signature(name, arguments))
+    }
+}
+
+fn is_missing_plan_governor_block(msg: &serde_json::Value) -> bool {
+    msg.get("role").and_then(|v| v.as_str()) == Some("tool")
+        && msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|content| {
+                content.contains("GOVERNOR BLOCKED") && content.contains("Missing valid <plan>")
+            })
+            .unwrap_or(false)
+}
+
+fn consecutive_missing_plan_blocks_for_tool(
+    messages: &[serde_json::Value],
+    tc: &ToolCallData,
+) -> usize {
+    let target_sig = blocked_tool_call_signature(&tc.name, &tc.arguments);
+    let mut count = 0usize;
+    let mut idx = messages.len();
+    while idx >= 2 {
+        let tool_msg = &messages[idx - 1];
+        let assistant_msg = &messages[idx - 2];
+        if !is_missing_plan_governor_block(tool_msg) {
+            break;
+        }
+        let Some(sig) = assistant_blocked_tool_call_signature(assistant_msg) else {
+            break;
+        };
+        if sig != target_sig {
+            break;
+        }
+        count = count.saturating_add(1);
+        idx -= 2;
+    }
+    count
 }
 
 fn pick_interesting_error_line(stdout: &str, stderr: &str) -> String {
@@ -9982,7 +10068,70 @@ Execute only the new minimal action: {}",
                 None => match active_plan.as_ref() {
                     Some(plan) => plan.clone(),
                     None => {
-                        if matches!(cfg.provider, ProviderKind::Mistral) {
+                        if let Some(rescued) = rescue_read_only_missing_plan_for_tool_turn(
+                            &messages,
+                            tc,
+                            &root_user_text,
+                            root_read_only,
+                            cfg.provider.clone(),
+                        ) {
+                            if validate_plan_for_task_contract(
+                                &rescued,
+                                root_read_only,
+                                &task_contract,
+                                &instruction_resolver,
+                            )
+                            .is_ok()
+                            {
+                                let _ = tx
+                                    .send(StreamToken::Delta(
+                                        "\n[compat] rescued repeated read-only plan-gate miss with synthetic observation plan\n"
+                                            .to_string(),
+                                    ))
+                                    .await;
+                                rescued
+                            } else {
+                                state = AgentState::Recovery;
+                                recovery.stage = Some(RecoveryStage::Diagnose);
+                                let block = governor_contract::missing_plan_message();
+
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                                    )))
+                                    .await;
+
+                                push_blocked_tool_exchange(
+                                    &mut messages,
+                                    &assistant_text_clean,
+                                    tc,
+                                    &block,
+                                );
+                                autosave_best_effort(
+                                    &autosaver,
+                                    &tx,
+                                    tool_root_abs.as_deref(),
+                                    checkpoint.as_deref(),
+                                    cur_cwd.as_deref(),
+                                    &messages,
+                                )
+                                .await;
+
+                                pending_system_hint = Some(block);
+                                let _ = tx
+                                    .send(StreamToken::GovernorState(build_governor_state(
+                                        state,
+                                        &recovery,
+                                        &mem,
+                                        file_tool_consec_failures,
+                                        last_mutation_step,
+                                        last_verify_ok_step,
+                                        last_reflection.as_ref(),
+                                    )))
+                                    .await;
+                                continue;
+                            }
+                        } else if matches!(cfg.provider, ProviderKind::Mistral) {
                             if let Some(repaired) = repair_mistral_plan_for_tool_turn(
                                 None,
                                 None,
@@ -14793,6 +14942,95 @@ verify: exit code is zero\n\
             normalized.arguments,
             serde_json::json!({"pattern":"/realize","dir":"src"}).to_string()
         );
+    }
+
+    #[test]
+    fn consecutive_missing_plan_blocks_for_tool_counts_same_observation_tool() {
+        let tc = ToolCallData {
+            id: "call_3".to_string(),
+            name: "search_files".to_string(),
+            arguments: serde_json::json!({"pattern":"/realize","dir":"src"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"/realize","dir":"src"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"/realize\",\"dir\":\"src\"}"
+            }),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"/realize","dir":"src"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"/realize\",\"dir\":\"src\"}"
+            }),
+        ];
+
+        assert_eq!(consecutive_missing_plan_blocks_for_tool(&messages, &tc), 2);
+    }
+
+    #[test]
+    fn rescue_read_only_missing_plan_for_tool_turn_after_repeated_blocks() {
+        let tc = ToolCallData {
+            id: "call_2".to_string(),
+            name: "search_files".to_string(),
+            arguments: serde_json::json!({"pattern":"/realize","dir":"src"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"/realize","dir":"src"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"/realize\",\"dir\":\"src\"}"
+            }),
+        ];
+
+        let rescued = rescue_read_only_missing_plan_for_tool_turn(
+            &messages,
+            &tc,
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            true,
+            ProviderKind::OpenAiCompatible,
+        )
+        .expect("rescue plan");
+        assert!(rescued.goal.contains("/realize"));
+        assert!(rescued
+            .acceptance_criteria
+            .iter()
+            .any(|item| item.contains("handler branch")));
     }
 
     #[test]
