@@ -5171,6 +5171,27 @@ fn build_read_only_iteration_cap_final_answer(
     Some(final_text)
 }
 
+fn maybe_build_read_only_auto_final_answer(
+    root_read_only: bool,
+    root_user_text: &str,
+    plan: Option<&PlanBlock>,
+    evidence: &ObservationEvidence,
+    messages: &[serde_json::Value],
+    working_mem: &WorkingMemory,
+) -> Option<String> {
+    if !root_read_only {
+        return None;
+    }
+    let plan = plan?;
+    build_read_only_iteration_cap_final_answer(
+        root_user_text,
+        plan,
+        evidence,
+        messages,
+        working_mem,
+    )
+}
+
 fn evidence_path_matches(target: &str, candidate: &str) -> bool {
     let target_sig = normalize_memory_entry(target);
     let candidate_sig = normalize_memory_entry(candidate);
@@ -11310,6 +11331,44 @@ Fix the path/permissions, or switch to explicit tools (write_file/read_file/patc
                 }
             }
 
+            if let Some(final_text) = maybe_build_read_only_auto_final_answer(
+                root_read_only,
+                &root_user_text,
+                active_plan.as_ref(),
+                &observation_evidence,
+                &messages,
+                &working_mem,
+            ) {
+                state = AgentState::Done;
+                messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[agent] auto-finalized read-only inspection after no-tool turn.\n\n{final_text}\n"
+                    )))
+                    .await;
+                break;
+            }
+
             // Common failure mode: model "explains what to do" but never calls tools.
             // Try once to force a tool call so long sessions keep moving.
             if !forced_tool_once && iter + 1 < max_iters {
@@ -14013,6 +14072,73 @@ remaining_gap: still need to run cargo test\n\
         assert!(final_text.starts_with("[DONE]"));
         assert!(final_text.contains("src/tui/events.rs"));
         assert!(final_text.contains("acceptance 1"));
+    }
+
+    #[test]
+    fn maybe_build_read_only_auto_final_answer_reuses_read_only_evidence() {
+        let plan = PlanBlock {
+            goal: "Locate the /realize slash command handler in the TUI".to_string(),
+            steps: vec![
+                "search src".to_string(),
+                "read the matching file".to_string(),
+                "confirm the context".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path containing the `/realize` slash command handler is identified."
+                    .to_string(),
+                "The handler logic is confirmed to be part of the TUI component.".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"/realize\",\"dir\":\"src\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: '/realize' — 1 match(es)]\nsrc/tui/events.rs:465:         \"/realize\" => {"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/tui/events.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/tui/events.rs] (2918 lines, 108025 bytes)\nfn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {\n    match cmd_lc.as_str() {\n        \"/realize\" => {"
+            }),
+        ];
+        let evidence = collect_observation_evidence(&messages);
+
+        let final_text = maybe_build_read_only_auto_final_answer(
+            true,
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything. Final answer must include the file path.",
+            Some(&plan),
+            &evidence,
+            &messages,
+            &WorkingMemory::default(),
+        )
+        .expect("auto final answer");
+
+        assert!(final_text.starts_with("[DONE]"));
+        assert!(final_text.contains("src/tui/events.rs"));
     }
 
     #[test]
