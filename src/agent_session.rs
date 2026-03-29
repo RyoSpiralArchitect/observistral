@@ -29,9 +29,18 @@ pub struct ObservationSearchCache {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct ObservationResolutionCache {
+    pub query: String,
+    pub canonical_path: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct ObservationCache {
     pub reads: Vec<ObservationReadCache>,
     pub searches: Vec<ObservationSearchCache>,
+    #[serde(default)]
+    pub resolutions: Vec<ObservationResolutionCache>,
 }
 
 fn extract_tag_block<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
@@ -534,6 +543,11 @@ mod tests {
                     hit_count: 3,
                     paths: vec!["src/tui/agent.rs".to_string()],
                 }],
+                resolutions: vec![ObservationResolutionCache {
+                    query: "tui/events.rs".to_string(),
+                    canonical_path: "src/tui/events.rs".to_string(),
+                    source: "repo_map:read_file".to_string(),
+                }],
             }),
             vec![json!({"role":"user","content":"hi"})],
         );
@@ -546,6 +560,14 @@ mod tests {
                 .and_then(|cache| cache.reads.first())
                 .map(|read| read.path.as_str()),
             Some("src/main.rs")
+        );
+        assert_eq!(
+            loaded
+                .observation_cache
+                .as_ref()
+                .and_then(|cache| cache.resolutions.first())
+                .map(|resolution| resolution.canonical_path.as_str()),
+            Some("src/tui/events.rs")
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -570,6 +592,7 @@ mod tests {
                 path: "README.md".to_string(),
             }],
             searches: Vec::new(),
+            resolutions: Vec::new(),
         }));
         assert!(saver
             .save_best_effort(None, None, None, &existing.messages)

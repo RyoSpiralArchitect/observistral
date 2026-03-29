@@ -122,6 +122,24 @@ async fn emit_repo_map_fallback_telemetry(
     .await;
 }
 
+async fn emit_resolution_memory_hit_telemetry(
+    tx: &mpsc::Sender<StreamToken>,
+    tool_name: &str,
+    query: &str,
+    canonical_path: &str,
+) {
+    emit_telemetry_event(
+        tx,
+        "resolution_memory_hit",
+        json!({
+            "tool": tool_name,
+            "query": query,
+            "canonical_path": canonical_path,
+        }),
+    )
+    .await;
+}
+
 fn push_blocked_tool_exchange(
     messages: &mut Vec<serde_json::Value>,
     assistant_text: &str,
@@ -482,6 +500,50 @@ fn build_repo_map_glob_hint(pattern: &str, fallback: &crate::repo_map::RepoMapFa
             pattern, guidance
         ),
     }
+}
+
+fn remember_repo_map_resolution(
+    evidence: &mut ObservationEvidence,
+    query: &str,
+    fallback: &crate::repo_map::RepoMapFallback,
+    source: &str,
+) {
+    let canonical = fallback.top_path.as_deref().or(fallback.top_dir.as_deref());
+    let Some(canonical) = canonical else {
+        return;
+    };
+    evidence.remember_resolution(query, canonical, source);
+}
+
+fn rewrite_tool_call_with_resolution(
+    tc: &ToolCallData,
+    evidence: &ObservationEvidence,
+) -> Option<(ToolCallData, String, String)> {
+    let key = match tc.name.as_str() {
+        "read_file" | "write_file" | "patch_file" | "apply_diff" => "path",
+        "list_dir" | "glob" | "search_files" => "dir",
+        _ => return None,
+    };
+    let mut args = serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()?;
+    let original = args.get(key)?.as_str()?.trim().to_string();
+    if original.is_empty() {
+        return None;
+    }
+    let canonical = evidence.resolve_path_alias(original.as_str())?;
+    if normalize_path_alias(original.as_str()) == normalize_path_alias(canonical.as_str()) {
+        return None;
+    }
+    args[key] = serde_json::Value::String(canonical.clone());
+    let arguments = serde_json::to_string(&args).ok()?;
+    Some((
+        ToolCallData {
+            id: tc.id.clone(),
+            name: tc.name.clone(),
+            arguments,
+        },
+        original,
+        canonical,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3514,6 +3576,25 @@ fn normalize_memory_entry(s: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn normalize_path_alias(s: &str) -> String {
+    strip_matching_quotes(s.trim())
+        .trim()
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn path_alias_matches(query_sig: &str, candidate: &str) -> bool {
+    let candidate_sig = normalize_path_alias(candidate);
+    if query_sig.is_empty() || candidate_sig.is_empty() {
+        return false;
+    }
+    query_sig == candidate_sig
+        || candidate_sig.ends_with(format!("/{query_sig}").as_str())
+        || query_sig.ends_with(format!("/{candidate_sig}").as_str())
+}
+
 fn strip_matching_quotes(s: &str) -> &str {
     let bytes = s.as_bytes();
     if bytes.len() >= 2
@@ -4531,9 +4612,17 @@ struct ObservationReadEvidence {
 }
 
 #[derive(Debug, Clone, Default)]
+struct ObservationResolutionEvidence {
+    query: String,
+    canonical_path: String,
+    source: String,
+}
+
+#[derive(Debug, Clone, Default)]
 struct ObservationEvidence {
     searches: Vec<ObservationSearchEvidence>,
     reads: Vec<ObservationReadEvidence>,
+    resolutions: Vec<ObservationResolutionEvidence>,
 }
 
 impl ObservationEvidence {
@@ -4563,6 +4652,34 @@ impl ObservationEvidence {
         self.reads.push(ObservationReadEvidence { command, path });
         if self.reads.len() > 8 {
             self.reads.remove(0);
+        }
+    }
+
+    fn remember_resolution(&mut self, query: &str, canonical_path: &str, source: &str) {
+        let query = compact_one_line(query.trim(), 180);
+        let canonical_path = compact_one_line(canonical_path.trim(), 180);
+        let source = compact_one_line(source.trim(), 80);
+        if query == "-" || canonical_path == "-" || source == "-" {
+            return;
+        }
+        let query_sig = normalize_path_alias(query.as_str());
+        let canonical_sig = normalize_path_alias(canonical_path.as_str());
+        if query_sig.is_empty() || canonical_sig.is_empty() {
+            return;
+        }
+        if let Some(pos) = self.resolutions.iter().position(|item| {
+            normalize_path_alias(item.query.as_str()) == query_sig
+                || normalize_path_alias(item.canonical_path.as_str()) == canonical_sig
+        }) {
+            self.resolutions.remove(pos);
+        }
+        self.resolutions.push(ObservationResolutionEvidence {
+            query,
+            canonical_path,
+            source,
+        });
+        if self.resolutions.len() > 12 {
+            self.resolutions.remove(0);
         }
     }
 
@@ -4622,6 +4739,25 @@ impl ObservationEvidence {
                 search.paths.as_slice(),
             );
         }
+        for resolution in &cache.resolutions {
+            self.remember_resolution(
+                resolution.query.as_str(),
+                resolution.canonical_path.as_str(),
+                resolution.source.as_str(),
+            );
+        }
+    }
+
+    fn resolve_path_alias(&self, query: &str) -> Option<String> {
+        let query_sig = normalize_path_alias(query);
+        if query_sig.is_empty() {
+            return None;
+        }
+        self.resolutions
+            .iter()
+            .rev()
+            .find(|entry| path_alias_matches(query_sig.as_str(), entry.query.as_str()))
+            .map(|entry| entry.canonical_path.clone())
     }
 
     fn to_session_cache(&self) -> crate::agent_session::ObservationCache {
@@ -4643,6 +4779,17 @@ impl ObservationEvidence {
                     hit_count: search.hit_count,
                     paths: search.paths.clone(),
                 })
+                .collect(),
+            resolutions: self
+                .resolutions
+                .iter()
+                .map(
+                    |resolution| crate::agent_session::ObservationResolutionCache {
+                        query: resolution.query.clone(),
+                        canonical_path: resolution.canonical_path.clone(),
+                        source: resolution.source.clone(),
+                    },
+                )
                 .collect(),
         }
     }
@@ -10420,7 +10567,28 @@ Execute only the new minimal action: {}",
             continue;
         }
 
-        let tool_call: Option<ToolCallData> = tool_calls.pop();
+        let mut tool_call: Option<ToolCallData> = tool_calls.pop();
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, canonical)) =
+                rewrite_tool_call_with_resolution(tc, &observation_evidence)
+            {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[resolution] {} '{}' -> '{}'\n",
+                        rewritten.name, original, canonical
+                    )))
+                    .await;
+                emit_resolution_memory_hit_telemetry(
+                    &tx,
+                    rewritten.name.as_str(),
+                    original.as_str(),
+                    canonical.as_str(),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
 
         if realize_cfg.enabled {
             let materialize_reason =
@@ -13417,6 +13585,13 @@ Required now: {}",
                 if let Some(root) = tool_root_abs.as_deref() {
                     if let Some(fallback) = crate::repo_map::lazy_list_dir_fallback(root, &dir) {
                         emit_repo_map_fallback_telemetry(&tx, "list_dir", &dir, &fallback).await;
+                        remember_repo_map_resolution(
+                            &mut observation_evidence,
+                            dir.as_str(),
+                            &fallback,
+                            "repo_map:list_dir",
+                        );
+                        sync_observation_cache_autosave(&autosaver, &observation_evidence);
                         result.push_str("\n");
                         result.push_str(&fallback.content);
                         repo_map_display =
@@ -13573,6 +13748,13 @@ Required now: {}",
                 if let Some(root) = tool_root_abs.as_deref() {
                     if let Some(fallback) = crate::repo_map::lazy_glob_fallback(root, &pattern) {
                         emit_repo_map_fallback_telemetry(&tx, "glob", &pattern, &fallback).await;
+                        remember_repo_map_resolution(
+                            &mut observation_evidence,
+                            pattern.as_str(),
+                            &fallback,
+                            "repo_map:glob",
+                        );
+                        sync_observation_cache_autosave(&autosaver, &observation_evidence);
                         result.push_str("\n");
                         result.push_str(&fallback.content);
                         repo_map_display = Some(build_repo_map_display_banner("glob", &fallback));
@@ -13938,6 +14120,16 @@ Required now: {}",
                                         &fallback,
                                     )
                                     .await;
+                                    remember_repo_map_resolution(
+                                        &mut observation_evidence,
+                                        path.as_str(),
+                                        &fallback,
+                                        "repo_map:read_file",
+                                    );
+                                    sync_observation_cache_autosave(
+                                        &autosaver,
+                                        &observation_evidence,
+                                    );
                                     content.push_str("\n");
                                     content.push_str(&fallback.content);
                                     repo_map_display =
@@ -14233,6 +14425,11 @@ Action required: call read_file(path) first to confirm current contents, then re
                     let observed_path = parse_read_file_result_path(result.as_str())
                         .unwrap_or_else(|| compact_one_line(path.as_str(), 160));
                     observation_evidence.remember_read(command.as_str(), observed_path.as_str());
+                    observation_evidence.remember_resolution(
+                        path.as_str(),
+                        observed_path.as_str(),
+                        "read_file",
+                    );
                     sync_observation_cache_autosave(&autosaver, &observation_evidence);
                 }
                 assumption_ledger.refresh_confirmations(&working_mem);
@@ -15324,6 +15521,7 @@ remaining_gap: still need to run cargo test\n\
                 command: "read_file(path=src/tui/events.rs)".to_string(),
                 path: "src/tui/events.rs".to_string(),
             }],
+            resolutions: Vec::new(),
         };
 
         let scores = build_read_only_evidence_scores(
@@ -15442,6 +15640,7 @@ remaining_gap: still need to run cargo test\n\
                 ],
             }],
             reads: vec![],
+            resolutions: Vec::new(),
         };
 
         let hint = build_read_only_search_to_read_hint(
@@ -15553,6 +15752,7 @@ remaining_gap: still need to run cargo test\n\
                 paths: vec!["src/tui/events.rs".to_string()],
             }],
             reads: vec![],
+            resolutions: Vec::new(),
         };
 
         let hint = build_read_only_diagnose_coercion_hint(
@@ -15609,6 +15809,7 @@ remaining_gap: still need to run cargo test\n\
                 paths: vec!["src/tui/events.rs".to_string()],
             }],
             reads: vec![],
+            resolutions: Vec::new(),
         };
 
         let action = choose_read_only_diagnose_rescue_action(
@@ -17195,6 +17396,44 @@ verify: exit code is zero\n\
     }
 
     #[test]
+    fn resolution_memory_resolves_suffix_alias_to_canonical_path() {
+        let mut evidence = ObservationEvidence::default();
+        evidence.remember_resolution("tui/events.rs", "src/tui/events.rs", "repo_map:read_file");
+
+        assert_eq!(
+            evidence.resolve_path_alias("tui/events.rs").as_deref(),
+            Some("src/tui/events.rs")
+        );
+        assert_eq!(
+            evidence.resolve_path_alias("./tui/events.rs").as_deref(),
+            Some("src/tui/events.rs")
+        );
+    }
+
+    #[test]
+    fn rewrite_tool_call_with_resolution_rewrites_read_file_path() {
+        let mut evidence = ObservationEvidence::default();
+        evidence.remember_resolution("tui/events.rs", "src/tui/events.rs", "repo_map:read_file");
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"tui/events.rs"}).to_string(),
+        };
+
+        let (rewritten, original, canonical) =
+            rewrite_tool_call_with_resolution(&tc, &evidence).expect("rewritten");
+        assert_eq!(original, "tui/events.rs");
+        assert_eq!(canonical, "src/tui/events.rs");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rewritten.arguments)
+                .ok()
+                .and_then(|v| v.get("path").and_then(|v| v.as_str()).map(str::to_string))
+                .as_deref(),
+            Some("src/tui/events.rs")
+        );
+    }
+
+    #[test]
     fn realize_preset_parser_accepts_named_levels() {
         assert_eq!(
             "off".parse::<RealizePreset>().ok(),
@@ -17273,6 +17512,7 @@ next_probe: patch the recovery branch in run_agentic_json\n\
                 path: "src/tui/agent.rs".to_string(),
             }],
             searches: Vec::new(),
+            resolutions: Vec::new(),
         };
 
         assert!(validate_evidence_block(&evidence_block, &tc, &observations).is_ok());
@@ -17303,6 +17543,7 @@ next_probe: patch the recovery branch in run_agentic_json\n\
                 path: "src/server.rs".to_string(),
             }],
             searches: Vec::new(),
+            resolutions: Vec::new(),
         };
 
         let err = validate_evidence_block(&evidence_block, &tc, &observations)
