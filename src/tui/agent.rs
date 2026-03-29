@@ -3923,6 +3923,47 @@ fn canonicalize_evidence_command(command: &str) -> String {
     normalize_memory_entry(trimmed)
 }
 
+fn resolution_arg_keys_for_command(name: &str) -> &'static [&'static str] {
+    match name {
+        "read_file" | "write_file" | "patch_file" | "apply_diff" => &["path"],
+        "list_dir" => &["dir", "path"],
+        "glob" | "search_files" => &["dir", "path"],
+        _ => &[],
+    }
+}
+
+fn canonicalize_evidence_command_with_resolution(
+    command: &str,
+    evidence: &ObservationEvidence,
+) -> String {
+    let sig = canonicalize_evidence_command(command);
+    if sig.is_empty() {
+        return sig;
+    }
+    let Some((name, mut args)) = parse_named_command_signature(sig.as_str()) else {
+        return sig;
+    };
+    let mut changed = false;
+    for key in resolution_arg_keys_for_command(name.as_str()) {
+        let Some(value) = args.get(*key).cloned() else {
+            continue;
+        };
+        let Some(canonical) = evidence.resolve_path_alias(value.as_str()) else {
+            continue;
+        };
+        if normalize_path_alias(value.as_str()) == normalize_path_alias(canonical.as_str()) {
+            continue;
+        }
+        args.insert((*key).to_string(), canonical);
+        changed = true;
+    }
+    if !changed {
+        return sig;
+    }
+    let args_vec = args.into_iter().collect::<Vec<_>>();
+    canonicalize_named_command(name.as_str(), &args_vec).unwrap_or(sig)
+}
+
 fn remember_recent_unique(
     items: &mut Vec<String>,
     value: &str,
@@ -5377,13 +5418,23 @@ fn build_read_only_completion_hint(
         return None;
     }
 
-    let known_commands = collect_known_acceptance_commands(messages, working_mem);
+    let known_commands = canonicalize_known_acceptance_commands(
+        &collect_known_acceptance_commands(messages, working_mem),
+        evidence,
+    );
     let cite_commands: Vec<String> = strong
         .iter()
         .flat_map(|score| score.suggested_commands.iter().cloned())
         .chain(known_commands.iter().rev().cloned())
         .fold(Vec::<String>::new(), |mut acc, command| {
-            remember_recent_unique(&mut acc, command.as_str(), 4, 200);
+            let canonical =
+                canonicalize_evidence_command_with_resolution(command.as_str(), evidence);
+            let chosen = if canonical.is_empty() {
+                compact_one_line(command.as_str(), 200)
+            } else {
+                canonical
+            };
+            remember_recent_unique(&mut acc, chosen.as_str(), 4, 200);
             acc
         });
 
@@ -5633,13 +5684,16 @@ fn build_read_only_iteration_cap_final_answer(
         return None;
     }
 
-    let known_commands = collect_known_acceptance_commands(messages, working_mem);
+    let known_commands = canonicalize_known_acceptance_commands(
+        &collect_known_acceptance_commands(messages, working_mem),
+        evidence,
+    );
     let mut completed_rows: Vec<(usize, String)> = scores
         .iter()
         .filter(|score| score.total >= 0.70)
         .filter_map(|score| {
             let command = score.suggested_commands.iter().find_map(|cmd| {
-                resolve_known_acceptance_command(cmd.as_str(), &known_commands)
+                resolve_known_acceptance_command(cmd.as_str(), &known_commands, evidence)
                     .map(|s| s.to_string())
             })?;
             Some((score.idx, command))
@@ -6087,11 +6141,28 @@ fn collect_known_acceptance_commands(
     commands
 }
 
+fn canonicalize_known_acceptance_commands(
+    known_commands: &[String],
+    evidence: &ObservationEvidence,
+) -> Vec<String> {
+    known_commands.iter().fold(Vec::new(), |mut acc, command| {
+        let canonical = canonicalize_evidence_command_with_resolution(command.as_str(), evidence);
+        let chosen = if canonical.is_empty() {
+            compact_one_line(command.as_str(), 200)
+        } else {
+            canonical
+        };
+        remember_recent_unique(&mut acc, chosen.as_str(), 16, 200);
+        acc
+    })
+}
+
 fn resolve_known_acceptance_command<'a>(
     command: &str,
     known_commands: &'a [String],
+    evidence: &ObservationEvidence,
 ) -> Option<&'a str> {
-    let want = canonicalize_evidence_command(command);
+    let want = canonicalize_evidence_command_with_resolution(command, evidence);
     if want.is_empty() {
         return None;
     }
@@ -6099,7 +6170,7 @@ fn resolve_known_acceptance_command<'a>(
     known_commands
         .iter()
         .find(|candidate| {
-            let sig = canonicalize_evidence_command(candidate);
+            let sig = canonicalize_evidence_command_with_resolution(candidate, evidence);
             if sig.is_empty() {
                 return false;
             }
@@ -6135,6 +6206,7 @@ fn validate_done_acceptance(
     remaining_acceptance: &[String],
     acceptance_evidence: &[DoneAcceptanceEvidence],
     known_commands: &[String],
+    observation_evidence: &ObservationEvidence,
 ) -> Result<Vec<(usize, String)>> {
     let Some(plan) = plan else {
         return Err(anyhow!(governor_contract::done_requires_plan_message()));
@@ -6200,9 +6272,11 @@ fn validate_done_acceptance(
                 governor_contract::done_evidence_duplicate_criteria_message()
             ));
         }
-        let Some(known_command) =
-            resolve_known_acceptance_command(evidence.command.as_str(), known_commands)
-        else {
+        let Some(known_command) = resolve_known_acceptance_command(
+            evidence.command.as_str(),
+            known_commands,
+            observation_evidence,
+        ) else {
             return Err(anyhow!(
                 governor_contract::done_evidence_unknown_command_message()
             ));
@@ -13093,8 +13167,10 @@ Required now: {}",
             let acceptance_evidence = parse_done_acceptance_evidence(&args["acceptance_evidence"]);
             let next_steps = args["next_steps"].as_str().unwrap_or("").trim();
             let done_plan = validated_plan_for_turn.as_ref().or(active_plan.as_ref());
-            let known_acceptance_commands =
-                collect_known_acceptance_commands(&messages, &working_mem);
+            let known_acceptance_commands = canonicalize_known_acceptance_commands(
+                &collect_known_acceptance_commands(&messages, &working_mem),
+                &observation_evidence,
+            );
             let read_only_scores = if root_read_only {
                 done_plan
                     .map(|plan| {
@@ -13115,6 +13191,7 @@ Required now: {}",
                 &remaining_acceptance,
                 &acceptance_evidence,
                 &known_acceptance_commands,
+                &observation_evidence,
             ) {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -15303,6 +15380,7 @@ remaining_gap: still need to run cargo test\n\
             &remaining_acceptance,
             &acceptance_evidence,
             &known_commands,
+            &ObservationEvidence::default(),
         )
         .is_ok());
     }
@@ -15334,6 +15412,7 @@ remaining_gap: still need to run cargo test\n\
             &remaining_acceptance,
             &acceptance_evidence,
             &known_commands,
+            &ObservationEvidence::default(),
         )
         .is_err());
     }
@@ -15362,6 +15441,7 @@ remaining_gap: still need to run cargo test\n\
             &remaining_acceptance,
             &acceptance_evidence,
             &known_commands,
+            &ObservationEvidence::default(),
         )
         .is_err());
     }
@@ -15387,6 +15467,7 @@ remaining_gap: still need to run cargo test\n\
             &remaining_acceptance,
             &acceptance_evidence,
             &known_commands,
+            &ObservationEvidence::default(),
         )
         .is_err());
     }
@@ -15415,6 +15496,7 @@ remaining_gap: still need to run cargo test\n\
             &remaining_acceptance,
             &acceptance_evidence,
             &known_commands,
+            &ObservationEvidence::default(),
         )
         .is_err());
     }
@@ -15457,6 +15539,7 @@ remaining_gap: still need to run cargo test\n\
             &remaining_acceptance,
             &acceptance_evidence,
             &known_commands,
+            &ObservationEvidence::default(),
         )
         .is_ok());
     }
@@ -16246,8 +16329,126 @@ remaining_gap: still need to run cargo test\n\
             &remaining_acceptance,
             &acceptance_evidence,
             &known_commands,
+            &ObservationEvidence::default(),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn validate_done_acceptance_uses_resolution_memory_for_shorthand_paths() {
+        let plan = PlanBlock {
+            goal: "locate slash command".to_string(),
+            steps: vec![
+                "inspect src".to_string(),
+                "read src/tui/events.rs".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path is identified".to_string(),
+                "The handler context is confirmed".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+
+        let completed_acceptance = vec!["acceptance 1".to_string(), "acceptance 2".to_string()];
+        let remaining_acceptance = Vec::new();
+        let acceptance_evidence = vec![
+            DoneAcceptanceEvidence {
+                criterion: "acceptance 1".to_string(),
+                command: "grep -n \"/realize\" tui/events.rs".to_string(),
+            },
+            DoneAcceptanceEvidence {
+                criterion: "acceptance 2".to_string(),
+                command: "read_file(path=tui/events.rs)".to_string(),
+            },
+        ];
+        let known_commands = vec![
+            "search_files(dir=src/tui/events.rs, pattern=/realize)".to_string(),
+            "read_file(path=src/tui/events.rs)".to_string(),
+        ];
+        let mut observation_evidence = ObservationEvidence::default();
+        observation_evidence.remember_resolution(
+            "tui/events.rs",
+            "src/tui/events.rs",
+            "repo_map:read_file",
+        );
+
+        assert!(validate_done_acceptance(
+            Some(&plan),
+            &completed_acceptance,
+            &remaining_acceptance,
+            &acceptance_evidence,
+            &known_commands,
+            &observation_evidence,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn build_read_only_completion_hint_canonicalizes_resolution_memory_paths() {
+        let plan = PlanBlock {
+            goal: "Locate the /realize slash command handler in the TUI".to_string(),
+            steps: vec![
+                "search src".to_string(),
+                "read the matching file".to_string(),
+                "confirm the context".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path containing the `/realize` slash command handler is identified."
+                    .to_string(),
+                "The handler logic is confirmed to be part of the TUI component.".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"/realize\",\"dir\":\"src\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: '/realize' — 1 match(es)]\nsrc/tui/events.rs:465:         \"/realize\" => {"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"tui/events.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/tui/events.rs] (2918 lines, 108025 bytes)\nfn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {\n    match cmd_lc.as_str() {\n        \"/realize\" => {"
+            }),
+        ];
+
+        let mut evidence = collect_observation_evidence(&messages);
+        evidence.remember_resolution("tui/events.rs", "src/tui/events.rs", "repo_map:read_file");
+        let hint = build_read_only_completion_hint(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            &plan,
+            &evidence,
+            &messages,
+            &WorkingMemory::default(),
+        )
+        .expect("completion hint");
+
+        assert!(hint.contains("read_file(path=src/tui/events.rs)"));
+        assert!(!hint.contains("read_file(path=tui/events.rs)"));
     }
 
     #[test]
