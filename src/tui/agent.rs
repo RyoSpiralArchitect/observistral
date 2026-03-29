@@ -3646,6 +3646,25 @@ fn canonicalize_evidence_command(command: &str) -> String {
     }
 
     let low = trimmed.to_ascii_lowercase();
+    if low.starts_with("read_file of ") || low.starts_with("read file of ") {
+        let path = trimmed
+            .split_once(" of ")
+            .map(|(_, rhs)| {
+                rhs.trim()
+                    .trim_matches('`')
+                    .trim_matches('"')
+                    .trim_matches('\'')
+            })
+            .unwrap_or("")
+            .trim();
+        if !path.is_empty() {
+            if let Some(sig) =
+                canonicalize_named_command("read_file", &[("path".to_string(), path.to_string())])
+            {
+                return sig;
+            }
+        }
+    }
     if let Some(rest) = trimmed.strip_prefix("read_file ") {
         if let Some(sig) = canonicalize_named_command(
             "read_file",
@@ -3666,6 +3685,40 @@ fn canonicalize_evidence_command(command: &str) -> String {
             canonicalize_named_command("glob", &[("pattern".to_string(), rest.trim().to_string())])
         {
             return sig;
+        }
+    }
+    if low.starts_with("search_files for ") || low.starts_with("search files for ") {
+        let normalized = trimmed
+            .replace("search files for ", "search_files for ")
+            .replace(" in `", " in ")
+            .replace(" in \"", " in ")
+            .replace(" in '", " in ");
+        let rest = normalized
+            .strip_prefix("search_files for ")
+            .unwrap_or(normalized.as_str());
+        if let Some((pattern, dir)) = rest.rsplit_once(" in ") {
+            let pattern = pattern
+                .trim()
+                .trim_matches('`')
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim();
+            let dir = dir
+                .trim()
+                .trim_matches('`')
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim_end_matches('/')
+                .trim();
+            if let Some(sig) = canonicalize_named_command(
+                "search_files",
+                &[
+                    ("pattern".to_string(), pattern.to_string()),
+                    ("dir".to_string(), dir.to_string()),
+                ],
+            ) {
+                return sig;
+            }
         }
     }
     if let Some(rest) = trimmed.strip_prefix("search_files ") {
@@ -5681,6 +5734,11 @@ fn build_done_acceptance_recovery_hint(
             "Rule: for read-only tasks, criteria with strong scores are good completed candidates; medium scores usually need one more confirming read/search; weak scores should stay remaining."
                 .to_string(),
         );
+        if read_only_scores.iter().all(|score| score.total < 0.60) {
+            lines.push(
+                "Hint: you do not have enough read/search evidence yet. Use observation tools first, then call done.".to_string(),
+            );
+        }
     }
 
     if lines.is_empty() {
@@ -11496,7 +11554,11 @@ Required now: {}",
                 Ok(rows) => rows,
                 Err(e) => {
                     state = AgentState::Recovery;
-                    recovery.stage = Some(RecoveryStage::Verify);
+                    recovery.stage = Some(if root_read_only {
+                        RecoveryStage::Diagnose
+                    } else {
+                        RecoveryStage::Verify
+                    });
                     let hint = build_done_acceptance_recovery_hint(
                         &e.to_string(),
                         &known_acceptance_commands,
@@ -14905,6 +14967,18 @@ verify: exit code is zero\n\
         );
         assert!(used_synth);
         assert_eq!(selected.expect("selected think").goal, plan.goal);
+    }
+
+    #[test]
+    fn canonicalize_evidence_command_accepts_natural_language_search_and_read() {
+        assert_eq!(
+            canonicalize_evidence_command("search_files for `/realize` in `src/`"),
+            "search_files(dir=src, pattern=/realize)"
+        );
+        assert_eq!(
+            canonicalize_evidence_command("read_file of `src/tui/events.rs`"),
+            "read_file(path=src/tui/events.rs)"
+        );
     }
 
     #[test]
