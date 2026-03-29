@@ -4641,6 +4641,12 @@ struct CriterionEvidenceScore {
     suggested_commands: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadOnlyDiagnoseRescueAction {
+    Search { pattern: String, dir: String },
+    Read { path: String },
+}
+
 fn criterion_prefers_read_confirmation(criterion: &str) -> bool {
     let low = criterion.to_ascii_lowercase();
     [
@@ -5283,6 +5289,37 @@ fn build_read_only_diagnose_coercion_hint(
     }
 
     Some(build_read_only_diagnose_search_hint(root_user_text))
+}
+
+fn choose_read_only_diagnose_rescue_action(
+    root_user_text: &str,
+    plan: Option<&PlanBlock>,
+    evidence: &ObservationEvidence,
+) -> Option<ReadOnlyDiagnoseRescueAction> {
+    let fallback_plan;
+    let plan = if let Some(plan) = plan {
+        plan
+    } else {
+        fallback_plan = synthetic_read_only_observation_plan(root_user_text);
+        &fallback_plan
+    };
+
+    if let Some(search) = evidence.searches.last() {
+        if let Some(path) =
+            best_read_only_followup_read_path(root_user_text, plan, &search.paths, evidence)
+        {
+            return Some(ReadOnlyDiagnoseRescueAction::Read { path });
+        }
+    }
+
+    if evidence.searches.is_empty() {
+        return Some(ReadOnlyDiagnoseRescueAction::Search {
+            pattern: first_slash_literal(root_user_text).unwrap_or_else(|| "realize".to_string()),
+            dir: "src".to_string(),
+        });
+    }
+
+    None
 }
 
 fn build_read_only_iteration_cap_final_answer(
@@ -9498,6 +9535,7 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
     let mut file_cache: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut read_only_diagnose_streak: usize = 0;
+    let mut read_only_diagnose_rescue_count: usize = 0;
 
     let max_iters = max_iters.max(1).min(64);
     for iter in 0..max_iters {
@@ -11888,6 +11926,368 @@ Fix the path/permissions, or switch to explicit tools (write_file/read_file/patc
                     )))
                     .await;
                 break;
+            }
+
+            if root_read_only
+                && read_only_diagnose_streak >= 2
+                && read_only_diagnose_rescue_count < 3
+                && iter + 1 < max_iters
+            {
+                if active_plan.is_none() {
+                    let synthetic_plan = synthetic_read_only_observation_plan(&root_user_text);
+                    adopt_valid_plan(
+                        &synthetic_plan,
+                        &mut working_mem,
+                        &mut assumption_ledger,
+                        &mut active_plan,
+                        &mut intent_required_verification,
+                        path_required_verification,
+                        &mut required_verification,
+                        &mut recovery,
+                        &mut last_verify_ok_step,
+                        last_build_verify_ok_step,
+                        last_behavioral_verify_ok_step,
+                    );
+                }
+
+                if let Some(action) = choose_read_only_diagnose_rescue_action(
+                    &root_user_text,
+                    active_plan.as_ref(),
+                    &observation_evidence,
+                ) {
+                    read_only_diagnose_rescue_count =
+                        read_only_diagnose_rescue_count.saturating_add(1);
+                    match action {
+                        ReadOnlyDiagnoseRescueAction::Search { pattern, dir } => {
+                            emit_telemetry_event(
+                                &tx,
+                                "read_only_autorescue",
+                                json!({
+                                    "action": "search_files",
+                                    "pattern": pattern,
+                                    "dir": dir,
+                                    "diagnose_streak": read_only_diagnose_streak,
+                                    "count": read_only_diagnose_rescue_count,
+                                }),
+                            )
+                            .await;
+                            let arguments = json!({
+                                "pattern": pattern,
+                                "dir": dir,
+                            })
+                            .to_string();
+                            let tc = ToolCallData {
+                                id: format!(
+                                    "auto_ro_diag_search_{}_{}",
+                                    iter, read_only_diagnose_rescue_count
+                                ),
+                                name: "search_files".to_string(),
+                                arguments: arguments.clone(),
+                            };
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "\n[agent] read-only diagnose rescue -> search_files(pattern=\"{}\", dir=\"{}\")\n",
+                                    pattern, dir
+                                )))
+                                .await;
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "\n\n[SEARCH_FILES] {pattern}\n"
+                                )))
+                                .await;
+                            let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
+                            messages.push(json!({
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": tc.arguments
+                                    }
+                                }]
+                            }));
+                            step_seq = step_seq.saturating_add(1);
+                            let (result, is_error) = crate::file_tools::tool_search_files(
+                                pattern.as_str(),
+                                dir.as_str(),
+                                false,
+                                tool_root_abs.as_deref(),
+                            );
+                            let parsed_search_paths = if is_error {
+                                Vec::new()
+                            } else {
+                                parse_search_result_paths(result.as_str())
+                            };
+                            recovery.on_diagnostic_result(!is_error);
+                            let first_line = result.lines().next().unwrap_or("").to_string();
+                            if is_error {
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "[RESULT_FILE_ERR] {first_line}\n"
+                                    )))
+                                    .await;
+                                pending_system_hint = Some(format!(
+                                    "Read-only diagnose rescue search failed: {first_line}"
+                                ));
+                                state = AgentState::Recovery;
+                            } else {
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "[RESULT_SEARCH] {first_line}\n"
+                                    )))
+                                    .await;
+                                state = if recovery.in_recovery() {
+                                    AgentState::Recovery
+                                } else {
+                                    AgentState::Planning
+                                };
+                                update_working_memory_after_non_exec(
+                                    &mut working_mem,
+                                    "search_files",
+                                    false,
+                                    None,
+                                    None,
+                                    test_cmd.as_deref(),
+                                );
+                                let command = canonicalize_tool_call_command(
+                                    "search_files",
+                                    arguments.as_str(),
+                                )
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "search_files(pattern={}, dir={})",
+                                        compact_one_line(pattern.as_str(), 160),
+                                        compact_one_line(dir.as_str(), 160)
+                                    )
+                                });
+                                observation_evidence.remember_search(
+                                    command.as_str(),
+                                    pattern.as_str(),
+                                    parse_search_hit_count(result.as_str()),
+                                    parsed_search_paths.as_slice(),
+                                );
+                                sync_observation_cache_autosave(&autosaver, &observation_evidence);
+                                assumption_ledger.refresh_confirmations(&working_mem);
+                                pending_system_hint = active_plan.as_ref().and_then(|plan| {
+                                    build_read_only_search_to_read_hint(
+                                        &root_user_text,
+                                        plan,
+                                        parsed_search_paths.as_slice(),
+                                        &observation_evidence,
+                                    )
+                                    .or_else(|| {
+                                        build_read_only_completion_hint(
+                                            &root_user_text,
+                                            plan,
+                                            &observation_evidence,
+                                            &messages,
+                                            &working_mem,
+                                        )
+                                    })
+                                });
+                            }
+
+                            let history_result = if is_error {
+                                result.clone()
+                            } else {
+                                compact_success_tool_result_for_history("search_files", &result)
+                            };
+                            messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": history_result,
+                            }));
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
+                            .await;
+                            let _ = tx
+                                .send(StreamToken::GovernorState(build_governor_state(
+                                    state,
+                                    &recovery,
+                                    &mem,
+                                    file_tool_consec_failures,
+                                    last_mutation_step,
+                                    last_verify_ok_step,
+                                    last_reflection.as_ref(),
+                                )))
+                                .await;
+                            continue;
+                        }
+                        ReadOnlyDiagnoseRescueAction::Read { path } => {
+                            emit_telemetry_event(
+                                &tx,
+                                "read_only_autorescue",
+                                json!({
+                                    "action": "read_file",
+                                    "path": path,
+                                    "diagnose_streak": read_only_diagnose_streak,
+                                    "count": read_only_diagnose_rescue_count,
+                                }),
+                            )
+                            .await;
+                            let arguments = json!({ "path": path }).to_string();
+                            let tc = ToolCallData {
+                                id: format!(
+                                    "auto_ro_diag_read_{}_{}",
+                                    iter, read_only_diagnose_rescue_count
+                                ),
+                                name: "read_file".to_string(),
+                                arguments: arguments.clone(),
+                            };
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "\n[agent] read-only diagnose rescue -> read_file(path=\"{}\")\n",
+                                    path
+                                )))
+                                .await;
+                            let _ = tx
+                                .send(StreamToken::Delta(format!("\n\n[READ_FILE] {path}\n")))
+                                .await;
+                            let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
+                            messages.push(json!({
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": tc.arguments
+                                    }
+                                }]
+                            }));
+                            step_seq = step_seq.saturating_add(1);
+                            let cache_key = crate::file_tools::resolve_safe_path(
+                                path.as_str(),
+                                tool_root_abs.as_deref(),
+                            )
+                            .ok()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| {
+                                format!("{}|{}", path, tool_root_abs.as_deref().unwrap_or(""))
+                            });
+                            let (result, is_error) =
+                                if let Some(cached) = file_cache.get(&cache_key) {
+                                    let header =
+                                        cached.lines().next().unwrap_or(path.as_str()).to_string();
+                                    let _ = tx
+                                        .send(StreamToken::Delta(format!("[CACHE_HIT] {header}\n")))
+                                        .await;
+                                    (
+                                        format!(
+                                            "{} [⚡ cached — unchanged since last read]\n{cached}",
+                                            header
+                                        ),
+                                        false,
+                                    )
+                                } else {
+                                    let (content, err) = crate::file_tools::tool_read_file(
+                                        path.as_str(),
+                                        tool_root_abs.as_deref(),
+                                    );
+                                    if !err {
+                                        file_cache.insert(cache_key.clone(), content.clone());
+                                    }
+                                    (content, err)
+                                };
+                            recovery.on_diagnostic_result(!is_error);
+                            let first_line = result.lines().next().unwrap_or("").to_string();
+                            if is_error {
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "[RESULT_FILE_ERR] {first_line}\n"
+                                    )))
+                                    .await;
+                                pending_system_hint = Some(format!(
+                                    "Read-only diagnose rescue read failed: {first_line}"
+                                ));
+                                state = AgentState::Recovery;
+                            } else {
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "[RESULT_FILE] {first_line}\n"
+                                    )))
+                                    .await;
+                                state = if recovery.in_recovery() {
+                                    AgentState::Recovery
+                                } else {
+                                    AgentState::Planning
+                                };
+                                update_working_memory_after_non_exec(
+                                    &mut working_mem,
+                                    "read_file",
+                                    false,
+                                    None,
+                                    None,
+                                    test_cmd.as_deref(),
+                                );
+                                let command =
+                                    canonicalize_tool_call_command("read_file", arguments.as_str())
+                                        .unwrap_or_else(|| {
+                                            format!(
+                                                "read_file(path={})",
+                                                compact_one_line(path.as_str(), 160)
+                                            )
+                                        });
+                                let observed_path = parse_read_file_result_path(result.as_str())
+                                    .unwrap_or_else(|| compact_one_line(path.as_str(), 160));
+                                observation_evidence
+                                    .remember_read(command.as_str(), observed_path.as_str());
+                                sync_observation_cache_autosave(&autosaver, &observation_evidence);
+                                assumption_ledger.refresh_confirmations(&working_mem);
+                                pending_system_hint = active_plan.as_ref().and_then(|plan| {
+                                    build_read_only_completion_hint(
+                                        &root_user_text,
+                                        plan,
+                                        &observation_evidence,
+                                        &messages,
+                                        &working_mem,
+                                    )
+                                });
+                            }
+
+                            let history_result = if is_error {
+                                result.clone()
+                            } else {
+                                compact_success_tool_result_for_history("read_file", &result)
+                            };
+                            messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": history_result,
+                            }));
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
+                            .await;
+                            let _ = tx
+                                .send(StreamToken::GovernorState(build_governor_state(
+                                    state,
+                                    &recovery,
+                                    &mem,
+                                    file_tool_consec_failures,
+                                    last_mutation_step,
+                                    last_verify_ok_step,
+                                    last_reflection.as_ref(),
+                                )))
+                                .await;
+                            continue;
+                        }
+                    }
+                }
             }
 
             // Common failure mode: model "explains what to do" but never calls tools.
@@ -14690,6 +15090,64 @@ remaining_gap: still need to run cargo test\n\
         .expect("diagnose coercion hint");
 
         assert!(hint.contains("read_file(path=\"src/tui/events.rs\")"));
+    }
+
+    #[test]
+    fn choose_read_only_diagnose_rescue_action_starts_with_search() {
+        let action = choose_read_only_diagnose_rescue_action(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            None,
+            &ObservationEvidence::default(),
+        );
+
+        assert_eq!(
+            action,
+            Some(ReadOnlyDiagnoseRescueAction::Search {
+                pattern: "/realize".to_string(),
+                dir: "src".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn choose_read_only_diagnose_rescue_action_advances_to_read() {
+        let plan = PlanBlock {
+            goal: "Locate the /realize slash command handler in the TUI".to_string(),
+            steps: vec![
+                "search src".to_string(),
+                "read the matching file".to_string(),
+                "confirm the context".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path containing the `/realize` slash command handler is identified."
+                    .to_string(),
+                "The handler logic is confirmed to be part of the TUI component.".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+        let evidence = ObservationEvidence {
+            searches: vec![ObservationSearchEvidence {
+                command: "search_files(pattern=/realize, dir=src)".to_string(),
+                pattern: "/realize".to_string(),
+                hit_count: 1,
+                paths: vec!["src/tui/events.rs".to_string()],
+            }],
+            reads: vec![],
+        };
+
+        let action = choose_read_only_diagnose_rescue_action(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            Some(&plan),
+            &evidence,
+        );
+
+        assert_eq!(
+            action,
+            Some(ReadOnlyDiagnoseRescueAction::Read {
+                path: "src/tui/events.rs".to_string(),
+            })
+        );
     }
 
     #[test]
