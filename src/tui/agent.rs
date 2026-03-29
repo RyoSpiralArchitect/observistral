@@ -4641,6 +4641,22 @@ struct CriterionEvidenceScore {
     suggested_commands: Vec<String>,
 }
 
+fn criterion_prefers_read_confirmation(criterion: &str) -> bool {
+    let low = criterion.to_ascii_lowercase();
+    [
+        "read",
+        "verify",
+        "confirmed",
+        "confirm",
+        "context",
+        "handler",
+        "logic",
+        "branch",
+    ]
+    .iter()
+    .any(|term| low.contains(term))
+}
+
 fn parse_done_acceptance_evidence(value: &serde_json::Value) -> Vec<DoneAcceptanceEvidence> {
     let serde_json::Value::Array(items) = value else {
         return Vec::new();
@@ -5008,12 +5024,12 @@ fn build_read_only_evidence_scores(
                 .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
             let mut suggested_commands = Vec::new();
-            let search_specificity = if let Some((score, search)) = best_search {
-                remember_recent_unique(&mut suggested_commands, &search.command, 3, 200);
-                score
-            } else {
-                0.0
-            };
+            let (search_specificity, best_search_command) =
+                if let Some((score, search)) = best_search {
+                    (score, Some(search.command.clone()))
+                } else {
+                    (0.0, None)
+                };
 
             let best_path = evidence
                 .reads
@@ -5028,7 +5044,7 @@ fn build_read_only_evidence_scores(
                 .or_else(|| global_best_path.clone())
                 .or_else(|| evidence.reads.first().map(|read| read.path.clone()));
 
-            let read_confirm = evidence
+            let (read_confirm, best_read_command) = evidence
                 .reads
                 .iter()
                 .map(|read| {
@@ -5049,16 +5065,33 @@ fn build_read_only_evidence_scores(
                     (score.clamp(0.0, 1.0), read)
                 })
                 .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(score, read)| {
-                    remember_recent_unique(&mut suggested_commands, &read.command, 3, 200);
-                    score
-                })
-                .unwrap_or(0.0);
+                .map(|(score, read)| (score, Some(read.command.clone())))
+                .unwrap_or((0.0, None));
 
             let repo_prior = best_path
                 .as_deref()
                 .map(|path| path_prior_score(path, root_user_text, &plan.goal, criterion))
                 .unwrap_or(0.0);
+
+            let prefer_read = best_read_command.is_some()
+                && (criterion_prefers_read_confirmation(criterion)
+                    || read_confirm + 0.05 >= search_specificity);
+
+            if prefer_read {
+                if let Some(command) = best_read_command.as_deref() {
+                    remember_recent_unique(&mut suggested_commands, command, 3, 200);
+                }
+                if let Some(command) = best_search_command.as_deref() {
+                    remember_recent_unique(&mut suggested_commands, command, 3, 200);
+                }
+            } else {
+                if let Some(command) = best_search_command.as_deref() {
+                    remember_recent_unique(&mut suggested_commands, command, 3, 200);
+                }
+                if let Some(command) = best_read_command.as_deref() {
+                    remember_recent_unique(&mut suggested_commands, command, 3, 200);
+                }
+            }
 
             let total = (search_specificity * 0.30 + read_confirm * 0.50 + repo_prior * 0.20)
                 .clamp(0.0, 1.0);
@@ -14366,6 +14399,10 @@ remaining_gap: still need to run cargo test\n\
         assert_eq!(scores.len(), 3);
         assert!(scores[0].total >= 0.80);
         assert!(scores[1].read_confirm >= 0.80);
+        assert!(scores[1]
+            .suggested_commands
+            .first()
+            .is_some_and(|cmd| cmd.contains("read_file")));
         assert!(scores[2]
             .suggested_commands
             .iter()
@@ -14615,6 +14652,7 @@ remaining_gap: still need to run cargo test\n\
 
         assert!(final_text.starts_with("[DONE]"));
         assert!(final_text.contains("src/tui/events.rs"));
+        assert!(final_text.contains("via `read_file(path=src/tui/events.rs)`"));
     }
 
     #[test]
