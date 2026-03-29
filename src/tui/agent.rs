@@ -5341,6 +5341,44 @@ If that finds a plausible code file, read it next instead of searching again."
     )
 }
 
+fn first_action_deadline_iters(root_read_only: bool, goal_wants_actions: bool) -> usize {
+    if root_read_only || goal_wants_actions {
+        2
+    } else {
+        3
+    }
+}
+
+fn build_first_action_constraint_hint(
+    root_user_text: &str,
+    root_read_only: bool,
+    goal_wants_actions: bool,
+) -> Option<String> {
+    if root_read_only {
+        let pattern = first_slash_literal(root_user_text).unwrap_or_else(|| "realize".to_string());
+        return Some(format!(
+            "[First Action Constraint]\n\
+This task is read-only inspection.\n\
+Within the first 2 turns, you must call ONE observation tool.\n\
+Do not keep diagnosing in prose.\n\
+Preferred first action now:\n\
+search_files(pattern=\"{pattern}\", dir=\"src\")\n\
+If that finds a likely code file, read it next instead of searching again."
+        ));
+    }
+    if goal_wants_actions {
+        return Some(
+            "[First Action Constraint]\n\
+This task requires local action.\n\
+Within the first 2 turns, you must call ONE real tool.\n\
+Do not continue with planning-only prose.\n\
+Pick the smallest safe action that creates evidence."
+                .to_string(),
+        );
+    }
+    None
+}
+
 fn build_read_only_diagnose_coercion_hint(
     root_user_text: &str,
     plan: Option<&PlanBlock>,
@@ -9527,6 +9565,7 @@ Fix: use --provider openai-compatible (or --provider mistral).",
     let mut last_reflection: Option<ReflectionBlock> = None;
     let mut reflection_guard: Option<ReflectionBlock> = None;
     let mut forced_tool_once = false;
+    let mut tool_calls_this_run: usize = 0;
     // C — token budget guardian
     let mut budget_warned = false;
     // D — consecutive file-tool failure escalation
@@ -9763,6 +9802,7 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
         std::collections::HashMap::new();
     let mut read_only_diagnose_streak: usize = 0;
     let mut read_only_diagnose_rescue_count: usize = 0;
+    let first_action_deadline = first_action_deadline_iters(root_read_only, goal_wants_actions);
 
     let max_iters = max_iters.max(1).min(64);
     for iter in 0..max_iters {
@@ -9831,6 +9871,20 @@ Be concise: prefer tool calls over long explanations. Summarise intermediate res
                 &working_mem,
             );
             if let Some(hint) = hint {
+                pending_system_hint = Some(hint);
+            }
+        }
+
+        if tool_calls_this_run == 0
+            && iter + 1 >= first_action_deadline.saturating_sub(1)
+            && pending_system_hint.is_none()
+            && reflection_required.is_none()
+        {
+            if let Some(hint) = build_first_action_constraint_hint(
+                &root_user_text,
+                root_read_only,
+                goal_wants_actions,
+            ) {
                 pending_system_hint = Some(hint);
             }
         }
@@ -12203,7 +12257,8 @@ Fix the path/permissions, or switch to explicit tools (write_file/read_file/patc
             }
 
             if root_read_only
-                && read_only_diagnose_streak >= 2
+                && (read_only_diagnose_streak >= 2
+                    || (tool_calls_this_run == 0 && iter + 1 >= first_action_deadline))
                 && read_only_diagnose_rescue_count < 3
                 && iter + 1 < max_iters
             {
@@ -12233,6 +12288,7 @@ Fix the path/permissions, or switch to explicit tools (write_file/read_file/patc
                         read_only_diagnose_rescue_count.saturating_add(1);
                     match action {
                         ReadOnlyDiagnoseRescueAction::Search { pattern, dir } => {
+                            tool_calls_this_run = tool_calls_this_run.saturating_add(1);
                             emit_telemetry_event(
                                 &tx,
                                 "read_only_autorescue",
@@ -12396,6 +12452,7 @@ Fix the path/permissions, or switch to explicit tools (write_file/read_file/patc
                             continue;
                         }
                         ReadOnlyDiagnoseRescueAction::Read { path } => {
+                            tool_calls_this_run = tool_calls_this_run.saturating_add(1);
                             emit_telemetry_event(
                                 &tx,
                                 "read_only_autorescue",
@@ -12624,6 +12681,7 @@ Do NOT respond with text-only instructions."
         // ── Execute the tool ───────────────────────────────────────────────
         let tc = tool_call.unwrap();
         step_seq = step_seq.saturating_add(1);
+        tool_calls_this_run = tool_calls_this_run.saturating_add(1);
         let this_step = step_seq;
         let step_label_for_turn = resolve_step_label(
             validated_plan_for_turn.as_ref(),
@@ -15357,6 +15415,32 @@ remaining_gap: still need to run cargo test\n\
         .expect("diagnose coercion hint");
 
         assert!(hint.contains("search_files(pattern=\"/realize\", dir=\"src\")"));
+    }
+
+    #[test]
+    fn first_action_constraint_hint_prefers_observation_tool_for_read_only() {
+        assert_eq!(first_action_deadline_iters(true, true), 2);
+        let hint = build_first_action_constraint_hint(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            true,
+            true,
+        )
+        .expect("hint");
+        assert!(hint.contains("[First Action Constraint]"));
+        assert!(hint.contains("search_files(pattern=\"/realize\", dir=\"src\")"));
+    }
+
+    #[test]
+    fn first_action_constraint_hint_requires_tool_for_action_tasks() {
+        assert_eq!(first_action_deadline_iters(false, true), 2);
+        let hint = build_first_action_constraint_hint(
+            "Fix the /realize command handling and keep tests passing.",
+            false,
+            true,
+        )
+        .expect("hint");
+        assert!(hint.contains("Within the first 2 turns"));
+        assert!(hint.contains("call ONE real tool"));
     }
 
     #[test]
