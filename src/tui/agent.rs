@@ -7246,6 +7246,9 @@ fn rescue_read_only_missing_think_for_tool_turn(
     if !root_read_only || !mistral_observation_tool(tc.name.as_str()) {
         return None;
     }
+    if tc.name == "read_file" {
+        return Some(compat_synthetic_think(tc, plan));
+    }
     if matches!(provider, ProviderKind::Mistral) {
         return Some(compat_synthetic_think(tc, plan));
     }
@@ -15316,6 +15319,29 @@ verify: exit code is zero\n\
         .expect("synthetic think");
         assert_eq!(rescued.tool, "search_files");
         assert!(rescued.next.contains("search"));
+    }
+
+    #[test]
+    fn rescue_read_only_missing_think_for_read_file_is_immediate() {
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"src/tui/events.rs"}).to_string(),
+        };
+        let plan = synthetic_read_only_observation_plan(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+        );
+
+        let rescued = rescue_read_only_missing_think_for_tool_turn(
+            &[],
+            &tc,
+            &plan,
+            true,
+            ProviderKind::OpenAiCompatible,
+        )
+        .expect("synthetic think");
+        assert_eq!(rescued.tool, "read_file");
+        assert!(rescued.next.contains("read"));
     }
 
     #[test]
