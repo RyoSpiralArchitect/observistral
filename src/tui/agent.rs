@@ -3631,20 +3631,26 @@ fn canonicalize_evidence_command(command: &str) -> String {
     if let Some(open_idx) = trimmed.find('(') {
         if trimmed.ends_with(')') {
             let name = trimmed[..open_idx].trim();
-            let inner = &trimmed[open_idx + 1..trimmed.len() - 1];
-            let args = split_top_level_args(inner)
-                .into_iter()
-                .filter_map(|part| {
-                    let (key, value) = part.split_once('=')?;
-                    Some((key.trim().to_string(), value.trim().to_string()))
-                })
-                .collect::<Vec<_>>();
-            if let Some(sig) = canonicalize_named_command(name, &args) {
-                return sig;
+            if !name.contains(char::is_whitespace) {
+                let inner = &trimmed[open_idx + 1..trimmed.len() - 1];
+                let args = split_top_level_args(inner)
+                    .into_iter()
+                    .filter_map(|part| {
+                        let (key, value) = part.split_once('=')?;
+                        Some((key.trim().to_string(), value.trim().to_string()))
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(sig) = canonicalize_named_command(name, &args) {
+                    return sig;
+                }
             }
         }
     }
 
+    let trimmed = trimmed
+        .split_once(" (")
+        .map(|(head, _)| head.trim())
+        .unwrap_or(trimmed);
     let low = trimmed.to_ascii_lowercase();
     if low.starts_with("read_file of ") || low.starts_with("read file of ") {
         let path = trimmed
@@ -3668,7 +3674,14 @@ fn canonicalize_evidence_command(command: &str) -> String {
     if let Some(rest) = trimmed.strip_prefix("read_file ") {
         if let Some(sig) = canonicalize_named_command(
             "read_file",
-            &[("path".to_string(), rest.trim().to_string())],
+            &[(
+                "path".to_string(),
+                rest.trim()
+                    .trim_matches('`')
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string(),
+            )],
         ) {
             return sig;
         }
@@ -3695,6 +3708,42 @@ fn canonicalize_evidence_command(command: &str) -> String {
             .replace(" in '", " in ");
         let rest = normalized
             .strip_prefix("search_files for ")
+            .unwrap_or(normalized.as_str());
+        if let Some((pattern, dir)) = rest.rsplit_once(" in ") {
+            let pattern = pattern
+                .trim()
+                .trim_matches('`')
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim();
+            let dir = dir
+                .trim()
+                .trim_matches('`')
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim_end_matches('/')
+                .trim();
+            if let Some(sig) = canonicalize_named_command(
+                "search_files",
+                &[
+                    ("pattern".to_string(), pattern.to_string()),
+                    ("dir".to_string(), dir.to_string()),
+                ],
+            ) {
+                return sig;
+            }
+        }
+    }
+    if low.starts_with("search_files with pattern ")
+        || low.starts_with("search files with pattern ")
+    {
+        let normalized = trimmed
+            .replace("search files with pattern ", "search_files with pattern ")
+            .replace(" in `", " in ")
+            .replace(" in \"", " in ")
+            .replace(" in '", " in ");
+        let rest = normalized
+            .strip_prefix("search_files with pattern ")
             .unwrap_or(normalized.as_str());
         if let Some((pattern, dir)) = rest.rsplit_once(" in ") {
             let pattern = pattern
@@ -15103,6 +15152,18 @@ verify: exit code is zero\n\
         );
         assert_eq!(
             canonicalize_evidence_command("read_file of `src/tui/events.rs`"),
+            "read_file(path=src/tui/events.rs)"
+        );
+        assert_eq!(
+            canonicalize_evidence_command(
+                "search_files with pattern \"/realize\" in src/ (succeeded with matches in src/tui/events.rs)"
+            ),
+            "search_files(dir=src, pattern=/realize)"
+        );
+        assert_eq!(
+            canonicalize_evidence_command(
+                "read_file src/tui/events.rs (succeeded with confirmation of handling logic)"
+            ),
             "read_file(path=src/tui/events.rs)"
         );
     }
