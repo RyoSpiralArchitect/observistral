@@ -1676,6 +1676,15 @@ fn compact_one_line(s: &str, max_chars: usize) -> String {
     }
 }
 
+fn compact_multiline_block(s: &str) -> String {
+    s.replace("\r\n", "\n")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn approx_tokens_text(s: &str) -> usize {
     // Rough heuristic:
     // - ASCII-ish text: ~4 chars/token
@@ -6408,6 +6417,52 @@ fn inline_block_from_name(name: &str) -> Option<String> {
     Some(format!("<{tag}>\n{body}"))
 }
 
+fn markdownish_block_fields(raw: &str) -> Option<String> {
+    let mut body = raw
+        .replace("**•**", "\n")
+        .replace('•', "\n")
+        .replace("**", "")
+        .replace('`', "")
+        .replace("</thinking>", "")
+        .replace("</plan>", "")
+        .replace("</think>", "");
+    body = compact_multiline_block(body.as_str());
+    let body = body.trim();
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_string())
+    }
+}
+
+fn markdownish_mistral_blocks_from_name(name: &str) -> Vec<String> {
+    let trimmed = name.trim();
+    let low = trimmed.to_ascii_lowercase();
+    if !low.starts_with("plan") {
+        return Vec::new();
+    }
+
+    let plan_raw = if let Some((plan, _think)) = trimmed.split_once("<thinking>") {
+        plan
+    } else {
+        trimmed
+    };
+    let mut blocks = Vec::new();
+    let mut plan_body = plan_raw.trim().to_string();
+    if plan_body.to_ascii_lowercase().starts_with("plan") {
+        plan_body = plan_body[4..]
+            .trim_start_matches(|c: char| c == ':' || c == '>' || c.is_whitespace())
+            .to_string();
+    }
+    if let Some(body) = markdownish_block_fields(plan_body.as_str()) {
+        if parse_plan_block(format!("<plan>\n{body}\n</plan>").as_str()).is_some() {
+            blocks.push(format!("<plan>\n{body}\n</plan>"));
+        }
+    }
+
+    blocks
+}
+
 fn mistral_nested_tool_payload(tc: &ToolCallData) -> Option<(Vec<String>, ToolCallData)> {
     let value: serde_json::Value = serde_json::from_str(&tc.arguments).ok()?;
     let obj = value.as_object()?;
@@ -6458,6 +6513,15 @@ fn split_concatenated_json_values(raw: &str) -> Vec<serde_json::Value> {
 fn normalize_mistral_tool_call(tc: &ToolCallData) -> (Vec<String>, Option<ToolCallData>) {
     if let Some(block) = pseudo_tool_call_to_block_text(tc) {
         return (vec![block], None);
+    }
+    let markdownish_blocks = markdownish_mistral_blocks_from_name(&tc.name);
+    if !markdownish_blocks.is_empty() {
+        if let Some((mut prelude, normalized)) = mistral_nested_tool_payload(tc) {
+            let mut blocks = markdownish_blocks;
+            blocks.append(&mut prelude);
+            return (blocks, Some(normalized));
+        }
+        return (markdownish_blocks, None);
     }
     if let Some(block) = inline_block_from_name(&tc.name) {
         if let Some((mut prelude, normalized)) = mistral_nested_tool_payload(tc) {
@@ -14693,6 +14757,33 @@ verify: exit code is zero\n\
         assert_eq!(think.tool, "search_files");
         let normalized = normalized.expect("real tool preserved");
         assert_eq!(normalized.name, "search_files");
+    }
+
+    #[test]
+    fn normalize_mistral_tool_call_extracts_markdownish_plan_name_and_wrapper_tool() {
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "plan**goal:** Locate where the `/realize` slash command is handled in the TUI. **•**steps:** 1) Use `search_files` to search for the literal string `/realize` in `src`. 2) Read the matching file. **•**acceptance:** 1) The file path handling `/realize` is identified. 2) The handler branch is confirmed by `read_file`. **•**risks:** wrong file. **•**assumptions:** observation tools are sufficient. <thinking> **goal:** Find direct matches. **step:** 1. **tool:** `search_files`. **risk:** wrong path. **doubt:** maybe aliased. **next:** Search `/realize` in `src`. **verify:** confirm a TUI match. </thinking>".to_string(),
+            arguments: serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "search_files",
+                    "parameters": {"pattern": "/realize", "dir": "src"}
+                }
+            })
+            .to_string(),
+        };
+
+        let (blocks, normalized) = normalize_mistral_tool_call(&tc);
+        assert_eq!(blocks.len(), 1);
+        let plan = parse_plan_block(&blocks[0]).expect("plan parsed");
+        assert!(plan.goal.contains("/realize"));
+        let normalized = normalized.expect("real tool preserved");
+        assert_eq!(normalized.name, "search_files");
+        assert_eq!(
+            normalized.arguments,
+            serde_json::json!({"pattern":"/realize","dir":"src"}).to_string()
+        );
     }
 
     #[test]
