@@ -10277,9 +10277,9 @@ Execute only the new minimal action: {}",
         // ── Append assistant turn ──────────────────────────────────────────
         if let Some(ref tc) = tool_call {
             state = AgentState::Executing;
-            if let Some(plan) = parsed_plan.clone() {
+            if let Some(plan) = validated_plan_for_turn.as_ref() {
                 adopt_valid_plan(
-                    &plan,
+                    plan,
                     &mut working_mem,
                     &mut assumption_ledger,
                     &mut active_plan,
