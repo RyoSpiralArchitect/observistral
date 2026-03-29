@@ -6441,6 +6441,15 @@ fn markdownish_mistral_blocks_from_name(name: &str) -> Vec<String> {
     if !low.starts_with("plan") {
         return Vec::new();
     }
+    let looks_markdownish = trimmed.contains("**")
+        || trimmed.contains('•')
+        || low.contains("**goal")
+        || low.contains("**steps")
+        || low.contains("**acceptance")
+        || low.contains("<thinking>");
+    if !looks_markdownish {
+        return Vec::new();
+    }
 
     let plan_raw = if let Some((plan, _think)) = trimmed.split_once("<thinking>") {
         plan
