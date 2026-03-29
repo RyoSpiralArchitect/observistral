@@ -13405,6 +13405,57 @@ Action required: call read_file(path) first to confirm current contents, then re
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
+            if !is_error && root_read_only && tc.name.as_str() == "read_file" {
+                if let Some(plan) = active_plan.as_ref() {
+                    if iter + 1 == max_iters {
+                        if let Some(final_text) = build_read_only_iteration_cap_final_answer(
+                            &root_user_text,
+                            plan,
+                            &observation_evidence,
+                            &messages,
+                            &working_mem,
+                        ) {
+                            state = AgentState::Done;
+                            messages
+                                .push(json!({"role": "assistant", "content": final_text.clone()}));
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
+                            .await;
+                            let _ = tx
+                                .send(StreamToken::GovernorState(build_governor_state(
+                                    state,
+                                    &recovery,
+                                    &mem,
+                                    file_tool_consec_failures,
+                                    last_mutation_step,
+                                    last_verify_ok_step,
+                                    last_reflection.as_ref(),
+                                )))
+                                .await;
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "\n[agent] iteration cap reached; auto-finalized read-only inspection.\n\n{final_text}\n"
+                                )))
+                                .await;
+                            break;
+                        }
+                    } else if let Some(hint) = build_read_only_completion_hint(
+                        &root_user_text,
+                        plan,
+                        &observation_evidence,
+                        &messages,
+                        &working_mem,
+                    ) {
+                        pending_system_hint = Some(hint);
+                    }
+                }
+            }
             autosave_best_effort(
                 &autosaver,
                 &tx,
