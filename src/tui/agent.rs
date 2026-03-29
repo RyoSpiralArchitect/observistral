@@ -6552,6 +6552,127 @@ fn pseudo_tool_call_to_block_text(tc: &ToolCallData) -> Option<String> {
     pseudo_block_text_from_named_args(&tc.name, &args)
 }
 
+fn known_runtime_tool_name_from_text(text: &str) -> Option<String> {
+    const TOOL_NAMES: [&str; 9] = [
+        "exec",
+        "read_file",
+        "write_file",
+        "patch_file",
+        "apply_diff",
+        "search_files",
+        "list_dir",
+        "glob",
+        "done",
+    ];
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let low = trimmed.to_ascii_lowercase();
+    for tool in TOOL_NAMES {
+        if low == tool {
+            return Some(tool.to_string());
+        }
+    }
+    for tool in TOOL_NAMES {
+        if let Some(prefix) = low.strip_suffix(tool) {
+            let boundary_ok = prefix
+                .chars()
+                .last()
+                .map(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+                .unwrap_or(true);
+            if boundary_ok {
+                return Some(tool.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn mistral_wrapped_tool_payload(tc: &ToolCallData) -> Option<ToolCallData> {
+    mistral_nested_tool_payload(tc).map(|(_, normalized)| normalized)
+}
+
+fn mistral_name_embedded_blocks_and_tool(
+    tc: &ToolCallData,
+) -> Option<(Vec<String>, Option<ToolCallData>)> {
+    let raw = tc.name.trim();
+    let low = raw.to_ascii_lowercase();
+    if !(low.starts_with("plan>")
+        || low.contains("<plan>")
+        || low.contains("<think>")
+        || low.contains("</plan>")
+        || low.contains("</think>"))
+    {
+        return None;
+    }
+
+    let mut blocks = Vec::new();
+    let mut rest = raw;
+    let mut tool_from_think: Option<String> = None;
+
+    if let Some(after_plan_prefix) = raw.strip_prefix("plan>") {
+        let after_low = after_plan_prefix.to_ascii_lowercase();
+        if let Some(end) = after_low.find("</plan>") {
+            let plan_chunk = &after_plan_prefix[..end + "</plan>".len()];
+            let block = format!("<plan>{plan_chunk}");
+            if parse_plan_block(&block).is_some() {
+                blocks.push(block);
+                rest = &after_plan_prefix[end + "</plan>".len()..];
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        if let Some(plan_body) = extract_tag_block(raw, "plan") {
+            let block = format!("<plan>\n{plan_body}\n</plan>");
+            if parse_plan_block(&block).is_some() {
+                blocks.push(block);
+                if let Some(plan_end) = low.find("</plan>") {
+                    rest = &raw[plan_end + "</plan>".len()..];
+                }
+            }
+        }
+    }
+
+    let think_search = if rest == raw { raw } else { rest };
+    if let Some(think_body) = extract_tag_block(think_search, "think") {
+        let block = format!("<think>\n{think_body}\n</think>");
+        if let Some(think) = parse_think_block(&block) {
+            if !think.tool.trim().is_empty() {
+                tool_from_think = Some(think.tool.clone());
+            }
+            blocks.push(block);
+            if let Some(think_end) = think_search.to_ascii_lowercase().find("</think>") {
+                rest = &think_search[think_end + "</think>".len()..];
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let normalized = mistral_wrapped_tool_payload(tc)
+        .or_else(|| {
+            tool_from_think.map(|tool| ToolCallData {
+                id: tc.id.clone(),
+                name: tool,
+                arguments: tc.arguments.clone(),
+            })
+        })
+        .or_else(|| {
+            known_runtime_tool_name_from_text(rest).map(|tool| ToolCallData {
+                id: tc.id.clone(),
+                name: tool,
+                arguments: tc.arguments.clone(),
+            })
+        });
+
+    Some((blocks, normalized))
+}
+
 fn inline_block_from_name(name: &str) -> Option<String> {
     let trimmed = name.trim();
     let (tag, rest, fields, close_tag) = if let Some(rest) = trimmed.strip_prefix("plan>") {
@@ -6700,6 +6821,9 @@ fn split_concatenated_json_values(raw: &str) -> Vec<serde_json::Value> {
 fn normalize_mistral_tool_call(tc: &ToolCallData) -> (Vec<String>, Option<ToolCallData>) {
     if let Some(block) = pseudo_tool_call_to_block_text(tc) {
         return (vec![block], None);
+    }
+    if let Some((blocks, normalized)) = mistral_name_embedded_blocks_and_tool(tc) {
+        return (blocks, normalized);
     }
     let markdownish_blocks = markdownish_mistral_blocks_from_name(&tc.name);
     if !markdownish_blocks.is_empty() {
@@ -15808,6 +15932,28 @@ verify: exit code is zero\n\
         assert_eq!(
             normalized.arguments,
             serde_json::json!({"pattern":"/realize","dir":"src"}).to_string()
+        );
+    }
+
+    #[test]
+    fn normalize_mistral_tool_call_extracts_embedded_plan_think_and_tool_name() {
+        let tc = ToolCallData {
+            id: "call_1".to_string(),
+            name: "plan><goal>Locate the exact file and code context where the /realize slash command is handled in the TUI.</goal><steps>1) List the TUI-related directories to confirm structure and naming conventions.</steps><steps>2) Search for the literal \"/realize\" string across Rust files to pinpoint the handler.</steps><acceptance>1) The file path containing the /realize slash command handler is confirmed by search_files evidence.</acceptance><acceptance>2) The handling context is confirmed by read_file evidence.</acceptance><risks>wrong file</risks><assumptions>repo is local</assumptions></plan>teří<think><goal>Confirm TUI directory structure and naming.</goal><step>1</step><tool>list_dir</tool><risk>TUI directory may not exist.</risk><doubt>Directory names may vary.</doubt><next>list_dir src/</next><verify>Directory listing shows TUI directory.</verify></think>teřílist_dir".to_string(),
+            arguments: serde_json::json!({"dir":"src"}).to_string(),
+        };
+
+        let (blocks, normalized) = normalize_mistral_tool_call(&tc);
+        assert_eq!(blocks.len(), 2);
+        let plan = parse_plan_block(&blocks[0]).expect("plan parsed");
+        let think = parse_think_block(&blocks[1]).expect("think parsed");
+        assert!(plan.goal.contains("/realize"));
+        assert_eq!(think.tool, "list_dir");
+        let normalized = normalized.expect("tool restored");
+        assert_eq!(normalized.name, "list_dir");
+        assert_eq!(
+            normalized.arguments,
+            serde_json::json!({"dir":"src"}).to_string()
         );
     }
 
