@@ -5231,7 +5231,13 @@ fn maybe_build_read_only_auto_final_answer(
     if !root_read_only {
         return None;
     }
-    let plan = plan?;
+    let fallback_plan;
+    let plan = if let Some(plan) = plan {
+        plan
+    } else {
+        fallback_plan = synthetic_read_only_observation_plan(root_user_text);
+        &fallback_plan
+    };
     build_read_only_iteration_cap_final_answer(
         root_user_text,
         plan,
@@ -14185,6 +14191,58 @@ remaining_gap: still need to run cargo test\n\
             &WorkingMemory::default(),
         )
         .expect("auto final answer");
+
+        assert!(final_text.starts_with("[DONE]"));
+        assert!(final_text.contains("src/tui/events.rs"));
+    }
+
+    #[test]
+    fn maybe_build_read_only_auto_final_answer_falls_back_to_synthetic_plan() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"/realize\",\"dir\":\"src/tui\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: '/realize' — 3 match(es)]\nevents.rs:763: \"/realize\" => {\nintent.rs:519: raw_user_prompt: \"Find /realize handler\"\nagent.rs:100: something"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/tui/events.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/tui/events.rs] (3639 lines, 133416 bytes)\nfn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {\n    match cmd_lc.as_str() {\n        \"/realize\" => {"
+            }),
+        ];
+        let evidence = collect_observation_evidence(&messages);
+
+        let final_text = maybe_build_read_only_auto_final_answer(
+            true,
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything. Final answer must include the file path.",
+            None,
+            &evidence,
+            &messages,
+            &WorkingMemory::default(),
+        )
+        .expect("auto final answer with synthetic plan");
 
         assert!(final_text.starts_with("[DONE]"));
         assert!(final_text.contains("src/tui/events.rs"));
