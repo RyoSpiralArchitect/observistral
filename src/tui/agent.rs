@@ -7172,6 +7172,26 @@ fn rescue_read_only_missing_plan_for_tool_turn(
     Some(synthetic_read_only_observation_plan(root_user_text))
 }
 
+fn rescue_read_only_missing_think_for_tool_turn(
+    messages: &[serde_json::Value],
+    tc: &ToolCallData,
+    plan: &PlanBlock,
+    root_read_only: bool,
+    provider: ProviderKind,
+) -> Option<ThinkBlock> {
+    if !root_read_only || !mistral_observation_tool(tc.name.as_str()) {
+        return None;
+    }
+    if matches!(provider, ProviderKind::Mistral) {
+        return Some(compat_synthetic_think(tc, plan));
+    }
+    let prior_blocks = consecutive_missing_think_blocks_for_tool(messages, tc);
+    if prior_blocks.saturating_add(1) < 2 {
+        return None;
+    }
+    Some(compat_synthetic_think(tc, plan))
+}
+
 fn repair_mistral_plan_for_tool_turn(
     parsed_plan: Option<&PlanBlock>,
     active_plan: Option<&PlanBlock>,
@@ -7810,6 +7830,17 @@ fn is_missing_plan_governor_block(msg: &serde_json::Value) -> bool {
             .unwrap_or(false)
 }
 
+fn is_missing_think_governor_block(msg: &serde_json::Value) -> bool {
+    msg.get("role").and_then(|v| v.as_str()) == Some("tool")
+        && msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|content| {
+                content.contains("GOVERNOR BLOCKED") && content.contains("Missing <think>")
+            })
+            .unwrap_or(false)
+}
+
 fn consecutive_missing_plan_blocks_for_tool(
     messages: &[serde_json::Value],
     tc: &ToolCallData,
@@ -7821,6 +7852,31 @@ fn consecutive_missing_plan_blocks_for_tool(
         let tool_msg = &messages[idx - 1];
         let assistant_msg = &messages[idx - 2];
         if !is_missing_plan_governor_block(tool_msg) {
+            break;
+        }
+        let Some(sig) = assistant_blocked_tool_call_signature(assistant_msg) else {
+            break;
+        };
+        if sig != target_sig {
+            break;
+        }
+        count = count.saturating_add(1);
+        idx -= 2;
+    }
+    count
+}
+
+fn consecutive_missing_think_blocks_for_tool(
+    messages: &[serde_json::Value],
+    tc: &ToolCallData,
+) -> usize {
+    let target_sig = blocked_tool_call_signature(&tc.name, &tc.arguments);
+    let mut count = 0usize;
+    let mut idx = messages.len();
+    while idx >= 2 {
+        let tool_msg = &messages[idx - 1];
+        let assistant_msg = &messages[idx - 2];
+        if !is_missing_think_governor_block(tool_msg) {
             break;
         }
         let Some(sig) = assistant_blocked_tool_call_signature(assistant_msg) else {
@@ -10280,11 +10336,30 @@ Execute only the new minimal action: {}",
                 },
             };
 
-            let compat_synth_think = if matches!(cfg.provider, ProviderKind::Mistral) {
-                Some(compat_synthetic_think(tc, &candidate_plan))
-            } else {
-                None
-            };
+            if active_plan.is_none() && root_read_only && mistral_observation_tool(tc.name.as_str())
+            {
+                adopt_valid_plan(
+                    &candidate_plan,
+                    &mut working_mem,
+                    &mut assumption_ledger,
+                    &mut active_plan,
+                    &mut intent_required_verification,
+                    path_required_verification,
+                    &mut required_verification,
+                    &mut recovery,
+                    &mut last_verify_ok_step,
+                    last_build_verify_ok_step,
+                    last_behavioral_verify_ok_step,
+                );
+            }
+
+            let compat_synth_think = rescue_read_only_missing_think_for_tool_turn(
+                &messages,
+                tc,
+                &candidate_plan,
+                root_read_only,
+                cfg.provider.clone(),
+            );
 
             let (think, used_compat_synth) = select_think_for_tool_turn(
                 parsed_think.as_ref(),
@@ -10335,10 +10410,11 @@ Execute only the new minimal action: {}",
                 }
             };
 
-            if used_compat_synth && matches!(cfg.provider, ProviderKind::Mistral) {
+            if used_compat_synth {
                 let _ = tx
                     .send(StreamToken::Delta(
-                        "\n[compat] synthesized think block for Mistral tool turn\n".to_string(),
+                        "\n[compat] synthesized think block for read-only observation tool turn\n"
+                            .to_string(),
                     ))
                     .await;
             }
@@ -15031,6 +15107,95 @@ verify: exit code is zero\n\
             .acceptance_criteria
             .iter()
             .any(|item| item.contains("handler branch")));
+    }
+
+    #[test]
+    fn consecutive_missing_think_blocks_for_tool_counts_same_observation_tool() {
+        let tc = ToolCallData {
+            id: "call_3".to_string(),
+            name: "search_files".to_string(),
+            arguments: serde_json::json!({"pattern":"realize","dir":"src"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"realize","dir":"src"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"realize\",\"dir\":\"src\"}"
+            }),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"realize","dir":"src"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"realize\",\"dir\":\"src\"}"
+            }),
+        ];
+
+        assert_eq!(consecutive_missing_think_blocks_for_tool(&messages, &tc), 2);
+    }
+
+    #[test]
+    fn rescue_read_only_missing_think_for_tool_turn_after_repeated_blocks() {
+        let tc = ToolCallData {
+            id: "call_2".to_string(),
+            name: "search_files".to_string(),
+            arguments: serde_json::json!({"pattern":"realize","dir":"src"}).to_string(),
+        };
+        let plan = synthetic_read_only_observation_plan(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+        );
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"realize","dir":"src"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"realize\",\"dir\":\"src\"}"
+            }),
+        ];
+
+        let rescued = rescue_read_only_missing_think_for_tool_turn(
+            &messages,
+            &tc,
+            &plan,
+            true,
+            ProviderKind::OpenAiCompatible,
+        )
+        .expect("synthetic think");
+        assert_eq!(rescued.tool, "search_files");
+        assert!(rescued.next.contains("search"));
     }
 
     #[test]
