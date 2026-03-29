@@ -975,7 +975,7 @@ mean_drift: {mean_drift:.3}\n\
 summary: {summary}\n\
 latest_intent: {intent}\n\
 Rule: stay close to that summary. If you are ready to commit it, emit <realize>reason: why now</realize>.\n\
-A tool call also counts as realization, so do not wander before committing.",
+A non-done tool call also counts as realization. `done` does NOT; commit first, then finalize.",
         window_end = cfg.window_end,
         defer_score = latent.defer_score,
         metric = match cfg.drift_metric {
@@ -1000,6 +1000,32 @@ fn build_realize_banner(
         mean_drift = metrics.mean_drift(),
         missing = metrics.missing,
         leakage = metrics.early_leakage
+    )
+}
+
+fn tool_call_realizes_latent(
+    realize_reason: Option<&str>,
+    tool_call: Option<&ToolCallData>,
+) -> bool {
+    if realize_reason.is_some() {
+        return true;
+    }
+    tool_call
+        .map(|tc| tc.name.as_str() != "done")
+        .unwrap_or(false)
+}
+
+fn build_realize_done_gate_message(latent: &LatentPlanBuffer) -> String {
+    format!(
+        "[Realize Gate] Pending latent content must be committed before `done`.\n\
+summary: {}\n\
+latest_intent: {}\n\
+Required now:\n\
+- Emit <realize>reason: enough evidence to commit</realize>.\n\
+- On the following turn, call `done` with the finalized summary/evidence.\n\
+Do not call `done` while latent_pending=true.",
+        compact_one_line(latent.summary.as_str(), 180),
+        latent.latest_intent.as_deref().unwrap_or("-")
     )
 }
 
@@ -1451,7 +1477,8 @@ fn realize_on_demand_addon(preset: Option<RealizePreset>) -> Option<String> {
         "Realize-on-demand (experimental) is enabled.\n\
 Plan-bearing no-tool turns may be held latent before they are committed.\n\
 - If you want to commit a pending latent plan/claim explicitly, emit <realize>reason: why now</realize>.\n\
-- A tool call also counts as realization.\n\
+- A non-done tool call also counts as realization.\n\
+- `done` requires latent content to be committed first.\n\
 - Stay close to the latest latent summary while it is pending; wandering raises drift.\n\
 - Session preset: {}.\n\
 - Current defaults: defer_threshold={:.2}, realization_window={}..{}, drift_metric={}, lambda={}..{}.",
@@ -10396,13 +10423,16 @@ Execute only the new minimal action: {}",
         let tool_call: Option<ToolCallData> = tool_calls.pop();
 
         if realize_cfg.enabled {
-            let materialize_reason = if let Some(reason) = realize_reason.as_ref() {
-                Some(format!("explicit:{reason}"))
-            } else if tool_call.is_some() {
-                Some("tool_call".to_string())
-            } else {
-                None
-            };
+            let materialize_reason =
+                if tool_call_realizes_latent(realize_reason.as_deref(), tool_call.as_ref()) {
+                    if let Some(reason) = realize_reason.as_ref() {
+                        Some(format!("explicit:{reason}"))
+                    } else {
+                        Some("tool_call".to_string())
+                    }
+                } else {
+                    None
+                };
             if let Some(reason) = materialize_reason {
                 if let Some(latent) = latent_plan.take() {
                     let latency = iter.saturating_sub(latent.created_iter);
@@ -12781,6 +12811,61 @@ Execute this minimal action instead: {}",
 
         // ── done tool ──────────────────────────────────────────────────────
         if tc.name.as_str() == "done" {
+            if realize_cfg.enabled {
+                if let Some(latent) = latent_plan.as_ref() {
+                    state = AgentState::Recovery;
+                    recovery.stage = Some(RecoveryStage::Diagnose);
+                    let block = build_realize_done_gate_message(latent);
+
+                    let _ = tx
+                        .send(StreamToken::Delta(format!(
+                            "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                        )))
+                        .await;
+
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": format!(
+                            "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                            tc.name, tc.arguments
+                        ),
+                    }));
+                    autosave_best_effort(
+                        &autosaver,
+                        &tx,
+                        tool_root_abs.as_deref(),
+                        checkpoint.as_deref(),
+                        cur_cwd.as_deref(),
+                        &messages,
+                    )
+                    .await;
+
+                    pending_system_hint = Some(block);
+                    emit_realize_state(
+                        &tx,
+                        &realize_cfg,
+                        latent_plan.as_ref(),
+                        iter,
+                        latent_drift_for_prompt,
+                        &realize_metrics,
+                    )
+                    .await;
+                    let _ = tx
+                        .send(StreamToken::GovernorState(build_governor_state(
+                            state,
+                            &recovery,
+                            &mem,
+                            file_tool_consec_failures,
+                            last_mutation_step,
+                            last_verify_ok_step,
+                            last_reflection.as_ref(),
+                        )))
+                        .await;
+                    continue;
+                }
+            }
+
             let last_mutation = last_mutation_step.unwrap_or(0);
             let last_verify_ok = last_verify_ok_step.unwrap_or(0);
             if last_mutation > 0 && last_verify_ok < last_mutation {
@@ -16924,6 +17009,53 @@ verify: exit code is zero\n\
             parse_realize_block(text).as_deref(),
             Some("enough evidence to commit this plan")
         );
+    }
+
+    #[test]
+    fn non_done_tool_realizes_latent_but_done_does_not() {
+        let read = ToolCallData {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: "{\"path\":\"src/tui/events.rs\"}".to_string(),
+        };
+        let done = ToolCallData {
+            id: "call_done".to_string(),
+            name: "done".to_string(),
+            arguments: "{\"summary\":\"ok\",\"completed_acceptance\":[],\"remaining_acceptance\":[],\"acceptance_evidence\":[]}".to_string(),
+        };
+
+        assert!(tool_call_realizes_latent(None, Some(&read)));
+        assert!(!tool_call_realizes_latent(None, Some(&done)));
+        assert!(tool_call_realizes_latent(
+            Some("enough evidence to commit"),
+            Some(&done)
+        ));
+    }
+
+    #[test]
+    fn build_realize_done_gate_message_mentions_commit_before_done() {
+        let latent = LatentPlanBuffer {
+            raw_text: "<plan>...</plan>".to_string(),
+            plan: PlanBlock {
+                goal: "Locate the /realize handler".to_string(),
+                steps: vec!["search for /realize".to_string()],
+                acceptance_criteria: vec!["identify the handler file".to_string()],
+                risks: "wrong file".to_string(),
+                assumptions: "observation tools are enough".to_string(),
+            },
+            summary: "goal: locate /realize; steps: search | read".to_string(),
+            latest_intent: Some("tool: read_file; next: inspect src/tui/events.rs".to_string()),
+            anchor_baseline: "goal: locate /realize".to_string(),
+            created_iter: 2,
+            defer_score: 0.62,
+            tail_updates: 1,
+        };
+
+        let msg = build_realize_done_gate_message(&latent);
+        assert!(msg.contains("[Realize Gate]"));
+        assert!(msg.contains("before `done`"));
+        assert!(msg.contains("goal: locate /realize"));
+        assert!(msg.contains("<realize>reason: enough evidence to commit</realize>"));
     }
 
     #[test]
