@@ -4968,19 +4968,88 @@ fn search_hit_specificity(hit_count: usize) -> f32 {
     }
 }
 
+fn path_filename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn task_prefers_handler_path(root_user_text: &str, criterion: &str) -> bool {
+    let low = format!("{root_user_text} {criterion}").to_ascii_lowercase();
+    [
+        "slash", "command", "handler", "handled", "handle", "branch", "context",
+    ]
+    .iter()
+    .any(|term| low.contains(term))
+}
+
 fn path_prior_score(path: &str, root_user_text: &str, plan_goal: &str, criterion: &str) -> f32 {
     let mut task_tokens = keyword_tokens(root_user_text);
     task_tokens.extend(keyword_tokens(plan_goal));
     task_tokens.extend(keyword_tokens(criterion));
-    let path_tokens = keyword_tokens(path);
+    let path_tokens = keyword_tokens(path)
+        .into_iter()
+        .filter(|token| !matches!(token.as_str(), "src" | "test" | "tests"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let path_low = path.to_ascii_lowercase();
+    let file_low = path_filename(path).to_ascii_lowercase();
     let mut score = token_overlap_score(&path_tokens, &task_tokens);
-    if task_tokens.contains("tui") && path_tokens.contains("tui") {
-        score = (score + 0.35).clamp(0.0, 1.0);
+    if path_tokens.len() <= 1 {
+        score = (score - 0.20).clamp(0.0, 1.0);
+    }
+    if task_tokens.contains("tui") && path_low.starts_with("src/tui/") {
+        score = (score + 0.25).clamp(0.0, 1.0);
     }
     if task_tokens.contains("realize") && path_tokens.contains("events") {
-        score = (score + 0.15).clamp(0.0, 1.0);
+        score = (score + 0.20).clamp(0.0, 1.0);
+    }
+    if task_prefers_handler_path(root_user_text, criterion) {
+        if path_tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "event"
+                    | "events"
+                    | "command"
+                    | "commands"
+                    | "handler"
+                    | "handlers"
+                    | "slash"
+                    | "dispatch"
+            )
+        }) {
+            score = (score + 0.30).clamp(0.0, 1.0);
+        }
+        if file_low == "ui.rs"
+            || path_tokens
+                .iter()
+                .any(|token| matches!(token.as_str(), "ui" | "view" | "render" | "layout"))
+        {
+            score = (score - 0.20).clamp(0.0, 1.0);
+        }
     }
     score
+}
+
+fn build_read_only_strong_final_answer(
+    root_user_text: &str,
+    plan: &PlanBlock,
+    evidence: &ObservationEvidence,
+    messages: &[serde_json::Value],
+    working_mem: &WorkingMemory,
+) -> Option<String> {
+    let scores = build_read_only_evidence_scores(root_user_text, plan, evidence);
+    let strong_read_count = scores
+        .iter()
+        .filter(|score| score.total >= 0.80 && score.read_confirm >= 0.80)
+        .count();
+    if strong_read_count < 2 {
+        return None;
+    }
+    build_read_only_iteration_cap_final_answer(
+        root_user_text,
+        plan,
+        evidence,
+        messages,
+        working_mem,
+    )
 }
 
 fn build_read_only_evidence_scores(
@@ -5176,6 +5245,7 @@ You already have enough observation evidence to call done directly now.\n",
     }
     out.push_str(
         "If your plan includes meta constraints like `no files modified`, keep them in remaining_acceptance instead of blocking done.\n\
+Do NOT call another observation tool if the file path and handler context are already confirmed.\n\
 Next assistant turn: emit a <think> block with `tool: done`, then call `done` immediately.\n\
 If you cite handler confirmation, prefer the successful `read_file(...)` command over another search.\n\
 Final answer must include the file path.",
@@ -5202,11 +5272,23 @@ fn best_read_only_followup_read_path(
         .map(|path| {
             let mut score =
                 path_prior_score(path, root_user_text, &plan.goal, criteria_blob.as_str());
+            let file_low = path_filename(path).to_ascii_lowercase();
             if path.starts_with("src/") {
                 score = (score + 0.20).clamp(0.0, 1.0);
             }
             if path.contains("/tui/") || path.starts_with("src/tui/") {
                 score = (score + 0.10).clamp(0.0, 1.0);
+            }
+            if task_prefers_handler_path(root_user_text, criteria_blob.as_str()) {
+                if matches!(
+                    file_low.as_str(),
+                    "events.rs" | "commands.rs" | "command.rs" | "handlers.rs" | "handler.rs"
+                ) {
+                    score = (score + 0.35).clamp(0.0, 1.0);
+                }
+                if matches!(file_low.as_str(), "ui.rs" | "view.rs" | "layout.rs") {
+                    score = (score - 0.25).clamp(0.0, 1.0);
+                }
             }
             (score, path)
         })
@@ -6590,10 +6672,6 @@ fn known_runtime_tool_name_from_text(text: &str) -> Option<String> {
     None
 }
 
-fn mistral_wrapped_tool_payload(tc: &ToolCallData) -> Option<ToolCallData> {
-    mistral_nested_tool_payload(tc).map(|(_, normalized)| normalized)
-}
-
 fn mistral_name_embedded_blocks_and_tool(
     tc: &ToolCallData,
 ) -> Option<(Vec<String>, Option<ToolCallData>)> {
@@ -6612,14 +6690,36 @@ fn mistral_name_embedded_blocks_and_tool(
     let mut rest = raw;
     let mut tool_from_think: Option<String> = None;
 
-    if let Some(after_plan_prefix) = raw.strip_prefix("plan>") {
-        let after_low = after_plan_prefix.to_ascii_lowercase();
-        if let Some(end) = after_low.find("</plan>") {
-            let plan_chunk = &after_plan_prefix[..end + "</plan>".len()];
-            let block = format!("<plan>{plan_chunk}");
+    if low.starts_with("plan>")
+        && !low.contains("<think>")
+        && !low.contains("<goal>")
+        && !low.contains("<steps>")
+        && !low.contains("<acceptance")
+        && !low.contains("<risks>")
+        && !low.contains("<assumptions>")
+    {
+        if let Some(block) = inline_block_from_name(raw) {
             if parse_plan_block(&block).is_some() {
                 blocks.push(block);
-                rest = &after_plan_prefix[end + "</plan>".len()..];
+                if let Some(plan_end) = low.find("</plan>") {
+                    rest = &raw[plan_end + "</plan>".len()..];
+                } else {
+                    rest = "";
+                }
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        if let Some(after_plan_prefix) = raw.strip_prefix("plan>") {
+            let after_low = after_plan_prefix.to_ascii_lowercase();
+            if let Some(end) = after_low.find("</plan>") {
+                let plan_chunk = &after_plan_prefix[..end + "</plan>".len()];
+                let block = format!("<plan>{plan_chunk}");
+                if parse_plan_block(&block).is_some() {
+                    blocks.push(block);
+                    rest = &after_plan_prefix[end + "</plan>".len()..];
+                }
             }
         }
     }
@@ -6654,13 +6754,16 @@ fn mistral_name_embedded_blocks_and_tool(
         return None;
     }
 
-    let normalized = mistral_wrapped_tool_payload(tc)
-        .or_else(|| {
-            tool_from_think.map(|tool| ToolCallData {
-                id: tc.id.clone(),
-                name: tool,
-                arguments: tc.arguments.clone(),
-            })
+    if let Some((mut prelude, normalized)) = mistral_nested_tool_payload(tc) {
+        blocks.append(&mut prelude);
+        return Some((blocks, Some(normalized)));
+    }
+
+    let normalized = tool_from_think
+        .map(|tool| ToolCallData {
+            id: tc.id.clone(),
+            name: tool,
+            arguments: tc.arguments.clone(),
         })
         .or_else(|| {
             known_runtime_tool_name_from_text(rest).map(|tool| ToolCallData {
@@ -10681,6 +10784,53 @@ Execute only the new minimal action: {}",
                     last_build_verify_ok_step,
                     last_behavioral_verify_ok_step,
                 );
+            }
+
+            if root_read_only
+                && tc.name.as_str() != "done"
+                && matches!(
+                    tc.name.as_str(),
+                    "search_files" | "read_file" | "list_dir" | "glob"
+                )
+                && !observation_evidence.reads.is_empty()
+            {
+                if let Some(final_text) = build_read_only_strong_final_answer(
+                    &root_user_text,
+                    &candidate_plan,
+                    &observation_evidence,
+                    &messages,
+                    &working_mem,
+                ) {
+                    state = AgentState::Done;
+                    messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+                    autosave_best_effort(
+                        &autosaver,
+                        &tx,
+                        tool_root_abs.as_deref(),
+                        checkpoint.as_deref(),
+                        cur_cwd.as_deref(),
+                        &messages,
+                    )
+                    .await;
+                    let _ = tx
+                        .send(StreamToken::GovernorState(build_governor_state(
+                            state,
+                            &recovery,
+                            &mem,
+                            file_tool_consec_failures,
+                            last_mutation_step,
+                            last_verify_ok_step,
+                            last_reflection.as_ref(),
+                        )))
+                        .await;
+                    let _ = tx
+                        .send(StreamToken::Delta(format!(
+                            "\n[agent] strong read-only evidence already satisfied the task; auto-finalized instead of executing {}.\n\n{final_text}\n",
+                            tc.name
+                        )))
+                        .await;
+                    break;
+                }
             }
 
             let compat_synth_think = rescue_read_only_missing_think_for_tool_turn(
@@ -15164,6 +15314,38 @@ remaining_gap: still need to run cargo test\n\
     }
 
     #[test]
+    fn best_read_only_followup_read_path_prefers_events_over_ui_for_slash_handler() {
+        let plan = PlanBlock {
+            goal: "Locate where `/realize` is handled in the TUI".to_string(),
+            steps: vec![
+                "search src".to_string(),
+                "read the matching file".to_string(),
+                "confirm the handler context".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path containing the `/realize` slash command handler is identified."
+                    .to_string(),
+                "The handler branch is confirmed by read_file.".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+        let best = best_read_only_followup_read_path(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            &plan,
+            &[
+                "src/tui/ui.rs".to_string(),
+                "src/tui/events.rs".to_string(),
+                "src/runtime_eval.rs".to_string(),
+            ],
+            &ObservationEvidence::default(),
+        )
+        .expect("best follow-up path");
+
+        assert_eq!(best, "src/tui/events.rs");
+    }
+
+    #[test]
     fn build_read_only_diagnose_coercion_hint_starts_with_search_when_no_observation_exists() {
         let hint = build_read_only_diagnose_coercion_hint(
             "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
@@ -15407,6 +15589,113 @@ remaining_gap: still need to run cargo test\n\
         assert!(final_text.starts_with("[DONE]"));
         assert!(final_text.contains("src/tui/events.rs"));
         assert!(final_text.contains("via `read_file(path=src/tui/events.rs)`"));
+    }
+
+    #[test]
+    fn build_read_only_strong_final_answer_requires_strong_read_backed_evidence() {
+        let plan = PlanBlock {
+            goal: "Locate the /realize slash command handler in the TUI".to_string(),
+            steps: vec![
+                "search src".to_string(),
+                "read the matching file".to_string(),
+                "confirm the context".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path containing the `/realize` slash command handler is identified."
+                    .to_string(),
+                "The handler logic is confirmed to be part of the TUI component.".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+        let strong_messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"/realize\",\"dir\":\"src/tui\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: '/realize' — 2 match(es)]\nsrc/tui/events.rs:763: \"/realize\" => {\nsrc/tui/ui.rs:401: \"/realize\""
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/tui/events.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/tui/events.rs] (3639 lines, 133416 bytes)\nfn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {\n    match cmd_lc.as_str() {\n        \"/realize\" => {"
+            }),
+        ];
+        let strong_evidence = collect_observation_evidence(&strong_messages);
+        let final_text = build_read_only_strong_final_answer(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            &plan,
+            &strong_evidence,
+            &strong_messages,
+            &WorkingMemory::default(),
+        )
+        .expect("strong final answer");
+        assert!(final_text.contains("src/tui/events.rs"));
+
+        let weak_messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"realize\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: 'realize' — 50 match(es)]\nREADME.md:511: realize\nsrc/tui/events.rs:763: \"/realize\" => {\nsrc/tui/ui.rs:401: \"/realize\""
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/tui/ui.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/tui/ui.rs] (1861 lines, 67793 bytes)\npub fn render(frame: &mut Frame, app: &App) {"
+            }),
+        ];
+        let weak_evidence = collect_observation_evidence(&weak_messages);
+        assert!(build_read_only_strong_final_answer(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            &plan,
+            &weak_evidence,
+            &weak_messages,
+            &WorkingMemory::default(),
+        )
+        .is_none());
     }
 
     #[test]
