@@ -5144,6 +5144,70 @@ Final answer must include the file path.",
     Some(out)
 }
 
+fn best_read_only_followup_read_path(
+    root_user_text: &str,
+    plan: &PlanBlock,
+    search_paths: &[String],
+    evidence: &ObservationEvidence,
+) -> Option<String> {
+    let already_read: std::collections::HashSet<String> = evidence
+        .reads
+        .iter()
+        .map(|read| normalize_for_signature(&read.path))
+        .collect();
+    let criteria_blob = plan.acceptance_criteria.join(" ; ");
+    search_paths
+        .iter()
+        .filter(|path| !path.trim().is_empty())
+        .filter(|path| !already_read.contains(&normalize_for_signature(path)))
+        .map(|path| {
+            let mut score =
+                path_prior_score(path, root_user_text, &plan.goal, criteria_blob.as_str());
+            if path.starts_with("src/") {
+                score = (score + 0.20).clamp(0.0, 1.0);
+            }
+            if path.contains("/tui/") || path.starts_with("src/tui/") {
+                score = (score + 0.10).clamp(0.0, 1.0);
+            }
+            (score, path)
+        })
+        .filter(|(score, _)| *score >= 0.35)
+        .max_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(b.1))
+        })
+        .map(|(_, path)| path.clone())
+}
+
+fn build_read_only_search_to_read_hint(
+    root_user_text: &str,
+    plan: &PlanBlock,
+    search_paths: &[String],
+    evidence: &ObservationEvidence,
+) -> Option<String> {
+    if !evidence.reads.is_empty() {
+        return None;
+    }
+    let best_path =
+        best_read_only_followup_read_path(root_user_text, plan, search_paths, evidence)?;
+    let search_attempts = evidence.searches.len();
+    let mut out = String::from(
+        "[Read-Only Next Step]\n\
+You already have a plausible code candidate from successful search.\n",
+    );
+    if search_attempts >= 2 {
+        out.push_str("Do NOT call search_files again yet. Inspect the strongest hit first.\n");
+    }
+    out.push_str("Next assistant turn: emit a valid <think> block, then call exactly:\n");
+    out.push_str(&format!("read_file(path=\"{best_path}\")\n"));
+    out.push_str(
+        "Verify by confirming the handler branch or slash-command context inside that file.\n\
+If that file is not the handler, only then return to search/glob.",
+    );
+    Some(out)
+}
+
 fn build_read_only_iteration_cap_final_answer(
     root_user_text: &str,
     plan: &PlanBlock,
@@ -12741,6 +12805,11 @@ Required now: {}",
             let base = tool_root_abs.as_deref();
             let (mut result, is_error) =
                 crate::file_tools::tool_search_files(&pattern, &dir, ci, base);
+            let parsed_search_paths = if is_error {
+                Vec::new()
+            } else {
+                parse_search_result_paths(result.as_str())
+            };
             let mut repo_map_hint: Option<String> = None;
             let mut repo_map_display: Option<String> = None;
             if !is_error
@@ -12809,7 +12878,7 @@ Required now: {}",
                     command.as_str(),
                     pattern.as_str(),
                     parse_search_hit_count(result.as_str()),
-                    parse_search_result_paths(result.as_str()).as_slice(),
+                    parsed_search_paths.as_slice(),
                 );
                 sync_observation_cache_autosave(&autosaver, &observation_evidence);
                 assumption_ledger.refresh_confirmations(&working_mem);
@@ -12865,6 +12934,13 @@ Required now: {}",
                                 .await;
                             break;
                         }
+                    } else if let Some(hint) = build_read_only_search_to_read_hint(
+                        &root_user_text,
+                        plan,
+                        parsed_search_paths.as_slice(),
+                        &observation_evidence,
+                    ) {
+                        pending_system_hint = Some(hint);
                     } else if let Some(hint) = build_read_only_completion_hint(
                         &root_user_text,
                         plan,
@@ -14358,6 +14434,50 @@ remaining_gap: still need to run cargo test\n\
         assert!(hint.contains("call done directly now"));
         assert!(hint.contains("tool: done"));
         assert!(hint.contains("src/tui/events.rs") || hint.contains("read_file"));
+    }
+
+    #[test]
+    fn build_read_only_search_to_read_hint_prefers_best_src_tui_candidate() {
+        let plan = PlanBlock {
+            goal: "Locate the /realize slash command handler in the TUI".to_string(),
+            steps: vec![
+                "search src".to_string(),
+                "read the matching file".to_string(),
+                "confirm the context".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The exact file path containing the `/realize` slash command handler is identified."
+                    .to_string(),
+                "The handler logic is confirmed to be part of the TUI component.".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "repo indexed".to_string(),
+        };
+        let evidence = ObservationEvidence {
+            searches: vec![ObservationSearchEvidence {
+                command: "search_files(pattern=/realize, dir=src)".to_string(),
+                pattern: "/realize".to_string(),
+                hit_count: 4,
+                paths: vec![
+                    "README.md".to_string(),
+                    "src/runtime_eval.rs".to_string(),
+                    "src/tui/events.rs".to_string(),
+                    "src/tui/agent.rs".to_string(),
+                ],
+            }],
+            reads: vec![],
+        };
+
+        let hint = build_read_only_search_to_read_hint(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything. Final answer must include the file path.",
+            &plan,
+            &evidence.searches[0].paths,
+            &evidence,
+        )
+        .expect("search-to-read hint");
+
+        assert!(hint.contains("read_file(path=\"src/tui/events.rs\")"));
+        assert!(hint.contains("plausible code candidate"));
     }
 
     #[test]
