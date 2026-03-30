@@ -13644,6 +13644,53 @@ Required now: {}",
             ) {
                 Ok(rows) => rows,
                 Err(e) => {
+                    if root_read_only {
+                        if let Some(plan) = done_plan {
+                            if let Some(final_text) = build_read_only_strong_final_answer(
+                                &root_user_text,
+                                plan,
+                                &observation_evidence,
+                                &messages,
+                                &working_mem,
+                            ) {
+                                state = AgentState::Done;
+                                messages.push(json!({
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "content": "OK: done"
+                                }));
+                                messages.push(
+                                    json!({"role": "assistant", "content": final_text.clone()}),
+                                );
+                                autosave_best_effort(
+                                    &autosaver,
+                                    &tx,
+                                    tool_root_abs.as_deref(),
+                                    checkpoint.as_deref(),
+                                    cur_cwd.as_deref(),
+                                    &messages,
+                                )
+                                .await;
+                                let _ = tx
+                                    .send(StreamToken::GovernorState(build_governor_state(
+                                        state,
+                                        &recovery,
+                                        &mem,
+                                        file_tool_consec_failures,
+                                        last_mutation_step,
+                                        last_verify_ok_step,
+                                        last_reflection.as_ref(),
+                                    )))
+                                    .await;
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "\n[agent] strong read-only evidence rescued invalid done gate; auto-finalized instead.\n\n{final_text}\n"
+                                    )))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
                     state = AgentState::Recovery;
                     recovery.stage = Some(if root_read_only {
                         RecoveryStage::Diagnose
@@ -16638,6 +16685,59 @@ remaining_gap: still need to run cargo test\n\
             &WorkingMemory::default(),
         )
         .is_none());
+    }
+
+    #[test]
+    fn build_read_only_strong_final_answer_supports_pane_prefs_task() {
+        let plan = synthetic_read_only_observation_plan(
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+        );
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"prefs\",\"dir\":\"src/tui\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: 'prefs' — 2 match(es)]\nsrc/tui/events.rs:124: let saved = prefs::snapshot_app_prefs(app);\nsrc/tui/prefs.rs:183: pub fn snapshot_app_prefs(app: &App) -> TuiPrefs {"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/tui/prefs.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/tui/prefs.rs] (327 lines, 10301 bytes)\npub fn snapshot_app_prefs(app: &App) -> TuiPrefs {\npub fn apply_prefs_to_app(app: &mut App, prefs: &TuiPrefs) {"
+            }),
+        ];
+        let evidence = collect_observation_evidence(&messages);
+        let final_text = build_read_only_strong_final_answer(
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+            &plan,
+            &evidence,
+            &messages,
+            &WorkingMemory::default(),
+        )
+        .expect("strong final answer");
+
+        assert!(final_text.contains("src/tui/prefs.rs"));
+        assert!(final_text.contains("read_file(path=src/tui/prefs.rs)"));
     }
 
     #[test]
