@@ -5696,7 +5696,14 @@ fn best_read_only_followup_read_path(
         .map(|read| normalize_for_signature(&read.path))
         .collect();
     let criteria_blob = plan.acceptance_criteria.join(" ; ");
-    search_paths
+    let mut candidate_paths: Vec<String> = search_paths.to_vec();
+    let preferred_path = preferred_read_only_read_path_hint(root_user_text).to_string();
+    if !candidate_paths.iter().any(|path| {
+        normalize_for_signature(path.as_str()) == normalize_for_signature(preferred_path.as_str())
+    }) {
+        candidate_paths.push(preferred_path.clone());
+    }
+    candidate_paths
         .iter()
         .filter(|path| !path.trim().is_empty())
         .filter(|path| !already_read.contains(&normalize_for_signature(path)))
@@ -5720,6 +5727,11 @@ fn best_read_only_followup_read_path(
                 if matches!(file_low.as_str(), "ui.rs" | "view.rs" | "layout.rs") {
                     score = (score - 0.25).clamp(0.0, 1.0);
                 }
+            }
+            if normalize_for_signature(path.as_str())
+                == normalize_for_signature(preferred_path.as_str())
+            {
+                score = (score + 0.20).clamp(0.0, 1.0);
             }
             (score, path)
         })
@@ -16055,6 +16067,46 @@ remaining_gap: still need to run cargo test\n\
         .expect("best follow-up path");
 
         assert_eq!(best, "src/tui/events.rs");
+    }
+
+    #[test]
+    fn best_read_only_followup_read_path_prefers_prefs_rs_for_prefs_task() {
+        let plan = synthetic_read_only_observation_plan(
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+        );
+        let best = best_read_only_followup_read_path(
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+            &plan,
+            &[
+                "src/tui/events.rs".to_string(),
+                "src/tui/ui.rs".to_string(),
+                "src/tui/app.rs".to_string(),
+            ],
+            &ObservationEvidence::default(),
+        )
+        .expect("best follow-up path");
+
+        assert_eq!(best, "src/tui/prefs.rs");
+    }
+
+    #[test]
+    fn best_read_only_followup_read_path_prefers_agent_rs_for_repo_map_flow_task() {
+        let plan = synthetic_read_only_observation_plan(
+            "Find where the coder-side repo-map fallback for read_file misses is wired into the TUI agent flow. Do not edit anything.",
+        );
+        let best = best_read_only_followup_read_path(
+            "Find where the coder-side repo-map fallback for read_file misses is wired into the TUI agent flow. Do not edit anything.",
+            &plan,
+            &[
+                "src/runtime_eval.rs".to_string(),
+                "src/agent_session.rs".to_string(),
+                "src/repo_map.rs".to_string(),
+            ],
+            &ObservationEvidence::default(),
+        )
+        .expect("best follow-up path");
+
+        assert_eq!(best, "src/tui/agent.rs");
     }
 
     #[test]
