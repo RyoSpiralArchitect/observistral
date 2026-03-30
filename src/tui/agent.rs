@@ -546,6 +546,38 @@ fn rewrite_tool_call_with_resolution(
     ))
 }
 
+fn rewrite_tool_call_to_search_files(
+    tc: &ToolCallData,
+    pattern: &str,
+    dir: &str,
+) -> Option<(ToolCallData, String, String)> {
+    let rewritten = ToolCallData {
+        id: tc.id.clone(),
+        name: "search_files".to_string(),
+        arguments: json!({
+            "pattern": pattern,
+            "dir": dir,
+        })
+        .to_string(),
+    };
+    let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| blocked_tool_call_signature(tc.name.as_str(), tc.arguments.as_str()));
+    let coerced =
+        canonicalize_tool_call_command(rewritten.name.as_str(), rewritten.arguments.as_str())
+            .unwrap_or_else(|| {
+                format!(
+                    "search_files(pattern={}, dir={})",
+                    compact_one_line(pattern, 120),
+                    compact_one_line(dir, 160)
+                )
+            });
+    if original == coerced {
+        None
+    } else {
+        Some((rewritten, original, coerced))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DriftMetric {
     Cos,
@@ -8792,6 +8824,10 @@ fn is_missing_think_governor_block(msg: &serde_json::Value) -> bool {
             .unwrap_or(false)
 }
 
+fn is_missing_gate_governor_block(msg: &serde_json::Value) -> bool {
+    is_missing_plan_governor_block(msg) || is_missing_think_governor_block(msg)
+}
+
 fn consecutive_missing_plan_blocks_for_tool(
     messages: &[serde_json::Value],
     tc: &ToolCallData,
@@ -8838,6 +8874,27 @@ fn consecutive_missing_plan_blocks_for_observation(messages: &[serde_json::Value
     count
 }
 
+fn consecutive_missing_gate_blocks_for_observation(messages: &[serde_json::Value]) -> usize {
+    let mut count = 0usize;
+    let mut idx = messages.len();
+    while idx >= 2 {
+        let tool_msg = &messages[idx - 1];
+        let assistant_msg = &messages[idx - 2];
+        if !is_missing_gate_governor_block(tool_msg) {
+            break;
+        }
+        let Some(name) = assistant_blocked_tool_name(assistant_msg) else {
+            break;
+        };
+        if !mistral_observation_tool(name.as_str()) {
+            break;
+        }
+        count = count.saturating_add(1);
+        idx -= 2;
+    }
+    count
+}
+
 fn consecutive_missing_think_blocks_for_tool(
     messages: &[serde_json::Value],
     tc: &ToolCallData,
@@ -8861,6 +8918,55 @@ fn consecutive_missing_think_blocks_for_tool(
         idx -= 2;
     }
     count
+}
+
+fn coerce_read_only_observation_tool_call(
+    messages: &[serde_json::Value],
+    tc: &ToolCallData,
+    root_user_text: &str,
+    root_read_only: bool,
+    evidence: &ObservationEvidence,
+) -> Option<(ToolCallData, String, String)> {
+    if !root_read_only || !evidence.reads.is_empty() {
+        return None;
+    }
+    if !matches!(tc.name.as_str(), "search_files" | "list_dir" | "glob") {
+        return None;
+    }
+    let repeated_gate_misses =
+        consecutive_missing_gate_blocks_for_observation(messages).saturating_add(1);
+    if repeated_gate_misses < 2 {
+        return None;
+    }
+
+    let preferred_pattern = preferred_read_only_search_pattern(root_user_text);
+    let preferred_dir = preferred_read_only_search_dir(root_user_text);
+    match tc.name.as_str() {
+        "search_files" => {
+            let args = serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()?;
+            let current_pattern = args
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let current_dir = args
+                .get("dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if normalize_for_signature(current_pattern)
+                == normalize_for_signature(preferred_pattern.as_str())
+                && normalize_path_alias(current_dir) == normalize_path_alias(preferred_dir)
+            {
+                return None;
+            }
+            rewrite_tool_call_to_search_files(tc, preferred_pattern.as_str(), preferred_dir)
+        }
+        "list_dir" | "glob" => {
+            rewrite_tool_call_to_search_files(tc, preferred_pattern.as_str(), preferred_dir)
+        }
+        _ => None,
+    }
 }
 
 fn consecutive_missing_think_blocks_for_observation(messages: &[serde_json::Value]) -> usize {
@@ -10957,6 +11063,34 @@ Execute only the new minimal action: {}",
                     rewritten.name.as_str(),
                     original.as_str(),
                     canonical.as_str(),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) = coerce_read_only_observation_tool_call(
+                &messages,
+                tc,
+                &root_user_text,
+                root_read_only,
+                &observation_evidence,
+            ) {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[compat] coerced repeated read-only observation miss: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "read_only_tool_coercion",
+                    json!({
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                    }),
                 )
                 .await;
                 tool_call = Some(rewritten);
@@ -17536,6 +17670,112 @@ verify: exit code is zero\n\
         .expect("synthetic think");
         assert_eq!(rescued.tool, "read_file");
         assert!(rescued.next.contains("read"));
+    }
+
+    #[test]
+    fn coerce_read_only_observation_tool_call_rewrites_search_pattern_after_repeated_gate_misses() {
+        let tc = ToolCallData {
+            id: "call_3".to_string(),
+            name: "search_files".to_string(),
+            arguments: serde_json::json!({"pattern":"pane","dir":"src"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"pane","dir":"src"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"pane\",\"dir\":\"src\"}"
+            }),
+        ];
+
+        let (rewritten, original, coerced) = coerce_read_only_observation_tool_call(
+            &messages,
+            &tc,
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+            true,
+            &ObservationEvidence::default(),
+        )
+        .expect("coerced");
+
+        assert_eq!(original, "search_files(dir=src, pattern=pane)");
+        assert_eq!(rewritten.name, "search_files");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rewritten.arguments).expect("json")
+                ["pattern"]
+                .as_str(),
+            Some("prefs")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rewritten.arguments).expect("json")["dir"]
+                .as_str(),
+            Some("src/tui")
+        );
+        assert_eq!(coerced, "search_files(dir=src/tui, pattern=prefs)");
+    }
+
+    #[test]
+    fn coerce_read_only_observation_tool_call_rewrites_list_dir_to_preferred_search() {
+        let tc = ToolCallData {
+            id: "call_3".to_string(),
+            name: "list_dir".to_string(),
+            arguments: serde_json::json!({"dir":"src"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"agent","dir":"src"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"agent\",\"dir\":\"src\"}"
+            }),
+        ];
+
+        let (rewritten, _original, coerced) = coerce_read_only_observation_tool_call(
+            &messages,
+            &tc,
+            "Locate where the coder-side repo-map read_file fallback is wired into the TUI agent flow. Do not edit anything.",
+            true,
+            &ObservationEvidence::default(),
+        )
+        .expect("coerced");
+
+        assert_eq!(rewritten.name, "search_files");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rewritten.arguments).expect("json")
+                ["pattern"]
+                .as_str(),
+            Some("lazy_read_fallback")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rewritten.arguments).expect("json")["dir"]
+                .as_str(),
+            Some("src/tui")
+        );
+        assert_eq!(
+            coerced,
+            "search_files(dir=src/tui, pattern=lazy_read_fallback)"
+        );
     }
 
     #[test]
