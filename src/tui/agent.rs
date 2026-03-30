@@ -8083,7 +8083,8 @@ fn rescue_read_only_missing_plan_for_tool_turn(
         return None;
     }
     let prior_blocks = consecutive_missing_plan_blocks_for_tool(messages, tc);
-    if prior_blocks.saturating_add(1) < 2 {
+    let prior_observation_blocks = consecutive_missing_plan_blocks_for_observation(messages);
+    if prior_blocks.saturating_add(1) < 2 && prior_observation_blocks.saturating_add(1) < 3 {
         return None;
     }
     if matches!(provider, ProviderKind::Mistral) {
@@ -8113,7 +8114,8 @@ fn rescue_read_only_missing_think_for_tool_turn(
         return Some(compat_synthetic_think(tc, plan));
     }
     let prior_blocks = consecutive_missing_think_blocks_for_tool(messages, tc);
-    if prior_blocks.saturating_add(1) < 2 {
+    let prior_observation_blocks = consecutive_missing_think_blocks_for_observation(messages);
+    if prior_blocks.saturating_add(1) < 2 && prior_observation_blocks.saturating_add(1) < 2 {
         return None;
     }
     Some(compat_synthetic_think(tc, plan))
@@ -8746,6 +8748,16 @@ fn assistant_blocked_tool_call_signature(msg: &serde_json::Value) -> Option<Stri
     }
 }
 
+fn assistant_blocked_tool_name(msg: &serde_json::Value) -> Option<String> {
+    let tool_calls = msg.get("tool_calls")?.as_array()?;
+    let tc = tool_calls.first()?;
+    tc.get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
 fn is_missing_plan_governor_block(msg: &serde_json::Value) -> bool {
     msg.get("role").and_then(|v| v.as_str()) == Some("tool")
         && msg
@@ -8793,6 +8805,27 @@ fn consecutive_missing_plan_blocks_for_tool(
     count
 }
 
+fn consecutive_missing_plan_blocks_for_observation(messages: &[serde_json::Value]) -> usize {
+    let mut count = 0usize;
+    let mut idx = messages.len();
+    while idx >= 2 {
+        let tool_msg = &messages[idx - 1];
+        let assistant_msg = &messages[idx - 2];
+        if !is_missing_plan_governor_block(tool_msg) {
+            break;
+        }
+        let Some(name) = assistant_blocked_tool_name(assistant_msg) else {
+            break;
+        };
+        if !mistral_observation_tool(name.as_str()) {
+            break;
+        }
+        count = count.saturating_add(1);
+        idx -= 2;
+    }
+    count
+}
+
 fn consecutive_missing_think_blocks_for_tool(
     messages: &[serde_json::Value],
     tc: &ToolCallData,
@@ -8810,6 +8843,27 @@ fn consecutive_missing_think_blocks_for_tool(
             break;
         };
         if sig != target_sig {
+            break;
+        }
+        count = count.saturating_add(1);
+        idx -= 2;
+    }
+    count
+}
+
+fn consecutive_missing_think_blocks_for_observation(messages: &[serde_json::Value]) -> usize {
+    let mut count = 0usize;
+    let mut idx = messages.len();
+    while idx >= 2 {
+        let tool_msg = &messages[idx - 1];
+        let assistant_msg = &messages[idx - 2];
+        if !is_missing_think_governor_block(tool_msg) {
+            break;
+        }
+        let Some(name) = assistant_blocked_tool_name(assistant_msg) else {
+            break;
+        };
+        if !mistral_observation_tool(name.as_str()) {
             break;
         }
         count = count.saturating_add(1);
@@ -17130,6 +17184,51 @@ verify: exit code is zero\n\
     }
 
     #[test]
+    fn consecutive_missing_plan_blocks_for_observation_counts_mixed_tools() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"prefs","dir":"src/tui"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"prefs\",\"dir\":\"src/tui\"}"
+            }),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "list_dir",
+                        "arguments": serde_json::json!({"dir":"src/tui"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nlist_dir\narguments:\n{\"dir\":\"src/tui\"}"
+            }),
+        ];
+
+        assert_eq!(
+            consecutive_missing_plan_blocks_for_observation(&messages),
+            2
+        );
+    }
+
+    #[test]
     fn rescue_read_only_missing_plan_for_tool_turn_after_repeated_blocks() {
         let tc = ToolCallData {
             id: "call_2".to_string(),
@@ -17169,6 +17268,65 @@ verify: exit code is zero\n\
             .acceptance_criteria
             .iter()
             .any(|item| item.contains("handler branch")));
+    }
+
+    #[test]
+    fn rescue_read_only_missing_plan_for_tool_turn_after_mixed_observation_blocks() {
+        let tc = ToolCallData {
+            id: "call_3".to_string(),
+            name: "search_files".to_string(),
+            arguments: serde_json::json!({"pattern":"prefs","dir":"src/tui"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"prefs","dir":"src/tui"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"prefs\",\"dir\":\"src/tui\"}"
+            }),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "list_dir",
+                        "arguments": serde_json::json!({"dir":"src/tui"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nlist_dir\narguments:\n{\"dir\":\"src/tui\"}"
+            }),
+        ];
+
+        let rescued = rescue_read_only_missing_plan_for_tool_turn(
+            &messages,
+            &tc,
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+            true,
+            ProviderKind::OpenAiCompatible,
+        )
+        .expect("rescue plan");
+        assert!(rescued.goal.contains("pane-scoped TUI preferences"));
+        assert!(rescued
+            .steps
+            .iter()
+            .any(|step| step.contains("search_files(pattern=\"prefs\", dir=\"src/tui\")")));
     }
 
     #[test]
@@ -17216,6 +17374,51 @@ verify: exit code is zero\n\
         ];
 
         assert_eq!(consecutive_missing_think_blocks_for_tool(&messages, &tc), 2);
+    }
+
+    #[test]
+    fn consecutive_missing_think_blocks_for_observation_counts_mixed_tools() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"prefs","dir":"src/tui"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"prefs\",\"dir\":\"src/tui\"}"
+            }),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "list_dir",
+                        "arguments": serde_json::json!({"dir":"src/tui"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\nlist_dir\narguments:\n{\"dir\":\"src/tui\"}"
+            }),
+        ];
+
+        assert_eq!(
+            consecutive_missing_think_blocks_for_observation(&messages),
+            2
+        );
     }
 
     #[test]
