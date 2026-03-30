@@ -8145,13 +8145,27 @@ fn rescue_read_only_missing_think_for_tool_turn(
     messages: &[serde_json::Value],
     tc: &ToolCallData,
     plan: &PlanBlock,
+    root_user_text: &str,
     root_read_only: bool,
     provider: ProviderKind,
+    evidence: &ObservationEvidence,
 ) -> Option<ThinkBlock> {
     if !root_read_only || !mistral_observation_tool(tc.name.as_str()) {
         return None;
     }
     if tc.name == "read_file" {
+        return Some(compat_synthetic_think(tc, plan));
+    }
+    if tc.name == "done"
+        && build_read_only_completion_hint(
+            root_user_text,
+            plan,
+            evidence,
+            messages,
+            &WorkingMemory::default(),
+        )
+        .is_some()
+    {
         return Some(compat_synthetic_think(tc, plan));
     }
     if matches!(provider, ProviderKind::Mistral) {
@@ -11596,8 +11610,10 @@ Execute only the new minimal action: {}",
                 &messages,
                 tc,
                 &candidate_plan,
+                &root_user_text,
                 root_read_only,
                 cfg.provider.clone(),
+                &observation_evidence,
             );
 
             let (think, used_compat_synth) = select_think_for_tool_turn(
@@ -17641,8 +17657,10 @@ verify: exit code is zero\n\
             &messages,
             &tc,
             &plan,
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
             true,
             ProviderKind::OpenAiCompatible,
+            &ObservationEvidence::default(),
         )
         .expect("synthetic think");
         assert_eq!(rescued.tool, "search_files");
@@ -17664,12 +17682,57 @@ verify: exit code is zero\n\
             &[],
             &tc,
             &plan,
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
             true,
             ProviderKind::OpenAiCompatible,
+            &ObservationEvidence::default(),
         )
         .expect("synthetic think");
         assert_eq!(rescued.tool, "read_file");
         assert!(rescued.next.contains("read"));
+    }
+
+    #[test]
+    fn rescue_read_only_missing_think_for_done_is_immediate_with_strong_evidence() {
+        let tc = ToolCallData {
+            id: "call_done".to_string(),
+            name: "done".to_string(),
+            arguments: serde_json::json!({
+                "summary":"Found prefs storage",
+                "completed_acceptance":["1) file identified","2) context confirmed"],
+                "remaining_acceptance":[],
+                "acceptance_evidence":[{"criterion":"file identified","command":"read_file(path=src/tui/prefs.rs)"}]
+            })
+            .to_string(),
+        };
+        let plan = synthetic_read_only_observation_plan(
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+        );
+        let evidence = ObservationEvidence {
+            searches: vec![ObservationSearchEvidence {
+                command: "search_files(dir=src/tui, pattern=prefs)".to_string(),
+                pattern: "prefs".to_string(),
+                hit_count: 2,
+                paths: vec!["src/tui/prefs.rs".to_string()],
+            }],
+            reads: vec![ObservationReadEvidence {
+                command: "read_file(path=src/tui/prefs.rs)".to_string(),
+                path: "src/tui/prefs.rs".to_string(),
+            }],
+            resolutions: Vec::new(),
+        };
+
+        let rescued = rescue_read_only_missing_think_for_tool_turn(
+            &[],
+            &tc,
+            &plan,
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+            true,
+            ProviderKind::OpenAiCompatible,
+            &evidence,
+        )
+        .expect("synthetic think");
+        assert_eq!(rescued.tool, "done");
     }
 
     #[test]
