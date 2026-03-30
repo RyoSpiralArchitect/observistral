@@ -2179,6 +2179,39 @@ fn build_tui_meta_failure_packet_for_selector(
         .into_iter()
         .rev()
         .collect();
+    let recent_tool_results: Vec<serde_json::Value> = base
+        .iter()
+        .filter(|m| matches!(m.role, Role::Tool) && m.complete)
+        .rev()
+        .take(4)
+        .map(|m| {
+            json!({
+                "digest": meta_digest_text(&m.content, 260, 6),
+                "first_line": meta_first_line(&m.content, 220),
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let intent_anchor = app
+        .coder_intent_anchor
+        .as_ref()
+        .map(|anchor| {
+            json!({
+                "revision": anchor.revision,
+                "goal": anchor.goal,
+                "target": anchor.target,
+                "constraints": anchor.constraints,
+                "success_criteria": anchor.success_criteria,
+                "optimization_hints": anchor.optimization_hints,
+                "ambiguity": anchor.ambiguity,
+                "confidence": anchor.confidence,
+                "requires_human_confirmation": anchor.requires_human_confirmation,
+                "baseline": intent::anchor_baseline(anchor),
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
     let actual_outcome = meta_digest_text(&target_msg.content, 320, 8);
     let system_digest = meta_digest_text(
         &format!(
@@ -2207,12 +2240,13 @@ fn build_tui_meta_failure_packet_for_selector(
         "checkpoint": app.last_git_checkpoint.clone(),
         "system_prompt_digest": system_digest,
         "project_context_digest": app.project_stack_label.clone(),
+        "intent_anchor": intent_anchor,
         "agents_md_digest": serde_json::Value::Null,
         "available_tools": Vec::<String>::new(),
         "recent_user_messages": recent_users,
         "recent_assistant_messages": recent_assistant,
         "recent_tool_calls": Vec::<serde_json::Value>::new(),
-        "recent_tool_results": Vec::<serde_json::Value>::new(),
+        "recent_tool_results": recent_tool_results,
         "last_error_digest": meta_first_line(&target_msg.content, 240),
         "loop_signals": {
             "same_command_repeats": 0,
@@ -2224,6 +2258,7 @@ fn build_tui_meta_failure_packet_for_selector(
         "packet_notes": vec![
             "tui meta-diagnose packet built from visible coder history".to_string(),
             "tui path does not preserve structured tool-call snapshots".to_string(),
+            "intent_anchor and recent tool results are included when available".to_string(),
         ],
     }))
 }
@@ -2311,6 +2346,8 @@ Required output format:\n\
 Rules:\n\
 - Prefer small, local, reversible actions.\n\
 - Mention exact files, commands, or symbols when possible.\n\
+- Respect intent_anchor.goal/target when present; do not widen scope.\n\
+- If recent_tool_results already contain useful evidence, continue from that evidence instead of restarting broad search.\n\
 - If the blocker is repo code, say so directly.\n\
 - If the blocker is instruction/harness/tooling, say so directly.\n\
 - Do not broaden into a full review.\n\
@@ -2711,6 +2748,49 @@ mod tests {
             msg(Role::Assistant, "done"),
         ];
         assert!(latest_tui_next_action_target(&app).is_none());
+    }
+
+    #[test]
+    fn meta_failure_packet_includes_intent_anchor_and_recent_tool_results() {
+        let mut app = App::new(
+            test_cfg(Mode::Jikkyo),
+            test_cfg(Mode::Observer),
+            test_cfg(Mode::Chat),
+            None,
+            Some(isolated_prefs_root()),
+            false,
+            "en".to_string(),
+            None,
+        );
+        app.coder_intent_anchor = Some(intent::apply_intent_update(
+            None,
+            intent::normalize_intent_update(
+                "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+                None,
+            ),
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+        ));
+        app.coder.messages = vec![
+            msg(Role::User, "Find prefs storage"),
+            msg(
+                Role::Tool,
+                "[src/tui/prefs.rs] (123 lines)\nfn save_tui_prefs(...)",
+            ),
+            msg(Role::Assistant, "[GOVERNOR BLOCK]\nMissing <think>"),
+        ];
+
+        let packet = build_tui_meta_failure_packet_for_selector(&app, "last-fail").expect("packet");
+        assert_eq!(
+            packet
+                .get("intent_anchor")
+                .and_then(|v| v.get("goal"))
+                .and_then(|v| v.as_str()),
+            Some("Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.")
+        );
+        assert!(packet
+            .get("recent_tool_results")
+            .and_then(|v| v.as_array())
+            .is_some_and(|rows| !rows.is_empty()));
     }
 
     #[test]
