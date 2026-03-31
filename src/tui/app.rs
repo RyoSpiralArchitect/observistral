@@ -6,6 +6,7 @@ use crate::streaming::{GovernorState, RealizeState};
 
 use super::agent::RealizePreset;
 use super::intent::IntentAnchor;
+use super::suggestion::ObserverSuggestionEnvelope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -177,6 +178,8 @@ pub struct App {
     pub auto_fix_mode: bool,
     /// Pending auto-fix text: set by handle_observer_token, consumed on next Tick.
     pub pending_auto_fix: Option<String>,
+    /// Pending advisory-only Observer suggestion for the next Coder continuation turn.
+    pub pending_observer_hint: Option<String>,
     pub coder_max_iters: Option<usize>,
     pub quit: bool,
 
@@ -194,6 +197,8 @@ pub struct App {
     pub coder_realize_state: Option<RealizeState>,
     /// Latest normalized user intent anchor for the Coder.
     pub coder_intent_anchor: Option<IntentAnchor>,
+    /// Latest structured next-action suggestion emitted by the Observer.
+    pub last_observer_suggestion: Option<ObserverSuggestionEnvelope>,
 
     /// Running task handles used for Ctrl+K cancellation.
     pub coder_task: Option<JoinHandle<()>>,
@@ -270,6 +275,7 @@ impl App {
             project_test_cmd: None,
             auto_fix_mode: false,
             pending_auto_fix: None,
+            pending_observer_hint: None,
             coder_max_iters,
             quit: false,
             tick_count: 0,
@@ -278,6 +284,7 @@ impl App {
             coder_realize_preset: RealizePreset::tui_default(),
             coder_realize_state: None,
             coder_intent_anchor: None,
+            last_observer_suggestion: None,
             coder_task: None,
             observer_task: None,
             chat_task: None,

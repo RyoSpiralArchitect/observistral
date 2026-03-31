@@ -21,6 +21,7 @@ use super::agent;
 use super::app::{App, Focus, Message, RightTab, Role, Task, TaskPhase, TaskTarget};
 use super::intent;
 use super::prefs;
+use super::suggestion;
 
 // ── Clipboard ─────────────────────────────────────────────────────────────────
 
@@ -1071,6 +1072,9 @@ pub async fn run_event_loop(
                         send_coder_with_text(app, &coder_tx, fix_text).await;
                     }
                 }
+                if app.pending_observer_hint.is_some() && !app.coder.streaming {
+                    send_coder_with_text(app, &coder_tx, "Continue.".to_string()).await;
+                }
             }
         }
 
@@ -1464,6 +1468,7 @@ fn handle_observer_token(token: StreamToken, app: &mut App) {
             let next_action_mode = app.observer_next_action_mode;
             if next_action_mode {
                 app.observer_next_action_mode = false;
+                finalize_observer_next_action_suggestion(app);
                 return;
             }
             // A — auto-fix pipeline: queue the review text for Coder on next Tick.
@@ -1665,6 +1670,7 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
     let intent_anchor =
         intent::apply_intent_update(app.coder_intent_anchor.as_ref(), intent_update, &text);
     let intent_anchor_message = intent::render_intent_anchor(&intent_anchor);
+    let observer_soft_hint = app.pending_observer_hint.take();
     if intent_anchor.requires_human_confirmation {
         app.coder.push_tool(
             "[intent] ambiguous update detected; keeping current scope until clarified."
@@ -1721,6 +1727,12 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
         role: "system".to_string(),
         content: intent_anchor_message,
     });
+    if let Some(observer_hint) = observer_soft_hint {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: observer_hint,
+        });
+    }
     let hist_len = history.len();
     for m in history.iter().take(hist_len.saturating_sub(1)) {
         messages.push(m.clone());
@@ -2325,24 +2337,29 @@ fn build_tui_next_action_prompt(
         _ => "Japanese",
     };
     let reason = reason_hint.trim();
+    let schema = json!({
+        "summary": format!("{lang_name} summary of the blocker"),
+        "primary_blocker": "missing_concrete_next_step",
+        "suggestions": [{
+            "kind": "read",
+            "reason": format!("{lang_name} reason"),
+            "confidence": 0.84,
+            "suggested_tool": "read_file",
+            "suggested_args": { "path": "src/tui/events.rs" },
+            "based_on": ["intent_anchor", "recent_tool_results"]
+        }],
+        "quickest_check": "read_file(path=src/tui/events.rs)",
+        "why_this_first": format!("{lang_name} why this is the smallest next step"),
+        "fallback": format!("{lang_name} fallback if the first action fails")
+    });
     format!(
         "This is intervention mode, not critique.\n\
 Tool calls, code changes, and diff application are forbidden.\n\
 Your task is to help the Coder take the next concrete step only.\n\
-Write explanations in {lang_name}. Keep the section headers below in English exactly as written.\n\n\
-Required output format:\n\
---- blocker ---\n\
-<1-2 sentences>\n\
---- next_actions ---\n\
-1. <best next concrete action>\n\
-2. <backup action>\n\
-3. <last resort action>\n\
---- quickest_check ---\n\
-<one command, file, or symbol to inspect first>\n\
---- why_this_first ---\n\
-<one sentence>\n\
---- fallback ---\n\
-<one sentence if the first action fails>\n\n\
+Write all free-text explanations in {lang_name}. Keep enum values, tool names, and file paths in English.\n\
+Return JSON only. No markdown. No backticks. No prose outside JSON.\n\n\
+Output schema:\n\
+{}\n\n\
 Rules:\n\
 - Prefer small, local, reversible actions.\n\
 - Mention exact files, commands, or symbols when possible.\n\
@@ -2351,14 +2368,123 @@ Rules:\n\
 - If the blocker is repo code, say so directly.\n\
 - If the blocker is instruction/harness/tooling, say so directly.\n\
 - Do not broaden into a full review.\n\
-- If evidence is weak, make quickest_check purely diagnostic.\n\n\
+- If evidence is weak, make quickest_check purely diagnostic.\n\
+- suggestions.kind must be exactly one of: search | read | done | clarify | abandon_path\n\
+- suggestions.suggested_args must be an object (or empty object)\n\
+- suggestions.based_on should cite coarse facts only: intent_anchor, recent_tool_results, recovery_stage, failure_kind\n\
+- Keep suggestions advisory-only; do not claim you already executed anything.\n\n\
 reason_hint: {reason}\n\
 stuck packet:\n\
 <packet>\n\
 {}\n\
 </packet>",
+        serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".to_string()),
         serde_json::to_string_pretty(packet).unwrap_or_else(|_| "{}".to_string())
     )
+}
+
+fn finalize_observer_next_action_suggestion(app: &mut App) {
+    let Some(idx) = app.observer.messages.iter().rposition(|m| {
+        matches!(m.role, Role::Assistant) && m.complete && !m.content.trim().is_empty()
+    }) else {
+        app.last_observer_suggestion = None;
+        return;
+    };
+    let raw = app
+        .observer
+        .messages
+        .get(idx)
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    if raw.trim().is_empty() {
+        app.last_observer_suggestion = None;
+        return;
+    }
+    if let Some(parsed) = suggestion::parse_observer_suggestion_envelope(&raw) {
+        let rendered = suggestion::format_observer_suggestion_envelope(&parsed);
+        if let Some(msg) = app.observer.messages.get_mut(idx) {
+            msg.content = rendered;
+        }
+        if let Some(hint) = build_observer_suggestion_soft_hint(&parsed) {
+            app.pending_observer_hint = Some(hint);
+            app.coder.push_tool(
+                "(observer suggestion) queued an advisory next step for the next coder continuation."
+                    .to_string(),
+            );
+        } else {
+            app.pending_observer_hint = None;
+        }
+        app.last_observer_suggestion = Some(parsed);
+    } else {
+        app.last_observer_suggestion = None;
+        app.pending_observer_hint = None;
+        app.observer.push_tool(
+            "(next-action) structured parse failed; raw Observer output was preserved.".to_string(),
+        );
+    }
+}
+
+fn build_observer_suggestion_soft_hint(
+    env: &suggestion::ObserverSuggestionEnvelope,
+) -> Option<String> {
+    let primary = env.suggestions.first()?;
+    if primary.confidence < 0.75 {
+        return None;
+    }
+    let action = if let Some(tool) = primary.suggested_tool.as_deref() {
+        let args = render_observer_suggestion_args(&primary.suggested_args);
+        if args.is_empty() {
+            tool.to_string()
+        } else {
+            format!("{tool}({args})")
+        }
+    } else if !env.quickest_check.is_empty() {
+        env.quickest_check.clone()
+    } else {
+        primary.reason.clone()
+    };
+    let reason = if primary.reason.is_empty() {
+        env.summary.as_str()
+    } else {
+        primary.reason.as_str()
+    };
+    Some(format!(
+        "[Observer advisory — soft hint only]\n\
+Stay within the current intent anchor and task scope.\n\
+If you are still stuck, prefer this next step before widening search:\n\
+{action}\n\
+Why: {reason}"
+    ))
+}
+
+fn render_observer_suggestion_args(args: &serde_json::Value) -> String {
+    let Some(obj) = args.as_object() else {
+        return String::new();
+    };
+    let mut keys: Vec<&String> = obj.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .filter_map(|key| {
+            let value = obj.get(key)?;
+            Some(format!(
+                "{key}={}",
+                render_observer_suggestion_arg_value(value)
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_observer_suggestion_arg_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(render_observer_suggestion_arg_value)
+            .collect::<Vec<_>>()
+            .join("|"),
+        _ => value.to_string(),
+    }
 }
 
 async fn send_meta_diagnose(app: &mut App, tx: &mpsc::Sender<StreamToken>, selector: &str) {
@@ -2565,6 +2691,8 @@ async fn send_next_action_assist(
 
     app.observer_meta_mode = false;
     app.observer_next_action_mode = true;
+    app.last_observer_suggestion = None;
+    app.pending_observer_hint = None;
     app.ignore_observer_tokens = false;
     app.observer_loop_retry_budget = 0;
     app.observer_loop_pending = None;
@@ -2791,6 +2919,128 @@ mod tests {
             .get("recent_tool_results")
             .and_then(|v| v.as_array())
             .is_some_and(|rows| !rows.is_empty()));
+    }
+
+    #[test]
+    fn next_action_prompt_requests_json_schema() {
+        let mut app = App::new(
+            test_cfg(Mode::Jikkyo),
+            test_cfg(Mode::Observer),
+            test_cfg(Mode::Chat),
+            None,
+            Some(isolated_prefs_root()),
+            false,
+            "en".to_string(),
+            None,
+        );
+        app.coder_intent_anchor = Some(intent::apply_intent_update(
+            None,
+            intent::normalize_intent_update(
+                "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+                None,
+            ),
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+        ));
+        app.coder.messages = vec![
+            msg(Role::User, "Find prefs storage"),
+            msg(
+                Role::Tool,
+                "[src/tui/prefs.rs] (123 lines)\nfn save_tui_prefs(...)",
+            ),
+            msg(Role::Assistant, "[GOVERNOR BLOCK]\nMissing <think>"),
+        ];
+
+        let packet = build_tui_meta_failure_packet_for_selector(&app, "last-fail").expect("packet");
+        let prompt = build_tui_next_action_prompt(&packet, "en", "missing_think");
+        assert!(prompt.contains("Return JSON only."));
+        assert!(prompt.contains("\"suggestions\""));
+        assert!(prompt.contains("search | read | done | clarify | abandon_path"));
+    }
+
+    #[test]
+    fn handle_observer_token_parses_structured_next_action_suggestion() {
+        let mut app = App::new(
+            test_cfg(Mode::Jikkyo),
+            test_cfg(Mode::Observer),
+            test_cfg(Mode::Chat),
+            None,
+            Some(isolated_prefs_root()),
+            false,
+            "en".to_string(),
+            None,
+        );
+        app.observer_next_action_mode = true;
+        app.observer.streaming = true;
+        let mut msg = Message::new_streaming(Role::Assistant);
+        msg.content = serde_json::json!({
+            "summary": "Coder has enough evidence and should read the prefs file directly.",
+            "primary_blocker": "missing_concrete_next_step",
+            "suggestions": [{
+                "kind": "read",
+                "reason": "The latest search already narrowed the scope to prefs storage.",
+                "confidence": 0.91,
+                "suggested_tool": "read_file",
+                "suggested_args": { "path": "src/tui/prefs.rs" },
+                "based_on": ["intent_anchor", "recent_tool_results"]
+            }],
+            "quickest_check": "read_file(path=src/tui/prefs.rs)",
+            "why_this_first": "It confirms the storage file without widening scope.",
+            "fallback": "If prefs.rs is unrelated, inspect events.rs next."
+        })
+        .to_string();
+        app.observer.messages.push(msg);
+
+        handle_observer_token(StreamToken::Done, &mut app);
+
+        assert!(!app.observer_next_action_mode);
+        let stored = app
+            .last_observer_suggestion
+            .as_ref()
+            .expect("structured suggestion should be stored");
+        assert_eq!(stored.primary_blocker, "missing_concrete_next_step");
+        assert!(app.pending_observer_hint.is_some());
+        let last = app.observer.messages.last().expect("observer response");
+        assert!(last.content.contains("--- blocker ---"));
+        assert!(last.content.contains("read_file(path=src/tui/prefs.rs)"));
+    }
+
+    #[test]
+    fn build_observer_suggestion_soft_hint_requires_high_confidence() {
+        let low = suggestion::ObserverSuggestionEnvelope {
+            summary: "Need a better next step.".to_string(),
+            primary_blocker: "missing_concrete_next_step".to_string(),
+            suggestions: vec![suggestion::ObserverSuggestion {
+                kind: suggestion::ObserverSuggestionKind::Read,
+                reason: "Read the prefs file next.".to_string(),
+                confidence: 0.60,
+                suggested_tool: Some("read_file".to_string()),
+                suggested_args: serde_json::json!({"path": "src/tui/prefs.rs"}),
+                based_on: vec!["recent_tool_results".to_string()],
+            }],
+            quickest_check: String::new(),
+            why_this_first: String::new(),
+            fallback: String::new(),
+        };
+        assert!(build_observer_suggestion_soft_hint(&low).is_none());
+
+        let high = suggestion::ObserverSuggestionEnvelope {
+            summary: "The next step is clear.".to_string(),
+            primary_blocker: "missing_concrete_next_step".to_string(),
+            suggestions: vec![suggestion::ObserverSuggestion {
+                kind: suggestion::ObserverSuggestionKind::Read,
+                reason: "Read the prefs file next.".to_string(),
+                confidence: 0.92,
+                suggested_tool: Some("read_file".to_string()),
+                suggested_args: serde_json::json!({"path": "src/tui/prefs.rs"}),
+                based_on: vec!["recent_tool_results".to_string()],
+            }],
+            quickest_check: String::new(),
+            why_this_first: String::new(),
+            fallback: String::new(),
+        };
+        let hint = build_observer_suggestion_soft_hint(&high).expect("high-confidence hint");
+        assert!(hint.contains("[Observer advisory"));
+        assert!(hint.contains("read_file(path=src/tui/prefs.rs)"));
     }
 
     #[test]

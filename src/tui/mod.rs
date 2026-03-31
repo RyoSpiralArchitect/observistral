@@ -3,6 +3,7 @@ pub mod app;
 pub mod events;
 pub mod intent;
 pub mod prefs;
+pub mod suggestion;
 pub mod ui;
 
 use anyhow::{Context, Result};
