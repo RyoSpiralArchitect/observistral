@@ -496,6 +496,28 @@ fn preferred_done_command_for_score(
     })
 }
 
+fn preferred_known_command_for_evidence<'a>(
+    command: &str,
+    known_commands: &'a [String],
+    evidence: &ObservationEvidence,
+) -> Option<&'a str> {
+    let want = canonicalize_evidence_command_with_resolution(command, evidence);
+    if let Some((name, args)) = parse_named_command_signature(want.as_str()) {
+        if name == "read_file" {
+            if let Some(path) = args.get("path") {
+                if let Some(candidate) = known_commands
+                    .iter()
+                    .rev()
+                    .find(|candidate| is_read_file_command_for_path(candidate, path, evidence))
+                {
+                    return Some(candidate.as_str());
+                }
+            }
+        }
+    }
+    resolve_known_acceptance_command(command, known_commands, evidence)
+}
+
 pub(super) fn validate_done_acceptance(
     plan: Option<&PlanBlock>,
     completed_acceptance: &[String],
@@ -568,7 +590,7 @@ pub(super) fn validate_done_acceptance(
                 governor_contract::done_evidence_duplicate_criteria_message()
             ));
         }
-        let Some(known_command) = resolve_known_acceptance_command(
+        let Some(known_command) = preferred_known_command_for_evidence(
             evidence.command.as_str(),
             known_commands,
             observation_evidence,
@@ -734,5 +756,54 @@ mod tests {
         assert!(final_text.contains("src/tui/agent.rs"));
         assert!(final_text.contains("via `read_file(path=src/tui/agent.rs)`"));
         assert!(!final_text.contains("via `search_files("));
+    }
+
+    #[test]
+    fn validate_done_acceptance_prefers_read_file_evidence_when_present() {
+        let plan = synthetic_read_only_observation_plan(
+            "Find where coder-side repo-map read_file fallback is wired into the TUI agent flow. Do not edit anything.",
+        );
+        let completed_acceptance = vec![
+            "1) File path identifying coder-side repo-map read_file fallback wiring".to_string(),
+            "2) Confirmed handling context where read_file miss fallback is invoked".to_string(),
+        ];
+        let acceptance_evidence = vec![
+            DoneAcceptanceEvidence {
+                criterion: completed_acceptance[0].clone(),
+                command: "search_files(dir=src/tui, pattern=lazy_read_fallback)".to_string(),
+            },
+            DoneAcceptanceEvidence {
+                criterion: completed_acceptance[1].clone(),
+                command: "read_file(path=src/tui/agent.rs)".to_string(),
+            },
+        ];
+        let known_commands = vec![
+            "search_files(dir=src/tui, pattern=lazy_read_fallback)".to_string(),
+            "read_file(path=src/tui/agent.rs)".to_string(),
+        ];
+        let mut evidence = ObservationEvidence::default();
+        evidence.remember_read("read_file(path=tui/agent.rs)", "src/tui/agent.rs");
+        evidence.remember_resolution("tui/agent.rs", "src/tui/agent.rs", "repo_map:read_file");
+
+        let rows = validate_done_acceptance(
+            Some(&plan),
+            &completed_acceptance,
+            &[],
+            &acceptance_evidence,
+            &known_commands,
+            &evidence,
+        )
+        .expect("done evidence rows");
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    0,
+                    "search_files(dir=src/tui, pattern=lazy_read_fallback)".to_string(),
+                ),
+                (1, "read_file(path=src/tui/agent.rs)".to_string()),
+            ]
+        );
     }
 }
