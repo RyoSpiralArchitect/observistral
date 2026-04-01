@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "defaults": {
+    "tool_root": ".",
+    "lang": "en"
+  },
+  "cases": [
+    {
+      "id": "pane-prefs-observer-suggestion",
+      "prompt": "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything. Final answer must include the main file path.",
+      "tags": ["tui", "observer", "suggestion", "prefs"],
+      "coder_messages": [
+        {
+          "role": "user",
+          "content": "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything. Final answer must include the main file path."
+        },
+        {
+          "role": "tool",
+          "content": "[src/tui/events.rs] (123 lines)\nfn handle_slash_command(...)"
+        },
+        {
+          "role": "assistant",
+          "content": "[GOVERNOR BLOCK]\nMissing <think>\nNeed one concrete next step before broadening search."
+        }
+      ],
+      "observer_response": {
+        "summary": "Coder already has enough evidence to stop searching broadly and read the prefs implementation directly.",
+        "primary_blocker": "missing_concrete_next_step",
+        "suggestions": [
+          {
+            "kind": "read",
+            "reason": "The current task is about pane-scoped TUI preferences, so the smallest next step is to read the prefs implementation file directly.",
+            "confidence": 0.91,
+            "suggested_tool": "read_file",
+            "suggested_args": {
+              "path": "src/tui/prefs.rs"
+            },
+            "based_on": ["intent_anchor", "recent_tool_results", "failure_kind"]
+          },
+          {
+            "kind": "search",
+            "reason": "If that read does not answer the question, search for save_tui_prefs within src/tui next.",
+            "confidence": 0.64,
+            "suggested_tool": "search_files",
+            "suggested_args": {
+              "pattern": "save_tui_prefs",
+              "dir": "src/tui"
+            },
+            "based_on": ["recent_tool_results"]
+          }
+        ],
+        "quickest_check": "read_file(path=src/tui/prefs.rs)",
+        "why_this_first": "It confirms storage and restore behavior without widening scope.",
+        "fallback": "If prefs.rs is not the main storage point, search save_tui_prefs inside src/tui next."
+      },
+      "checks": [
+        { "kind": "suggestion_parsed" },
+        { "kind": "hint_queued" },
+        { "kind": "observer_contains", "value": "src/tui/prefs.rs" },
+        { "kind": "coder_system_contains", "value": "read_file(path=src/tui/prefs.rs)" }
+      ]
+    },
+    {
+      "id": "repo-map-fallback-observer-suggestion",
+      "prompt": "Find where the coder-side repo-map fallback for read_file misses is wired into the TUI agent flow. Do not edit anything. Final answer must include the file path.",
+      "tags": ["tui", "observer", "suggestion", "repo-map", "fallback"],
+      "coder_messages": [
+        {
+          "role": "user",
+          "content": "Find where the coder-side repo-map fallback for read_file misses is wired into the TUI agent flow. Do not edit anything. Final answer must include the file path."
+        },
+        {
+          "role": "tool",
+          "content": "[src/repo_map.rs] (212 lines)\\npub(crate) fn lazy_read_file_fallback(...)"
+        },
+        {
+          "role": "assistant",
+          "content": "[GOVERNOR BLOCK]\\nNeed one concrete next step before broadening search. Current evidence points to a helper, not the TUI wiring point."
+        }
+      ],
+      "observer_response": {
+        "summary": "The helper file is already visible, so the next step should inspect the TUI agent wiring instead of staying in repo_map.rs.",
+        "primary_blocker": "helper_not_integration_point",
+        "suggestions": [
+          {
+            "kind": "read",
+            "reason": "The prompt asks where the fallback is wired into the TUI agent flow, so read the TUI agent file where the fallback is invoked.",
+            "confidence": 0.9,
+            "suggested_tool": "read_file",
+            "suggested_args": {
+              "path": "src/tui/agent.rs"
+            },
+            "based_on": ["intent_anchor", "recent_tool_results", "failure_kind"]
+          },
+          {
+            "kind": "search",
+            "reason": "If the exact hook is still unclear, search for lazy_read_file_fallback inside src/tui next.",
+            "confidence": 0.67,
+            "suggested_tool": "search_files",
+            "suggested_args": {
+              "pattern": "lazy_read_file_fallback",
+              "dir": "src/tui"
+            },
+            "based_on": ["recent_tool_results"]
+          }
+        ],
+        "quickest_check": "read_file(path=src/tui/agent.rs)",
+        "why_this_first": "That is the smallest step that can confirm the integration point without widening scope.",
+        "fallback": "If agent.rs does not show the hook clearly, search lazy_read_file_fallback within src/tui next."
+      },
+      "checks": [
+        { "kind": "suggestion_parsed" },
+        { "kind": "hint_queued" },
+        { "kind": "observer_contains", "value": "src/tui/agent.rs" },
+        { "kind": "coder_system_contains", "value": "read_file(path=src/tui/agent.rs)" }
+      ]
+    }
+  ]
+}

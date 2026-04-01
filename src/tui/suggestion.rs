@@ -1,7 +1,7 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObserverSuggestionKind {
     Search,
@@ -23,7 +23,7 @@ impl ObserverSuggestionKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObserverSuggestion {
     pub kind: ObserverSuggestionKind,
     #[serde(default)]
@@ -38,7 +38,7 @@ pub struct ObserverSuggestion {
     pub based_on: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObserverSuggestionEnvelope {
     #[serde(default)]
     pub summary: String,

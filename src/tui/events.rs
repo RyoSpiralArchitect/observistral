@@ -2,7 +2,7 @@ use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -1681,6 +1681,11 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
             .push_tool("[intent] continue update preserved current scope.".to_string());
     }
     app.coder_intent_anchor = Some(intent_anchor.clone());
+    if observer_soft_hint.is_some() {
+        app.coder.push_tool(
+            "(observer suggestion) advisory applied to this coder continuation turn.".to_string(),
+        );
+    }
 
     // Expand @file references: read files and collect system messages to inject.
     let at_refs = parse_at_refs(&text);
@@ -1718,31 +1723,16 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
         .map(|p| p.prompt)
         .unwrap_or("");
     let lang = language_instruction(Some(&app.lang), &cfg.mode);
-    let system = agent::coder_system(persona_prompt, lang, Some(realize_preset));
-    let mut messages = vec![ChatMessage {
-        role: "system".to_string(),
-        content: system,
-    }];
-    messages.push(ChatMessage {
-        role: "system".to_string(),
-        content: intent_anchor_message,
-    });
-    if let Some(observer_hint) = observer_soft_hint {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: observer_hint,
-        });
-    }
-    let hist_len = history.len();
-    for m in history.iter().take(hist_len.saturating_sub(1)) {
-        messages.push(m.clone());
-    }
-    // Inject @file system messages immediately before the user turn.
-    messages.extend(at_ref_messages);
-    messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: text,
-    });
+    let messages = build_coder_request_messages(
+        lang,
+        realize_preset,
+        &history,
+        intent_anchor_message,
+        observer_soft_hint,
+        &at_ref_messages,
+        &text,
+        persona_prompt,
+    );
 
     // Scan project context once per session (guarded by stack_label being None).
     let (project_context, agents_md): (Option<String>, Option<String>) =
@@ -1788,6 +1778,43 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
         }
     });
     app.coder_task = Some(handle);
+}
+
+fn build_coder_request_messages(
+    lang: &str,
+    realize_preset: agent::RealizePreset,
+    history: &[ChatMessage],
+    intent_anchor_message: String,
+    observer_soft_hint: Option<String>,
+    at_ref_messages: &[ChatMessage],
+    user_text: &str,
+    persona_prompt: &str,
+) -> Vec<ChatMessage> {
+    let system = agent::coder_system(persona_prompt, lang, Some(realize_preset));
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: system,
+    }];
+    messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: intent_anchor_message,
+    });
+    if let Some(observer_hint) = observer_soft_hint {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: observer_hint,
+        });
+    }
+    let hist_len = history.len();
+    for m in history.iter().take(hist_len.saturating_sub(1)) {
+        messages.push(m.clone());
+    }
+    messages.extend(at_ref_messages.iter().cloned());
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: user_text.to_string(),
+    });
+    messages
 }
 
 async fn send_coder_message(app: &mut App, tx: &mpsc::Sender<StreamToken>) {
@@ -2383,6 +2410,20 @@ stuck packet:\n\
     )
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct TuiNextActionReplayOutcome {
+    pub selector: String,
+    pub reason_hint: String,
+    pub target_message_id: Option<String>,
+    pub failure_kind: String,
+    pub packet: serde_json::Value,
+    pub observer_prompt: String,
+    pub observer_raw_response: String,
+    pub parsed_suggestion: Option<suggestion::ObserverSuggestionEnvelope>,
+    pub pending_observer_hint: Option<String>,
+    pub coder_preview_messages: Vec<ChatMessage>,
+}
+
 fn finalize_observer_next_action_suggestion(app: &mut App) {
     let Some(idx) = app.observer.messages.iter().rposition(|m| {
         matches!(m.role, Role::Assistant) && m.complete && !m.content.trim().is_empty()
@@ -2422,6 +2463,80 @@ fn finalize_observer_next_action_suggestion(app: &mut App) {
             "(next-action) structured parse failed; raw Observer output was preserved.".to_string(),
         );
     }
+}
+
+pub(crate) fn latest_tui_next_action_target(app: &App) -> Option<(usize, String)> {
+    latest_tui_next_action_target_impl(app)
+}
+
+pub(crate) fn replay_observer_next_action_case(
+    app: &mut App,
+    selector: &str,
+    reason_hint: &str,
+    observer_response: &str,
+) -> Result<TuiNextActionReplayOutcome, String> {
+    let packet = build_tui_meta_failure_packet_for_selector(app, selector)?;
+    let observer_prompt = build_tui_next_action_prompt(&packet, app.lang.as_str(), reason_hint);
+    let target_message_id = packet
+        .get("target_message_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let failure_kind = packet
+        .get("failure_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unclear")
+        .to_string();
+
+    app.observer_meta_mode = false;
+    app.observer_next_action_mode = true;
+    app.last_observer_suggestion = None;
+    app.pending_observer_hint = None;
+    app.ignore_observer_tokens = false;
+    app.observer.streaming = true;
+    app.observer
+        .messages
+        .push(Message::new_streaming(Role::Assistant));
+    if let Some(last) = app.observer.messages.last_mut() {
+        last.content = observer_response.to_string();
+    }
+    handle_observer_token(StreamToken::Done, app);
+
+    let preview_messages = preview_coder_continuation_messages(app, "Continue.");
+
+    Ok(TuiNextActionReplayOutcome {
+        selector: selector.to_string(),
+        reason_hint: reason_hint.to_string(),
+        target_message_id,
+        failure_kind,
+        packet,
+        observer_prompt,
+        observer_raw_response: observer_response.to_string(),
+        parsed_suggestion: app.last_observer_suggestion.clone(),
+        pending_observer_hint: app.pending_observer_hint.clone(),
+        coder_preview_messages: preview_messages,
+    })
+}
+
+fn preview_coder_continuation_messages(app: &App, text: &str) -> Vec<ChatMessage> {
+    let history = app.coder.chat_history();
+    let intent_update = intent::normalize_intent_update(text, app.coder_intent_anchor.as_ref());
+    let intent_anchor =
+        intent::apply_intent_update(app.coder_intent_anchor.as_ref(), intent_update, text);
+    let intent_anchor_message = intent::render_intent_anchor(&intent_anchor);
+    let persona_prompt = resolve_persona(&app.coder_cfg.persona)
+        .map(|p| p.prompt)
+        .unwrap_or("");
+    let lang = language_instruction(Some(&app.lang), &app.coder_cfg.mode);
+    build_coder_request_messages(
+        lang,
+        app.coder_realize_preset,
+        &history,
+        intent_anchor_message,
+        app.pending_observer_hint.clone(),
+        &[],
+        text,
+        persona_prompt,
+    )
 }
 
 fn build_observer_suggestion_soft_hint(
@@ -2636,7 +2751,7 @@ async fn send_meta_diagnose(app: &mut App, tx: &mpsc::Sender<StreamToken>, selec
     app.observer_task = Some(handle);
 }
 
-fn latest_tui_next_action_target(app: &App) -> Option<(usize, String)> {
+fn latest_tui_next_action_target_impl(app: &App) -> Option<(usize, String)> {
     let (idx, msg) = app.coder.messages.iter().enumerate().rev().find(|(_, m)| {
         matches!(m.role, Role::Assistant) && m.complete && !m.content.trim().is_empty()
     })?;
@@ -3041,6 +3156,32 @@ mod tests {
         let hint = build_observer_suggestion_soft_hint(&high).expect("high-confidence hint");
         assert!(hint.contains("[Observer advisory"));
         assert!(hint.contains("read_file(path=src/tui/prefs.rs)"));
+    }
+
+    #[test]
+    fn build_coder_request_messages_includes_observer_soft_hint_as_system_message() {
+        let cfg = test_cfg(Mode::Jikkyo);
+        let lang = language_instruction(Some("en"), &cfg.mode);
+        let messages = build_coder_request_messages(
+            lang,
+            crate::tui::agent::RealizePreset::tui_default(),
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: "Continue.".to_string(),
+            }],
+            "[Intent Anchor]\ngoal: keep current scope".to_string(),
+            Some(
+                "[Observer advisory — soft hint only]\nPrefer read_file(path=src/tui/prefs.rs)."
+                    .to_string(),
+            ),
+            &[],
+            "Continue.",
+            "",
+        );
+
+        assert!(messages.iter().any(|m| {
+            m.role == "system" && m.content.contains("[Observer advisory — soft hint only]")
+        }));
     }
 
     #[test]

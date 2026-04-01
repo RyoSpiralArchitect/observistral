@@ -22,6 +22,7 @@ mod streaming;
 mod task_graph;
 mod trace_writer;
 mod tui;
+mod tui_replay;
 mod types;
 
 use anyhow::{Context, Result};
@@ -69,6 +70,9 @@ enum Command {
 
     /// Run a fixture-driven runtime evaluation suite against the headless Coder
     Eval(EvalArgs),
+
+    /// Replay a deterministic TUI stuck-case and inspect Observer suggestion plumbing
+    TuiReplay(TuiReplayArgs),
 
     /// Review `git diff` with Observer (or diff批評) and print critique
     Review(ReviewArgs),
@@ -232,6 +236,29 @@ struct EvalArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+struct TuiReplayArgs {
+    /// Directory to replay against (defaults to current directory)
+    #[arg(long, short = 'C', alias = "root")]
+    tool_root: Option<String>,
+
+    /// TUI replay spec JSON file
+    #[arg(long, default_value = ".obstral/tui_replay.json")]
+    spec: PathBuf,
+
+    /// Output directory for per-case artifacts and the final report
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
+
+    /// Only run cases whose id or tags contain this substring
+    #[arg(long)]
+    filter: Option<String>,
+
+    /// Cap the number of selected cases
+    #[arg(long)]
+    max_cases: Option<usize>,
+}
+
+#[derive(Args, Debug, Clone)]
 struct InitArgs {
     /// Directory to write `.obstral.md` into (defaults to current directory)
     #[arg(long, short = 'C', alias = "root")]
@@ -335,6 +362,7 @@ async fn main() -> Result<()> {
         Some(Command::Chat { prompt }) => run_chat(prompt, cli.common).await,
         Some(Command::Agent(args)) => run_agent(args, cli.common).await,
         Some(Command::Eval(args)) => run_eval(args, cli.common).await,
+        Some(Command::TuiReplay(args)) => tui_replay::run(args, cli.common).await,
         Some(Command::Review(args)) => run_review(args, cli.common).await,
         Some(Command::Init(args)) => run_init(args, cli.common).await,
         Some(Command::Repl) => repl::run(cli.common.to_partial_config()).await,

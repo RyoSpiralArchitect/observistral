@@ -576,6 +576,13 @@ In the Web UI, Chat has two optional helpers:
 
 Most TUI knobs are stored per project in `.obstral/tui_prefs.json`, including pane `provider/base_url/mode/model/persona/temp`, Coder `/realize`, `/lang`, `/autofix`, `Ctrl+A` auto-observe, and the last right-side tab.
 
+### Engineering Docs
+
+- [Runtime architecture](./docs/runtime-architecture.md)
+- [State schema](./docs/state-schema.md)
+- [TUI agent split plan](./docs/tui-agent-split-plan.md)
+- [Repo-specific contributor rules](./AGENTS.md)
+
 ---
 
 ## Security

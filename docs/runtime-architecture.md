@@ -34,6 +34,12 @@ The point of the layering is to make failures legible and prevent the classic ag
 - phase drift (polish advice during core failures)
 - approvals and actions getting entangled
 
+Related docs:
+
+- `docs/state-schema.md` — typed state ownership and persistence boundaries
+- `docs/tui-agent-split-plan.md` — extraction plan for `src/tui/agent.rs`
+- `AGENTS.md` — contributor replay/eval policy and high-touch file rules
+
 ## Mapping To Current Code (2026-03)
 
 The runtime is already present, but parts are still "in one file". This mapping makes it explicit.
@@ -122,4 +128,3 @@ Current code:
 3. Promote TaskRouter outputs into a DAG (dependencies + statuses), persisted into the session.
 4. Formalize governor decisions as structured events (so UI can visualize "why we stopped").
 5. Keep tools stable (their safety properties are the foundation), improve orchestration above them.
-
