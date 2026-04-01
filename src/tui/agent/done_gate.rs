@@ -208,7 +208,12 @@ pub(super) fn build_read_only_completion_hint(
     );
     let cite_commands: Vec<String> = strong
         .iter()
-        .flat_map(|score| score.suggested_commands.iter().cloned())
+        .filter_map(|score| preferred_done_command_for_score(score, &known_commands, evidence))
+        .chain(
+            strong
+                .iter()
+                .flat_map(|score| score.suggested_commands.iter().cloned()),
+        )
         .chain(known_commands.iter().rev().cloned())
         .fold(Vec::<String>::new(), |mut acc, command| {
             let canonical =
@@ -287,10 +292,7 @@ pub(super) fn build_read_only_iteration_cap_final_answer(
         .iter()
         .filter(|score| score.total >= 0.70)
         .filter_map(|score| {
-            let command = score.suggested_commands.iter().find_map(|cmd| {
-                resolve_known_acceptance_command(cmd.as_str(), &known_commands, evidence)
-                    .map(|s| s.to_string())
-            })?;
+            let command = preferred_done_command_for_score(score, &known_commands, evidence)?;
             Some((score.idx, command))
         })
         .collect();
@@ -434,6 +436,64 @@ fn resolve_known_acceptance_command<'a>(
                 })
         })
         .map(|s| s.as_str())
+}
+
+fn is_read_file_command_for_path(
+    command: &str,
+    path: &str,
+    evidence: &ObservationEvidence,
+) -> bool {
+    let sig = canonicalize_evidence_command_with_resolution(command, evidence);
+    let Some((name, args)) = parse_named_command_signature(sig.as_str()) else {
+        return false;
+    };
+    if name != "read_file" {
+        return false;
+    }
+    let Some(candidate_path) = args.get("path") else {
+        return false;
+    };
+    normalize_path_alias(candidate_path.as_str()) == normalize_path_alias(path)
+}
+
+fn preferred_done_command_for_score(
+    score: &CriterionEvidenceScore,
+    known_commands: &[String],
+    evidence: &ObservationEvidence,
+) -> Option<String> {
+    if score.read_confirm >= 0.70 {
+        if let Some(path) = score.best_path.as_deref() {
+            if let Some(command) = known_commands
+                .iter()
+                .rev()
+                .find(|candidate| is_read_file_command_for_path(candidate, path, evidence))
+            {
+                return Some(command.clone());
+            }
+        }
+        if let Some(command) = score.suggested_commands.iter().find_map(|cmd| {
+            let resolved =
+                resolve_known_acceptance_command(cmd.as_str(), known_commands, evidence)?;
+            if is_read_file_command_for_path(
+                resolved,
+                score.best_path.as_deref().unwrap_or(""),
+                evidence,
+            ) || canonicalize_evidence_command_with_resolution(resolved, evidence)
+                .starts_with("read_file(")
+            {
+                Some(resolved.to_string())
+            } else {
+                None
+            }
+        }) {
+            return Some(command);
+        }
+    }
+
+    score.suggested_commands.iter().find_map(|cmd| {
+        resolve_known_acceptance_command(cmd.as_str(), known_commands, evidence)
+            .map(|s| s.to_string())
+    })
 }
 
 pub(super) fn validate_done_acceptance(
@@ -612,5 +672,67 @@ pub(super) fn build_done_acceptance_recovery_hint(
         String::new()
     } else {
         format!("\n{}", lines.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn iteration_cap_final_answer_prefers_read_file_for_repo_map_fallback_task() {
+        let plan = synthetic_read_only_observation_plan(
+            "Find where coder-side repo-map read_file fallback is wired into the TUI agent flow. Do not edit anything.",
+        );
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"lazy_read_fallback\",\"dir\":\"src/tui\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: 'lazy_read_fallback' — 1 match(es)]\nsrc/tui/agent.rs:12577: crate::repo_map::lazy_read_fallback(root, &path)"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"tui/agent.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/tui/agent.rs] (16610 lines, 712345 bytes)\nif let Some(fallback) = crate::repo_map::lazy_read_fallback(root, &path) {"
+            }),
+        ];
+
+        let mut evidence = collect_observation_evidence(&messages);
+        evidence.remember_resolution("tui/agent.rs", "src/tui/agent.rs", "repo_map:read_file");
+        let final_text = build_read_only_iteration_cap_final_answer(
+            "Find where coder-side repo-map read_file fallback is wired into the TUI agent flow. Do not edit anything.",
+            &plan,
+            &evidence,
+            &messages,
+            &WorkingMemory::default(),
+        )
+        .expect("final answer");
+
+        assert!(final_text.contains("src/tui/agent.rs"));
+        assert!(final_text.contains("via `read_file(path=src/tui/agent.rs)`"));
+        assert!(!final_text.contains("via `search_files("));
     }
 }
