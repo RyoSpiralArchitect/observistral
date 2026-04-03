@@ -13111,7 +13111,43 @@ Action required: call read_file(path) first to confirm current contents, then re
             }));
             if !is_error && root_read_only && tc.name.as_str() == "read_file" {
                 if let Some(plan) = active_plan.as_ref() {
-                    if iter + 1 == max_iters {
+                    if let Some(final_text) = maybe_build_read_only_auto_final_answer(
+                        true,
+                        &root_user_text,
+                        Some(plan),
+                        &observation_evidence,
+                        &messages,
+                        &working_mem,
+                    ) {
+                        state = AgentState::Done;
+                        messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+                        autosave_best_effort(
+                            &autosaver,
+                            &tx,
+                            tool_root_abs.as_deref(),
+                            checkpoint.as_deref(),
+                            cur_cwd.as_deref(),
+                            &messages,
+                        )
+                        .await;
+                        let _ = tx
+                            .send(StreamToken::GovernorState(build_governor_state(
+                                state,
+                                &recovery,
+                                &mem,
+                                file_tool_consec_failures,
+                                last_mutation_step,
+                                last_verify_ok_step,
+                                last_reflection.as_ref(),
+                            )))
+                            .await;
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "\n[agent] auto-finalized read-only inspection after sufficient observation.\n\n{final_text}\n"
+                            )))
+                            .await;
+                        break;
+                    } else if iter + 1 == max_iters {
                         if let Some(final_text) = build_read_only_iteration_cap_final_answer(
                             &root_user_text,
                             plan,
