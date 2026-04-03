@@ -13,6 +13,7 @@ store state without first choosing the correct owner.
 | Provider/runtime config | `src/config.rs` | process / launch | CLI args + env | `PartialConfig`, `RunConfig` |
 | Project-local TUI prefs | `src/tui/prefs.rs` | cross-session | `.obstral/tui_prefs.json` | `TuiPrefs`, `PanePrefs`, `coder_realize_preset`, pane model/provider/mode |
 | Session persistence | `src/agent_session.rs` | resumable run | `session.json` | `AgentSession`, `ObservationCache`, recent reflections |
+| Project-local reflection ledger | `src/reflection_ledger.rs` | cross-session | `.obstral/reflection_ledger.json` | recurring wrong assumptions, next minimal actions, reflection counts |
 | In-memory orchestration state | `src/tui/app.rs` | live TUI session | memory only | `App`, `pending_auto_fix`, `pending_observer_hint`, `last_observer_suggestion` |
 | Intent state | `src/tui/intent.rs` | live session, optionally persisted later | memory only today | `IntentAnchor`, `IntentUpdateKind`, normalized constraints/success criteria |
 | Replay/eval fixtures | `.obstral/*.json` + `src/runtime_eval.rs` + `src/tui_replay.rs` | versioned test input/output | repo files + `.tmp/` artifacts | runtime eval spec, TUI replay spec, reports |
@@ -93,7 +94,34 @@ This is the right home for typed operational memory such as:
 - evidence-backed observations
 - recent successful commands used for `done` citation
 
-### 4. In-memory orchestration state
+### 4. Project-local reflection ledger
+
+Code:
+
+- `src/reflection_ledger.rs`
+
+File:
+
+- `.obstral/reflection_ledger.json`
+
+Owns:
+
+- recurring wrong assumptions that have already been refuted
+- previously effective next minimal actions
+- lightweight cross-session reflection counts
+
+Examples:
+
+- `"broad search was unnecessary" => "read src/tui/prefs.rs"`
+- `"cargo test was necessary first" => "run targeted tests"`
+
+This layer is intentionally bias-only memory:
+
+- it should guide the next probe
+- it should not be treated as proof
+- it must yield to current tool output when contradicted
+
+### 5. In-memory orchestration state
 
 Code:
 
@@ -116,7 +144,7 @@ Examples:
 This layer should stay transient. If a field must survive restart/resume, it
 likely belongs in prefs or session persistence instead.
 
-### 5. Intent state
+### 6. Intent state
 
 Code:
 
@@ -140,7 +168,7 @@ Important rule:
 
 - vague modifiers may refine quality but must not widen `goal` or `target`
 
-### 6. Replay and eval fixtures
+### 7. Replay and eval fixtures
 
 Code:
 
@@ -178,7 +206,8 @@ If the answer is not clear, document it here first.
 
 - Move more evidence-backed memory behind `ObservationCache` rather than ad hoc
   in `App`.
+- Keep the reflection ledger project-local and bias-oriented; do not let it
+  silently override current evidence.
 - Keep `IntentAnchor` memory-first for now; only persist it after replay/eval
   proves the shape is stable.
 - Keep replay/eval specs versioned and human-editable.
-

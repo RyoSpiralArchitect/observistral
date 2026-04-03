@@ -174,6 +174,56 @@ async fn emit_resolution_memory_hit_telemetry(
     .await;
 }
 
+fn reflection_ledger_action_match<'a>(
+    ledger: &'a crate::reflection_ledger::ReflectionLedger,
+    tc: &ToolCallData,
+) -> Option<(
+    &'a crate::reflection_ledger::ReflectionLedgerEntry,
+    f32,
+    String,
+)> {
+    let action = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| blocked_tool_call_signature(tc.name.as_str(), tc.arguments.as_str()));
+    let action_sig = normalize_for_signature(action.as_str());
+    let action_tokens = keyword_tokens(action.as_str());
+    let tool_name = tc.name.to_ascii_lowercase();
+    let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
+    let primary_target = args
+        .get("path")
+        .or_else(|| args.get("dir"))
+        .or_else(|| args.get("command"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let target_sig = normalize_for_signature(primary_target.as_str());
+
+    let mut best: Option<(&crate::reflection_ledger::ReflectionLedgerEntry, f32)> = None;
+    for entry in &ledger.entries {
+        let next = entry.next_minimal_action.as_str();
+        let next_sig = normalize_for_signature(next);
+        let next_tokens = keyword_tokens(next);
+        let mut score = token_overlap_score(&next_tokens, &action_tokens);
+        if !tool_name.is_empty() && next_sig.contains(tool_name.as_str()) {
+            score += 0.10;
+        }
+        if !target_sig.is_empty() && next_sig.contains(target_sig.as_str()) {
+            score += 0.35;
+        }
+        if next_sig.contains(action_sig.as_str()) || action_sig.contains(next_sig.as_str()) {
+            score += 0.25;
+        }
+        score = score.clamp(0.0, 1.0);
+        if score >= 0.45 {
+            match best {
+                Some((_, best_score)) if best_score >= score => {}
+                _ => best = Some((entry, score)),
+            }
+        }
+    }
+    best.map(|(entry, score)| (entry, score, action))
+}
+
 fn push_blocked_tool_exchange(
     messages: &mut Vec<serde_json::Value>,
     assistant_text: &str,
@@ -4571,6 +4621,7 @@ struct StablePromptCache {
     task_contract_hash: Option<u64>,
     working_memory_hash: Option<u64>,
     assumption_ledger_hash: Option<u64>,
+    reflection_ledger_hash: Option<u64>,
     verification_hash: Option<u64>,
 }
 
@@ -8261,6 +8312,34 @@ Execute only the new minimal action: {}",
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .and_then(absolutize_path);
+    let reflection_ledger_path = tool_root_abs
+        .as_deref()
+        .map(crate::reflection_ledger::path_for_root);
+    let mut reflection_ledger = if let Some(path) = reflection_ledger_path.as_ref() {
+        match crate::reflection_ledger::ReflectionLedger::load(path) {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[reflection_ledger] WARN: {e:#}\n"
+                    )))
+                    .await;
+                crate::reflection_ledger::ReflectionLedger::default()
+            }
+        }
+    } else {
+        crate::reflection_ledger::ReflectionLedger::default()
+    };
+    let mut reflection_ledger_warned = false;
+    emit_telemetry_event(
+        &tx,
+        "reflection_ledger_loaded",
+        json!({
+            "entries": reflection_ledger.entries.len(),
+            "path": reflection_ledger_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        }),
+    )
+    .await;
 
     fn has_system_prefix(messages: &[serde_json::Value], prefix: &str) -> bool {
         messages.iter().any(|m| {
@@ -8608,6 +8687,29 @@ This is the LAST model call for this run.\n\
             }));
         }
 
+        if let Some(reflection_prompt) = reflection_ledger.build_prompt() {
+            let compact_prompt = reflection_ledger
+                .build_compact_prompt()
+                .unwrap_or_else(|| reflection_prompt.clone());
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": render_cached_prompt(
+                    &mut prompt_cache.reflection_ledger_hash,
+                    reflection_prompt,
+                    compact_prompt,
+                ),
+            }));
+            emit_telemetry_event(
+                &tx,
+                "reflection_ledger_prompted",
+                json!({
+                    "entries": reflection_ledger.entries.len(),
+                    "iter": iter,
+                }),
+            )
+            .await;
+        }
+
         if let (true, Some(latent), Some(drift)) = (
             realize_cfg.enabled,
             latent_plan.as_ref(),
@@ -8827,6 +8929,43 @@ This is the LAST model call for this run.\n\
             reflection_required = None;
 
             if let Some(ref r) = last_reflection {
+                if reflection_ledger.remember(
+                    r.wrong_assumption.as_str(),
+                    r.next_minimal_action.as_str(),
+                    Some(reason.as_str()),
+                    r.last_outcome.as_str(),
+                    r.goal_delta.as_str(),
+                    r.strategy_change.as_str(),
+                ) {
+                    let remembered_count = reflection_ledger
+                        .find_entry(r.wrong_assumption.as_str(), r.next_minimal_action.as_str())
+                        .map(|entry| entry.count)
+                        .unwrap_or(1);
+                    emit_telemetry_event(
+                        &tx,
+                        "reflection_ledger_remembered",
+                        json!({
+                            "wrong_assumption": r.wrong_assumption,
+                            "next_minimal_action": r.next_minimal_action,
+                            "trigger": reason,
+                            "count": remembered_count,
+                            "entries": reflection_ledger.entries.len(),
+                        }),
+                    )
+                    .await;
+                    if let Some(path) = reflection_ledger_path.as_ref() {
+                        if let Err(e) = reflection_ledger.save_atomic(path) {
+                            if !reflection_ledger_warned {
+                                reflection_ledger_warned = true;
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "\n[reflection_ledger] WARN: {e:#}\n"
+                                    )))
+                                    .await;
+                            }
+                        }
+                    }
+                }
                 if !r.wrong_assumption.trim().is_empty() {
                     assumption_ledger.mark_refuted(
                         r.wrong_assumption.as_str(),
@@ -8998,6 +9137,26 @@ Execute only the new minimal action: {}",
                 )
                 .await;
                 tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((entry, score, action)) =
+                reflection_ledger_action_match(&reflection_ledger, tc)
+            {
+                emit_telemetry_event(
+                    &tx,
+                    "reflection_ledger_action_hit",
+                    json!({
+                        "tool": tc.name,
+                        "score": score,
+                        "action": action,
+                        "wrong_assumption": entry.wrong_assumption,
+                        "next_minimal_action": entry.next_minimal_action,
+                        "count": entry.count,
+                    }),
+                )
+                .await;
             }
         }
 

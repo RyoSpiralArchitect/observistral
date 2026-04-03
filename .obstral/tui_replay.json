@@ -114,6 +114,65 @@
         { "kind": "observer_contains", "value": "src/tui/agent.rs" },
         { "kind": "coder_system_contains", "value": "read_file(path=src/tui/agent.rs)" }
       ]
+    },
+    {
+      "id": "pane-prefs-observer-contract",
+      "prompt": "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything. Final answer must include the main file path.",
+      "tags": ["tui", "observer", "suggestion", "contract", "prefs"],
+      "coder_messages": [
+        {
+          "role": "user",
+          "content": "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything. Final answer must include the main file path."
+        },
+        {
+          "role": "tool",
+          "content": "[src/tui/events.rs] (123 lines)\nfn handle_slash_command(...)"
+        },
+        {
+          "role": "assistant",
+          "content": "[GOVERNOR BLOCK]\nMissing <think>\nNeed one concrete next step before broadening search."
+        }
+      ],
+      "observer_response": {
+        "summary": "Coder already has enough evidence to stop broad searching, but the next move has a security-sensitive angle because prefs writes are easy to mis-scope.",
+        "primary_blocker": "missing_concrete_next_step",
+        "scores": {
+          "correctness": 0.87,
+          "security": 0.58,
+          "efficiency": 0.77,
+          "readability": 0.82
+        },
+        "response_contract": {
+          "required": true,
+          "focus_axes": ["security"],
+          "note": "If you do not take the focused read step now, explicitly override or defer with a narrow reason."
+        },
+        "suggestions": [
+          {
+            "kind": "read",
+            "reason": "Read the prefs implementation file directly before making any broader claim about serialized pane settings.",
+            "confidence": 0.93,
+            "suggested_tool": "read_file",
+            "suggested_args": {
+              "path": "src/tui/prefs.rs"
+            },
+            "based_on": ["intent_anchor", "recent_tool_results", "failure_kind"]
+          }
+        ],
+        "quickest_check": "read_file(path=src/tui/prefs.rs)",
+        "why_this_first": "It confirms the serialization path without widening scope or guessing from a slash-handler file.",
+        "fallback": "If prefs.rs is not the main storage point, override explicitly and narrow the next search to save_tui_prefs in src/tui."
+      },
+      "checks": [
+        { "kind": "suggestion_parsed" },
+        { "kind": "hint_queued" },
+        { "kind": "contract_queued" },
+        { "kind": "observer_contains", "value": "\"required\":true" },
+        { "kind": "coder_system_contains", "value": "[Observer response contract]" },
+        { "kind": "coder_system_contains", "value": "accept | override | defer" },
+        { "kind": "coder_system_contains", "value": "Focus axes: security" },
+        { "kind": "coder_system_contains", "value": "read_file(path=src/tui/prefs.rs)" }
+      ]
     }
   ]
 }

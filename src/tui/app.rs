@@ -180,6 +180,8 @@ pub struct App {
     pub pending_auto_fix: Option<String>,
     /// Pending advisory-only Observer suggestion for the next Coder continuation turn.
     pub pending_observer_hint: Option<String>,
+    /// Pending Observer contract for the next Coder continuation turn.
+    pub pending_observer_contract: Option<ObserverSuggestionEnvelope>,
     pub coder_max_iters: Option<usize>,
     pub quit: bool,
 
@@ -199,6 +201,12 @@ pub struct App {
     pub coder_intent_anchor: Option<IntentAnchor>,
     /// Latest structured next-action suggestion emitted by the Observer.
     pub last_observer_suggestion: Option<ObserverSuggestionEnvelope>,
+    /// Active Observer contract currently being answered by the Coder turn.
+    pub active_observer_contract: Option<ObserverSuggestionEnvelope>,
+    /// First tool action observed while an Observer contract is active.
+    pub active_observer_first_tool: Option<(String, String)>,
+    /// Latest Observer contract outcome recorded from a Coder turn.
+    pub last_observer_contract_outcome: Option<String>,
 
     /// Running task handles used for Ctrl+K cancellation.
     pub coder_task: Option<JoinHandle<()>>,
@@ -276,6 +284,7 @@ impl App {
             auto_fix_mode: false,
             pending_auto_fix: None,
             pending_observer_hint: None,
+            pending_observer_contract: None,
             coder_max_iters,
             quit: false,
             tick_count: 0,
@@ -285,6 +294,9 @@ impl App {
             coder_realize_state: None,
             coder_intent_anchor: None,
             last_observer_suggestion: None,
+            active_observer_contract: None,
+            active_observer_first_tool: None,
+            last_observer_contract_outcome: None,
             coder_task: None,
             observer_task: None,
             chat_task: None,

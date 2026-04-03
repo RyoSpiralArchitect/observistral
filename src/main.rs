@@ -14,6 +14,7 @@ mod pending_edits;
 mod personas;
 mod project;
 mod providers;
+mod reflection_ledger;
 mod repl;
 mod repo_map;
 mod runtime_eval;
@@ -1166,6 +1167,7 @@ fn build_inventory_state(root: &Path) -> Result<serde_json::Value> {
     let state_schema_path = root.join("docs/state-schema.md");
     let session_example_path = root.join(".tmp/obstral_session.json");
     let prefs_path = root.join(".obstral/tui_prefs.json");
+    let reflection_ledger_path = root.join(".obstral/reflection_ledger.json");
     let runtime_spec_path = root.join(".obstral/runtime_eval.json");
     let replay_spec_path = root.join(".obstral/tui_replay.json");
 
@@ -1201,6 +1203,17 @@ fn build_inventory_state(root: &Path) -> Result<serde_json::Value> {
             "owner_present": root.join("src/agent_session.rs").exists(),
             "backing_present": session_example_path.exists(),
             "status": if root.join("src/agent_session.rs").exists() { "implemented" } else { "missing" },
+        }),
+        json!({
+            "key": "reflection_ledger",
+            "owner": "src/reflection_ledger.rs",
+            "lifetime": "cross-session",
+            "backing_store": ".obstral/reflection_ledger.json",
+            "persisted": true,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/reflection_ledger.rs").exists(),
+            "backing_present": reflection_ledger_path.exists(),
+            "status": if root.join("src/reflection_ledger.rs").exists() && reflection_ledger_path.exists() { "implemented" } else if root.join("src/reflection_ledger.rs").exists() { "partial" } else { "missing" },
         }),
         json!({
             "key": "in_memory_app",
