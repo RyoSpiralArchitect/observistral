@@ -27,6 +27,26 @@ fn criterion_prefers_read_confirmation(criterion: &str) -> bool {
     .any(|term| low.contains(term))
 }
 
+fn single_observed_read_target(evidence: &ObservationEvidence) -> Option<String> {
+    let observed_paths = evidence
+        .searches
+        .iter()
+        .flat_map(|search| search.paths.iter())
+        .map(|path| normalize_path_alias(path))
+        .filter(|path| !path.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    if observed_paths.len() != 1 {
+        return None;
+    }
+    let target_sig = observed_paths.into_iter().next()?;
+    evidence
+        .reads
+        .iter()
+        .rev()
+        .find(|read| normalize_path_alias(read.path.as_str()) == target_sig)
+        .map(|read| read.path.clone())
+}
+
 pub(super) fn build_read_only_strong_final_answer(
     root_user_text: &str,
     plan: &PlanBlock,
@@ -195,10 +215,29 @@ pub(super) fn build_read_only_completion_hint(
     }
 
     let scores = build_read_only_evidence_scores(root_user_text, plan, evidence);
+    let single_target = single_observed_read_target(evidence);
+    let medium_threshold = if single_target.is_some() { 0.55 } else { 0.60 };
     let strong: Vec<&CriterionEvidenceScore> =
         scores.iter().filter(|score| score.total >= 0.85).collect();
-    let medium_or_better = scores.iter().filter(|score| score.total >= 0.60).count();
-    if strong.is_empty() || medium_or_better < 2 {
+    let medium_or_better = scores
+        .iter()
+        .filter(|score| score.total >= medium_threshold)
+        .count();
+    let completed_scores: Vec<&CriterionEvidenceScore> =
+        if !strong.is_empty() && medium_or_better >= 2 {
+            strong
+        } else if single_target.is_some() && medium_or_better >= 2 {
+            scores
+                .iter()
+                .filter(|score| score.total >= medium_threshold)
+                .collect()
+        } else if single_target.is_some() {
+            scores.iter().collect()
+        } else {
+            return None;
+        };
+
+    if completed_scores.is_empty() {
         return None;
     }
 
@@ -206,11 +245,11 @@ pub(super) fn build_read_only_completion_hint(
         &collect_known_acceptance_commands(messages, working_mem),
         evidence,
     );
-    let cite_commands: Vec<String> = strong
+    let cite_commands: Vec<String> = completed_scores
         .iter()
         .filter_map(|score| preferred_done_command_for_score(score, &known_commands, evidence))
         .chain(
-            strong
+            completed_scores
                 .iter()
                 .flat_map(|score| score.suggested_commands.iter().cloned()),
         )
@@ -227,7 +266,7 @@ pub(super) fn build_read_only_completion_hint(
             acc
         });
 
-    let completed_lines = strong
+    let completed_lines = completed_scores
         .iter()
         .take(2)
         .map(|score| {
@@ -279,8 +318,14 @@ pub(super) fn build_read_only_iteration_cap_final_answer(
     }
 
     let scores = build_read_only_evidence_scores(root_user_text, plan, evidence);
-    let medium_or_better = scores.iter().filter(|score| score.total >= 0.60).count();
-    if medium_or_better < 2 {
+    let single_target = single_observed_read_target(evidence);
+    let medium_threshold = if single_target.is_some() { 0.55 } else { 0.60 };
+    let completion_threshold = if single_target.is_some() { 0.55 } else { 0.70 };
+    let medium_or_better = scores
+        .iter()
+        .filter(|score| score.total >= medium_threshold)
+        .count();
+    if medium_or_better < 2 && single_target.is_none() {
         return None;
     }
 
@@ -290,7 +335,7 @@ pub(super) fn build_read_only_iteration_cap_final_answer(
     );
     let mut completed_rows: Vec<(usize, String)> = scores
         .iter()
-        .filter(|score| score.total >= 0.70)
+        .filter(|score| single_target.is_some() || score.total >= completion_threshold)
         .filter_map(|score| {
             let command = preferred_done_command_for_score(score, &known_commands, evidence)?;
             Some((score.idx, command))
@@ -805,5 +850,113 @@ mod tests {
                 (1, "read_file(path=src/tui/agent.rs)".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn completion_hint_accepts_single_observed_generic_target_after_read() {
+        let plan = synthetic_read_only_observation_plan(
+            "Locate where project-local profile aliases are loaded for the greet command. Do not edit anything.",
+        );
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"aliases\",\"dir\":\"src\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: 'aliases' — 7 match(es)]\nsrc/config.rs:7:     pub aliases: BTreeMap<String, String>,"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/config.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/config.rs] (39 lines, 1136 bytes)\npub fn resolve_profile_alias(root: &Path, requested: Option<&str>, config: &AppConfig) -> String {"
+            }),
+        ];
+        let evidence = collect_observation_evidence(&messages);
+
+        let hint = build_read_only_completion_hint(
+            "Locate where project-local profile aliases are loaded for the greet command. Do not edit anything.",
+            &plan,
+            &evidence,
+            &messages,
+            &WorkingMemory::default(),
+        )
+        .expect("completion hint");
+
+        assert!(hint.contains("call done directly now"));
+        assert!(hint.contains("src/config.rs"));
+    }
+
+    #[test]
+    fn iteration_cap_final_answer_supports_single_observed_generic_target() {
+        let plan = synthetic_read_only_observation_plan(
+            "Locate where project-local profile aliases are loaded for the greet command. Do not edit anything.",
+        );
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"aliases\",\"dir\":\"src\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: 'aliases' — 7 match(es)]\nsrc/config.rs:7:     pub aliases: BTreeMap<String, String>,"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/config.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/config.rs] (39 lines, 1136 bytes)\npub fn resolve_profile_alias(root: &Path, requested: Option<&str>, config: &AppConfig) -> String {"
+            }),
+        ];
+        let evidence = collect_observation_evidence(&messages);
+
+        let final_text = build_read_only_iteration_cap_final_answer(
+            "Locate where project-local profile aliases are loaded for the greet command. Do not edit anything.",
+            &plan,
+            &evidence,
+            &messages,
+            &WorkingMemory::default(),
+        )
+        .expect("final answer");
+
+        assert!(final_text.contains("src/config.rs"));
+        assert!(final_text.contains("read_file(path=src/config.rs)"));
     }
 }
