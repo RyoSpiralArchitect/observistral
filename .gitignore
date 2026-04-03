@@ -34,6 +34,7 @@ __pycache__/
 .tmp/
 .spiral/
 tests/_tmp/
+.DS_Store
 
 # Local scratch projects created during demos/tests (keep out of git)
 MazeGame/
