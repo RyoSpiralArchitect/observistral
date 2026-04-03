@@ -38,6 +38,18 @@
         { "kind": "tool_call_seen", "name": "read_file" },
         { "kind": "assistant_contains", "value": "src/tui/agent.rs" }
       ]
+    },
+    {
+      "id": "sandbox-config-alias-loading",
+      "tool_root": "tests/fixtures/mini-rust-cli",
+      "tags": ["sandbox", "rust", "config", "read-only"],
+      "prompt": "Locate where project-local profile aliases are loaded for the greet command. Do not edit anything. Final answer must include the main file path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "assistant_contains", "value": "src/config.rs" }
+      ]
     }
   ]
 }

@@ -311,7 +311,8 @@ pub(super) fn normalize_mistral_tool_call(
 pub(super) fn build_mistral_think_only_hint(root_user_text: &str, think: &ThinkBlock) -> String {
     let pattern = preferred_read_only_search_pattern(root_user_text);
     let dir = preferred_read_only_search_dir(root_user_text);
-    let read_path = preferred_read_only_read_path_hint(root_user_text);
+    let read_path = preferred_read_only_read_path_hint(root_user_text)
+        .unwrap_or("<matching file from the latest successful search>");
     let tool = think.tool.trim();
     let suggested = match tool {
         "search_files" => format!("search_files(pattern=\"{pattern}\", dir=\"{dir}\")"),

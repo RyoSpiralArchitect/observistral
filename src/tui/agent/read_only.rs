@@ -228,13 +228,13 @@ pub(super) fn preferred_read_only_search_dir(root_user_text: &str) -> &'static s
     }
 }
 
-pub(super) fn preferred_read_only_read_path_hint(root_user_text: &str) -> &'static str {
+pub(super) fn preferred_read_only_read_path_hint(root_user_text: &str) -> Option<&'static str> {
     if task_prefers_prefs_path(root_user_text, "") {
-        "src/tui/prefs.rs"
+        Some("src/tui/prefs.rs")
     } else if task_prefers_agent_flow_path(root_user_text, "") {
-        "src/tui/agent.rs"
+        Some("src/tui/agent.rs")
     } else {
-        "src/tui/events.rs"
+        None
     }
 }
 
@@ -370,18 +370,29 @@ pub(super) fn best_read_only_followup_read_path(
         .iter()
         .map(|read| normalize_for_signature(&read.path))
         .collect();
-    let criteria_blob = plan.acceptance_criteria.join(" ; ");
-    let mut candidate_paths: Vec<String> = search_paths.to_vec();
-    let preferred_path = preferred_read_only_read_path_hint(root_user_text).to_string();
-    if !candidate_paths.iter().any(|path| {
-        normalize_for_signature(path.as_str()) == normalize_for_signature(preferred_path.as_str())
-    }) {
-        candidate_paths.push(preferred_path.clone());
+    let mut observed_candidates: Vec<String> = Vec::new();
+    for path in search_paths.iter().filter(|path| !path.trim().is_empty()) {
+        if already_read.contains(&normalize_for_signature(path)) {
+            continue;
+        }
+        remember_recent_unique(&mut observed_candidates, path.as_str(), 8, 160);
     }
-    candidate_paths
+    if observed_candidates.len() == 1 {
+        return observed_candidates.into_iter().next();
+    }
+    if let Some(preferred_path) = preferred_read_only_read_path_hint(root_user_text) {
+        if !observed_candidates.iter().any(|path| {
+            normalize_for_signature(path.as_str()) == normalize_for_signature(preferred_path)
+        }) {
+            observed_candidates.push(preferred_path.to_string());
+        }
+    }
+    if observed_candidates.is_empty() {
+        return None;
+    }
+    let criteria_blob = plan.acceptance_criteria.join(" ; ");
+    observed_candidates
         .iter()
-        .filter(|path| !path.trim().is_empty())
-        .filter(|path| !already_read.contains(&normalize_for_signature(path)))
         .map(|path| {
             let mut score =
                 path_prior_score(path, root_user_text, &plan.goal, criteria_blob.as_str());
@@ -403,10 +414,11 @@ pub(super) fn best_read_only_followup_read_path(
                     score = (score - 0.25).clamp(0.0, 1.0);
                 }
             }
-            if normalize_for_signature(path.as_str())
-                == normalize_for_signature(preferred_path.as_str())
-            {
-                score = (score + 0.20).clamp(0.0, 1.0);
+            if let Some(preferred_path) = preferred_read_only_read_path_hint(root_user_text) {
+                if normalize_for_signature(path.as_str()) == normalize_for_signature(preferred_path)
+                {
+                    score = (score + 0.20).clamp(0.0, 1.0);
+                }
             }
             (score, path)
         })
@@ -567,7 +579,6 @@ pub(super) fn build_read_only_plan_rewrite_hint(root_user_text: &str) -> String 
     let pattern = preferred_read_only_search_pattern(root_user_text);
     let dir = preferred_read_only_search_dir(root_user_text);
     let secondary_pattern = preferred_read_only_secondary_search_pattern(root_user_text);
-    let read_path = preferred_read_only_read_path_hint(root_user_text);
     let (accept1, accept2, risks) = synthetic_read_only_acceptance(root_user_text);
     let step1 = format!("search_files(pattern=\"{pattern}\", dir=\"{dir}\")");
     let step2 = secondary_pattern
@@ -587,7 +598,7 @@ assumptions: 1) observation tools are sufficient 2) no edits or behavioral verif
 </plan>\n\
 Then emit <think> and call ONE tool immediately after it.\n\
 Suggested next tool: search_files(pattern=\"{pattern}\", dir=\"{dir}\")\n\
-If you already have a strong hit, use read_file(path=\"{read_path}\") instead."
+If you already have a strong hit, read that matching file instead of searching again."
     )
 }
 
@@ -671,5 +682,46 @@ pub(super) fn coerce_read_only_observation_tool_call(
             rewrite_tool_call_to_search_files(tc, preferred_pattern.as_str(), preferred_dir)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_observed_search_hit_becomes_followup_read_even_for_generic_task() {
+        let prompt = "Locate where project-local profile aliases are loaded for the greet command.";
+        let plan = synthetic_read_only_observation_plan(prompt);
+
+        let path = best_read_only_followup_read_path(
+            prompt,
+            &plan,
+            &[String::from("src/config.rs")],
+            &ObservationEvidence::default(),
+        );
+
+        assert_eq!(path.as_deref(), Some("src/config.rs"));
+    }
+
+    #[test]
+    fn generic_followup_does_not_invent_repo_specific_runtime_path() {
+        let prompt = "Locate where project-local profile aliases are loaded for the greet command.";
+        let plan = synthetic_read_only_observation_plan(prompt);
+
+        let path =
+            best_read_only_followup_read_path(prompt, &plan, &[], &ObservationEvidence::default());
+
+        assert_eq!(path, None);
+    }
+
+    #[test]
+    fn generic_plan_rewrite_hint_avoids_events_rs_default() {
+        let hint = build_read_only_plan_rewrite_hint(
+            "Locate where project-local profile aliases are loaded for the greet command.",
+        );
+
+        assert!(hint.contains("read that matching file instead of searching again."));
+        assert!(!hint.contains("src/tui/events.rs"));
     }
 }
