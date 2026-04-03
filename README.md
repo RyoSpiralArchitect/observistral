@@ -15,7 +15,7 @@ Every AI coding tool has the same problem: the model that writes your code also 
 
 That's not a review. That's a self-defense monologue.
 
-OBSTRAL fixes this by running Coder and Observer in **completely separate contexts**. The Observer has never seen a single line of your code being written. It only sees the output. That's what makes it honest.
+OBSTRAL fixes this by running Coder and Observer in **completely separate contexts**. The Observer does not share the Coder's live working context or hidden scratchpad. It critiques outputs, transcripts, and optional git diff snapshots after the fact. That's what keeps it honest.
 
 ---
 
@@ -34,7 +34,7 @@ It's a development control engine.
 | Role | What it does | What it never does |
 |---|---|---|
 | **Coder** | Acts — files, shell commands, agentic loop (up to 12 steps), 5 built-in tools | Review or second-guess its own work |
-| **Observer** | Critiques — scores every proposal, escalates what you ignore | Touch any code. It only reads. |
+| **Observer** | Critiques — scores every proposal, escalates what you ignore | Write code or share the Coder's live working context |
 | **Chat** | Thinks with you — design, rubber duck, tradeoffs | Interrupt the execution loop |
 
 Different roles. Different models if you want. Different contexts always.
@@ -103,7 +103,7 @@ The runtime now also detects when a repo-map is ready and can use it as a lazy f
 
 Other tools: same model writes code → same model reviews code → model defends its own choices.
 
-OBSTRAL: fresh context for every Observer run. The Observer doesn't know what it *would have* written. It only judges what it sees.
+OBSTRAL: fresh context for every Observer run. The Observer doesn't know what it *would have* written, and it doesn't share the Coder's live scratchpad. It judges emitted outputs, transcripts, and optional diff snapshots after they exist.
 
 Result: sharper feedback, honest risk assessment, no defensive hedging.
 
@@ -559,7 +559,7 @@ Today `health` rolls up:
 
 ### Approvals
 
-- **Web UI**: edits/commands can queue as pending items. Approve/reject from the browser.
+- **Web UI**: edits/commands queue as pending items in **Settings**. A header badge jumps straight to the pending approvals list, where you can approve/reject from the browser.
 - **CLI (`obstral agent`)**: prompts before running `exec` and applying file edits (`write_file` / `patch_file` / `apply_diff`). Use `-y/--yes` or `--no-approvals` to skip prompts.
 - **TUI**: currently auto-approves tool actions.
 

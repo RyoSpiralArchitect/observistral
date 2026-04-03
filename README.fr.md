@@ -15,7 +15,7 @@ Tous les outils de code IA ont le meme probleme : le modele qui ecrit votre code
 
 Ce n'est pas une revue de code. C'est un monologue de defense.
 
-OBSTRAL resout ca en faisant tourner Coder et Observer dans des **contextes entierement separes**. L'Observer n'a vu aucune ligne de votre code en cours d'ecriture. Il ne connait que le resultat. C'est ce qui le rend honnete.
+OBSTRAL resout ca en faisant tourner Coder et Observer dans des **contextes entierement separes**. L'Observer ne partage ni le contexte de travail en direct du Coder ni son scratchpad cache. Il critique les sorties, les transcripts et, si necessaire, des snapshots de `git diff` apres coup. C'est ce qui le rend honnete.
 
 ---
 
@@ -34,7 +34,7 @@ C'est un moteur de controle du processus de developpement.
 | Role | Ce qu'il fait | Ce qu'il ne fait jamais |
 |---|---|---|
 | **Coder** | Agit — fichiers, commandes shell, boucle agentique (12 etapes max), 5 outils integres | Relire ou remettre en question son propre travail |
-| **Observer** | Critique — score chaque proposition, escalade ce que vous ignorez | Toucher au code. Il lit seulement. |
+| **Observer** | Critique — score chaque proposition, escalade ce que vous ignorez | Ecrire du code ou partager le contexte de travail en direct du Coder |
 | **Chat** | Reflechit avec vous — conception, canard en plastique, compromis | Interrompre la boucle d'execution |
 
 Roles distincts. Modeles distincts si vous le souhaitez. Contextes toujours distincts.
@@ -82,7 +82,7 @@ L'analyse s'execute une fois par session, prend moins de 200 ms et ignore silenc
 
 Autres outils : meme modele ecrit le code → meme modele le relit → modele defend ses propres choix.
 
-OBSTRAL : contexte vierge a chaque execution de l'Observer. Il ne sait pas ce qu'il *aurait* ecrit. Il juge uniquement ce qu'il voit.
+OBSTRAL : contexte vierge a chaque execution de l'Observer. Il ne sait pas ce qu'il *aurait* ecrit et ne partage pas le scratchpad vivant du Coder. Il juge uniquement les sorties, les transcripts et, si besoin, les snapshots de diff.
 
 Resultat : feedbacks plus tranchants, evaluation de risques honnete, pas de demi-mesures.
 

@@ -61,6 +61,8 @@
       noMatches: "No matches",
       pendingEdits: "Pending edits",
       pendingCommands: "Pending commands",
+      approvals: "Approvals",
+      openApprovals: "Open approvals",
       approve: "Approve",
       reject: "Reject",
       send: "Send",
@@ -273,6 +275,8 @@
       commandApproval: "コマンド承認",
       pendingEdits: "保留中の編集",
       pendingCommands: "保留中のコマンド",
+      approvals: "承認",
+      openApprovals: "保留中の承認",
       approve: "承認",
       reject: "却下",
       metaDiagnose: "メタ診断",
@@ -341,6 +345,8 @@
       noMatches: "Aucun résultat",
       pendingEdits: "Éditions en attente",
       pendingCommands: "Commandes en attente",
+      approvals: "Approbations",
+      openApprovals: "Approbations en attente",
       approve: "Approuver",
       reject: "Rejeter",
       send: "Envoyer",
@@ -3718,6 +3724,8 @@
     const [projectScan, setProjectScan] = useState(null);
     const [projectScanLoading, setProjectScanLoading] = useState(false);
     const projectScanRootRef = useRef("");
+    const settingsPanelRef = useRef(null);
+    const approvalsSectionRef = useRef(null);
     const [gitCheckpoint, setGitCheckpoint] = useState(null);
 
     const [threadState, setThreadState] = useState(() => {
@@ -4147,6 +4155,18 @@
         .then((r) => r.json())
         .then((j) => setPendingCommands(j && Array.isArray(j.pending) ? j.pending : []))
         .catch(() => {});
+    };
+
+    const pendingApprovalCount = (pendingEdits ? pendingEdits.length : 0) + (pendingCommands ? pendingCommands.length : 0);
+
+    const jumpToPendingApprovals = () => {
+      const target = approvalsSectionRef.current || settingsPanelRef.current;
+      if (!target || typeof target.scrollIntoView !== "function") return;
+      try {
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+      } catch (_) {
+        target.scrollIntoView();
+      }
     };
 
     useEffect(() => {
@@ -9971,6 +9991,18 @@ state: ${agentState}`);
               e("button", { className: "seg-btn " + (lang === "fr" ? "active" : ""), onClick: () => setLang("fr") }, "FR")
             ),
             e("button", { className: "btn", onClick: refreshStatus, type: "button" }, tr(lang, "refresh")),
+            pendingApprovalCount
+              ? e(
+                  "button",
+                  {
+                    className: "btn btn-warn",
+                    onClick: jumpToPendingApprovals,
+                    type: "button",
+                    title: tr(lang, "openApprovals"),
+                  },
+                  `${tr(lang, "approvals")} ${pendingApprovalCount}`
+                )
+              : null,
             e("button", {
               className: "btn btn-icon",
               title: tr(lang, "shortcuts") + " (?)",
@@ -10095,8 +10127,15 @@ state: ${agentState}`);
           ),
           e(
             "div",
-            { className: "panel" },
-            e("div", { className: "panel-header" }, e("h2", null, tr(lang, "settings"))),
+            { className: "panel", ref: settingsPanelRef },
+            e(
+              "div",
+              { className: "panel-header" },
+              e("h2", null, tr(lang, "settings")),
+              pendingApprovalCount
+                ? e("span", { className: "pill", title: tr(lang, "openApprovals") }, `${tr(lang, "approvals")}: ${pendingApprovalCount}`)
+                : null
+            ),
             e(
               "div",
               { className: "panel-body" },
@@ -10785,7 +10824,7 @@ state: ${agentState}`);
               ),
               e(
                 "div",
-                { className: "field", style: { marginTop: "10px" } },
+                { className: "field", style: { marginTop: "10px" }, ref: approvalsSectionRef },
                 e("label", null, tr(lang, "pendingEdits")),
                 pendingEdits && pendingEdits.length
                   ? e(
