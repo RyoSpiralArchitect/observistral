@@ -409,6 +409,14 @@ obstral agent "fix the failing test" -C . --vibe --trace-out .tmp/obstral_trace.
 obstral eval -C . --spec .obstral/runtime_eval.json
 obstral eval -C . --spec .obstral/runtime_eval.json --filter repo-map --continue-on-error
 
+# inspect repo/runtime inventory surfaces
+obstral inventory health -C .
+obstral inventory health -C . --json
+obstral inventory health -C . --ci --fail-on yellow
+obstral inventory manifest -C .
+obstral inventory parity -C .
+obstral inventory replay-status -C . --json
+
 # auto-fix loop (Coder → Observer diff review → Coder)
 obstral agent "fix the failing test" -C . --vibe --autofix
 obstral agent "fix the failing test" -C . --vibe --autofix 3
@@ -509,6 +517,45 @@ Current v1 guidance:
 - eval runs non-interactively so cases must not rely on manual approvals
 - scoring is artifact-based today: completion, errors, tool usage, assistant output, graph size
 - the report also surfaces light telemetry from traces: iterations, repo-map fallback hits, governor/recovery pressure, and realize summary counters
+
+### Inventory / Parity CLI
+
+`obstral inventory` prints lightweight repo/runtime inventory views for ops and parity work.
+
+Examples:
+
+```bash
+obstral inventory health -C .
+obstral inventory health -C . --json
+obstral inventory health -C . --ci --fail-on yellow
+obstral inventory manifest -C .
+obstral inventory commands -C .
+obstral inventory tools -C .
+obstral inventory state -C .
+obstral inventory replay-status -C . --json
+obstral inventory parity -C .
+```
+
+Current views:
+- `health`: top-level green/yellow/red ops snapshot with next actions
+- `manifest`: package/provider/mode/persona/spec/docs/state snapshot
+- `commands`: top-level CLI commands plus TUI slash commands
+- `tools`: built-in Coder tool definitions and required args
+- `state`: typed state ownership / persistence / health snapshot
+- `replay-status`: runtime-eval / TUI-replay spec counts plus latest reports under `.tmp/`
+- `parity`: high-level implemented/partial/missing map for quality and runtime surfaces
+
+`health` is the intended entry point for automation:
+- `--json`: stable machine-readable output for scripts/CI
+- `--ci --fail-on red|yellow`: exit non-zero when health crosses the chosen threshold
+
+Today `health` rolls up:
+- latest runtime-eval proof
+- latest TUI-replay proof
+- typed state readiness
+- split-module progress
+- surface parity status
+- proof freshness (`fresh/recent/stale/old/missing`)
 
 ### Approvals
 

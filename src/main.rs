@@ -28,7 +28,8 @@ mod types;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tokio::sync::mpsc;
 
 use crate::chatbot::ChatBot;
@@ -73,6 +74,9 @@ enum Command {
 
     /// Replay a deterministic TUI stuck-case and inspect Observer suggestion plumbing
     TuiReplay(TuiReplayArgs),
+
+    /// Print an internal manifest / parity / replay inventory for this repo
+    Inventory(InventoryArgs),
 
     /// Review `git diff` with Observer (or diff批評) and print critique
     Review(ReviewArgs),
@@ -259,6 +263,128 @@ struct TuiReplayArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+struct InventoryArgs {
+    /// Directory to inspect (defaults to current directory)
+    #[arg(long, short = 'C', alias = "root")]
+    tool_root: Option<String>,
+
+    #[arg(value_enum, default_value = "manifest")]
+    what: InventoryWhat,
+
+    /// Emit machine-readable JSON instead of plain text
+    #[arg(long)]
+    json: bool,
+
+    /// Exit non-zero when inventory health meets the selected failure threshold
+    #[arg(long)]
+    ci: bool,
+
+    /// Failure threshold for `--ci` health checks
+    #[arg(long, value_enum, default_value = "red")]
+    fail_on: InventoryFailOn,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum InventoryWhat {
+    Health,
+    Manifest,
+    Commands,
+    Tools,
+    ReplayStatus,
+    Parity,
+    State,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum InventoryFailOn {
+    Red,
+    Yellow,
+}
+
+const INVENTORY_CLI_COMMANDS: &[(&str, &str)] = &[
+    ("chat", "one-shot chat prompt"),
+    ("agent", "headless coding agent loop"),
+    ("eval", "fixture-driven runtime eval harness"),
+    ("tui-replay", "deterministic TUI stuck-case replay"),
+    ("inventory", "repo/runtime manifest and parity surfaces"),
+    ("review", "Observer review over git diff"),
+    ("init", "write .obstral.md template"),
+    ("repl", "interactive REPL"),
+    ("serve", "local web UI + JSON API"),
+    ("tui", "dual-pane terminal UI"),
+    ("list", "list providers/modes/personas"),
+];
+
+const INVENTORY_SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/provider", "set pane provider"),
+    ("/base_url", "set pane base URL"),
+    ("/model", "set pane model"),
+    ("/mode", "set pane mode"),
+    ("/persona", "set pane persona"),
+    ("/temp", "set pane temperature"),
+    ("/lang", "set UI language"),
+    ("/tab", "switch right-side tab"),
+    ("/keys", "show key help"),
+    ("/realize", "set coder realize preset"),
+    ("/root", "switch project root"),
+    ("/find", "locate a message"),
+    ("/autofix", "set autofix rounds"),
+    ("/diff", "load diff into pane"),
+    ("/init", "write .obstral.md"),
+    ("/rollback", "restore git checkpoint"),
+    ("/help", "show slash help"),
+    ("/meta-diagnose", "Observer meta diagnosis of a failure"),
+];
+
+const INVENTORY_PARITY_TARGETS: &[(&str, &str, &str)] = &[
+    (
+        "runtime_eval",
+        "quality",
+        "headless coder fixture harness with per-case reports",
+    ),
+    (
+        "tui_replay",
+        "quality",
+        "deterministic observer/coder stuck-case replay",
+    ),
+    (
+        "repo_map",
+        "retrieval",
+        "offline repo-map indexing plus runtime fallback hooks",
+    ),
+    (
+        "observer_soft_hint",
+        "observer",
+        "typed Observer suggestion routed back as advisory-only coder hint",
+    ),
+    (
+        "intent_anchor",
+        "memory",
+        "intent normalization and anchor-driven drift baseline",
+    ),
+    (
+        "resolution_memory",
+        "memory",
+        "canonical path/evidence memory for typo and alias repair",
+    ),
+    (
+        "typed_state_docs",
+        "ops",
+        "documented ownership for prefs/session/intent/runtime state",
+    ),
+    (
+        "agent_split_plan",
+        "ops",
+        "module split plan for the high-churn coder loop",
+    ),
+    (
+        "surface_parity",
+        "ux",
+        "headless/TUI/Web surfaces staying aligned enough for reuse",
+    ),
+];
+
+#[derive(Args, Debug, Clone)]
 struct InitArgs {
     /// Directory to write `.obstral.md` into (defaults to current directory)
     #[arg(long, short = 'C', alias = "root")]
@@ -363,6 +489,7 @@ async fn main() -> Result<()> {
         Some(Command::Agent(args)) => run_agent(args, cli.common).await,
         Some(Command::Eval(args)) => run_eval(args, cli.common).await,
         Some(Command::TuiReplay(args)) => tui_replay::run(args, cli.common).await,
+        Some(Command::Inventory(args)) => run_inventory(args).await,
         Some(Command::Review(args)) => run_review(args, cli.common).await,
         Some(Command::Init(args)) => run_init(args, cli.common).await,
         Some(Command::Repl) => repl::run(cli.common.to_partial_config()).await,
@@ -411,6 +538,1232 @@ fn run_list(what: ListWhat) {
                 } else {
                     println!("{p}\t{label}");
                 }
+            }
+        }
+    }
+}
+
+async fn run_inventory(args: InventoryArgs) -> Result<()> {
+    let root = args.tool_root.clone().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    let root = PathBuf::from(root.unwrap_or_else(|| ".".to_string()));
+
+    let value = match args.what {
+        InventoryWhat::Health => build_inventory_health(&root)?,
+        InventoryWhat::Manifest => build_inventory_manifest(&root)?,
+        InventoryWhat::Commands => build_inventory_commands(),
+        InventoryWhat::Tools => build_inventory_tools(),
+        InventoryWhat::ReplayStatus => build_inventory_replay_status(&root)?,
+        InventoryWhat::Parity => build_inventory_parity(&root)?,
+        InventoryWhat::State => build_inventory_state(&root)?,
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).context("failed to serialize inventory json")?
+        );
+    } else {
+        match args.what {
+            InventoryWhat::Health => print_inventory_health(&value),
+            InventoryWhat::Manifest => print_inventory_manifest(&value),
+            InventoryWhat::Commands => print_inventory_commands(&value),
+            InventoryWhat::Tools => print_inventory_tools(&value),
+            InventoryWhat::ReplayStatus => print_inventory_replay_status(&value),
+            InventoryWhat::Parity => print_inventory_parity(&value),
+            InventoryWhat::State => print_inventory_state(&value),
+        }
+    }
+
+    if args.ci {
+        enforce_inventory_ci(&args, &value)?;
+    }
+    Ok(())
+}
+
+fn enforce_inventory_ci(args: &InventoryArgs, value: &serde_json::Value) -> Result<()> {
+    if !matches!(args.what, InventoryWhat::Health) {
+        anyhow::bail!("--ci is only supported with `obstral inventory health`");
+    }
+    let overall = value
+        .get("overall")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let should_fail = match args.fail_on {
+        InventoryFailOn::Red => overall == "red",
+        InventoryFailOn::Yellow => matches!(overall, "yellow" | "red"),
+    };
+    if should_fail {
+        anyhow::bail!(
+            "inventory health check failed (overall={overall}, fail_on={})",
+            match args.fail_on {
+                InventoryFailOn::Red => "red",
+                InventoryFailOn::Yellow => "yellow",
+            }
+        );
+    }
+    Ok(())
+}
+
+fn build_inventory_health(root: &Path) -> Result<serde_json::Value> {
+    let parity = build_inventory_parity(root)?;
+    let state = build_inventory_state(root)?;
+    let replay = build_inventory_replay_status(root)?;
+    let runtime_latest = replay
+        .get("runtime_eval")
+        .and_then(|v| v.get("latest_report"));
+    let tui_latest = replay
+        .get("tui_replay")
+        .and_then(|v| v.get("latest_report"));
+    let runtime_freshness = inventory_report_freshness(runtime_latest);
+    let tui_freshness = inventory_report_freshness(tui_latest);
+
+    let runtime_green = parity
+        .get("health")
+        .and_then(|v| v.get("latest_runtime_eval_green"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let tui_replay_green = parity
+        .get("health")
+        .and_then(|v| v.get("latest_tui_replay_green"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let split_modules_present = parity
+        .get("health")
+        .and_then(|v| v.get("split_modules_present"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let parity_missing = parity
+        .get("summary")
+        .and_then(|v| v.get("missing"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let state_missing = state
+        .get("summary")
+        .and_then(|v| v.get("missing"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let prefs_present = state
+        .get("health")
+        .and_then(|v| v.get("prefs_file_present"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let runtime_spec_present = state
+        .get("health")
+        .and_then(|v| v.get("runtime_eval_spec_present"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let tui_replay_spec_present = state
+        .get("health")
+        .and_then(|v| v.get("tui_replay_spec_present"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut checks = vec![
+        json!({
+            "key": "runtime_eval_proof",
+            "ok": runtime_green,
+            "severity": if runtime_green { "info" } else { "warn" },
+            "detail": if runtime_green { "latest runtime eval report is green" } else { "latest runtime eval proof is missing or stale" },
+            "freshness": runtime_freshness,
+        }),
+        json!({
+            "key": "tui_replay_proof",
+            "ok": tui_replay_green,
+            "severity": if tui_replay_green { "info" } else { "warn" },
+            "detail": if tui_replay_green { "latest TUI replay report is green" } else { "latest TUI replay proof is missing or stale" },
+            "freshness": tui_freshness,
+        }),
+        json!({
+            "key": "typed_state",
+            "ok": state_missing == 0,
+            "severity": if state_missing == 0 { "info" } else { "error" },
+            "detail": format!("state inventory missing layers: {state_missing}"),
+        }),
+        json!({
+            "key": "split_progress",
+            "ok": split_modules_present >= 4,
+            "severity": if split_modules_present >= 4 { "info" } else { "warn" },
+            "detail": format!("split modules present: {split_modules_present}/4"),
+        }),
+        json!({
+            "key": "surface_parity",
+            "ok": parity_missing == 0,
+            "severity": if parity_missing == 0 { "info" } else { "warn" },
+            "detail": format!("parity missing surfaces: {parity_missing}"),
+        }),
+        json!({
+            "key": "local_state_files",
+            "ok": prefs_present && runtime_spec_present && tui_replay_spec_present,
+            "severity": if prefs_present && runtime_spec_present && tui_replay_spec_present { "info" } else { "warn" },
+            "detail": format!(
+                "prefs={} runtime_eval_spec={} tui_replay_spec={}",
+                prefs_present, runtime_spec_present, tui_replay_spec_present
+            ),
+        }),
+        json!({
+            "key": "proof_freshness",
+            "ok": matches!(runtime_freshness, "fresh" | "recent" | "missing")
+                && matches!(tui_freshness, "fresh" | "recent" | "missing"),
+            "severity": if matches!(runtime_freshness, "old") || matches!(tui_freshness, "old") {
+                "warn"
+            } else {
+                "info"
+            },
+            "detail": format!("runtime_eval={} tui_replay={}", runtime_freshness, tui_freshness),
+        }),
+    ];
+
+    let red = checks.iter().any(|c| {
+        !c.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
+            && c.get("severity").and_then(|v| v.as_str()) == Some("error")
+    });
+    let yellow = checks
+        .iter()
+        .any(|c| !c.get("ok").and_then(|v| v.as_bool()).unwrap_or(false));
+    let overall = if red {
+        "red"
+    } else if yellow {
+        "yellow"
+    } else {
+        "green"
+    };
+
+    let mut next_actions = Vec::new();
+    if !runtime_green {
+        next_actions.push(json!({
+            "key": "runtime_eval_proof",
+            "action": "run `obstral eval -C . --spec .obstral/runtime_eval.json`"
+        }));
+    }
+    if !tui_replay_green {
+        next_actions.push(json!({
+            "key": "tui_replay_proof",
+            "action": "run `obstral tui-replay -C . --spec .obstral/tui_replay.json`"
+        }));
+    }
+    if split_modules_present < 4 {
+        next_actions.push(json!({
+            "key": "split_progress",
+            "action": "continue extracting high-churn logic from src/tui/agent.rs"
+        }));
+    }
+    if !prefs_present {
+        next_actions.push(json!({
+            "key": "local_state_files",
+            "action": "open the TUI once and persist project-local prefs into .obstral/tui_prefs.json"
+        }));
+    }
+    if matches!(runtime_freshness, "stale" | "old") && runtime_green {
+        next_actions.push(json!({
+            "key": "runtime_eval_proof",
+            "action": "refresh runtime eval proof so health reflects current behavior"
+        }));
+    }
+    if matches!(tui_freshness, "stale" | "old") && tui_replay_green {
+        next_actions.push(json!({
+            "key": "tui_replay_proof",
+            "action": "refresh TUI replay proof so observer hint health stays current"
+        }));
+    }
+
+    checks.sort_by_key(
+        |c| match c.get("severity").and_then(|v| v.as_str()).unwrap_or("info") {
+            "error" => 0,
+            "warn" => 1,
+            _ => 2,
+        },
+    );
+
+    Ok(json!({
+        "overall": overall,
+        "freshness": {
+            "runtime_eval": runtime_freshness,
+            "tui_replay": tui_freshness,
+        },
+        "checks": checks,
+        "next_actions": next_actions,
+        "state": state,
+        "parity": parity,
+        "replay_status": replay,
+    }))
+}
+
+fn build_inventory_manifest(root: &Path) -> Result<serde_json::Value> {
+    let cargo_toml = root.join("Cargo.toml");
+    let cargo_text = std::fs::read_to_string(&cargo_toml).unwrap_or_default();
+    let package_name = inventory_toml_value(&cargo_text, "name");
+    let package_version = inventory_toml_value(&cargo_text, "version");
+    let runtime_spec_path = root.join(".obstral/runtime_eval.json");
+    let tui_replay_spec_path = root.join(".obstral/tui_replay.json");
+    let runtime_cases = crate::runtime_eval::load_spec(&runtime_spec_path)
+        .map(|spec| spec.cases.len())
+        .unwrap_or(0);
+    let tui_replay_cases = std::fs::read_to_string(&tui_replay_spec_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<crate::tui_replay::TuiReplaySpec>(&text).ok())
+        .map(|spec| spec.cases.len())
+        .unwrap_or(0);
+    let providers = crate::config::supported_provider_presets(false)
+        .into_iter()
+        .map(|preset| {
+            json!({
+                "key": preset.key(),
+                "default_model": preset.default_model(false),
+                "coder_supported": preset.coder_supported(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let personas = crate::personas::supported_personas()
+        .into_iter()
+        .map(|key| {
+            let label = crate::personas::resolve_persona(key)
+                .map(|p| p.label)
+                .unwrap_or("");
+            json!({ "key": key, "label": label })
+        })
+        .collect::<Vec<_>>();
+    let docs = [
+        "README.md",
+        "AGENTS.md",
+        "docs/runtime-architecture.md",
+        "docs/state-schema.md",
+        "docs/tui-agent-split-plan.md",
+    ]
+    .into_iter()
+    .map(|rel| {
+        let path = root.join(rel);
+        json!({
+            "path": rel,
+            "exists": path.exists(),
+        })
+    })
+    .collect::<Vec<_>>();
+    let split_modules = [
+        "src/tui/agent/done_gate.rs",
+        "src/tui/agent/read_only.rs",
+        "src/tui/agent/provider_compat.rs",
+        "src/tui/agent/memory.rs",
+    ]
+    .into_iter()
+    .map(|rel| {
+        json!({
+            "path": rel,
+            "exists": root.join(rel).exists(),
+        })
+    })
+    .collect::<Vec<_>>();
+
+    Ok(json!({
+        "root": root,
+        "package": {
+            "name": package_name,
+            "version": package_version,
+        },
+        "providers": providers,
+        "modes": crate::modes::supported_modes(),
+        "personas": personas,
+        "specs": {
+            "runtime_eval_cases": runtime_cases,
+            "tui_replay_cases": tui_replay_cases,
+        },
+        "docs": docs,
+        "state_files": [
+            ".obstral/runtime_eval.json",
+            ".obstral/tui_replay.json",
+            ".obstral/tui_prefs.json",
+            ".obstral/repo_map.config.json",
+            ".obstral/repo_map.eval.json",
+        ],
+        "split_modules": split_modules,
+    }))
+}
+
+fn build_inventory_commands() -> serde_json::Value {
+    json!({
+        "cli": INVENTORY_CLI_COMMANDS
+            .iter()
+            .map(|(name, about)| json!({ "name": name, "about": about }))
+            .collect::<Vec<_>>(),
+        "slash": INVENTORY_SLASH_COMMANDS
+            .iter()
+            .map(|(name, about)| json!({ "name": name, "about": about }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn build_inventory_tools() -> serde_json::Value {
+    let defs = vec![
+        crate::tui::agent::exec_tool_def(),
+        crate::tui::agent::read_file_tool_def(),
+        crate::tui::agent::write_file_tool_def(),
+        crate::tui::agent::patch_file_tool_def(),
+        crate::tui::agent::search_files_tool_def(),
+        crate::tui::agent::apply_diff_tool_def(),
+        crate::tui::agent::list_dir_tool_def(),
+        crate::tui::agent::glob_tool_def(),
+        crate::tui::agent::done_tool_def(),
+    ];
+    let tools = defs
+        .into_iter()
+        .filter_map(|def| {
+            let function = def.get("function")?;
+            let params = function.get("parameters");
+            let properties = params
+                .and_then(|p| p.get("properties"))
+                .and_then(|p| p.as_object())
+                .map(|obj| obj.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let required = params
+                .and_then(|p| p.get("required"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Some(json!({
+                "name": function.get("name").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                "description": function.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                "property_keys": properties,
+                "required": required,
+            }))
+        })
+        .collect::<Vec<_>>();
+    json!({ "tools": tools })
+}
+
+fn build_inventory_replay_status(root: &Path) -> Result<serde_json::Value> {
+    let runtime_spec_path = root.join(".obstral/runtime_eval.json");
+    let runtime_cases = crate::runtime_eval::load_spec(&runtime_spec_path)
+        .map(|spec| spec.cases)
+        .unwrap_or_default();
+    let tui_replay_spec_path = root.join(".obstral/tui_replay.json");
+    let tui_replay_cases = std::fs::read_to_string(&tui_replay_spec_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<crate::tui_replay::TuiReplaySpec>(&text).ok())
+        .map(|spec| spec.cases)
+        .unwrap_or_default();
+
+    let tmp_dir = root.join(".tmp");
+    let latest_runtime = inventory_latest_report_with_prefix(&tmp_dir, "runtime_eval_");
+    let latest_tui_replay = inventory_latest_report_with_prefix(&tmp_dir, "tui_replay");
+
+    Ok(json!({
+        "runtime_eval": {
+            "spec_path": inventory_rel(root, &runtime_spec_path),
+            "cases": runtime_cases.iter().map(|case| json!({ "id": case.id, "tags": case.tags })).collect::<Vec<_>>(),
+            "latest_report": latest_runtime,
+        },
+        "tui_replay": {
+            "spec_path": inventory_rel(root, &tui_replay_spec_path),
+            "cases": tui_replay_cases.iter().map(|case| json!({ "id": case.id, "tags": case.tags })).collect::<Vec<_>>(),
+            "latest_report": latest_tui_replay,
+        }
+    }))
+}
+
+fn build_inventory_parity(root: &Path) -> Result<serde_json::Value> {
+    let tmp_dir = root.join(".tmp");
+    let latest_runtime = inventory_latest_report_with_prefix(&tmp_dir, "runtime_eval_");
+    let latest_tui_replay = inventory_latest_report_with_prefix(&tmp_dir, "tui_replay");
+    let runtime_green = inventory_report_is_green(latest_runtime.as_ref());
+    let tui_replay_green = inventory_report_is_green(latest_tui_replay.as_ref());
+    let split_paths = [
+        "src/tui/agent/done_gate.rs",
+        "src/tui/agent/read_only.rs",
+        "src/tui/agent/provider_compat.rs",
+        "src/tui/agent/memory.rs",
+    ];
+    let split_count = split_paths
+        .iter()
+        .filter(|rel| root.join(rel).exists())
+        .count();
+
+    let entries = INVENTORY_PARITY_TARGETS
+        .iter()
+        .map(|(key, area, detail)| {
+            let (status, evidence) = match *key {
+                "runtime_eval" => (
+                    if runtime_green {
+                        "implemented"
+                    } else if root.join(".obstral/runtime_eval.json").exists() {
+                        "partial"
+                    } else {
+                        "missing"
+                    },
+                    if let Some(report) = latest_runtime.as_ref() {
+                        report
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(".obstral/runtime_eval.json")
+                    } else {
+                        ".obstral/runtime_eval.json"
+                    },
+                ),
+                "tui_replay" => (
+                    if tui_replay_green {
+                        "implemented"
+                    } else if root.join(".obstral/tui_replay.json").exists() {
+                        "partial"
+                    } else {
+                        "missing"
+                    },
+                    if let Some(report) = latest_tui_replay.as_ref() {
+                        report
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(".obstral/tui_replay.json")
+                    } else {
+                        ".obstral/tui_replay.json"
+                    },
+                ),
+                "repo_map" => (
+                    if root.join("scripts/repo_map.py").exists()
+                        && root.join(".obstral/repo_map.config.json").exists()
+                        && root.join(".obstral/repo_map.eval.json").exists()
+                    {
+                        "implemented"
+                    } else {
+                        "missing"
+                    },
+                    "scripts/repo_map.py + .obstral/repo_map.*",
+                ),
+                "observer_soft_hint" => (
+                    if root.join("src/tui/suggestion.rs").exists()
+                        && root.join("src/tui/events.rs").exists()
+                    {
+                        "implemented"
+                    } else {
+                        "missing"
+                    },
+                    "src/tui/suggestion.rs",
+                ),
+                "intent_anchor" => (
+                    if root.join("src/tui/intent.rs").exists() {
+                        "implemented"
+                    } else {
+                        "missing"
+                    },
+                    "src/tui/intent.rs",
+                ),
+                "resolution_memory" => (
+                    if root.join("src/tui/agent/memory.rs").exists() {
+                        "implemented"
+                    } else {
+                        "missing"
+                    },
+                    "src/tui/agent/memory.rs",
+                ),
+                "typed_state_docs" => (
+                    if root.join("docs/state-schema.md").exists() {
+                        "implemented"
+                    } else {
+                        "missing"
+                    },
+                    "docs/state-schema.md",
+                ),
+                "agent_split_plan" => (
+                    if root.join("docs/tui-agent-split-plan.md").exists() && split_count == 4 {
+                        "implemented"
+                    } else if root.join("docs/tui-agent-split-plan.md").exists() && split_count > 0
+                    {
+                        "partial"
+                    } else {
+                        "missing"
+                    },
+                    "docs/tui-agent-split-plan.md + src/tui/agent/*",
+                ),
+                "surface_parity" => (
+                    if runtime_green && tui_replay_green {
+                        "implemented"
+                    } else if root.join("src/tui").exists() && root.join("web").exists() {
+                        "partial"
+                    } else {
+                        "missing"
+                    },
+                    "runtime_eval + tui_replay + TUI/Web surfaces",
+                ),
+                _ => ("unknown", "-"),
+            };
+            json!({
+                "key": key,
+                "area": area,
+                "status": status,
+                "detail": detail,
+                "evidence": evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    let implemented = entries
+        .iter()
+        .filter(|entry| entry.get("status").and_then(|v| v.as_str()) == Some("implemented"))
+        .count();
+    let partial = entries
+        .iter()
+        .filter(|entry| entry.get("status").and_then(|v| v.as_str()) == Some("partial"))
+        .count();
+    let missing = entries
+        .iter()
+        .filter(|entry| entry.get("status").and_then(|v| v.as_str()) == Some("missing"))
+        .count();
+    let gaps = entries
+        .iter()
+        .filter_map(|entry| {
+            let status = entry
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            if status == "implemented" {
+                return None;
+            }
+            let key = entry
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let next = match key {
+                "runtime_eval" => {
+                    "run `obstral eval -C . --spec .obstral/runtime_eval.json` to refresh proof"
+                }
+                "tui_replay" => {
+                    "run `obstral tui-replay -C . --spec .obstral/tui_replay.json` to refresh proof"
+                }
+                "surface_parity" => {
+                    "compare TUI/Web/headless flows and promote shared checks into replay/eval"
+                }
+                "agent_split_plan" => "continue extracting high-churn logic from src/tui/agent.rs",
+                _ => "add missing wiring or proof artifact",
+            };
+            Some(json!({
+                "key": key,
+                "status": status,
+                "next_action": next,
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "summary": {
+            "implemented": implemented,
+            "partial": partial,
+            "missing": missing,
+            "total": entries.len(),
+        },
+        "health": {
+            "latest_runtime_eval_green": runtime_green,
+            "latest_tui_replay_green": tui_replay_green,
+            "split_modules_present": split_count,
+        },
+        "entries": entries,
+        "gaps": gaps,
+    }))
+}
+
+fn build_inventory_state(root: &Path) -> Result<serde_json::Value> {
+    let state_schema_path = root.join("docs/state-schema.md");
+    let session_example_path = root.join(".tmp/obstral_session.json");
+    let prefs_path = root.join(".obstral/tui_prefs.json");
+    let runtime_spec_path = root.join(".obstral/runtime_eval.json");
+    let replay_spec_path = root.join(".obstral/tui_replay.json");
+
+    let layers = vec![
+        json!({
+            "key": "runtime_config",
+            "owner": "src/config.rs",
+            "lifetime": "process / launch",
+            "backing_store": "CLI args + env",
+            "persisted": false,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/config.rs").exists(),
+            "status": if root.join("src/config.rs").exists() { "implemented" } else { "missing" },
+        }),
+        json!({
+            "key": "tui_prefs",
+            "owner": "src/tui/prefs.rs",
+            "lifetime": "cross-session",
+            "backing_store": ".obstral/tui_prefs.json",
+            "persisted": true,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/tui/prefs.rs").exists(),
+            "backing_present": prefs_path.exists(),
+            "status": if root.join("src/tui/prefs.rs").exists() && prefs_path.exists() { "implemented" } else if root.join("src/tui/prefs.rs").exists() { "partial" } else { "missing" },
+        }),
+        json!({
+            "key": "session_persistence",
+            "owner": "src/agent_session.rs",
+            "lifetime": "resumable run",
+            "backing_store": "session.json",
+            "persisted": true,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/agent_session.rs").exists(),
+            "backing_present": session_example_path.exists(),
+            "status": if root.join("src/agent_session.rs").exists() { "implemented" } else { "missing" },
+        }),
+        json!({
+            "key": "in_memory_app",
+            "owner": "src/tui/app.rs",
+            "lifetime": "live TUI session",
+            "backing_store": "memory only",
+            "persisted": false,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/tui/app.rs").exists(),
+            "status": if root.join("src/tui/app.rs").exists() { "implemented" } else { "missing" },
+        }),
+        json!({
+            "key": "intent_anchor",
+            "owner": "src/tui/intent.rs",
+            "lifetime": "live session",
+            "backing_store": "memory only today",
+            "persisted": false,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/tui/intent.rs").exists(),
+            "status": if root.join("src/tui/intent.rs").exists() { "implemented" } else { "missing" },
+        }),
+        json!({
+            "key": "runtime_eval_fixture",
+            "owner": "src/runtime_eval.rs",
+            "lifetime": "versioned test input/output",
+            "backing_store": ".obstral/runtime_eval.json + .tmp/runtime_eval_*",
+            "persisted": true,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/runtime_eval.rs").exists(),
+            "backing_present": runtime_spec_path.exists(),
+            "status": if root.join("src/runtime_eval.rs").exists() && runtime_spec_path.exists() { "implemented" } else if root.join("src/runtime_eval.rs").exists() { "partial" } else { "missing" },
+        }),
+        json!({
+            "key": "tui_replay_fixture",
+            "owner": "src/tui_replay.rs",
+            "lifetime": "versioned test input/output",
+            "backing_store": ".obstral/tui_replay.json + .tmp/tui_replay_*",
+            "persisted": true,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/tui_replay.rs").exists(),
+            "backing_present": replay_spec_path.exists(),
+            "status": if root.join("src/tui_replay.rs").exists() && replay_spec_path.exists() { "implemented" } else if root.join("src/tui_replay.rs").exists() { "partial" } else { "missing" },
+        }),
+    ];
+
+    let implemented = layers
+        .iter()
+        .filter(|entry| entry.get("status").and_then(|v| v.as_str()) == Some("implemented"))
+        .count();
+    let partial = layers
+        .iter()
+        .filter(|entry| entry.get("status").and_then(|v| v.as_str()) == Some("partial"))
+        .count();
+    let missing = layers
+        .iter()
+        .filter(|entry| entry.get("status").and_then(|v| v.as_str()) == Some("missing"))
+        .count();
+    let persisted = layers
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("persisted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        })
+        .count();
+
+    let gaps = layers
+        .iter()
+        .filter_map(|entry| {
+            let status = entry.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+            if status == "implemented" {
+                return None;
+            }
+            let key = entry.get("key").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let next = match key {
+                "tui_prefs" => "load/save a project-local .obstral/tui_prefs.json at least once to confirm persistence",
+                "runtime_eval_fixture" => "keep .obstral/runtime_eval.json in sync with current regression cases",
+                "tui_replay_fixture" => "keep .obstral/tui_replay.json aligned with observer stuck-case coverage",
+                _ => "add missing owner or backing store",
+            };
+            Some(json!({
+                "key": key,
+                "status": status,
+                "next_action": next,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "schema_doc": {
+            "path": inventory_rel(root, &state_schema_path),
+            "exists": state_schema_path.exists(),
+        },
+        "summary": {
+            "implemented": implemented,
+            "partial": partial,
+            "missing": missing,
+            "persisted_layers": persisted,
+            "total": layers.len(),
+        },
+        "health": {
+            "prefs_file_present": prefs_path.exists(),
+            "runtime_eval_spec_present": runtime_spec_path.exists(),
+            "tui_replay_spec_present": replay_spec_path.exists(),
+            "session_example_present": session_example_path.exists(),
+        },
+        "layers": layers,
+        "gaps": gaps,
+    }))
+}
+
+fn inventory_latest_report_with_prefix(tmp_dir: &Path, prefix: &str) -> Option<serde_json::Value> {
+    let mut best: Option<(PathBuf, SystemTime)> = None;
+    for entry in std::fs::read_dir(tmp_dir).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let name = path.file_name()?.to_str()?;
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let report_path = path.join("report.json");
+        if !report_path.exists() {
+            continue;
+        }
+        let modified = report_path.metadata().ok()?.modified().ok()?;
+        if best
+            .as_ref()
+            .map(|(_, current)| modified > *current)
+            .unwrap_or(true)
+        {
+            best = Some((report_path, modified));
+        }
+    }
+    let (report_path, modified) = best?;
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).ok()?).ok()?;
+    Some(json!({
+        "path": report_path,
+        "modified_ms": modified.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis()),
+        "age_ms": modified.elapsed().ok().map(|d| d.as_millis()),
+        "freshness": inventory_modified_freshness(modified),
+        "summary": report.get("summary").cloned().unwrap_or_else(|| json!({})),
+    }))
+}
+
+fn inventory_report_is_green(report: Option<&serde_json::Value>) -> bool {
+    let Some(report) = report else {
+        return false;
+    };
+    let passed = report
+        .get("summary")
+        .and_then(|summary| summary.get("passed"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total = report
+        .get("summary")
+        .and_then(|summary| summary.get("total"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    total > 0 && passed == total
+}
+
+fn inventory_report_freshness(report: Option<&serde_json::Value>) -> &'static str {
+    match report
+        .and_then(|report| report.get("freshness"))
+        .and_then(|v| v.as_str())
+    {
+        Some("fresh") => "fresh",
+        Some("recent") => "recent",
+        Some("stale") => "stale",
+        Some("old") => "old",
+        Some("unknown") => "unknown",
+        _ => "missing",
+    }
+}
+
+fn inventory_modified_freshness(modified: SystemTime) -> &'static str {
+    let age = modified.elapsed().ok();
+    let Some(age) = age else {
+        return "unknown";
+    };
+    let secs = age.as_secs();
+    if secs <= 6 * 60 * 60 {
+        "fresh"
+    } else if secs <= 3 * 24 * 60 * 60 {
+        "recent"
+    } else if secs <= 7 * 24 * 60 * 60 {
+        "stale"
+    } else {
+        "old"
+    }
+}
+
+fn inventory_toml_value(text: &str, key: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package || !trimmed.starts_with(key) {
+            continue;
+        }
+        let (_, value) = trimmed.split_once('=')?;
+        let value = value.trim().trim_matches('"');
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn inventory_rel(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn print_inventory_manifest(value: &serde_json::Value) {
+    println!("Manifest");
+    if let Some(root) = value.get("root").and_then(|v| v.as_str()) {
+        println!("root: {root}");
+    }
+    if let Some(pkg) = value.get("package") {
+        let name = pkg
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let version = pkg
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        println!("package: {name} {version}");
+    }
+    println!(
+        "providers: {} | modes: {} | personas: {}",
+        value
+            .get("providers")
+            .and_then(|v| v.as_array())
+            .map(|v| v.len())
+            .unwrap_or(0),
+        value
+            .get("modes")
+            .and_then(|v| v.as_array())
+            .map(|v| v.len())
+            .unwrap_or(0),
+        value
+            .get("personas")
+            .and_then(|v| v.as_array())
+            .map(|v| v.len())
+            .unwrap_or(0),
+    );
+    if let Some(specs) = value.get("specs") {
+        println!(
+            "specs: runtime_eval={} | tui_replay={}",
+            specs
+                .get("runtime_eval_cases")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            specs
+                .get("tui_replay_cases")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        );
+    }
+}
+
+fn print_inventory_health(value: &serde_json::Value) {
+    println!(
+        "Health: {}",
+        value
+            .get("overall")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+    );
+    if let Some(freshness) = value.get("freshness") {
+        println!(
+            "freshness: runtime_eval={} | tui_replay={}",
+            freshness
+                .get("runtime_eval")
+                .and_then(|v| v.as_str())
+                .unwrap_or("missing"),
+            freshness
+                .get("tui_replay")
+                .and_then(|v| v.as_str())
+                .unwrap_or("missing"),
+        );
+    }
+    if let Some(checks) = value.get("checks").and_then(|v| v.as_array()) {
+        for check in checks {
+            println!(
+                "- {:<18} {:<5} {}{}",
+                check
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
+                if check.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    "ok"
+                } else {
+                    "bad"
+                },
+                check.get("detail").and_then(|v| v.as_str()).unwrap_or(""),
+                check
+                    .get("freshness")
+                    .and_then(|v| v.as_str())
+                    .map(|f| format!(" [{f}]"))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    if let Some(actions) = value.get("next_actions").and_then(|v| v.as_array()) {
+        if !actions.is_empty() {
+            println!("\nNext Actions");
+            for action in actions {
+                println!(
+                    "- {}",
+                    action.get("action").and_then(|v| v.as_str()).unwrap_or("")
+                );
+            }
+        }
+    }
+}
+
+fn print_inventory_commands(value: &serde_json::Value) {
+    println!("CLI Commands");
+    if let Some(cli) = value.get("cli").and_then(|v| v.as_array()) {
+        for item in cli {
+            println!(
+                "- {}: {}",
+                item.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
+                item.get("about").and_then(|v| v.as_str()).unwrap_or("")
+            );
+        }
+    }
+    println!("\nSlash Commands");
+    if let Some(slash) = value.get("slash").and_then(|v| v.as_array()) {
+        for item in slash {
+            println!(
+                "- {}: {}",
+                item.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
+                item.get("about").and_then(|v| v.as_str()).unwrap_or("")
+            );
+        }
+    }
+}
+
+fn print_inventory_tools(value: &serde_json::Value) {
+    println!("Tools");
+    if let Some(tools) = value.get("tools").and_then(|v| v.as_array()) {
+        for tool in tools {
+            let props = tool
+                .get("property_keys")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            println!(
+                "- {} [{}]",
+                tool.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
+                props
+            );
+        }
+    }
+}
+
+fn print_inventory_replay_status(value: &serde_json::Value) {
+    println!("Replay Status");
+    for key in ["runtime_eval", "tui_replay"] {
+        let section = &value[key];
+        let case_count = section
+            .get("cases")
+            .and_then(|v| v.as_array())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        println!("- {key}: {case_count} cases");
+        if let Some(latest) = section.get("latest_report") {
+            let path = latest.get("path").and_then(|v| v.as_str()).unwrap_or("-");
+            let passed = latest
+                .get("summary")
+                .and_then(|summary| summary.get("passed"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let total = latest
+                .get("summary")
+                .and_then(|summary| summary.get("total"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let freshness = latest
+                .get("freshness")
+                .and_then(|v| v.as_str())
+                .unwrap_or("missing");
+            println!("  latest: {path} ({passed}/{total} passed, freshness={freshness})");
+        }
+    }
+}
+
+fn print_inventory_parity(value: &serde_json::Value) {
+    println!("Parity");
+    if let Some(summary) = value.get("summary") {
+        let implemented = summary
+            .get("implemented")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let partial = summary.get("partial").and_then(|v| v.as_u64()).unwrap_or(0);
+        let missing = summary.get("missing").and_then(|v| v.as_u64()).unwrap_or(0);
+        let total = summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+        println!(
+            "summary: implemented={implemented} partial={partial} missing={missing} total={total}"
+        );
+    }
+    if let Some(health) = value.get("health") {
+        println!(
+            "health: runtime_eval={} | tui_replay={} | split_modules={}",
+            health
+                .get("latest_runtime_eval_green")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            health
+                .get("latest_tui_replay_green")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            health
+                .get("split_modules_present")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        );
+    }
+    if let Some(entries) = value.get("entries").and_then(|v| v.as_array()) {
+        for entry in entries {
+            println!(
+                "- {:<22} {:<11} {}",
+                entry
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
+                entry
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
+                entry.get("detail").and_then(|v| v.as_str()).unwrap_or("")
+            );
+        }
+    }
+    if let Some(gaps) = value.get("gaps").and_then(|v| v.as_array()) {
+        if !gaps.is_empty() {
+            println!("\nNext Gaps");
+            for gap in gaps {
+                println!(
+                    "- {} ({}) -> {}",
+                    gap.get("key").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                    gap.get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown"),
+                    gap.get("next_action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                );
+            }
+        }
+    }
+}
+
+fn print_inventory_state(value: &serde_json::Value) {
+    println!("State");
+    if let Some(schema) = value.get("schema_doc") {
+        println!(
+            "schema: {} ({})",
+            schema.get("path").and_then(|v| v.as_str()).unwrap_or("-"),
+            if schema
+                .get("exists")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                "present"
+            } else {
+                "missing"
+            }
+        );
+    }
+    if let Some(summary) = value.get("summary") {
+        println!(
+            "summary: implemented={} partial={} missing={} persisted={} total={}",
+            summary
+                .get("implemented")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            summary.get("partial").and_then(|v| v.as_u64()).unwrap_or(0),
+            summary.get("missing").and_then(|v| v.as_u64()).unwrap_or(0),
+            summary
+                .get("persisted_layers")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0),
+        );
+    }
+    if let Some(health) = value.get("health") {
+        println!(
+            "health: prefs={} runtime_eval_spec={} tui_replay_spec={} session_example={}",
+            health
+                .get("prefs_file_present")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            health
+                .get("runtime_eval_spec_present")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            health
+                .get("tui_replay_spec_present")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            health
+                .get("session_example_present")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        );
+    }
+    if let Some(layers) = value.get("layers").and_then(|v| v.as_array()) {
+        for layer in layers {
+            println!(
+                "- {:<22} {:<11} {} -> {}",
+                layer
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
+                layer
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
+                layer.get("owner").and_then(|v| v.as_str()).unwrap_or("-"),
+                layer
+                    .get("backing_store")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-"),
+            );
+        }
+    }
+    if let Some(gaps) = value.get("gaps").and_then(|v| v.as_array()) {
+        if !gaps.is_empty() {
+            println!("\nState Gaps");
+            for gap in gaps {
+                println!(
+                    "- {} ({}) -> {}",
+                    gap.get("key").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                    gap.get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown"),
+                    gap.get("next_action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                );
             }
         }
     }
