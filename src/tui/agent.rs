@@ -82,8 +82,8 @@ use self::read_only::{
     synthetic_read_only_observation_plan, ReadOnlyDiagnoseRescueAction,
 };
 use self::task_harness::{
-    build_fix_stage_progress_hint, build_progress_gate_block, coerce_artifact_creation_tool_call,
-    TaskHarness,
+    allows_artifact_creation_during_diagnose, build_fix_stage_progress_hint,
+    build_progress_gate_block, coerce_artifact_creation_tool_call, TaskHarness,
 };
 
 #[derive(Debug, Clone)]
@@ -2764,7 +2764,12 @@ impl RecoveryGovernor {
         g
     }
 
-    fn maybe_block_tool(&self, tc: &ToolCallData, test_cmd: Option<&str>) -> Option<String> {
+    fn maybe_block_tool(
+        &self,
+        tc: &ToolCallData,
+        test_cmd: Option<&str>,
+        task_harness: TaskHarness,
+    ) -> Option<String> {
         let Some(stage) = self.stage else {
             return None;
         };
@@ -2782,6 +2787,9 @@ impl RecoveryGovernor {
                     if is_diagnostic_command(cmd.as_str()) {
                         return None;
                     }
+                }
+                if allows_artifact_creation_during_diagnose(task_harness, tc) {
+                    return None;
                 }
                 Some(format!(
                     "[Recovery Gate] stage=diagnose\n\
@@ -12263,7 +12271,7 @@ Required now: {}",
         // ── apply_diff tool ───────────────────────────────────────────────
         // Recovery gate: while recovering from failures, enforce a strict
         // Diagnose -> Fix -> Verify workflow to prevent phase drift.
-        if let Some(block) = recovery.maybe_block_tool(&tc, test_cmd.as_deref()) {
+        if let Some(block) = recovery.maybe_block_tool(&tc, test_cmd.as_deref(), task_harness) {
             state = AgentState::Recovery;
             let _ = tx
                 .send(StreamToken::Delta(format!(
@@ -17248,6 +17256,34 @@ verify: exit code is zero\n\
     fn goal_check_policy_respects_command_approval() {
         assert!(should_auto_run_goal_checks(false, DEFAULT_MAX_ITERS));
         assert!(!should_auto_run_goal_checks(true, DEFAULT_MAX_ITERS));
+    }
+
+    #[test]
+    fn recovery_gate_allows_new_file_write_during_diagnose() {
+        let recovery = RecoveryGovernor {
+            stage: Some(RecoveryStage::Diagnose),
+            required_verification: VerificationLevel::Behavioral,
+        };
+        let tc = ToolCallData {
+            id: "call_write".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path":"notes/todo.txt",
+                "content":"ship it\n"
+            })
+            .to_string(),
+        };
+
+        assert!(recovery
+            .maybe_block_tool(
+                &tc,
+                Some("test -f notes/todo.txt && grep -Fx \"ship it\" notes/todo.txt"),
+                TaskHarness::infer(
+                    "Create `notes/todo.txt` containing exactly `ship it`.",
+                    false,
+                ),
+            )
+            .is_none());
     }
 
     #[test]

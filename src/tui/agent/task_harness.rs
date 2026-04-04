@@ -395,6 +395,16 @@ pub(super) fn coerce_artifact_creation_tool_call(
     }
 }
 
+pub(super) fn allows_artifact_creation_during_diagnose(
+    harness: TaskHarness,
+    tc: &ToolCallData,
+) -> bool {
+    matches!(
+        harness.artifact_mode,
+        ArtifactMode::NewFiles | ArtifactMode::NewRepo
+    ) && matches!(tc.name.as_str(), "write_file" | "exec")
+}
+
 pub(super) fn build_fix_stage_progress_hint(
     harness: TaskHarness,
     messages: &[Value],
@@ -825,5 +835,21 @@ mod tests {
         assert_eq!(rewritten.name, "write_file");
         assert!(rewritten.arguments.contains("notes/todo.txt"));
         assert!(coerced.contains("write_file"));
+    }
+
+    #[test]
+    fn allows_artifact_creation_during_diagnose_for_new_file_write() {
+        let tc = ToolCallData {
+            id: "call_write".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({"path":"notes/todo.txt","content":"ship it\n"}).to_string(),
+        };
+        assert!(allows_artifact_creation_during_diagnose(
+            TaskHarness {
+                lane: TaskLane::CreateFile,
+                artifact_mode: ArtifactMode::NewFiles,
+            },
+            &tc,
+        ));
     }
 }
