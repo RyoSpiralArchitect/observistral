@@ -70,10 +70,10 @@ use self::read_only::best_read_only_followup_read_path;
 use self::read_only::{
     build_first_action_constraint_hint, build_read_only_diagnose_coercion_hint,
     build_read_only_plan_rewrite_hint, build_read_only_search_to_read_hint,
-    choose_read_only_diagnose_rescue_action, coerce_read_only_observation_tool_call,
-    first_action_deadline_iters, is_root_read_only_observation_task, path_prior_score,
-    preferred_read_only_read_path_hint, preferred_read_only_search_dir,
-    preferred_read_only_search_pattern, read_only_plan_violation,
+    choose_read_only_diagnose_rescue_action, coerce_read_only_followup_read_tool_call,
+    coerce_read_only_observation_tool_call, first_action_deadline_iters,
+    is_root_read_only_observation_task, path_prior_score, preferred_read_only_read_path_hint,
+    preferred_read_only_search_dir, preferred_read_only_search_pattern, read_only_plan_violation,
     synthetic_read_only_observation_plan, ReadOnlyDiagnoseRescueAction,
 };
 
@@ -9134,6 +9134,36 @@ Execute only the new minimal action: {}",
                         "from": original,
                         "to": coerced,
                         "tool": rewritten.name,
+                    }),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) = coerce_read_only_followup_read_tool_call(
+                &messages,
+                tc,
+                &root_user_text,
+                root_read_only,
+                active_plan.as_ref(),
+                &observation_evidence,
+            ) {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[compat] coerced repeated read-only follow-up read: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "read_only_tool_coercion",
+                    json!({
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                        "reason": "best_followup_read",
                     }),
                 )
                 .await;

@@ -732,6 +732,80 @@ pub(super) fn coerce_read_only_observation_tool_call(
     }
 }
 
+pub(super) fn coerce_read_only_followup_read_tool_call(
+    messages: &[serde_json::Value],
+    tc: &ToolCallData,
+    root_user_text: &str,
+    root_read_only: bool,
+    plan: Option<&PlanBlock>,
+    evidence: &ObservationEvidence,
+) -> Option<(ToolCallData, String, String)> {
+    if !root_read_only || !matches!(tc.name.as_str(), "read_file") || !evidence.reads.is_empty() {
+        return None;
+    }
+    let saw_recent_gate_miss = messages
+        .iter()
+        .rev()
+        .take(6)
+        .any(is_missing_gate_governor_block);
+    if !saw_recent_gate_miss {
+        return None;
+    }
+
+    let args = serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()?;
+    let current_path = args
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    if current_path.is_empty() {
+        return None;
+    }
+
+    let fallback_plan;
+    let plan = if let Some(plan) = plan {
+        plan
+    } else {
+        fallback_plan = synthetic_read_only_observation_plan(root_user_text);
+        &fallback_plan
+    };
+
+    let last_search = evidence.searches.last()?;
+    let handler_candidate = if task_prefers_handler_path(root_user_text, &plan.goal) {
+        last_search
+            .paths
+            .iter()
+            .find(|path| {
+                matches!(
+                    path_filename(path).to_ascii_lowercase().as_str(),
+                    "events.rs" | "commands.rs" | "command.rs" | "handlers.rs" | "handler.rs"
+                )
+            })
+            .cloned()
+    } else {
+        None
+    };
+    let best_path = handler_candidate
+        .or_else(|| {
+            best_read_only_followup_read_path(root_user_text, plan, &last_search.paths, evidence)
+        })
+        .or_else(|| {
+            last_search
+                .paths
+                .iter()
+                .find(|path| path.starts_with("src/"))
+                .cloned()
+        })
+        .or_else(|| last_search.paths.first().cloned())?;
+    if normalize_for_signature(current_path) == normalize_for_signature(best_path.as_str()) {
+        return None;
+    }
+
+    let mut rewritten = tc.clone();
+    rewritten.arguments = json!({ "path": best_path }).to_string();
+    Some((rewritten, current_path.to_string(), best_path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,5 +844,73 @@ mod tests {
 
         assert!(hint.contains("read that matching file instead of searching again."));
         assert!(!hint.contains("src/tui/events.rs"));
+    }
+
+    #[test]
+    fn coerce_read_only_followup_read_tool_call_prefers_best_handler_candidate() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"/realize","dir":"src/tui"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"/realize\",\"dir\":\"src/tui\"}"
+            }),
+        ];
+        let plan = synthetic_read_only_observation_plan(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+        );
+        let evidence = ObservationEvidence {
+            searches: vec![ObservationSearchEvidence {
+                command: "search_files(pattern=/realize, dir=src/tui)".to_string(),
+                pattern: "/realize".to_string(),
+                hit_count: 3,
+                paths: vec![
+                    "src/tui/events.rs".to_string(),
+                    "src/tui/intent.rs".to_string(),
+                    "src/tui/agent.rs".to_string(),
+                ],
+            }],
+            reads: Vec::new(),
+            resolutions: Vec::new(),
+        };
+        let tc = ToolCallData {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: "{\"path\":\"src/tui/intent.rs\"}".to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_read_only_followup_read_tool_call(
+            &messages,
+            &tc,
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            true,
+            Some(&plan),
+            &evidence,
+        )
+        .expect("coerced read");
+
+        assert_eq!(original, "src/tui/intent.rs");
+        assert_eq!(coerced, "src/tui/events.rs");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rewritten.arguments)
+                .ok()
+                .and_then(|args| args
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string))
+                .as_deref(),
+            Some("src/tui/events.rs")
+        );
     }
 }
