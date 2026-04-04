@@ -839,7 +839,7 @@ pub(super) fn rescue_missing_think_for_tool_turn(
     }
     if matches!(
         tc.name.as_str(),
-        "exec" | "write_file" | "patch_file" | "apply_diff"
+        "exec" | "write_file" | "patch_file" | "apply_diff" | "done"
     ) {
         return Some(compat_synthetic_think(tc, plan));
     }
@@ -1144,6 +1144,7 @@ pub(super) fn compat_synthetic_think(tc: &ToolCallData, plan: &PlanBlock) -> Thi
                 Some(format!("glob {pattern} in {dir}"))
             })
             .unwrap_or_else(|| "glob for candidate files".to_string()),
+        "done" => "call done immediately".to_string(),
         _ => format!("run {}", tc.name),
     };
 

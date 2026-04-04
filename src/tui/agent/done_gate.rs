@@ -742,6 +742,126 @@ pub(super) fn build_done_acceptance_recovery_hint(
     }
 }
 
+fn finalization_step_hint(step: &str) -> bool {
+    let low = step.to_ascii_lowercase();
+    [
+        "done",
+        "final",
+        "finalize",
+        "summary",
+        "summarize",
+        "report",
+        "handoff",
+        "wrap up",
+        "finish",
+    ]
+    .iter()
+    .any(|term| low.contains(term))
+}
+
+fn known_commands_have_required_verification(
+    known_commands: &[String],
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+) -> bool {
+    known_commands.iter().any(|command| {
+        classify_verify_level(command.as_str(), test_cmd)
+            .map(|level| level.satisfies(required_verification))
+            .unwrap_or(false)
+    })
+}
+
+pub(super) fn should_prefer_done_after_verified_action(
+    tc: &ToolCallData,
+    plan: &PlanBlock,
+    known_commands: &[String],
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+    last_mutation_step: Option<usize>,
+    last_verify_ok_step: Option<usize>,
+) -> bool {
+    if tc.name.as_str() == "done" {
+        return false;
+    }
+
+    let last_mutation = last_mutation_step.unwrap_or(0);
+    let last_verify_ok = last_verify_ok_step.unwrap_or(0);
+    if last_mutation == 0 || last_verify_ok <= last_mutation {
+        return false;
+    }
+
+    if !plan.steps.iter().any(|step| finalization_step_hint(step)) {
+        return false;
+    }
+
+    if !known_commands_have_required_verification(known_commands, required_verification, test_cmd) {
+        return false;
+    }
+
+    match tc.name.as_str() {
+        "read_file" | "search_files" | "list_dir" | "glob" => true,
+        "exec" => {
+            let command = parse_exec_command_from_args(tc.arguments.as_str()).unwrap_or_default();
+            classify_verify_level(command.as_str(), test_cmd)
+                .map(|level| level.satisfies(required_verification))
+                .unwrap_or_else(|| is_diagnostic_command(command.as_str()))
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn build_post_verify_done_completion_hint(
+    plan: &PlanBlock,
+    known_commands: &[String],
+    tc: &ToolCallData,
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+) -> String {
+    let attempted = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| blocked_tool_call_signature(tc.name.as_str(), tc.arguments.as_str()));
+    let verification_commands = known_commands
+        .iter()
+        .filter(|command| {
+            classify_verify_level(command.as_str(), test_cmd)
+                .map(|level| level.satisfies(required_verification))
+                .unwrap_or(false)
+        })
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut out = format!(
+        "[Completion Gate]\n\
+Required verification already passed after the latest mutation.\n\
+Attempted next action: {attempted}\n\
+Do NOT reopen inspection or rerun verification now.\n\
+Next assistant turn: emit a <think> block with `tool: done`, then call `done` immediately.\n\
+If any acceptance criterion is not fully proven, keep it in `remaining_acceptance` instead of gathering unrelated evidence.\n"
+    );
+    if !plan.acceptance_criteria.is_empty() {
+        out.push_str("Current acceptance criteria:\n");
+        for (idx, criterion) in plan.acceptance_criteria.iter().enumerate().take(4) {
+            out.push_str(&format!(
+                "- acceptance {}: {}\n",
+                idx + 1,
+                compact_one_line(criterion.as_str(), 160)
+            ));
+        }
+    }
+    if !verification_commands.is_empty() {
+        out.push_str("Known successful verification commands you can cite now:\n");
+        for command in verification_commands {
+            out.push_str("- ");
+            out.push_str(&compact_one_line(command.as_str(), 200));
+            out.push('\n');
+        }
+    }
+    out.push_str(
+        "If you still need to explain remaining work, use `next_steps` in `done`; do not read unrelated files now.",
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,5 +1078,110 @@ mod tests {
 
         assert!(final_text.contains("src/config.rs"));
         assert!(final_text.contains("read_file(path=src/config.rs)"));
+    }
+
+    #[test]
+    fn should_prefer_done_after_verified_action_blocks_post_verify_reads() {
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented".to_string(),
+                "cargo test 2>&1 passes".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "cargo test is relevant".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"Cargo.toml"}).to_string(),
+        };
+        let known_commands = vec!["cargo test 2>&1".to_string()];
+
+        assert!(should_prefer_done_after_verified_action(
+            &tc,
+            &plan,
+            &known_commands,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+            Some(4),
+            Some(5),
+        ));
+    }
+
+    #[test]
+    fn should_prefer_done_after_verified_action_waits_until_standalone_verify_exists() {
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented".to_string(),
+                "cargo test 2>&1 passes".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "cargo test is relevant".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_exec".to_string(),
+            name: "exec".to_string(),
+            arguments: serde_json::json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+        let known_commands = vec!["cargo test 2>&1".to_string()];
+
+        assert!(!should_prefer_done_after_verified_action(
+            &tc,
+            &plan,
+            &known_commands,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+            Some(4),
+            Some(4),
+        ));
+    }
+
+    #[test]
+    fn post_verify_done_completion_hint_mentions_done_and_verification() {
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented".to_string(),
+                "cargo test 2>&1 passes".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "cargo test is relevant".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"Cargo.toml"}).to_string(),
+        };
+        let hint = build_post_verify_done_completion_hint(
+            &plan,
+            &["cargo test 2>&1".to_string()],
+            &tc,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+        );
+
+        assert!(hint.contains("[Completion Gate]"));
+        assert!(hint.contains("tool: done"));
+        assert!(hint.contains("cargo test 2>&1"));
     }
 }

@@ -47,10 +47,11 @@ mod memory;
 mod provider_compat;
 mod read_only;
 use self::done_gate::{
-    build_done_acceptance_recovery_hint, build_read_only_completion_hint,
-    build_read_only_evidence_scores, build_read_only_iteration_cap_final_answer,
-    build_read_only_strong_final_answer, canonicalize_known_acceptance_commands,
-    maybe_build_read_only_auto_final_answer, validate_done_acceptance,
+    build_done_acceptance_recovery_hint, build_post_verify_done_completion_hint,
+    build_read_only_completion_hint, build_read_only_evidence_scores,
+    build_read_only_iteration_cap_final_answer, build_read_only_strong_final_answer,
+    canonicalize_known_acceptance_commands, maybe_build_read_only_auto_final_answer,
+    should_prefer_done_after_verified_action, validate_done_acceptance,
 };
 use self::memory::{
     canonicalize_evidence_command_with_resolution, normalize_memory_entry, normalize_path_alias,
@@ -10027,6 +10028,60 @@ Execute only the new minimal action: {}",
                 continue;
             }
 
+            let known_acceptance_commands = canonicalize_known_acceptance_commands(
+                &collect_known_acceptance_commands(&messages, &working_mem),
+                &observation_evidence,
+            );
+            if should_prefer_done_after_verified_action(
+                tc,
+                &candidate_plan,
+                &known_acceptance_commands,
+                required_verification,
+                test_cmd.as_deref(),
+                last_mutation_step,
+                last_verify_ok_step,
+            ) {
+                state = AgentState::Recovery;
+                let block = build_post_verify_done_completion_hint(
+                    &candidate_plan,
+                    &known_acceptance_commands,
+                    tc,
+                    required_verification,
+                    test_cmd.as_deref(),
+                );
+
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                    )))
+                    .await;
+
+                push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+
+                pending_system_hint = Some(block);
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
+
             if mutation_tool_requires_evidence(tc) {
                 let observations = &observation_evidence;
                 let evidence_block = match parse_evidence_block(&assistant_text) {
@@ -16208,6 +16263,51 @@ verify: exit code is zero\n\
 
         validate_think(&rescued, &plan, &tc).expect("valid synthetic think");
         assert_eq!(rescued.tool, "exec");
+    }
+
+    #[test]
+    fn rescue_missing_think_for_tool_turn_is_immediate_for_done() {
+        let tc = ToolCallData {
+            id: "call_done".to_string(),
+            name: "done".to_string(),
+            arguments: serde_json::json!({
+                "summary":"Fixed the bug and verified it.",
+                "completed_acceptance":["1) the requested change is implemented"],
+                "remaining_acceptance":["2) the final result cites the exact passing behavioral verification command"],
+                "acceptance_evidence":[{"criterion":"1) the requested change is implemented","command":"cargo test 2>&1"}]
+            })
+            .to_string(),
+        };
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented and confirmed by a passing behavioral verification command".to_string(),
+                "the final result cites the exact passing behavioral verification command".to_string(),
+            ],
+            risks: "wrong file or speculative fix; the chosen test may miss the requested behavior".to_string(),
+            assumptions: "the current repo state matches the task and the configured verification command is relevant".to_string(),
+        };
+
+        let rescued = rescue_missing_think_for_tool_turn(
+            &[],
+            &tc,
+            &plan,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            false,
+        )
+        .expect("synthetic think");
+
+        validate_think(&rescued, &plan, &tc).expect("valid synthetic think");
+        assert_eq!(rescued.tool, "done");
+        assert!(rescued.next.contains("done"));
     }
 
     #[test]
