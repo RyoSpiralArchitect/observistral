@@ -61,7 +61,8 @@ use self::memory::{
 use self::provider_compat::compat_synthetic_think;
 use self::provider_compat::{
     build_mistral_think_only_hint, mistral_observation_tool, normalize_mistral_tool_call,
-    repair_mistral_plan_for_tool_turn, rescue_read_only_missing_plan_for_tool_turn,
+    repair_mistral_plan_for_tool_turn, rescue_missing_plan_for_tool_turn,
+    rescue_missing_think_for_tool_turn, rescue_read_only_missing_plan_for_tool_turn,
     rescue_read_only_missing_think_for_tool_turn, select_think_for_tool_turn,
 };
 #[cfg(test)]
@@ -9218,6 +9219,7 @@ Execute only the new minimal action: {}",
         }
 
         if let Some(ref tc) = tool_call {
+            let mut used_general_plan_rescue = false;
             let candidate_plan = match parsed_plan.as_ref() {
                 Some(plan) => {
                     if let Err(e) = validate_plan_for_task_contract(
@@ -9397,6 +9399,73 @@ Execute only the new minimal action: {}",
                                 let _ = tx
                                     .send(StreamToken::Delta(
                                         "\n[compat] rescued repeated read-only plan-gate miss with synthetic observation plan\n"
+                                            .to_string(),
+                                    ))
+                                    .await;
+                                rescued
+                            } else {
+                                state = AgentState::Recovery;
+                                recovery.stage = Some(RecoveryStage::Diagnose);
+                                let block = governor_contract::missing_plan_message();
+
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                                    )))
+                                    .await;
+
+                                push_blocked_tool_exchange(
+                                    &mut messages,
+                                    &assistant_text_clean,
+                                    tc,
+                                    &block,
+                                );
+                                autosave_best_effort(
+                                    &autosaver,
+                                    &tx,
+                                    tool_root_abs.as_deref(),
+                                    checkpoint.as_deref(),
+                                    cur_cwd.as_deref(),
+                                    &messages,
+                                )
+                                .await;
+
+                                pending_system_hint = Some(block);
+                                let _ = tx
+                                    .send(StreamToken::GovernorState(build_governor_state(
+                                        state,
+                                        &recovery,
+                                        &mem,
+                                        file_tool_consec_failures,
+                                        last_mutation_step,
+                                        last_verify_ok_step,
+                                        last_reflection.as_ref(),
+                                    )))
+                                    .await;
+                                continue;
+                            }
+                        } else if let Some(rescued) = rescue_missing_plan_for_tool_turn(
+                            &messages,
+                            tc,
+                            &root_user_text,
+                            root_read_only,
+                            goal_wants_actions,
+                            cfg.provider.clone(),
+                            required_verification,
+                            test_cmd.as_deref(),
+                        ) {
+                            if validate_plan_for_task_contract(
+                                &rescued,
+                                root_read_only,
+                                &task_contract,
+                                &instruction_resolver,
+                            )
+                            .is_ok()
+                            {
+                                used_general_plan_rescue = true;
+                                let _ = tx
+                                    .send(StreamToken::Delta(
+                                        "\n[compat] rescued repeated plan-gate miss with synthetic action plan\n"
                                             .to_string(),
                                     ))
                                     .await;
@@ -9663,7 +9732,18 @@ Execute only the new minimal action: {}",
                 root_read_only,
                 cfg.provider.clone(),
                 &observation_evidence,
-            );
+            )
+            .or_else(|| {
+                rescue_missing_think_for_tool_turn(
+                    &messages,
+                    tc,
+                    &candidate_plan,
+                    root_read_only,
+                    goal_wants_actions,
+                    cfg.provider.clone(),
+                    used_general_plan_rescue,
+                )
+            });
 
             let (think, used_compat_synth) = select_think_for_tool_turn(
                 parsed_think.as_ref(),
@@ -9717,7 +9797,7 @@ Execute only the new minimal action: {}",
             if used_compat_synth {
                 let _ = tx
                     .send(StreamToken::Delta(
-                        "\n[compat] synthesized think block for read-only observation tool turn\n"
+                        "\n[compat] synthesized think block for the rescued tool turn\n"
                             .to_string(),
                     ))
                     .await;
@@ -14968,6 +15048,31 @@ remaining_gap: still need to run cargo test\n\
     }
 
     #[test]
+    fn preferred_read_only_search_pattern_ignores_instruction_stopwords() {
+        let pattern = preferred_read_only_search_pattern(
+            "Find the failing test and explain why it fails. Do not edit anything. Final answer must include the file path and the exact mismatch.",
+        );
+        assert_eq!(pattern, "test");
+    }
+
+    #[test]
+    fn synthetic_read_only_observation_plan_captures_failure_mismatch_tasks() {
+        let plan = synthetic_read_only_observation_plan(
+            "Find the failing test and explain why it fails. Do not edit anything. Final answer must include the file path and the exact mismatch.",
+        );
+        assert!(plan.goal.contains("failing test"));
+        assert!(plan.goal.contains("assertion mismatch"));
+        assert!(plan
+            .acceptance_criteria
+            .iter()
+            .any(|item| item.contains("failing test file path")));
+        assert!(plan
+            .acceptance_criteria
+            .iter()
+            .any(|item| item.contains("exact assertion mismatch")));
+    }
+
+    #[test]
     fn compact_success_tool_result_for_history_keeps_exec_signal() {
         let content = "OK (exit_code: 0)\nduration_ms: 150\ncwd: /tmp/demo\nstdout:\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\n[auto-test] ✓ PASSED (exit 0)\nfinished";
         let compact = compact_success_tool_result_for_history("exec", content);
@@ -15714,6 +15819,177 @@ verify: exit code is zero\n\
             .steps
             .iter()
             .any(|step| step.contains("search_files(pattern=\"prefs\", dir=\"src/tui\")")));
+    }
+
+    #[test]
+    fn rescue_missing_plan_for_tool_turn_after_repeated_blocks_for_openai_actions() {
+        let tc = ToolCallData {
+            id: "call_2".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"Cargo.toml"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": serde_json::json!({"path":"Cargo.toml"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nread_file\narguments:\n{\"path\":\"Cargo.toml\"}"
+            }),
+        ];
+
+        let rescued = rescue_missing_plan_for_tool_turn(
+            &messages,
+            &tc,
+            "Fix the failing test with the smallest code change. Run tests before you finish.",
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+        )
+        .expect("synthetic action plan");
+
+        assert!(rescued.goal.contains("Fix the failing test"));
+        assert!(rescued
+            .steps
+            .iter()
+            .any(|step| step.contains("read_file(path=Cargo.toml)")));
+        assert!(rescued
+            .steps
+            .iter()
+            .any(|step| step.contains("cargo test 2>&1")));
+        assert!(rescued
+            .acceptance_criteria
+            .iter()
+            .all(|item| item.contains("behavioral verification")));
+    }
+
+    #[test]
+    fn general_plan_rescue_pairs_with_valid_synthetic_think() {
+        let tc = ToolCallData {
+            id: "call_2".to_string(),
+            name: "search_files".to_string(),
+            arguments: serde_json::json!({"pattern":"test","dir":"src"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"test","dir":"src"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"test\",\"dir\":\"src\"}"
+            }),
+        ];
+
+        let plan = rescue_missing_plan_for_tool_turn(
+            &messages,
+            &tc,
+            "Fix the failing test with the smallest code change. Run tests before you finish.",
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+        )
+        .expect("synthetic action plan");
+        let think = compat_synthetic_think(&tc, &plan);
+
+        validate_think(&think, &plan, &tc).expect("valid synthetic think");
+        assert_eq!(think.tool, "search_files");
+        assert!(think.next.contains("search"));
+    }
+
+    #[test]
+    fn rescue_missing_think_for_tool_turn_after_repeated_blocks_for_openai_actions() {
+        let tc = ToolCallData {
+            id: "call_2".to_string(),
+            name: "list_dir".to_string(),
+            arguments: serde_json::json!({"dir":"."}).to_string(),
+        };
+        let plan = rescue_missing_plan_for_tool_turn(
+            &[json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": serde_json::json!({"path":"Cargo.toml"}).to_string()
+                    }
+                }]
+            }), json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nread_file\narguments:\n{\"path\":\"Cargo.toml\"}"
+            })],
+            &ToolCallData {
+                id: "call_plan".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path":"Cargo.toml"}).to_string(),
+            },
+            "Fix the failing test with the smallest code change. Run tests before you finish.",
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+        )
+        .expect("synthetic action plan");
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "list_dir",
+                        "arguments": serde_json::json!({"dir":"."}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\nlist_dir\narguments:\n{\"dir\":\".\"}"
+            }),
+        ];
+
+        let rescued = rescue_missing_think_for_tool_turn(
+            &messages,
+            &tc,
+            &plan,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            false,
+        )
+        .expect("synthetic think");
+
+        validate_think(&rescued, &plan, &tc).expect("valid synthetic think");
+        assert_eq!(rescued.tool, "list_dir");
     }
 
     #[test]
@@ -16575,6 +16851,45 @@ verify: exit code is zero\n\
             &plan,
             &tc,
             ProviderKind::Mistral,
+        );
+        assert!(used_synth);
+        assert_eq!(selected.expect("selected think").goal, plan.goal);
+    }
+
+    #[test]
+    fn select_think_for_tool_turn_prefers_synth_over_invalid_last_for_openai_compatible() {
+        let plan = PlanBlock {
+            goal: "Locate the failing test".to_string(),
+            steps: vec![
+                "search for the test".to_string(),
+                "read the matching file".to_string(),
+            ],
+            acceptance_criteria: vec!["report the file path".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "observation tools are sufficient".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_3".to_string(),
+            name: "search_files".to_string(),
+            arguments: "{\"pattern\":\"test\",\"dir\":\"src\"}".to_string(),
+        };
+        let invalid_last = ThinkBlock {
+            goal: String::new(),
+            step: 1,
+            tool: "search_files".to_string(),
+            risk: "r".to_string(),
+            doubt: "d".to_string(),
+            next: "search".to_string(),
+            verify: "confirm".to_string(),
+        };
+        let synth = compat_synthetic_think(&tc, &plan);
+        let (selected, used_synth) = select_think_for_tool_turn(
+            None,
+            Some(&invalid_last),
+            Some(&synth),
+            &plan,
+            &tc,
+            ProviderKind::OpenAiCompatible,
         );
         assert!(used_synth);
         assert_eq!(selected.expect("selected think").goal, plan.goal);

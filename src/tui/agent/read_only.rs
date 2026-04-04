@@ -139,10 +139,42 @@ fn task_prefers_agent_flow_path(root_user_text: &str, criterion: &str) -> bool {
                 .any(|term| low.contains(term))
 }
 
+fn task_prefers_failure_mismatch(root_user_text: &str) -> bool {
+    let low = root_user_text.to_ascii_lowercase();
+    (low.contains("failing test") || low.contains("failed test"))
+        || (low.contains("test")
+            && ["mismatch", "fails", "failing", "failure"]
+                .iter()
+                .any(|term| low.contains(term)))
+}
+
+fn ordered_keyword_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for token in text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| part.len() >= 3)
+    {
+        if seen.insert(token.clone()) {
+            out.push(token);
+        }
+    }
+    out
+}
+
 pub(super) fn preferred_read_only_search_pattern(root_user_text: &str) -> String {
     let low = root_user_text.to_ascii_lowercase();
     if let Some(slash) = first_slash_literal(root_user_text) {
         return slash;
+    }
+    if low.contains("failing test")
+        || (low.contains("test")
+            && ["fail", "fails", "failing", "mismatch"]
+                .iter()
+                .any(|term| low.contains(term)))
+    {
+        return "test".to_string();
     }
     if ["pane-scoped", "preferences", "preference", "prefs"]
         .iter()
@@ -176,25 +208,30 @@ pub(super) fn preferred_read_only_search_pattern(root_user_text: &str) -> String
         "preferences",
         "repo_map",
         "fallback",
+        "test",
         "read_file",
         "agent",
         "events",
         "commands",
     ];
-    let tokens = keyword_tokens(root_user_text);
+    let ordered_tokens = ordered_keyword_tokens(root_user_text);
+    let tokens = ordered_tokens
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     for token in PRIORITY {
         if tokens.contains(*token) {
             return (*token).to_string();
         }
     }
-    tokens
+    const GENERIC_STOPWORDS: &[&str] = &[
+        "and", "answer", "anything", "code", "content", "context", "edit", "exact", "explain",
+        "file", "files", "final", "find", "include", "locate", "main", "must", "not", "path",
+        "read", "report", "the", "this", "where", "why", "with", "without",
+    ];
+    ordered_tokens
         .into_iter()
-        .find(|token| {
-            !matches!(
-                token.as_str(),
-                "find" | "where" | "locate" | "main" | "file"
-            )
-        })
+        .find(|token| !GENERIC_STOPWORDS.contains(&token.as_str()))
         .unwrap_or_else(|| "realize".to_string())
 }
 
@@ -243,6 +280,9 @@ pub(super) fn synthetic_read_only_goal(root_user_text: &str) -> String {
     if let Some(slash) = first_slash_literal(root_user_text) {
         return format!("Locate where `{slash}` is handled in the TUI and report the file path.");
     }
+    if task_prefers_failure_mismatch(root_user_text) {
+        return "Locate the failing test and confirm the exact assertion mismatch.".to_string();
+    }
     if task_prefers_prefs_path(root_user_text, "") {
         return "Locate the main file where pane-scoped TUI preferences are serialized and restored."
             .to_string();
@@ -262,6 +302,13 @@ pub(super) fn synthetic_read_only_acceptance(root_user_text: &str) -> (String, S
             format!("the file path handling `{slash}` is identified"),
             "the handler branch is confirmed by read_file".to_string(),
             "the command may be matched without the leading slash; the handler may live outside the obvious TUI file".to_string(),
+        );
+    }
+    if task_prefers_failure_mismatch(root_user_text) {
+        return (
+            "the failing test file path is identified".to_string(),
+            "the exact assertion mismatch is confirmed by read_file".to_string(),
+            "the failure context may live in helper code while the assertion sits in a nearby test module".to_string(),
         );
     }
     if task_prefers_prefs_path(root_user_text, "") {

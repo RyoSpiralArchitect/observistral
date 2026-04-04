@@ -340,6 +340,191 @@ pub(super) fn mistral_observation_tool(name: &str) -> bool {
     )
 }
 
+fn consecutive_missing_plan_blocks_for_diagnostic_tools(messages: &[serde_json::Value]) -> usize {
+    let mut count = 0usize;
+    let mut idx = messages.len();
+    while idx >= 2 {
+        let tool_msg = &messages[idx - 1];
+        let assistant_msg = &messages[idx - 2];
+        if !is_missing_plan_governor_block(tool_msg) {
+            break;
+        }
+        let Some(name) = assistant_blocked_tool_name(assistant_msg) else {
+            break;
+        };
+        if !is_diagnostic_tool_name(name.as_str()) {
+            break;
+        }
+        count = count.saturating_add(1);
+        idx -= 2;
+    }
+    count
+}
+
+fn consecutive_missing_think_blocks_for_diagnostic_tools(messages: &[serde_json::Value]) -> usize {
+    let mut count = 0usize;
+    let mut idx = messages.len();
+    while idx >= 2 {
+        let tool_msg = &messages[idx - 1];
+        let assistant_msg = &messages[idx - 2];
+        if !is_missing_think_governor_block(tool_msg) {
+            break;
+        }
+        let Some(name) = assistant_blocked_tool_name(assistant_msg) else {
+            break;
+        };
+        if !is_diagnostic_tool_name(name.as_str()) {
+            break;
+        }
+        count = count.saturating_add(1);
+        idx -= 2;
+    }
+    count
+}
+
+fn synthetic_action_plan_goal(root_user_text: &str) -> String {
+    let goal = compact_one_line(root_user_text.trim(), 220);
+    if goal.is_empty() {
+        "Complete the requested task safely and verify the result.".to_string()
+    } else {
+        goal
+    }
+}
+
+fn synthetic_action_plan_first_step(tc: &ToolCallData) -> String {
+    if let Some(command) = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str()) {
+        match tc.name.as_str() {
+            "read_file" | "search_files" | "list_dir" | "glob" => {
+                return format!(
+                    "{command} to inspect the current target and confirm the relevant context"
+                );
+            }
+            _ => {
+                return format!("{command} to gather the smallest safe evidence first");
+            }
+        }
+    }
+
+    match tc.name.as_str() {
+        "read_file" => "read the current target file and confirm the edit context".to_string(),
+        "search_files" => {
+            "search for the current target and confirm the strongest match".to_string()
+        }
+        "list_dir" => "list the relevant directory and confirm the likely target files".to_string(),
+        "glob" => "glob for the likely target files before editing".to_string(),
+        _ => format!("use {} to gather the smallest safe evidence first", tc.name),
+    }
+}
+
+fn synthetic_action_plan_verify_step(
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+) -> String {
+    match required_verification {
+        VerificationLevel::Behavioral => {
+            let command = test_cmd
+                .map(|cmd| compact_one_line(cmd, 160))
+                .filter(|cmd| !cmd.is_empty())
+                .unwrap_or_else(|| "run the targeted behavioral verification command".to_string());
+            format!("{command} and confirm the requested behavior now passes")
+        }
+        VerificationLevel::Build => {
+            let command = verification_examples(VerificationLevel::Build);
+            if command.trim().is_empty() {
+                "run a real build/check/lint verification command and confirm it passes".to_string()
+            } else {
+                format!("{command} and confirm the requested scope still builds cleanly")
+            }
+        }
+    }
+}
+
+fn synthetic_action_plan_acceptance(required_verification: VerificationLevel) -> Vec<String> {
+    match required_verification {
+        VerificationLevel::Behavioral => vec![
+            "the requested change is implemented and confirmed by a passing behavioral verification command"
+                .to_string(),
+            "the final result cites the exact passing behavioral verification command".to_string(),
+        ],
+        VerificationLevel::Build => vec![
+            "the requested change is implemented and confirmed by a passing build/check/lint verification command"
+                .to_string(),
+            "the final result cites the exact passing build/check/lint verification command"
+                .to_string(),
+        ],
+    }
+}
+
+fn synthetic_action_plan_risks(required_verification: VerificationLevel) -> String {
+    match required_verification {
+        VerificationLevel::Behavioral => {
+            "wrong file or speculative fix; the chosen test may miss the requested behavior"
+                .to_string()
+        }
+        VerificationLevel::Build => {
+            "wrong file or speculative fix; build-only verification may miss the requested behavior"
+                .to_string()
+        }
+    }
+}
+
+fn synthetic_action_plan(
+    root_user_text: &str,
+    tc: &ToolCallData,
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+) -> PlanBlock {
+    PlanBlock {
+        goal: synthetic_action_plan_goal(root_user_text),
+        steps: vec![
+            synthetic_action_plan_first_step(tc),
+            "read the strongest candidate file and confirm the exact edit context".to_string(),
+            "apply the smallest evidence-backed code change in the confirmed target".to_string(),
+            synthetic_action_plan_verify_step(required_verification, test_cmd),
+            "call done with the verified outcome and any remaining gaps".to_string(),
+        ],
+        acceptance_criteria: synthetic_action_plan_acceptance(required_verification),
+        risks: synthetic_action_plan_risks(required_verification),
+        assumptions:
+            "the current repo state matches the task and the configured verification command is relevant"
+                .to_string(),
+    }
+}
+
+pub(super) fn rescue_missing_plan_for_tool_turn(
+    messages: &[serde_json::Value],
+    tc: &ToolCallData,
+    root_user_text: &str,
+    root_read_only: bool,
+    goal_wants_actions: bool,
+    provider: ProviderKind,
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+) -> Option<PlanBlock> {
+    if root_read_only || !goal_wants_actions {
+        return None;
+    }
+    if !matches!(provider, ProviderKind::OpenAiCompatible) {
+        return None;
+    }
+    if !is_diagnostic_tool_name(tc.name.as_str()) {
+        return None;
+    }
+
+    let prior_blocks = consecutive_missing_plan_blocks_for_tool(messages, tc);
+    let prior_diagnostic_blocks = consecutive_missing_plan_blocks_for_diagnostic_tools(messages);
+    if prior_blocks.saturating_add(1) < 2 && prior_diagnostic_blocks.saturating_add(1) < 3 {
+        return None;
+    }
+
+    Some(synthetic_action_plan(
+        root_user_text,
+        tc,
+        required_verification,
+        test_cmd,
+    ))
+}
+
 pub(super) fn rescue_read_only_missing_plan_for_tool_turn(
     messages: &[serde_json::Value],
     tc: &ToolCallData,
@@ -400,6 +585,37 @@ pub(super) fn rescue_read_only_missing_think_for_tool_turn(
     if prior_blocks.saturating_add(1) < 2 && prior_observation_blocks.saturating_add(1) < 2 {
         return None;
     }
+    Some(compat_synthetic_think(tc, plan))
+}
+
+pub(super) fn rescue_missing_think_for_tool_turn(
+    messages: &[serde_json::Value],
+    tc: &ToolCallData,
+    plan: &PlanBlock,
+    root_read_only: bool,
+    goal_wants_actions: bool,
+    provider: ProviderKind,
+    force: bool,
+) -> Option<ThinkBlock> {
+    if root_read_only || !goal_wants_actions {
+        return None;
+    }
+    if !matches!(provider, ProviderKind::OpenAiCompatible) {
+        return None;
+    }
+    if !is_diagnostic_tool_name(tc.name.as_str()) {
+        return None;
+    }
+    if force {
+        return Some(compat_synthetic_think(tc, plan));
+    }
+
+    let prior_blocks = consecutive_missing_think_blocks_for_tool(messages, tc);
+    let prior_diagnostic_blocks = consecutive_missing_think_blocks_for_diagnostic_tools(messages);
+    if prior_blocks.saturating_add(1) < 2 && prior_diagnostic_blocks.saturating_add(1) < 2 {
+        return None;
+    }
+
     Some(compat_synthetic_think(tc, plan))
 }
 
@@ -524,5 +740,20 @@ pub(super) fn select_think_for_tool_turn<'a>(
         );
     }
 
-    (parsed.or(compat_last).or(compat_synth), false)
+    if let Some(think) = parsed.filter(|think| validate_think(think, plan, tc).is_ok()) {
+        return (Some(think), false);
+    }
+    if let Some(think) = compat_last.filter(|think| validate_think(think, plan, tc).is_ok()) {
+        return (Some(think), false);
+    }
+    if let Some(think) = compat_synth.filter(|think| validate_think(think, plan, tc).is_ok()) {
+        return (Some(think), true);
+    }
+
+    let fallback = parsed.or(compat_last).or(compat_synth);
+    let used_synth = fallback
+        .zip(compat_synth)
+        .map(|(selected, synth)| std::ptr::eq(selected, synth))
+        .unwrap_or(false);
+    (fallback, used_synth)
 }
