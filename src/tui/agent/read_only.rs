@@ -748,9 +748,6 @@ pub(super) fn coerce_read_only_followup_read_tool_call(
         .rev()
         .take(6)
         .any(is_missing_gate_governor_block);
-    if !saw_recent_gate_miss {
-        return None;
-    }
 
     let args = serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()?;
     let current_path = args
@@ -771,6 +768,9 @@ pub(super) fn coerce_read_only_followup_read_tool_call(
     };
 
     let last_search = evidence.searches.last()?;
+    let preferred_path_hint = preferred_read_only_read_path_hint(root_user_text)
+        .map(str::to_string)
+        .filter(|path| !path.trim().is_empty());
     let handler_candidate = if task_prefers_handler_path(root_user_text, &plan.goal) {
         last_search
             .paths
@@ -785,7 +785,11 @@ pub(super) fn coerce_read_only_followup_read_tool_call(
     } else {
         None
     };
-    let best_path = handler_candidate
+    if !saw_recent_gate_miss && preferred_path_hint.is_none() && handler_candidate.is_none() {
+        return None;
+    }
+    let best_path = preferred_path_hint
+        .or(handler_candidate)
         .or_else(|| {
             best_read_only_followup_read_path(root_user_text, plan, &last_search.paths, evidence)
         })
@@ -911,6 +915,56 @@ mod tests {
                     .map(str::to_string))
                 .as_deref(),
             Some("src/tui/events.rs")
+        );
+    }
+
+    #[test]
+    fn coerce_read_only_followup_read_tool_call_prefers_prefs_owner_hint() {
+        let messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"prefs\",\"dir\":\"src/tui\"}"
+        })];
+        let plan = synthetic_read_only_observation_plan(
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+        );
+        let evidence = ObservationEvidence {
+            searches: vec![ObservationSearchEvidence {
+                command: "search_files(pattern=prefs, dir=src/tui)".to_string(),
+                pattern: "prefs".to_string(),
+                hit_count: 1,
+                paths: vec!["src/tui/events.rs".to_string()],
+            }],
+            reads: Vec::new(),
+            resolutions: Vec::new(),
+        };
+        let tc = ToolCallData {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: "{\"path\":\"src/tui/events.rs\"}".to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_read_only_followup_read_tool_call(
+            &messages,
+            &tc,
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+            true,
+            Some(&plan),
+            &evidence,
+        )
+        .expect("coerced read");
+
+        assert_eq!(original, "src/tui/events.rs");
+        assert_eq!(coerced, "src/tui/prefs.rs");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rewritten.arguments)
+                .ok()
+                .and_then(|args| args
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string))
+                .as_deref(),
+            Some("src/tui/prefs.rs")
         );
     }
 }
