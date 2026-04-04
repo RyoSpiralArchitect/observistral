@@ -355,9 +355,78 @@ Do NOT call the same observation tool on the same target again until the target 
     ))
 }
 
+pub(super) fn build_fix_stage_progress_hint(
+    harness: TaskHarness,
+    messages: &[Value],
+    recovery_stage: Option<RecoveryStage>,
+    test_cmd: Option<&str>,
+) -> Option<String> {
+    if recovery_stage != Some(RecoveryStage::Fix)
+        || harness.artifact_mode == ArtifactMode::ObserveOnly
+    {
+        return None;
+    }
+
+    let history = observation_history(messages);
+    let threshold = match harness.artifact_mode {
+        ArtifactMode::ExistingFiles => {
+            if history
+                .by_command
+                .keys()
+                .any(|command| command.starts_with("read_file("))
+            {
+                1
+            } else {
+                2
+            }
+        }
+        ArtifactMode::NewFiles | ArtifactMode::NewRepo => 1,
+        ArtifactMode::ObserveOnly => unreachable!(),
+    };
+    if history.total_successes < threshold {
+        return None;
+    }
+
+    let recent = history
+        .last_successful_command
+        .as_deref()
+        .unwrap_or("recent observation");
+    let action = match harness.artifact_mode {
+        ArtifactMode::ExistingFiles => {
+            "apply the smallest edit now with `patch_file` or `apply_diff`"
+        }
+        ArtifactMode::NewFiles => {
+            "create the requested file now with `write_file` or a minimal `exec`"
+        }
+        ArtifactMode::NewRepo => {
+            "create the requested repo/project artifact now with `write_file` or `exec`"
+        }
+        ArtifactMode::ObserveOnly => unreachable!(),
+    };
+    let verify_hint = test_cmd
+        .filter(|cmd| !cmd.trim().is_empty())
+        .map(|cmd| format!("Then verify with `{}`.", compact_one_line(cmd, 140)))
+        .unwrap_or_else(|| "Then run a real command that proves the artifact exists.".to_string());
+
+    Some(format!(
+        "[Task Harness]\n\
+Task lane: {}\n\
+Recent successful observation: {}\n\
+You already have enough context for the current phase.\n\
+Required now: {}.\n\
+{}\n\
+Do NOT continue with more read/search/list calls unless the target is still genuinely ambiguous.",
+        harness.lane_label(),
+        compact_one_line(recent, 160),
+        action,
+        verify_hint
+    ))
+}
+
 #[derive(Debug, Default)]
 struct ObservationHistory {
     total_successes: usize,
+    last_successful_command: Option<String>,
     by_command: BTreeMap<String, usize>,
 }
 
@@ -412,6 +481,7 @@ fn observation_history(messages: &[Value]) -> ObservationHistory {
                     continue;
                 }
                 out.total_successes += 1;
+                out.last_successful_command = Some(command.clone());
                 *out.by_command.entry(command.clone()).or_insert(0) += 1;
             }
             _ => {}
@@ -575,5 +645,38 @@ mod tests {
 
         assert!(block.contains("create the requested file now"));
         assert!(block.contains("notes/todo.txt") || block.contains("Configured"));
+    }
+
+    #[test]
+    fn build_fix_stage_progress_hint_prefers_creation_after_first_success() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_list",
+                    "type": "function",
+                    "function": {"name":"list_dir","arguments":"{\"dir\":\".\",\"include_hidden\":true}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_list",
+                "content": "[list_dir: '.' ・ 2 item(s)]\nREADME.md\n.obstral.md"
+            }),
+        ];
+
+        let hint = build_fix_stage_progress_hint(
+            TaskHarness {
+                lane: TaskLane::CreateFile,
+                artifact_mode: ArtifactMode::NewFiles,
+            },
+            &messages,
+            Some(RecoveryStage::Fix),
+            Some("test -f notes/todo.txt && grep -Fx \"ship it\" notes/todo.txt"),
+        )
+        .expect("fix-stage hint");
+
+        assert!(hint.contains("create the requested file now"));
+        assert!(hint.contains("notes/todo.txt"));
     }
 }

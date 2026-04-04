@@ -81,7 +81,7 @@ use self::read_only::{
     preferred_read_only_search_dir, preferred_read_only_search_pattern, read_only_plan_violation,
     synthetic_read_only_observation_plan, ReadOnlyDiagnoseRescueAction,
 };
-use self::task_harness::{build_progress_gate_block, TaskHarness};
+use self::task_harness::{build_fix_stage_progress_hint, build_progress_gate_block, TaskHarness};
 
 #[derive(Debug, Clone)]
 pub struct AgenticStartState {
@@ -12483,6 +12483,16 @@ Required now: {}",
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
+            if !is_error && !root_read_only {
+                if let Some(hint) = build_fix_stage_progress_hint(
+                    task_harness,
+                    &messages,
+                    recovery.stage,
+                    test_cmd.as_deref(),
+                ) {
+                    pending_system_hint = Some(hint);
+                }
+            }
             if !is_error && root_read_only {
                 if let Some(plan) = active_plan.as_ref() {
                     if iter + 1 == max_iters {
@@ -12655,6 +12665,16 @@ Required now: {}",
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
+            if !is_error && !root_read_only {
+                if let Some(hint) = build_fix_stage_progress_hint(
+                    task_harness,
+                    &messages,
+                    recovery.stage,
+                    test_cmd.as_deref(),
+                ) {
+                    pending_system_hint = Some(hint);
+                }
+            }
             if !is_error && root_read_only {
                 if let Some(plan) = active_plan.as_ref() {
                     if iter + 1 == max_iters {
@@ -12816,6 +12836,16 @@ Required now: {}",
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
+            if !is_error && !root_read_only {
+                if let Some(hint) = build_fix_stage_progress_hint(
+                    task_harness,
+                    &messages,
+                    recovery.stage,
+                    test_cmd.as_deref(),
+                ) {
+                    pending_system_hint = Some(hint);
+                }
+            }
             if !is_error && root_read_only {
                 if let Some(plan) = active_plan.as_ref() {
                     if iter + 1 == max_iters {
@@ -13486,6 +13516,16 @@ Action required: call read_file(path) first to confirm current contents, then re
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
+            if !is_error && !root_read_only {
+                if let Some(hint) = build_fix_stage_progress_hint(
+                    task_harness,
+                    &messages,
+                    recovery.stage,
+                    test_cmd.as_deref(),
+                ) {
+                    pending_system_hint = Some(hint);
+                }
+            }
             if !is_error && root_read_only && tc.name.as_str() == "read_file" {
                 if let Some(plan) = active_plan.as_ref() {
                     if let Some(final_text) = maybe_build_read_only_auto_final_answer(
