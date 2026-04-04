@@ -395,6 +395,48 @@ pub(super) fn coerce_artifact_creation_tool_call(
     }
 }
 
+pub(super) fn coerce_repo_goal_completion_tool_call(
+    harness: TaskHarness,
+    messages: &[Value],
+    tc: &ToolCallData,
+    test_cmd: Option<&str>,
+) -> Option<(ToolCallData, String, String)> {
+    if harness.artifact_mode != ArtifactMode::NewRepo || !is_observation_tool(tc.name.as_str()) {
+        return None;
+    }
+    if !latest_goal_check_missing(messages)
+        .iter()
+        .any(|entry| entry == ".git" || entry.ends_with("/.git"))
+    {
+        return None;
+    }
+    let repo_root = repo_root_from_test_cmd(test_cmd?)?;
+    let rewritten = ToolCallData {
+        id: tc.id.clone(),
+        name: "exec".to_string(),
+        arguments: serde_json::json!({
+            "command": format!("git init {repo_root}")
+        })
+        .to_string(),
+    };
+    let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| {
+            format!(
+                "{}({})",
+                tc.name,
+                compact_one_line(tc.arguments.as_str(), 120)
+            )
+        });
+    let coerced =
+        canonicalize_tool_call_command(rewritten.name.as_str(), rewritten.arguments.as_str())
+            .unwrap_or_else(|| compact_one_line(rewritten.arguments.as_str(), 200));
+    if original == coerced {
+        None
+    } else {
+        Some((rewritten, original, coerced))
+    }
+}
+
 pub(super) fn allows_artifact_creation_during_diagnose(
     harness: TaskHarness,
     tc: &ToolCallData,
@@ -613,6 +655,49 @@ fn supports_artifact_action(harness: TaskHarness, name: &str) -> bool {
         ArtifactMode::NewRepo => matches!(name, "write_file" | "exec"),
         ArtifactMode::ObserveOnly | ArtifactMode::ExistingFiles => false,
     }
+}
+
+fn latest_goal_check_missing(messages: &[Value]) -> Vec<String> {
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if !content.starts_with("[goal_check]") {
+            continue;
+        }
+        for line in content.lines() {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix("Missing:") else {
+                continue;
+            };
+            return rest
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToString::to_string)
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn repo_root_from_test_cmd(test_cmd: &str) -> Option<String> {
+    for segment in test_cmd.split("&&") {
+        let trimmed = segment.trim();
+        let Some(path) = trimmed.strip_prefix("test -d ") else {
+            continue;
+        };
+        let path = path.trim().trim_matches('\'').trim_matches('"').trim();
+        let Some(root) = path.strip_suffix("/.git") else {
+            continue;
+        };
+        let root = root.trim();
+        if !root.is_empty() {
+            return Some(root.to_string());
+        }
+    }
+    None
 }
 
 fn text_contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -851,5 +936,34 @@ mod tests {
             },
             &tc,
         ));
+    }
+
+    #[test]
+    fn coerce_repo_goal_completion_tool_call_rewrites_to_git_init() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": "[goal_check]\nThe task is NOT complete yet.\nMissing: .git\nFix it by using exec/write_file. Do NOT stop until the goals are satisfied."
+        })];
+        let tc = ToolCallData {
+            id: "call_list".to_string(),
+            name: "list_dir".to_string(),
+            arguments: json!({"dir":"demo_repo","include_hidden":true}).to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_repo_goal_completion_tool_call(
+            TaskHarness {
+                lane: TaskLane::ScaffoldRepo,
+                artifact_mode: ArtifactMode::NewRepo,
+            },
+            &messages,
+            &tc,
+            Some("test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore"),
+        )
+        .expect("rewritten");
+
+        assert_eq!(rewritten.name, "exec");
+        assert!(rewritten.arguments.contains("git init demo_repo"));
+        assert!(original.contains("list_dir"));
+        assert_eq!(coerced, "git init demo_repo");
     }
 }
