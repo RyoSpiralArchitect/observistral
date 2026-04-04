@@ -64,7 +64,7 @@
         { "kind": "error_free" },
         { "kind": "tool_call_seen", "name": "write_file" },
         { "kind": "tool_call_seen", "name": "exec" },
-        { "kind": "assistant_contains", "value": "notes/todo.txt" }
+        { "kind": "trace_event_seen", "event": "task_harness" }
       ]
     },
     {
@@ -78,7 +78,7 @@
         { "kind": "completed" },
         { "kind": "error_free" },
         { "kind": "tool_call_seen", "name": "exec" },
-        { "kind": "assistant_contains", "value": "demo_repo" }
+        { "kind": "trace_event_seen", "event": "task_harness" }
       ]
     },
     {
@@ -92,8 +92,8 @@
         { "kind": "completed" },
         { "kind": "error_free" },
         { "kind": "tool_call_seen", "name": "read_file" },
-        { "kind": "tool_call_seen", "name": "exec" },
-        { "kind": "assistant_contains", "value": "src/lib.rs" }
+        { "kind": "tool_call_seen", "name": "patch_file" },
+        { "kind": "trace_event_seen", "event": "task_harness" }
       ]
     }
   ]
