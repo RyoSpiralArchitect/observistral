@@ -786,7 +786,7 @@ pub(super) fn should_prefer_done_after_verified_action(
 
     let last_mutation = last_mutation_step.unwrap_or(0);
     let last_verify_ok = last_verify_ok_step.unwrap_or(0);
-    if last_mutation == 0 || last_verify_ok <= last_mutation {
+    if last_mutation == 0 || last_verify_ok < last_mutation {
         return false;
     }
 
@@ -1116,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn should_prefer_done_after_verified_action_waits_until_standalone_verify_exists() {
+    fn should_prefer_done_after_verified_action_accepts_verified_patch_auto_test() {
         let plan = PlanBlock {
             goal: "Fix the failing test with the smallest code change.".to_string(),
             steps: vec![
@@ -1139,10 +1139,44 @@ mod tests {
         };
         let known_commands = vec!["cargo test 2>&1".to_string()];
 
-        assert!(!should_prefer_done_after_verified_action(
+        assert!(should_prefer_done_after_verified_action(
             &tc,
             &plan,
             &known_commands,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+            Some(4),
+            Some(4),
+        ));
+    }
+
+    #[test]
+    fn should_prefer_done_after_verified_action_requires_known_verification_command() {
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented".to_string(),
+                "cargo test 2>&1 passes".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "cargo test is relevant".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"Cargo.toml"}).to_string(),
+        };
+
+        assert!(!should_prefer_done_after_verified_action(
+            &tc,
+            &plan,
+            &[],
             VerificationLevel::Behavioral,
             Some("cargo test 2>&1"),
             Some(4),
