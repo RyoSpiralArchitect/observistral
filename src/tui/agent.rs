@@ -61,7 +61,9 @@ use self::memory::{
 use self::provider_compat::compat_synthetic_think;
 use self::provider_compat::{
     build_mistral_think_only_hint, mistral_observation_tool, normalize_mistral_tool_call,
-    repair_mistral_plan_for_tool_turn, rescue_missing_plan_for_tool_turn,
+    repair_mistral_plan_for_tool_turn, repair_truncated_patch_tool_call_from_recent_mismatch,
+    rescue_missing_evidence_for_tool_turn, rescue_missing_impact_for_tool_turn,
+    rescue_missing_plan_for_tool_turn, rescue_missing_reflection_for_tool_turn,
     rescue_missing_think_for_tool_turn, rescue_read_only_missing_plan_for_tool_turn,
     rescue_read_only_missing_think_for_tool_turn, select_think_for_tool_turn,
 };
@@ -8875,6 +8877,27 @@ This is the LAST model call for this run.\n\
             break;
         }
 
+        if tool_calls.len() == 1 {
+            if let Some((rewritten, original, repaired)) =
+                repair_truncated_patch_tool_call_from_recent_mismatch(
+                    &messages,
+                    &tool_calls[0],
+                    root_read_only,
+                    goal_wants_actions,
+                    cfg.provider.clone(),
+                    &observation_evidence,
+                )
+            {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[compat] repaired malformed patch tool call from recent mismatch: {} -> {}\n",
+                        original, repaired
+                    )))
+                    .await;
+                tool_calls[0] = rewritten;
+            }
+        }
+
         // ── Reflection enforcement (before any tool call) ─────────────────
         // When reflection is required, the model MUST emit exactly one <reflect> block
         // AND exactly one tool call in the same assistant turn.
@@ -8882,14 +8905,44 @@ This is the LAST model call for this run.\n\
             let reflect = match parse_reflection_block(&assistant_text) {
                 Some(r) => r,
                 None => {
-                    let msg = governor_contract::reflection_missing_message(reason.as_str());
-                    let _ = tx
-                        .send(StreamToken::Delta(format!("\n[reflect] {msg}\n")))
-                        .await;
-                    pending_system_hint = Some(msg);
-                    state = AgentState::Recovery;
-                    reflection_required = Some(reason);
-                    continue;
+                    if tool_calls.len() == 1 {
+                        if let Some(reflect) = rescue_missing_reflection_for_tool_turn(
+                            reason.as_str(),
+                            &tool_calls[0],
+                            root_read_only,
+                            goal_wants_actions,
+                            cfg.provider.clone(),
+                            &mem,
+                            file_tool_consec_failures,
+                        ) {
+                            let _ = tx
+                                .send(StreamToken::Delta(
+                                    "\n[compat] synthesized reflection block for the rescued tool turn\n"
+                                        .to_string(),
+                                ))
+                                .await;
+                            reflect
+                        } else {
+                            let msg =
+                                governor_contract::reflection_missing_message(reason.as_str());
+                            let _ = tx
+                                .send(StreamToken::Delta(format!("\n[reflect] {msg}\n")))
+                                .await;
+                            pending_system_hint = Some(msg);
+                            state = AgentState::Recovery;
+                            reflection_required = Some(reason);
+                            continue;
+                        }
+                    } else {
+                        let msg = governor_contract::reflection_missing_message(reason.as_str());
+                        let _ = tx
+                            .send(StreamToken::Delta(format!("\n[reflect] {msg}\n")))
+                            .await;
+                        pending_system_hint = Some(msg);
+                        state = AgentState::Recovery;
+                        reflection_required = Some(reason);
+                        continue;
+                    }
                 }
             };
 
@@ -9018,14 +9071,42 @@ Execute only the new minimal action: {}",
             let impact = match parse_impact_block(&assistant_text) {
                 Some(impact) => impact,
                 None => {
-                    let msg = governor_contract::impact_missing_message(reason.as_str());
-                    let _ = tx
-                        .send(StreamToken::Delta(format!("\n[impact] {msg}\n")))
-                        .await;
-                    pending_system_hint = Some(msg);
-                    state = AgentState::Recovery;
-                    impact_required = Some(reason);
-                    continue;
+                    if tool_calls.len() == 1 {
+                        if let Some(impact) = rescue_missing_impact_for_tool_turn(
+                            reason.as_str(),
+                            &tool_calls[0],
+                            root_read_only,
+                            goal_wants_actions,
+                            cfg.provider.clone(),
+                            impact_plan.as_ref(),
+                        ) {
+                            let _ = tx
+                                .send(StreamToken::Delta(
+                                    "\n[compat] synthesized impact block for the rescued mutation turn\n"
+                                        .to_string(),
+                                ))
+                                .await;
+                            impact
+                        } else {
+                            let msg = governor_contract::impact_missing_message(reason.as_str());
+                            let _ = tx
+                                .send(StreamToken::Delta(format!("\n[impact] {msg}\n")))
+                                .await;
+                            pending_system_hint = Some(msg);
+                            state = AgentState::Recovery;
+                            impact_required = Some(reason);
+                            continue;
+                        }
+                    } else {
+                        let msg = governor_contract::impact_missing_message(reason.as_str());
+                        let _ = tx
+                            .send(StreamToken::Delta(format!("\n[impact] {msg}\n")))
+                            .await;
+                        pending_system_hint = Some(msg);
+                        state = AgentState::Recovery;
+                        impact_required = Some(reason);
+                        continue;
+                    }
                 }
             };
 
@@ -9951,43 +10032,59 @@ Execute only the new minimal action: {}",
                 let evidence_block = match parse_evidence_block(&assistant_text) {
                     Some(block) => block,
                     None => {
-                        state = AgentState::Recovery;
-                        recovery.stage = Some(RecoveryStage::Diagnose);
-                        let block =
-                            build_evidence_gate_prompt(tc, &observations, &assumption_ledger);
-                        let _ = tx
-                            .send(StreamToken::Delta(format!(
-                                "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
-                            )))
-                            .await;
-                        push_blocked_tool_exchange(
-                            &mut messages,
-                            &assistant_text_clean,
+                        if let Some(block) = rescue_missing_evidence_for_tool_turn(
                             tc,
-                            &block,
-                        );
-                        autosave_best_effort(
-                            &autosaver,
-                            &tx,
-                            tool_root_abs.as_deref(),
-                            checkpoint.as_deref(),
-                            cur_cwd.as_deref(),
-                            &messages,
-                        )
-                        .await;
-                        pending_system_hint = Some(block);
-                        let _ = tx
-                            .send(StreamToken::GovernorState(build_governor_state(
-                                state,
-                                &recovery,
-                                &mem,
-                                file_tool_consec_failures,
-                                last_mutation_step,
-                                last_verify_ok_step,
-                                last_reflection.as_ref(),
-                            )))
+                            root_read_only,
+                            goal_wants_actions,
+                            cfg.provider.clone(),
+                            observations,
+                        ) {
+                            let _ = tx
+                                .send(StreamToken::Delta(
+                                    "\n[compat] synthesized evidence block for the rescued mutation turn\n"
+                                        .to_string(),
+                                ))
+                                .await;
+                            block
+                        } else {
+                            state = AgentState::Recovery;
+                            recovery.stage = Some(RecoveryStage::Diagnose);
+                            let block =
+                                build_evidence_gate_prompt(tc, &observations, &assumption_ledger);
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                                )))
+                                .await;
+                            push_blocked_tool_exchange(
+                                &mut messages,
+                                &assistant_text_clean,
+                                tc,
+                                &block,
+                            );
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
                             .await;
-                        continue;
+                            pending_system_hint = Some(block);
+                            let _ = tx
+                                .send(StreamToken::GovernorState(build_governor_state(
+                                    state,
+                                    &recovery,
+                                    &mem,
+                                    file_tool_consec_failures,
+                                    last_mutation_step,
+                                    last_verify_ok_step,
+                                    last_reflection.as_ref(),
+                                )))
+                                .await;
+                            continue;
+                        }
                     }
                 };
                 if let Err(e) = validate_evidence_block(&evidence_block, tc, &observations) {
@@ -16020,6 +16117,252 @@ verify: exit code is zero\n\
 
         validate_think(&rescued, &plan, &tc).expect("valid synthetic think");
         assert_eq!(rescued.tool, "list_dir");
+    }
+
+    #[test]
+    fn rescue_missing_think_for_tool_turn_is_immediate_for_patch_file() {
+        let tc = ToolCallData {
+            id: "call_patch".to_string(),
+            name: "patch_file".to_string(),
+            arguments: serde_json::json!({
+                "path":"src/lib.rs",
+                "search":"Hello, {}?",
+                "replace":"Hello, {}!"
+            })
+            .to_string(),
+        };
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented and confirmed by a passing behavioral verification command".to_string(),
+                "the final result cites the exact passing behavioral verification command".to_string(),
+            ],
+            risks: "wrong file or speculative fix; the chosen test may miss the requested behavior".to_string(),
+            assumptions: "the current repo state matches the task and the configured verification command is relevant".to_string(),
+        };
+        let messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call_patch",
+            "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\npatch_file\narguments:\n{\"path\":\"src/lib.rs\",\"search\":\"Hello, {}?\",\"replace\":\"Hello, {}!\"}"
+        })];
+
+        let rescued = rescue_missing_think_for_tool_turn(
+            &messages,
+            &tc,
+            &plan,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            false,
+        )
+        .expect("synthetic think");
+
+        validate_think(&rescued, &plan, &tc).expect("valid synthetic think");
+        assert_eq!(rescued.tool, "patch_file");
+    }
+
+    #[test]
+    fn rescue_missing_think_for_tool_turn_is_immediate_for_exec() {
+        let tc = ToolCallData {
+            id: "call_exec".to_string(),
+            name: "exec".to_string(),
+            arguments: serde_json::json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented and confirmed by a passing behavioral verification command".to_string(),
+                "the final result cites the exact passing behavioral verification command".to_string(),
+            ],
+            risks: "wrong file or speculative fix; the chosen test may miss the requested behavior".to_string(),
+            assumptions: "the current repo state matches the task and the configured verification command is relevant".to_string(),
+        };
+        let messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call_exec",
+            "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\nexec\narguments:\n{\"command\":\"cargo test 2>&1\"}"
+        })];
+
+        let rescued = rescue_missing_think_for_tool_turn(
+            &messages,
+            &tc,
+            &plan,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            false,
+        )
+        .expect("synthetic think");
+
+        validate_think(&rescued, &plan, &tc).expect("valid synthetic think");
+        assert_eq!(rescued.tool, "exec");
+    }
+
+    #[test]
+    fn rescue_missing_reflection_for_tool_turn_synthesizes_valid_reflection_for_patch() {
+        let tc = ToolCallData {
+            id: "call_patch".to_string(),
+            name: "patch_file".to_string(),
+            arguments: serde_json::json!({
+                "path":"src/lib.rs",
+                "search":"Hello, {}?",
+                "replace":"Hello, {}!"
+            })
+            .to_string(),
+        };
+        let mut mem = FailureMemory::default();
+        mem.consecutive_failures = 1;
+
+        let reflect = rescue_missing_reflection_for_tool_turn(
+            "⚠ LOGIC ERROR: The code ran but produced wrong results.",
+            &tc,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            &mem,
+            0,
+        )
+        .expect("synthetic reflection");
+
+        validate_reflection(&reflect, &mem, 0).expect("valid synthetic reflection");
+        assert_eq!(reflect.last_outcome, "failure");
+        assert_eq!(reflect.strategy_change, StrategyChange::Adjust);
+        assert!(reflect.next_minimal_action.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn rescue_missing_impact_for_tool_turn_synthesizes_valid_impact_after_patch() {
+        let tc = ToolCallData {
+            id: "call_exec".to_string(),
+            name: "exec".to_string(),
+            arguments: serde_json::json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented and confirmed by a passing behavioral verification command".to_string(),
+                "the final result cites the exact passing behavioral verification command".to_string(),
+            ],
+            risks: "wrong file or speculative fix; the chosen test may miss the requested behavior".to_string(),
+            assumptions: "the current repo state matches the task and the configured verification command is relevant".to_string(),
+        };
+
+        let impact = rescue_missing_impact_for_tool_turn(
+            "successful mutation via patch_file: src/lib.rs",
+            &tc,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            Some(&plan),
+        )
+        .expect("synthetic impact");
+
+        validate_impact(&impact, Some(&plan)).expect("valid synthetic impact");
+        assert!(impact.changed.contains("src/lib.rs"));
+        assert!(impact.progress.contains("step 2"));
+        assert!(impact.remaining_gap.contains("cargo test 2>&1"));
+    }
+
+    #[test]
+    fn rescue_missing_evidence_for_tool_turn_synthesizes_valid_evidence_for_patch() {
+        let tc = ToolCallData {
+            id: "call_patch".to_string(),
+            name: "patch_file".to_string(),
+            arguments: serde_json::json!({
+                "path":"src/lib.rs",
+                "search":"Hello, {}?",
+                "replace":"Hello, {}!"
+            })
+            .to_string(),
+        };
+        let observations = ObservationEvidence {
+            reads: vec![ObservationReadEvidence {
+                command: "read_file(path=src/lib.rs)".to_string(),
+                path: "src/lib.rs".to_string(),
+            }],
+            searches: Vec::new(),
+            resolutions: Vec::new(),
+        };
+
+        let evidence = rescue_missing_evidence_for_tool_turn(
+            &tc,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            &observations,
+        )
+        .expect("synthetic evidence");
+
+        validate_evidence_block(&evidence, &tc, &observations).expect("valid synthetic evidence");
+        assert_eq!(evidence.target_files, vec!["src/lib.rs".to_string()]);
+        assert!(evidence.evidence.contains("read_file(path=src/lib.rs)"));
+    }
+
+    #[test]
+    fn repair_truncated_patch_tool_call_from_recent_mismatch_recovers_smoke_fix() {
+        let tc = ToolCallData {
+            id: "call_patch".to_string(),
+            name: "patch_file".to_string(),
+            arguments: "{\"path\":\"src/lib.rs\",\"search\":\"pub fn greet(name: &str) -> String {\\n    format!(\\\"Hello, {}?\\\", name)\\n}\\n\",\"replace\":\"".to_string(),
+        };
+        let messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call_exec",
+            "content": "thread 'tests::greet_is_excited' panicked at src/lib.rs:12:9:\nassertion `left == right` failed\n  left: \"Hello, Ada?\"\n right: \"Hello, Ada!\""
+        })];
+        let observations = ObservationEvidence {
+            reads: vec![ObservationReadEvidence {
+                command: "read_file(path=src/lib.rs)".to_string(),
+                path: "src/lib.rs".to_string(),
+            }],
+            searches: Vec::new(),
+            resolutions: Vec::new(),
+        };
+
+        let (rewritten, original, repaired) =
+            repair_truncated_patch_tool_call_from_recent_mismatch(
+                &messages,
+                &tc,
+                false,
+                true,
+                ProviderKind::OpenAiCompatible,
+                &observations,
+            )
+            .expect("repair malformed patch tool call");
+
+        assert!(original.starts_with("patch_file"));
+        assert!(original.contains("\"replace\":\""));
+        assert!(repaired.starts_with("patch_file("));
+        assert!(repaired.contains("Hello, {}!"));
+        assert_eq!(rewritten.name, "patch_file");
+        let rewritten_args =
+            serde_json::from_str::<serde_json::Value>(&rewritten.arguments).expect("valid json");
+        assert_eq!(
+            rewritten_args.get("path").and_then(|v| v.as_str()),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            rewritten_args.get("replace").and_then(|v| v.as_str()),
+            Some("pub fn greet(name: &str) -> String {\n    format!(\"Hello, {}!\", name)\n}\n")
+        );
     }
 
     #[test]

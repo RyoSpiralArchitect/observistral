@@ -491,6 +491,240 @@ fn synthetic_action_plan(
     }
 }
 
+fn extract_loose_json_string_field(raw: &str, field: &str) -> Option<(String, bool)> {
+    let needle = format!("\"{field}\"");
+    let start = raw.find(needle.as_str())?;
+    let after_key = &raw[start + needle.len()..];
+    let colon = after_key.find(':')?;
+    let mut tail = after_key[colon + 1..].trim_start();
+    if !tail.starts_with('"') {
+        return None;
+    }
+    tail = &tail[1..];
+
+    let mut out = String::new();
+    let mut chars = tail.chars();
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            match ch {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000C}'),
+                'u' => {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        let Some(h) = chars.next() else {
+                            return Some((out, false));
+                        };
+                        hex.push(h);
+                    }
+                    if let Ok(value) = u16::from_str_radix(hex.as_str(), 16) {
+                        if let Some(decoded) = char::from_u32(value as u32) {
+                            out.push(decoded);
+                        }
+                    }
+                }
+                other => out.push(other),
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some((out, true)),
+            other => out.push(other),
+        }
+    }
+
+    Some((out, false))
+}
+
+fn extract_first_quoted_text(text: &str) -> Option<String> {
+    let start = text.find('"')?;
+    let mut out = String::new();
+    let mut chars = text[start + 1..].chars();
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            out.push(match ch {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                other => other,
+            });
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(out),
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+fn recent_assertion_string_mismatch(messages: &[serde_json::Value]) -> Option<(String, String)> {
+    for msg in messages.iter().rev() {
+        let Some(content) = msg.get("content").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let mut left: Option<String> = None;
+        let mut right: Option<String> = None;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if left.is_none() && trimmed.starts_with("left: ") {
+                left = extract_first_quoted_text(trimmed);
+            }
+            if right.is_none() && trimmed.starts_with("right: ") {
+                right = extract_first_quoted_text(trimmed);
+            }
+        }
+        if let (Some(left), Some(right)) = (left, right) {
+            return Some((left, right));
+        }
+    }
+    None
+}
+
+fn mismatch_segment(left: &str, right: &str) -> Option<(String, String)> {
+    if left == right {
+        return None;
+    }
+
+    let left_chars: Vec<char> = left.chars().collect();
+    let right_chars: Vec<char> = right.chars().collect();
+    let mut prefix = 0usize;
+    while prefix < left_chars.len()
+        && prefix < right_chars.len()
+        && left_chars[prefix] == right_chars[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut suffix = 0usize;
+    while suffix + prefix < left_chars.len()
+        && suffix + prefix < right_chars.len()
+        && left_chars[left_chars.len() - 1 - suffix] == right_chars[right_chars.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let left_mid = left_chars[prefix..left_chars.len().saturating_sub(suffix)]
+        .iter()
+        .collect::<String>();
+    let right_mid = right_chars[prefix..right_chars.len().saturating_sub(suffix)]
+        .iter()
+        .collect::<String>();
+    if left_mid.is_empty() && right_mid.is_empty() {
+        None
+    } else {
+        Some((left_mid, right_mid))
+    }
+}
+
+pub(super) fn repair_truncated_patch_tool_call_from_recent_mismatch(
+    messages: &[serde_json::Value],
+    tc: &ToolCallData,
+    root_read_only: bool,
+    goal_wants_actions: bool,
+    provider: ProviderKind,
+    observations: &ObservationEvidence,
+) -> Option<(ToolCallData, String, String)> {
+    if root_read_only || !goal_wants_actions {
+        return None;
+    }
+    if !matches!(provider, ProviderKind::OpenAiCompatible) || tc.name != "patch_file" {
+        return None;
+    }
+
+    let parsed = serde_json::from_str::<serde_json::Value>(&tc.arguments).ok();
+    let parsed_path = parsed
+        .as_ref()
+        .and_then(|value| value.get("path").and_then(|v| v.as_str()))
+        .map(str::to_string);
+    let parsed_search = parsed
+        .as_ref()
+        .and_then(|value| value.get("search").and_then(|v| v.as_str()))
+        .map(str::to_string);
+    let parsed_replace = parsed
+        .as_ref()
+        .and_then(|value| value.get("replace").and_then(|v| v.as_str()))
+        .map(str::to_string);
+    if parsed_path.as_deref().unwrap_or("").trim().len() > 0
+        && parsed_search.as_deref().unwrap_or("").trim().len() > 0
+        && parsed_replace.as_deref().unwrap_or("").trim().len() > 0
+    {
+        return None;
+    }
+
+    let path = parsed_path.or_else(|| {
+        extract_loose_json_string_field(tc.arguments.as_str(), "path").map(|(value, _)| value)
+    })?;
+    let search = parsed_search.or_else(|| {
+        extract_loose_json_string_field(tc.arguments.as_str(), "search").map(|(value, _)| value)
+    })?;
+    if path.trim().is_empty()
+        || search.trim().is_empty()
+        || !observation_supports_target_path(path.as_str(), observations)
+    {
+        return None;
+    }
+
+    let replace_state = parsed_replace
+        .map(|value| (value, true))
+        .or_else(|| extract_loose_json_string_field(tc.arguments.as_str(), "replace"));
+    if let Some((replace, closed)) = replace_state.as_ref() {
+        if *closed && !replace.trim().is_empty() {
+            return None;
+        }
+    }
+
+    let (left, right) = recent_assertion_string_mismatch(messages)?;
+    let repaired_replace = if search.contains(left.as_str()) {
+        search.replacen(left.as_str(), right.as_str(), 1)
+    } else if let Some((old, new)) = mismatch_segment(left.as_str(), right.as_str()) {
+        if old.is_empty() || old.len() > 8 || search.matches(old.as_str()).count() != 1 {
+            return None;
+        }
+        search.replacen(old.as_str(), new.as_str(), 1)
+    } else {
+        return None;
+    };
+    if repaired_replace == search {
+        return None;
+    }
+
+    let rewritten = ToolCallData {
+        id: tc.id.clone(),
+        name: tc.name.clone(),
+        arguments: json!({
+            "path": path,
+            "search": search,
+            "replace": repaired_replace,
+        })
+        .to_string(),
+    };
+    let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| blocked_tool_call_signature(tc.name.as_str(), tc.arguments.as_str()));
+    let coerced =
+        canonicalize_tool_call_command(rewritten.name.as_str(), rewritten.arguments.as_str())
+            .unwrap_or_else(|| {
+                blocked_tool_call_signature(rewritten.name.as_str(), rewritten.arguments.as_str())
+            });
+    if original == coerced {
+        None
+    } else {
+        Some((rewritten, original, coerced))
+    }
+}
+
 pub(super) fn rescue_missing_plan_for_tool_turn(
     messages: &[serde_json::Value],
     tc: &ToolCallData,
@@ -603,6 +837,12 @@ pub(super) fn rescue_missing_think_for_tool_turn(
     if !matches!(provider, ProviderKind::OpenAiCompatible) {
         return None;
     }
+    if matches!(
+        tc.name.as_str(),
+        "exec" | "write_file" | "patch_file" | "apply_diff"
+    ) {
+        return Some(compat_synthetic_think(tc, plan));
+    }
     if !is_diagnostic_tool_name(tc.name.as_str()) {
         return None;
     }
@@ -617,6 +857,208 @@ pub(super) fn rescue_missing_think_for_tool_turn(
     }
 
     Some(compat_synthetic_think(tc, plan))
+}
+
+pub(super) fn rescue_missing_reflection_for_tool_turn(
+    reason: &str,
+    tc: &ToolCallData,
+    root_read_only: bool,
+    goal_wants_actions: bool,
+    provider: ProviderKind,
+    mem: &FailureMemory,
+    file_tool_consec_failures: usize,
+) -> Option<ReflectionBlock> {
+    if root_read_only || !goal_wants_actions {
+        return None;
+    }
+    if !matches!(provider, ProviderKind::OpenAiCompatible) {
+        return None;
+    }
+
+    let reason_low = reason.to_ascii_lowercase();
+    let last_outcome = if mem.consecutive_failures > 0
+        || reason_low.contains("failure")
+        || reason_low.contains("error")
+        || reason_low.contains("wrong results")
+    {
+        "failure"
+    } else {
+        "partial"
+    };
+    let repeated_failure = mem.same_error_repeats >= 2
+        || mem.same_command_repeats >= 3
+        || mem.same_output_repeats >= 2
+        || file_tool_consec_failures >= 2;
+    let strategy_change = if repeated_failure {
+        StrategyChange::Abandon
+    } else {
+        StrategyChange::Adjust
+    };
+    let wrong_assumption = match tc.name.as_str() {
+        "exec" => "verification happened before the fix was confirmed",
+        "patch_file" | "apply_diff" | "write_file" => {
+            "the intended edit was not yet precise enough"
+        }
+        "read_file" => "the current evidence was not specific enough",
+        "search_files" | "list_dir" | "glob" => "discovery was still too broad",
+        _ => "the previous action did not match the shortest safe next step",
+    }
+    .to_string();
+    let next_minimal_action = match tc.name.as_str() {
+        "exec" => "inspect the failing source before rerunning tests".to_string(),
+        "patch_file" | "apply_diff" => serde_json::from_str::<serde_json::Value>(&tc.arguments)
+            .ok()
+            .and_then(|v| {
+                v.get("path")
+                    .and_then(|x| x.as_str())
+                    .map(|path| format!("patch {path} with the smallest confirmed fix"))
+            })
+            .unwrap_or_else(|| "apply the smallest confirmed code fix".to_string()),
+        "write_file" => serde_json::from_str::<serde_json::Value>(&tc.arguments)
+            .ok()
+            .and_then(|v| {
+                v.get("path")
+                    .and_then(|x| x.as_str())
+                    .map(|path| format!("rewrite {path} only if replacement is necessary"))
+            })
+            .unwrap_or_else(|| "rewrite only the confirmed target file".to_string()),
+        "read_file" => serde_json::from_str::<serde_json::Value>(&tc.arguments)
+            .ok()
+            .and_then(|v| {
+                v.get("path")
+                    .and_then(|x| x.as_str())
+                    .map(|path| format!("read {path} and inspect the failing logic"))
+            })
+            .unwrap_or_else(|| "read the strongest failing code path".to_string()),
+        "search_files" => "search for the exact failing symbol or assertion".to_string(),
+        "list_dir" => "read the most likely source file instead of listing again".to_string(),
+        "glob" => "inspect the strongest matching file instead of globbing again".to_string(),
+        _ => format!("change approach before rerunning {}", tc.name),
+    };
+
+    Some(ReflectionBlock {
+        last_outcome: last_outcome.to_string(),
+        goal_delta: GoalDelta::Same,
+        wrong_assumption,
+        strategy_change,
+        next_minimal_action,
+    })
+}
+
+fn synthetic_impact_progress(plan: &PlanBlock) -> String {
+    let chosen_idx = plan
+        .steps
+        .iter()
+        .position(|step| {
+            let low = step.to_ascii_lowercase();
+            [
+                "patch",
+                "edit",
+                "write",
+                "apply",
+                "fix",
+                "change",
+                "update",
+                "implement",
+            ]
+            .iter()
+            .any(|term| low.contains(term))
+        })
+        .unwrap_or(0);
+    let label = plan
+        .steps
+        .get(chosen_idx)
+        .cloned()
+        .unwrap_or_else(|| "the current plan".to_string());
+    format!("step {} moved because {}", chosen_idx + 1, label)
+}
+
+fn synthetic_impact_changed(reason: &str) -> String {
+    let detail = reason
+        .split_once(':')
+        .map(|(_, rest)| compact_one_line(rest.trim(), 120))
+        .unwrap_or_default();
+    if detail.is_empty() {
+        "applied the confirmed smallest fix".to_string()
+    } else if reason.to_ascii_lowercase().contains("command") {
+        format!("applied the confirmed mutation command: {detail}")
+    } else {
+        format!("applied the confirmed smallest fix in {detail}")
+    }
+}
+
+fn synthetic_impact_remaining_gap(tc: &ToolCallData) -> String {
+    match tc.name.as_str() {
+        "exec" => parse_exec_command_from_args(&tc.arguments)
+            .map(|command| {
+                format!("still need to run {command} and confirm the acceptance criteria")
+            })
+            .unwrap_or_else(|| {
+                "still need the next verification run and final confirmation".to_string()
+            }),
+        _ => format!(
+            "still need the next planned action ({}) and final verification",
+            tc.name
+        ),
+    }
+}
+
+pub(super) fn rescue_missing_impact_for_tool_turn(
+    reason: &str,
+    tc: &ToolCallData,
+    root_read_only: bool,
+    goal_wants_actions: bool,
+    provider: ProviderKind,
+    plan: Option<&PlanBlock>,
+) -> Option<ImpactBlock> {
+    if root_read_only || !goal_wants_actions {
+        return None;
+    }
+    if !matches!(provider, ProviderKind::OpenAiCompatible) {
+        return None;
+    }
+    if !reason.to_ascii_lowercase().contains("successful mutation") {
+        return None;
+    }
+    let plan = plan?;
+
+    Some(ImpactBlock {
+        changed: synthetic_impact_changed(reason),
+        progress: synthetic_impact_progress(plan),
+        remaining_gap: synthetic_impact_remaining_gap(tc),
+    })
+}
+
+pub(super) fn rescue_missing_evidence_for_tool_turn(
+    tc: &ToolCallData,
+    root_read_only: bool,
+    goal_wants_actions: bool,
+    provider: ProviderKind,
+    observations: &ObservationEvidence,
+) -> Option<EvidenceBlock> {
+    if root_read_only || !goal_wants_actions {
+        return None;
+    }
+    if !matches!(provider, ProviderKind::OpenAiCompatible) {
+        return None;
+    }
+    if !mutation_tool_requires_evidence(tc) {
+        return None;
+    }
+    let target_path = mutation_target_path(tc)?;
+    if !observation_supports_target_path(target_path.as_str(), observations) {
+        return None;
+    }
+
+    Some(EvidenceBlock {
+        target_files: vec![target_path.clone()],
+        target_symbols: vec!["confirmed edit region".to_string()],
+        evidence: format!(
+            "read_file(path={target_path}) already confirmed the current code at the mutation target"
+        ),
+        open_questions: "none".to_string(),
+        next_probe: format!("patch {target_path} with the smallest confirmed fix"),
+    })
 }
 
 pub(super) fn repair_mistral_plan_for_tool_turn(
