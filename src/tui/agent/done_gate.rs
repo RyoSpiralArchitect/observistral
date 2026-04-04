@@ -924,6 +924,108 @@ fn criterion_prefers_observation_proof(criterion: &str) -> bool {
     .any(|term| low.contains(term))
 }
 
+fn latest_successful_mutation_path(messages: &[serde_json::Value]) -> Option<(String, String)> {
+    let mut pending_by_id: std::collections::BTreeMap<String, (String, String)> =
+        std::collections::BTreeMap::new();
+    let mut latest: Option<(String, String)> = None;
+
+    for msg in messages {
+        match msg.get("role").and_then(|v| v.as_str()).unwrap_or("") {
+            "assistant" => {
+                let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for tc in tool_calls {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let name = tc
+                        .get("function")
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if id.is_empty() || !matches!(name, "write_file" | "patch_file" | "apply_diff")
+                    {
+                        continue;
+                    }
+                    let Some(arguments) = tc
+                        .get("function")
+                        .and_then(|v| v.get("arguments"))
+                        .and_then(|v| v.as_str())
+                    else {
+                        continue;
+                    };
+                    let path = serde_json::from_str::<serde_json::Value>(arguments)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|path| !path.is_empty())
+                                .map(ToString::to_string)
+                        });
+                    let Some(path) = path else {
+                        continue;
+                    };
+                    pending_by_id.insert(id.to_string(), (name.to_string(), path));
+                }
+            }
+            "tool" => {
+                let id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if !looks_like_successful_mutation_result(content) {
+                    continue;
+                }
+                if let Some(entry) = pending_by_id.get(id) {
+                    latest = Some(entry.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    latest
+}
+
+fn looks_like_successful_mutation_result(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("OK: wrote '")
+        || trimmed.starts_with("OK: patched '")
+        || trimmed.starts_with("OK: applied ")
+}
+
+pub(super) fn synthesize_action_done_summary(
+    plan: Option<&PlanBlock>,
+    messages: &[serde_json::Value],
+) -> Option<String> {
+    if let Some((tool, path)) = latest_successful_mutation_path(messages) {
+        let path = compact_one_line(path.as_str(), 160);
+        return Some(match tool.as_str() {
+            "write_file" => format!("Created `{path}` and verified it."),
+            "patch_file" | "apply_diff" => {
+                format!("Updated `{path}` and verified the requested change.")
+            }
+            _ => format!("Completed the requested change in `{path}` and verified it."),
+        });
+    }
+
+    plan.map(|plan| {
+        let goal = compact_one_line(plan.goal.as_str(), 180);
+        if goal == "-" {
+            "Completed the requested task and verified it.".to_string()
+        } else {
+            format!("Completed and verified: {goal}")
+        }
+    })
+}
+
 pub(super) fn rescue_invalid_done_payload_for_verified_action(
     plan: Option<&PlanBlock>,
     known_commands: &[String],
@@ -1392,5 +1494,31 @@ mod tests {
         assert!(remaining.is_empty());
         assert_eq!(evidence.len(), 2);
         assert!(evidence.iter().all(|row| row.command == "cargo test 2>&1"));
+    }
+
+    #[test]
+    fn synthesize_action_done_summary_prefers_created_file_path() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_write",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments": "{\"path\":\"notes/todo.txt\",\"content\":\"ship it\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_write",
+                "content": "OK: wrote 'notes/todo.txt' (1 lines, 8 bytes)\n[auto-test] ✓ PASSED (exit 0)"
+            }),
+        ];
+
+        let summary = synthesize_action_done_summary(None, &messages).expect("summary");
+        assert!(summary.contains("notes/todo.txt"));
+        assert!(summary.contains("Created"));
     }
 }

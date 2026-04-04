@@ -63,7 +63,7 @@
         { "kind": "completed" },
         { "kind": "error_free" },
         { "kind": "tool_call_seen", "name": "write_file" },
-        { "kind": "tool_call_seen", "name": "exec" },
+        { "kind": "assistant_contains", "value": "notes/todo.txt" },
         { "kind": "trace_event_seen", "event": "task_harness" }
       ]
     },

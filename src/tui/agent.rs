@@ -53,7 +53,7 @@ use self::done_gate::{
     build_read_only_iteration_cap_final_answer, build_read_only_strong_final_answer,
     canonicalize_known_acceptance_commands, maybe_build_read_only_auto_final_answer,
     rescue_invalid_done_payload_for_verified_action, should_prefer_done_after_verified_action,
-    validate_done_acceptance,
+    synthesize_action_done_summary, validate_done_acceptance,
 };
 use self::memory::{
     canonicalize_evidence_command_with_resolution, normalize_memory_entry, normalize_path_alias,
@@ -12211,10 +12211,16 @@ Required now: {}",
                 }
             };
 
+            let summary_text = if summary.is_empty() {
+                synthesize_action_done_summary(done_plan, &messages).unwrap_or_default()
+            } else {
+                summary.to_string()
+            };
+
             let mut final_text = String::new();
             final_text.push_str("[DONE]\n");
-            if !summary.is_empty() {
-                final_text.push_str(summary);
+            if !summary_text.is_empty() {
+                final_text.push_str(summary_text.as_str());
             }
             final_text.push_str("\n\nAcceptance:\n");
             let evidence_by_idx: std::collections::HashMap<usize, String> =
