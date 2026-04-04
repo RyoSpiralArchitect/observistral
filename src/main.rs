@@ -2920,11 +2920,40 @@ fn resolve_eval_path(path: PathBuf, base_dir: &std::path::Path) -> PathBuf {
     }
 }
 
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dst)
+        .with_context(|| format!("failed to create eval case dir: {}", dst.display()))?;
+    let rd = std::fs::read_dir(src)
+        .with_context(|| format!("failed to read eval fixture dir: {}", src.display()))?;
+    for entry in rd {
+        let entry =
+            entry.with_context(|| format!("failed to read entry under {}", src.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to read file type for {}", entry.path().display()))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&from, &to).with_context(|| {
+                format!(
+                    "failed to copy eval fixture file {} -> {}",
+                    from.display(),
+                    to.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn resolve_eval_case_root(
+    case_dir: &std::path::Path,
     base_root: &std::path::Path,
     defaults: &crate::runtime_eval::RuntimeEvalDefaults,
     case: &crate::runtime_eval::RuntimeEvalCase,
-) -> String {
+) -> Result<String> {
     let raw = case
         .tool_root
         .as_deref()
@@ -2938,8 +2967,27 @@ fn resolve_eval_case_root(
             base_root.join(pb)
         }
     };
-    normalize_tool_root(Some(root.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+    let should_copy = case.copy_tool_root.unwrap_or(defaults.copy_tool_root);
+    let effective_root = if should_copy {
+        let copied_root = case_dir.join("tool_root");
+        if root.exists() {
+            copy_dir_recursive(&root, &copied_root)?;
+        } else {
+            std::fs::create_dir_all(&copied_root).with_context(|| {
+                format!(
+                    "failed to create copied eval tool_root: {}",
+                    copied_root.display()
+                )
+            })?;
+        }
+        copied_root
+    } else {
+        root
+    };
+    Ok(
+        normalize_tool_root(Some(effective_root.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| effective_root.to_string_lossy().into_owned()),
+    )
 }
 
 async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
@@ -3025,7 +3073,8 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
         let session_path = case_dir.join("session.json");
         let json_path = case_dir.join("final.json");
         let graph_path = case_dir.join("graph.json");
-        let case_root = resolve_eval_case_root(&base_root_path, &spec_data.defaults, case);
+        let case_root =
+            resolve_eval_case_root(&case_dir, &base_root_path, &spec_data.defaults, case)?;
         let case_lang = case
             .lang
             .clone()

@@ -46,6 +46,7 @@ mod done_gate;
 mod memory;
 mod provider_compat;
 mod read_only;
+mod task_harness;
 use self::done_gate::{
     build_done_acceptance_recovery_hint, build_post_verify_done_completion_hint,
     build_read_only_completion_hint, build_read_only_evidence_scores,
@@ -80,6 +81,7 @@ use self::read_only::{
     preferred_read_only_search_dir, preferred_read_only_search_pattern, read_only_plan_violation,
     synthetic_read_only_observation_plan, ReadOnlyDiagnoseRescueAction,
 };
+use self::task_harness::{build_progress_gate_block, TaskHarness};
 
 #[derive(Debug, Clone)]
 pub struct AgenticStartState {
@@ -4623,6 +4625,7 @@ struct DoneAcceptanceEvidence {
 #[derive(Debug, Clone, Default)]
 struct StablePromptCache {
     resolver_hash: Option<u64>,
+    task_harness_hash: Option<u64>,
     task_contract_hash: Option<u64>,
     working_memory_hash: Option<u64>,
     assumption_ledger_hash: Option<u64>,
@@ -8194,6 +8197,7 @@ Fix: use --provider openai-compatible (or --provider mistral).",
         .to_string();
     let root_user_text_low = root_user_text.to_ascii_lowercase();
     let root_read_only = is_root_read_only_observation_task(&root_user_text);
+    let task_harness = TaskHarness::infer(&root_user_text, root_read_only);
     let verification_contract = governor_contract::verification();
     let wants_repo_goal =
         text_contains_any(&root_user_text_low, &verification_contract.goal_repo_terms);
@@ -8310,6 +8314,16 @@ Execute only the new minimal action: {}",
     if realize_cfg.enabled {
         emit_realize_state(&tx, &realize_cfg, None, 0, None, &realize_metrics).await;
     }
+    emit_telemetry_event(
+        &tx,
+        "task_harness",
+        json!({
+            "lane": task_harness.lane_label(),
+            "artifact_mode": task_harness.artifact_mode_label(),
+            "read_only": root_read_only,
+        }),
+    )
+    .await;
 
     // Resolve tool_root once (absolute path) and track cwd across tool calls.
     // This prevents the classic "cd didn't persist, so git add ran in the wrong repo" failure.
@@ -8648,6 +8662,16 @@ This is the LAST model call for this run.\n\
                     &instruction_resolver,
                     required_verification,
                 ),
+            ),
+        }));
+
+        let harness_prompt = task_harness.prompt(test_cmd.as_deref());
+        msgs_for_call.push(json!({
+            "role": "system",
+            "content": render_cached_prompt(
+                &mut prompt_cache.task_harness_hash,
+                harness_prompt,
+                task_harness.compact_prompt(test_cmd.as_deref()),
             ),
         }));
 
@@ -10056,6 +10080,55 @@ Execute only the new minimal action: {}",
                         "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
                     )))
                     .await;
+
+                push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+
+                pending_system_hint = Some(block);
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
+
+            if let Some(block) = build_progress_gate_block(
+                task_harness,
+                tc,
+                &messages,
+                recovery.stage,
+                test_cmd.as_deref(),
+            ) {
+                state = AgentState::Recovery;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "progress_gate_blocked",
+                    json!({
+                        "lane": task_harness.lane_label(),
+                        "tool": tc.name,
+                    }),
+                )
+                .await;
 
                 push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
                 autosave_best_effort(

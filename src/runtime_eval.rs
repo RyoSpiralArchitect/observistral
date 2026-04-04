@@ -23,6 +23,8 @@ pub struct RuntimeEvalDefaults {
     #[serde(default)]
     pub tool_root: Option<String>,
     #[serde(default)]
+    pub copy_tool_root: bool,
+    #[serde(default)]
     pub lang: Option<String>,
     #[serde(default)]
     pub max_iters: Option<usize>,
@@ -36,6 +38,8 @@ pub struct RuntimeEvalCase {
     pub prompt: String,
     #[serde(default)]
     pub tool_root: Option<String>,
+    #[serde(default)]
+    pub copy_tool_root: Option<bool>,
     #[serde(default)]
     pub lang: Option<String>,
     #[serde(default)]
@@ -718,6 +722,28 @@ mod tests {
     }
 
     #[test]
+    fn load_spec_parses_copy_tool_root_flags() {
+        let spec: RuntimeEvalSpec = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "defaults": {
+                "tool_root": ".",
+                "copy_tool_root": true
+            },
+            "cases": [
+                {
+                    "id": "copy-case",
+                    "prompt": "do work",
+                    "copy_tool_root": false
+                }
+            ]
+        }))
+        .expect("spec");
+
+        assert!(spec.defaults.copy_tool_root);
+        assert_eq!(spec.cases[0].copy_tool_root, Some(false));
+    }
+
+    #[test]
     fn evaluate_case_collects_metrics_and_checks() {
         let dir = tempdir().unwrap();
         let trace_path = dir.path().join("trace.jsonl");
@@ -768,6 +794,7 @@ mod tests {
             id: "realize-events".to_string(),
             prompt: "locate slash command".to_string(),
             tool_root: None,
+            copy_tool_root: None,
             lang: None,
             max_iters: None,
             autofix: None,
@@ -854,6 +881,7 @@ mod tests {
             id: "broken".to_string(),
             prompt: "x".to_string(),
             tool_root: None,
+            copy_tool_root: None,
             lang: None,
             max_iters: None,
             autofix: None,

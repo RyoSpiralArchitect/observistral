@@ -86,13 +86,28 @@ Keep as the orchestration entrypoint:
 
 This file should become thinner over time and mostly coordinate modules.
 
+### 6. `src/tui/agent/task_harness.rs`
+
+Move:
+
+- task-lane inference such as `fix` / `create_file` / `init_repo`
+- artifact-shape hints that tell the runtime what “progress” looks like
+- progress-gate policy for repeated observation loops in action tasks
+
+Reason:
+
+- this is typed runtime state, not provider compatibility
+- it should stay auditable and testable without growing the main loop
+- action-task harnessing is now a distinct policy surface with its own eval cases
+
 ## Suggested extraction order
 
 1. `done_gate.rs`
 2. `read_only.rs`
 3. `provider_compat.rs`
 4. `memory.rs`
-5. optional `telemetry.rs` if loop instrumentation keeps growing
+5. `task_harness.rs`
+6. optional `telemetry.rs` if loop instrumentation keeps growing
 
 This order minimizes risk because the first two already have strong eval/replay
 pressure and the clearest ownership boundaries.
@@ -107,4 +122,3 @@ Each extraction should preserve:
 
 Do not extract purely for aesthetics. Extract around ownership boundaries and
 keep the tests close to the new module.
-
