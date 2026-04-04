@@ -447,6 +447,14 @@ pub(super) fn allows_artifact_creation_during_diagnose(
     ) && matches!(tc.name.as_str(), "write_file" | "exec")
 }
 
+pub(super) fn allows_artifact_creation_during_verify(
+    harness: TaskHarness,
+    tc: &ToolCallData,
+) -> bool {
+    harness.artifact_mode == ArtifactMode::NewRepo
+        && matches!(tc.name.as_str(), "write_file" | "exec")
+}
+
 pub(super) fn build_fix_stage_progress_hint(
     harness: TaskHarness,
     messages: &[Value],
@@ -933,6 +941,22 @@ mod tests {
             TaskHarness {
                 lane: TaskLane::CreateFile,
                 artifact_mode: ArtifactMode::NewFiles,
+            },
+            &tc,
+        ));
+    }
+
+    #[test]
+    fn allows_artifact_creation_during_verify_for_new_repo_write() {
+        let tc = ToolCallData {
+            id: "call_write".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({"path":"demo_repo/.gitignore","content":"target/\n"}).to_string(),
+        };
+        assert!(allows_artifact_creation_during_verify(
+            TaskHarness {
+                lane: TaskLane::ScaffoldRepo,
+                artifact_mode: ArtifactMode::NewRepo,
             },
             &tc,
         ));

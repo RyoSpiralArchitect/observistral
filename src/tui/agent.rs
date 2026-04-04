@@ -82,8 +82,8 @@ use self::read_only::{
     synthetic_read_only_observation_plan, ReadOnlyDiagnoseRescueAction,
 };
 use self::task_harness::{
-    allows_artifact_creation_during_diagnose, build_fix_stage_progress_hint,
-    build_progress_gate_block, coerce_artifact_creation_tool_call,
+    allows_artifact_creation_during_diagnose, allows_artifact_creation_during_verify,
+    build_fix_stage_progress_hint, build_progress_gate_block, coerce_artifact_creation_tool_call,
     coerce_repo_goal_completion_tool_call, TaskHarness,
 };
 
@@ -2800,6 +2800,9 @@ Required now: run diagnostics first (e.g. `pwd`, `ls`/`dir`, `git status`, `git 
             }
             RecoveryStage::Fix => None, // allow edits/commands to fix
             RecoveryStage::Verify => {
+                if allows_artifact_creation_during_verify(task_harness, tc) {
+                    return None;
+                }
                 if name == "exec" {
                     let cmd =
                         parse_exec_command_from_args(tc.arguments.as_str()).unwrap_or_default();
