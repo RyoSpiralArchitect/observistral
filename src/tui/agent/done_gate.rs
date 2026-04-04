@@ -862,6 +862,129 @@ If any acceptance criterion is not fully proven, keep it in `remaining_acceptanc
     out
 }
 
+fn preferred_action_verification_command(
+    known_commands: &[String],
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+) -> Option<String> {
+    known_commands.iter().rev().find_map(|command| {
+        classify_verify_level(command.as_str(), test_cmd)
+            .filter(|level| level.satisfies(required_verification))
+            .map(|_| command.clone())
+    })
+}
+
+fn preferred_action_observation_command(
+    known_commands: &[String],
+    observation_evidence: &ObservationEvidence,
+) -> Option<String> {
+    for prefix in ["read_file(", "search_files(", "glob(", "list_dir("] {
+        if let Some(command) = known_commands.iter().rev().find(|command| {
+            canonicalize_evidence_command_with_resolution(command.as_str(), observation_evidence)
+                .starts_with(prefix)
+        }) {
+            return Some(command.clone());
+        }
+    }
+    None
+}
+
+fn criterion_prefers_verification_proof(criterion: &str) -> bool {
+    let low = criterion.to_ascii_lowercase();
+    [
+        "implement",
+        "implemented",
+        "change",
+        "fix",
+        "verify",
+        "verification",
+        "behavioral",
+        "build",
+        "lint",
+        "test",
+        "pass",
+        "passes",
+        "final result",
+        "final answer",
+        "cite",
+        "command",
+        "summary",
+        "report",
+    ]
+    .iter()
+    .any(|term| low.contains(term))
+}
+
+fn criterion_prefers_observation_proof(criterion: &str) -> bool {
+    let low = criterion.to_ascii_lowercase();
+    [
+        "file", "path", "read", "context", "handler", "symbol", "location", "line",
+    ]
+    .iter()
+    .any(|term| low.contains(term))
+}
+
+pub(super) fn rescue_invalid_done_payload_for_verified_action(
+    plan: Option<&PlanBlock>,
+    known_commands: &[String],
+    observation_evidence: &ObservationEvidence,
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+    last_mutation_step: Option<usize>,
+    last_verify_ok_step: Option<usize>,
+) -> Option<(Vec<String>, Vec<String>, Vec<DoneAcceptanceEvidence>)> {
+    let plan = plan?;
+    let last_mutation = last_mutation_step.unwrap_or(0);
+    let last_verify_ok = last_verify_ok_step.unwrap_or(0);
+    if last_mutation == 0 || last_verify_ok < last_mutation {
+        return None;
+    }
+
+    let verify_command =
+        preferred_action_verification_command(known_commands, required_verification, test_cmd);
+    let observation_command =
+        preferred_action_observation_command(known_commands, observation_evidence);
+
+    let mut completed_acceptance = Vec::new();
+    let mut remaining_acceptance = Vec::new();
+    let mut acceptance_evidence = Vec::new();
+
+    for (idx, criterion) in plan.acceptance_criteria.iter().enumerate() {
+        let label = acceptance_reference_label(plan, idx);
+        let command = if criterion_prefers_verification_proof(criterion) {
+            verify_command
+                .clone()
+                .or_else(|| observation_command.clone())
+        } else if criterion_prefers_observation_proof(criterion) {
+            observation_command
+                .clone()
+                .or_else(|| verify_command.clone())
+        } else {
+            None
+        };
+
+        if let Some(command) = command {
+            completed_acceptance.push(label.clone());
+            acceptance_evidence.push(DoneAcceptanceEvidence {
+                criterion: label,
+                command,
+            });
+        } else {
+            remaining_acceptance.push(label);
+        }
+    }
+
+    if completed_acceptance.is_empty() {
+        return None;
+    }
+
+    Some((
+        completed_acceptance,
+        remaining_acceptance,
+        acceptance_evidence,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1217,5 +1340,57 @@ mod tests {
         assert!(hint.contains("[Completion Gate]"));
         assert!(hint.contains("tool: done"));
         assert!(hint.contains("cargo test 2>&1"));
+    }
+
+    #[test]
+    fn rescue_invalid_done_payload_for_verified_action_repairs_smoke_acceptance() {
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented and confirmed by a passing behavioral verification command".to_string(),
+                "the final result cites the exact passing behavioral verification command".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "cargo test is relevant".to_string(),
+        };
+        let observation_evidence = ObservationEvidence {
+            reads: vec![ObservationReadEvidence {
+                command: "read_file(path=src/lib.rs)".to_string(),
+                path: "src/lib.rs".to_string(),
+            }],
+            searches: Vec::new(),
+            resolutions: Vec::new(),
+        };
+
+        let (completed, remaining, evidence) = rescue_invalid_done_payload_for_verified_action(
+            Some(&plan),
+            &[
+                "read_file(path=src/lib.rs)".to_string(),
+                "cargo test 2>&1".to_string(),
+            ],
+            &observation_evidence,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+            Some(3),
+            Some(3),
+        )
+        .expect("rescued done payload");
+
+        assert_eq!(
+            completed,
+            vec![
+                acceptance_reference_label(&plan, 0),
+                acceptance_reference_label(&plan, 1)
+            ]
+        );
+        assert!(remaining.is_empty());
+        assert_eq!(evidence.len(), 2);
+        assert!(evidence.iter().all(|row| row.command == "cargo test 2>&1"));
     }
 }

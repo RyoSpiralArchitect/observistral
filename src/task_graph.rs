@@ -235,8 +235,15 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    text.chars().take(max_chars).collect()
+}
+
 fn first_line(s: &str, max: usize) -> String {
-    let mut line = s
+    let line = s
         .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("")
@@ -244,8 +251,8 @@ fn first_line(s: &str, max: usize) -> String {
     if line.is_empty() {
         return "(empty)".to_string();
     }
-    if line.len() > max {
-        line = &line[..max];
+    if line.chars().count() > max {
+        return truncate_chars(line, max);
     }
     line.to_string()
 }
@@ -256,10 +263,10 @@ fn summarize_args(args: &str, max: usize) -> String {
         return "".to_string();
     }
     let one = t.lines().next().unwrap_or("").trim().to_string();
-    if one.len() <= max {
+    if one.chars().count() <= max {
         one
     } else {
-        format!("{}...", &one[..max])
+        format!("{}...", truncate_chars(one.as_str(), max))
     }
 }
 
@@ -382,5 +389,22 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("\"nodes\""));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn first_line_truncates_utf8_safely() {
+        let text = "これはとても長い日本語の行です";
+        let line = first_line(text, 8);
+        assert_eq!(line, "これはとても長い");
+    }
+
+    #[test]
+    fn summarize_args_truncates_utf8_safely() {
+        let summary = summarize_args(
+            r#"{"summary":"これはとても長い日本語の完了メッセージです"}"#,
+            20,
+        );
+        assert!(summary.ends_with("..."));
+        assert!(summary.is_char_boundary(summary.len()));
     }
 }

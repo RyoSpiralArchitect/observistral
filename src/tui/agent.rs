@@ -51,7 +51,8 @@ use self::done_gate::{
     build_read_only_completion_hint, build_read_only_evidence_scores,
     build_read_only_iteration_cap_final_answer, build_read_only_strong_final_answer,
     canonicalize_known_acceptance_commands, maybe_build_read_only_auto_final_answer,
-    should_prefer_done_after_verified_action, validate_done_acceptance,
+    rescue_invalid_done_payload_for_verified_action, should_prefer_done_after_verified_action,
+    validate_done_acceptance,
 };
 use self::memory::{
     canonicalize_evidence_command_with_resolution, normalize_memory_entry, normalize_path_alias,
@@ -11922,9 +11923,10 @@ Required now: {}",
 
             let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
             let summary = args["summary"].as_str().unwrap_or("").trim();
-            let completed_acceptance = parse_string_list_arg(&args["completed_acceptance"]);
-            let remaining_acceptance = parse_string_list_arg(&args["remaining_acceptance"]);
-            let acceptance_evidence = parse_done_acceptance_evidence(&args["acceptance_evidence"]);
+            let mut completed_acceptance = parse_string_list_arg(&args["completed_acceptance"]);
+            let mut remaining_acceptance = parse_string_list_arg(&args["remaining_acceptance"]);
+            let mut acceptance_evidence =
+                parse_done_acceptance_evidence(&args["acceptance_evidence"]);
             let next_steps = args["next_steps"].as_str().unwrap_or("").trim();
             let done_plan = validated_plan_for_turn.as_ref().or(active_plan.as_ref());
             let known_acceptance_commands = canonicalize_known_acceptance_commands(
@@ -11955,107 +11957,147 @@ Required now: {}",
             ) {
                 Ok(rows) => rows,
                 Err(e) => {
-                    if root_read_only {
-                        if let Some(plan) = done_plan {
-                            if let Some(final_text) = build_read_only_strong_final_answer(
-                                &root_user_text,
-                                plan,
+                    let rescued_rows =
+                        if let Some((rescued_completed, rescued_remaining, rescued_evidence)) =
+                            rescue_invalid_done_payload_for_verified_action(
+                                done_plan,
+                                &known_acceptance_commands,
                                 &observation_evidence,
-                                &messages,
-                                &working_mem,
+                                required_verification,
+                                test_cmd.as_deref(),
+                                last_mutation_step,
+                                last_verify_ok_step,
+                            )
+                        {
+                            if let Ok(rows) = validate_done_acceptance(
+                                done_plan,
+                                &rescued_completed,
+                                &rescued_remaining,
+                                &rescued_evidence,
+                                &known_acceptance_commands,
+                                &observation_evidence,
                             ) {
-                                state = AgentState::Done;
-                                messages.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tc.id,
-                                    "content": "OK: done"
-                                }));
-                                messages.push(
-                                    json!({"role": "assistant", "content": final_text.clone()}),
-                                );
-                                autosave_best_effort(
-                                    &autosaver,
-                                    &tx,
-                                    tool_root_abs.as_deref(),
-                                    checkpoint.as_deref(),
-                                    cur_cwd.as_deref(),
+                                completed_acceptance = rescued_completed;
+                                remaining_acceptance = rescued_remaining;
+                                acceptance_evidence = rescued_evidence;
+                                Some(rows)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                    if let Some(rows) = rescued_rows {
+                        let _ = tx
+                            .send(StreamToken::Delta(
+                                "\n[compat] repaired done acceptance payload from current plan and known commands\n"
+                                    .to_string(),
+                            ))
+                            .await;
+                        rows
+                    } else {
+                        if root_read_only {
+                            if let Some(plan) = done_plan {
+                                if let Some(final_text) = build_read_only_strong_final_answer(
+                                    &root_user_text,
+                                    plan,
+                                    &observation_evidence,
                                     &messages,
-                                )
-                                .await;
-                                let _ = tx
-                                    .send(StreamToken::GovernorState(build_governor_state(
-                                        state,
-                                        &recovery,
-                                        &mem,
-                                        file_tool_consec_failures,
-                                        last_mutation_step,
-                                        last_verify_ok_step,
-                                        last_reflection.as_ref(),
-                                    )))
+                                    &working_mem,
+                                ) {
+                                    state = AgentState::Done;
+                                    messages.push(json!({
+                                        "role": "tool",
+                                        "tool_call_id": tc.id,
+                                        "content": "OK: done"
+                                    }));
+                                    messages.push(
+                                        json!({"role": "assistant", "content": final_text.clone()}),
+                                    );
+                                    autosave_best_effort(
+                                        &autosaver,
+                                        &tx,
+                                        tool_root_abs.as_deref(),
+                                        checkpoint.as_deref(),
+                                        cur_cwd.as_deref(),
+                                        &messages,
+                                    )
                                     .await;
-                                let _ = tx
-                                    .send(StreamToken::Delta(format!(
-                                        "\n[agent] strong read-only evidence rescued invalid done gate; auto-finalized instead.\n\n{final_text}\n"
-                                    )))
-                                    .await;
-                                break;
+                                    let _ = tx
+                                        .send(StreamToken::GovernorState(build_governor_state(
+                                            state,
+                                            &recovery,
+                                            &mem,
+                                            file_tool_consec_failures,
+                                            last_mutation_step,
+                                            last_verify_ok_step,
+                                            last_reflection.as_ref(),
+                                        )))
+                                        .await;
+                                    let _ = tx
+                                        .send(StreamToken::Delta(format!(
+                                            "\n[agent] strong read-only evidence rescued invalid done gate; auto-finalized instead.\n\n{final_text}\n"
+                                        )))
+                                        .await;
+                                    break;
+                                }
                             }
                         }
+                        state = AgentState::Recovery;
+                        recovery.stage = Some(if root_read_only {
+                            RecoveryStage::Diagnose
+                        } else {
+                            RecoveryStage::Verify
+                        });
+                        let hint = build_done_acceptance_recovery_hint(
+                            &e.to_string(),
+                            &known_acceptance_commands,
+                            &read_only_scores,
+                        );
+                        let block = format!(
+                            "{}{}",
+                            governor_contract::done_invalid_acceptance_message(&e.to_string()),
+                            hint
+                        );
+
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                            )))
+                            .await;
+
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": format!(
+                                "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                                tc.name, tc.arguments
+                            ),
+                        }));
+                        autosave_best_effort(
+                            &autosaver,
+                            &tx,
+                            tool_root_abs.as_deref(),
+                            checkpoint.as_deref(),
+                            cur_cwd.as_deref(),
+                            &messages,
+                        )
+                        .await;
+
+                        pending_system_hint = Some(block);
+                        let _ = tx
+                            .send(StreamToken::GovernorState(build_governor_state(
+                                state,
+                                &recovery,
+                                &mem,
+                                file_tool_consec_failures,
+                                last_mutation_step,
+                                last_verify_ok_step,
+                                last_reflection.as_ref(),
+                            )))
+                            .await;
+                        continue;
                     }
-                    state = AgentState::Recovery;
-                    recovery.stage = Some(if root_read_only {
-                        RecoveryStage::Diagnose
-                    } else {
-                        RecoveryStage::Verify
-                    });
-                    let hint = build_done_acceptance_recovery_hint(
-                        &e.to_string(),
-                        &known_acceptance_commands,
-                        &read_only_scores,
-                    );
-                    let block = format!(
-                        "{}{}",
-                        governor_contract::done_invalid_acceptance_message(&e.to_string()),
-                        hint
-                    );
-
-                    let _ = tx
-                        .send(StreamToken::Delta(format!(
-                            "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
-                        )))
-                        .await;
-
-                    messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": format!(
-                            "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
-                            tc.name, tc.arguments
-                        ),
-                    }));
-                    autosave_best_effort(
-                        &autosaver,
-                        &tx,
-                        tool_root_abs.as_deref(),
-                        checkpoint.as_deref(),
-                        cur_cwd.as_deref(),
-                        &messages,
-                    )
-                    .await;
-
-                    pending_system_hint = Some(block);
-                    let _ = tx
-                        .send(StreamToken::GovernorState(build_governor_state(
-                            state,
-                            &recovery,
-                            &mem,
-                            file_tool_consec_failures,
-                            last_mutation_step,
-                            last_verify_ok_step,
-                            last_reflection.as_ref(),
-                        )))
-                        .await;
-                    continue;
                 }
             };
 
