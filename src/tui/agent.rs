@@ -81,7 +81,10 @@ use self::read_only::{
     preferred_read_only_search_dir, preferred_read_only_search_pattern, read_only_plan_violation,
     synthetic_read_only_observation_plan, ReadOnlyDiagnoseRescueAction,
 };
-use self::task_harness::{build_fix_stage_progress_hint, build_progress_gate_block, TaskHarness};
+use self::task_harness::{
+    build_fix_stage_progress_hint, build_progress_gate_block, coerce_artifact_creation_tool_call,
+    TaskHarness,
+};
 
 #[derive(Debug, Clone)]
 pub struct AgenticStartState {
@@ -9279,6 +9282,31 @@ Execute only the new minimal action: {}",
         }
 
         if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) =
+                coerce_artifact_creation_tool_call(task_harness, &messages, tc)
+            {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[task_harness] restored blocked artifact action: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "task_harness_tool_coercion",
+                    json!({
+                        "lane": task_harness.lane_label(),
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                    }),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
             if let Some((entry, score, action)) =
                 reflection_ledger_action_match(&reflection_ledger, tc)
             {
@@ -9585,6 +9613,7 @@ Execute only the new minimal action: {}",
                             &messages,
                             tc,
                             &root_user_text,
+                            task_harness,
                             root_read_only,
                             goal_wants_actions,
                             cfg.provider.clone(),
@@ -16189,6 +16218,10 @@ verify: exit code is zero\n\
             &messages,
             &tc,
             "Fix the failing test with the smallest code change. Run tests before you finish.",
+            TaskHarness::infer(
+                "Fix the failing test with the smallest code change. Run tests before you finish.",
+                false,
+            ),
             false,
             true,
             ProviderKind::OpenAiCompatible,
@@ -16243,6 +16276,10 @@ verify: exit code is zero\n\
             &messages,
             &tc,
             "Fix the failing test with the smallest code change. Run tests before you finish.",
+            TaskHarness::infer(
+                "Fix the failing test with the smallest code change. Run tests before you finish.",
+                false,
+            ),
             false,
             true,
             ProviderKind::OpenAiCompatible,
@@ -16255,6 +16292,69 @@ verify: exit code is zero\n\
         validate_think(&think, &plan, &tc).expect("valid synthetic think");
         assert_eq!(think.tool, "search_files");
         assert!(think.next.contains("search"));
+    }
+
+    #[test]
+    fn rescue_missing_plan_for_create_file_accepts_write_file_turn() {
+        let prompt =
+            "Create `notes/todo.txt` containing exactly `ship it`. Verify it before you finish.";
+        let tc = ToolCallData {
+            id: "call_write_retry".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path":"notes/todo.txt",
+                "content":"ship it\n"
+            })
+            .to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_write_1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": serde_json::json!({
+                            "path":"notes/todo.txt",
+                            "content":"ship it\n"
+                        }).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_write_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nwrite_file\narguments:\n{\"path\":\"notes/todo.txt\",\"content\":\"ship it\\n\"}"
+            }),
+        ];
+
+        let rescued = rescue_missing_plan_for_tool_turn(
+            &messages,
+            &tc,
+            prompt,
+            TaskHarness::infer(prompt, false),
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            VerificationLevel::Behavioral,
+            Some("test -f notes/todo.txt && grep -Fx \"ship it\" notes/todo.txt"),
+        )
+        .expect("synthetic create-file plan");
+
+        assert!(rescued
+            .steps
+            .first()
+            .is_some_and(|step| step.contains("write_file(") && step.contains("notes/todo.txt")));
+        assert!(rescued
+            .acceptance_criteria
+            .iter()
+            .any(|item| item.contains("artifact")));
+        assert!(rescued
+            .acceptance_criteria
+            .iter()
+            .any(|item| item.contains("behavioral verification")));
     }
 
     #[test]
@@ -16287,6 +16387,10 @@ verify: exit code is zero\n\
                 arguments: serde_json::json!({"path":"Cargo.toml"}).to_string(),
             },
             "Fix the failing test with the smallest code change. Run tests before you finish.",
+            TaskHarness::infer(
+                "Fix the failing test with the smallest code change. Run tests before you finish.",
+                false,
+            ),
             false,
             true,
             ProviderKind::OpenAiCompatible,

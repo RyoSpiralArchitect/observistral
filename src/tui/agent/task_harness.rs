@@ -355,6 +355,46 @@ Do NOT call the same observation tool on the same target again until the target 
     ))
 }
 
+pub(super) fn coerce_artifact_creation_tool_call(
+    harness: TaskHarness,
+    messages: &[Value],
+    tc: &ToolCallData,
+) -> Option<(ToolCallData, String, String)> {
+    if !matches!(
+        harness.artifact_mode,
+        ArtifactMode::NewFiles | ArtifactMode::NewRepo
+    ) {
+        return None;
+    }
+    if !is_observation_tool(tc.name.as_str()) {
+        return None;
+    }
+
+    let rewritten = recent_blocked_artifact_action(messages, harness)?;
+    let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| {
+            format!(
+                "{}({})",
+                tc.name,
+                compact_one_line(tc.arguments.as_str(), 120)
+            )
+        });
+    let coerced =
+        canonicalize_tool_call_command(rewritten.name.as_str(), rewritten.arguments.as_str())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}({})",
+                    rewritten.name,
+                    compact_one_line(rewritten.arguments.as_str(), 120)
+                )
+            });
+    if original == coerced {
+        None
+    } else {
+        Some((rewritten, original, coerced))
+    }
+}
+
 pub(super) fn build_fix_stage_progress_hint(
     harness: TaskHarness,
     messages: &[Value],
@@ -498,6 +538,71 @@ fn looks_like_successful_observation_result(content: &str) -> bool {
 
 fn is_observation_tool(name: &str) -> bool {
     matches!(name, "read_file" | "search_files" | "list_dir" | "glob")
+}
+
+fn recent_blocked_artifact_action(
+    messages: &[Value],
+    harness: TaskHarness,
+) -> Option<ToolCallData> {
+    let mut idx = messages.len();
+    while idx >= 2 {
+        let tool_msg = &messages[idx - 1];
+        let assistant_msg = &messages[idx - 2];
+        idx -= 2;
+
+        if tool_msg.get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+        let content = tool_msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if !looks_like_missing_gate_block(content) {
+            break;
+        }
+        let Some(candidate) = first_tool_call_from_message(assistant_msg) else {
+            continue;
+        };
+        if !supports_artifact_action(harness, candidate.name.as_str()) {
+            continue;
+        }
+        if candidate.arguments.trim().is_empty() {
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+fn first_tool_call_from_message(msg: &Value) -> Option<ToolCallData> {
+    let tool_calls = msg.get("tool_calls")?.as_array()?;
+    let tc = tool_calls.first()?;
+    let id = tc.get("id").and_then(|v| v.as_str())?.trim();
+    let function = tc.get("function")?;
+    let name = function.get("name").and_then(|v| v.as_str())?.trim();
+    let arguments = function.get("arguments").and_then(|v| v.as_str())?.trim();
+    if id.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(ToolCallData {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments: arguments.to_string(),
+    })
+}
+
+fn looks_like_missing_gate_block(content: &str) -> bool {
+    content.contains("GOVERNOR BLOCKED")
+        && (content.contains("Missing valid <plan>") || content.contains("Missing <think>"))
+}
+
+fn supports_artifact_action(harness: TaskHarness, name: &str) -> bool {
+    match harness.artifact_mode {
+        ArtifactMode::NewFiles => matches!(name, "write_file" | "exec"),
+        ArtifactMode::NewRepo => matches!(name, "write_file" | "exec"),
+        ArtifactMode::ObserveOnly | ArtifactMode::ExistingFiles => false,
+    }
 }
 
 fn text_contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -678,5 +783,47 @@ mod tests {
 
         assert!(hint.contains("create the requested file now"));
         assert!(hint.contains("notes/todo.txt"));
+    }
+
+    #[test]
+    fn coerce_artifact_creation_tool_call_restores_blocked_write_file() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_write",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments":"{\"path\":\"notes/todo.txt\",\"content\":\"ship it\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_write",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nwrite_file\narguments:\n{\"path\":\"notes/todo.txt\",\"content\":\"ship it\\n\"}"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_list".to_string(),
+            name: "list_dir".to_string(),
+            arguments: json!({"dir":".","include_hidden":true}).to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_artifact_creation_tool_call(
+            TaskHarness {
+                lane: TaskLane::CreateFile,
+                artifact_mode: ArtifactMode::NewFiles,
+            },
+            &messages,
+            &tc,
+        )
+        .expect("rewritten");
+
+        assert_eq!(original, "list_dir(dir=., include_hidden=true)");
+        assert_eq!(rewritten.name, "write_file");
+        assert!(rewritten.arguments.contains("notes/todo.txt"));
+        assert!(coerced.contains("write_file"));
     }
 }

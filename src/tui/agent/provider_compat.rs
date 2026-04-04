@@ -1,3 +1,4 @@
+use super::task_harness::{ArtifactMode, TaskHarness};
 use super::*;
 
 fn mistral_name_embedded_blocks_and_tool(
@@ -391,7 +392,28 @@ fn synthetic_action_plan_goal(root_user_text: &str) -> String {
     }
 }
 
-fn synthetic_action_plan_first_step(tc: &ToolCallData) -> String {
+fn synthetic_action_plan_first_step(tc: &ToolCallData, task_harness: TaskHarness) -> String {
+    match task_harness.artifact_mode {
+        ArtifactMode::NewFiles => {
+            if let Some(command) =
+                canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+            {
+                return format!("{command} to create the requested file now");
+            }
+            return "create the requested file now with write_file or a minimal exec".to_string();
+        }
+        ArtifactMode::NewRepo => {
+            if let Some(command) =
+                canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+            {
+                return format!("{command} to create the requested repo/project artifact now");
+            }
+            return "create the requested repo/project artifact now with write_file or exec"
+                .to_string();
+        }
+        ArtifactMode::ObserveOnly | ArtifactMode::ExistingFiles => {}
+    }
+
     if let Some(command) = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str()) {
         match tc.name.as_str() {
             "read_file" | "search_files" | "list_dir" | "glob" => {
@@ -439,7 +461,30 @@ fn synthetic_action_plan_verify_step(
     }
 }
 
-fn synthetic_action_plan_acceptance(required_verification: VerificationLevel) -> Vec<String> {
+fn synthetic_action_plan_acceptance(
+    required_verification: VerificationLevel,
+    task_harness: TaskHarness,
+) -> Vec<String> {
+    if matches!(
+        task_harness.artifact_mode,
+        ArtifactMode::NewFiles | ArtifactMode::NewRepo
+    ) {
+        return match required_verification {
+            VerificationLevel::Behavioral => vec![
+                "the requested artifact is created and confirmed by a passing behavioral verification command"
+                    .to_string(),
+                "the final result cites the exact passing behavioral verification command"
+                    .to_string(),
+            ],
+            VerificationLevel::Build => vec![
+                "the requested artifact is created and confirmed by a passing build/check/lint verification command"
+                    .to_string(),
+                "the final result cites the exact passing build/check/lint verification command"
+                    .to_string(),
+            ],
+        };
+    }
+
     match required_verification {
         VerificationLevel::Behavioral => vec![
             "the requested change is implemented and confirmed by a passing behavioral verification command"
@@ -455,7 +500,26 @@ fn synthetic_action_plan_acceptance(required_verification: VerificationLevel) ->
     }
 }
 
-fn synthetic_action_plan_risks(required_verification: VerificationLevel) -> String {
+fn synthetic_action_plan_risks(
+    required_verification: VerificationLevel,
+    task_harness: TaskHarness,
+) -> String {
+    if matches!(
+        task_harness.artifact_mode,
+        ArtifactMode::NewFiles | ArtifactMode::NewRepo
+    ) {
+        return match required_verification {
+            VerificationLevel::Behavioral => {
+                "wrong path or incomplete artifact; the chosen test may miss the requested contents"
+                    .to_string()
+            }
+            VerificationLevel::Build => {
+                "wrong path or incomplete artifact; build-only verification may miss the requested contents"
+                    .to_string()
+            }
+        };
+    }
+
     match required_verification {
         VerificationLevel::Behavioral => {
             "wrong file or speculative fix; the chosen test may miss the requested behavior"
@@ -471,20 +535,36 @@ fn synthetic_action_plan_risks(required_verification: VerificationLevel) -> Stri
 fn synthetic_action_plan(
     root_user_text: &str,
     tc: &ToolCallData,
+    task_harness: TaskHarness,
     required_verification: VerificationLevel,
     test_cmd: Option<&str>,
 ) -> PlanBlock {
-    PlanBlock {
-        goal: synthetic_action_plan_goal(root_user_text),
-        steps: vec![
-            synthetic_action_plan_first_step(tc),
+    let steps = match task_harness.artifact_mode {
+        ArtifactMode::NewFiles => vec![
+            synthetic_action_plan_first_step(tc, task_harness),
+            synthetic_action_plan_verify_step(required_verification, test_cmd),
+            "call done with the created file path and the verified outcome".to_string(),
+        ],
+        ArtifactMode::NewRepo => vec![
+            synthetic_action_plan_first_step(tc, task_harness),
+            "create any minimal companion files or directories required by the request".to_string(),
+            synthetic_action_plan_verify_step(required_verification, test_cmd),
+            "call done with the created repo/project path and the verified outcome".to_string(),
+        ],
+        ArtifactMode::ObserveOnly | ArtifactMode::ExistingFiles => vec![
+            synthetic_action_plan_first_step(tc, task_harness),
             "read the strongest candidate file and confirm the exact edit context".to_string(),
             "apply the smallest evidence-backed code change in the confirmed target".to_string(),
             synthetic_action_plan_verify_step(required_verification, test_cmd),
             "call done with the verified outcome and any remaining gaps".to_string(),
         ],
-        acceptance_criteria: synthetic_action_plan_acceptance(required_verification),
-        risks: synthetic_action_plan_risks(required_verification),
+    };
+
+    PlanBlock {
+        goal: synthetic_action_plan_goal(root_user_text),
+        steps,
+        acceptance_criteria: synthetic_action_plan_acceptance(required_verification, task_harness),
+        risks: synthetic_action_plan_risks(required_verification, task_harness),
         assumptions:
             "the current repo state matches the task and the configured verification command is relevant"
                 .to_string(),
@@ -729,6 +809,7 @@ pub(super) fn rescue_missing_plan_for_tool_turn(
     messages: &[serde_json::Value],
     tc: &ToolCallData,
     root_user_text: &str,
+    task_harness: TaskHarness,
     root_read_only: bool,
     goal_wants_actions: bool,
     provider: ProviderKind,
@@ -741,19 +822,28 @@ pub(super) fn rescue_missing_plan_for_tool_turn(
     if !matches!(provider, ProviderKind::OpenAiCompatible) {
         return None;
     }
-    if !is_diagnostic_tool_name(tc.name.as_str()) {
+    let artifact_creation_turn = matches!(
+        task_harness.artifact_mode,
+        ArtifactMode::NewFiles | ArtifactMode::NewRepo
+    ) && matches!(tc.name.as_str(), "write_file" | "exec");
+    if !is_diagnostic_tool_name(tc.name.as_str()) && !artifact_creation_turn {
         return None;
     }
 
     let prior_blocks = consecutive_missing_plan_blocks_for_tool(messages, tc);
     let prior_diagnostic_blocks = consecutive_missing_plan_blocks_for_diagnostic_tools(messages);
-    if prior_blocks.saturating_add(1) < 2 && prior_diagnostic_blocks.saturating_add(1) < 3 {
+    if artifact_creation_turn {
+        if prior_blocks.saturating_add(1) < 2 {
+            return None;
+        }
+    } else if prior_blocks.saturating_add(1) < 2 && prior_diagnostic_blocks.saturating_add(1) < 3 {
         return None;
     }
 
     Some(synthetic_action_plan(
         root_user_text,
         tc,
+        task_harness,
         required_verification,
         test_cmd,
     ))
@@ -1144,6 +1234,22 @@ pub(super) fn compat_synthetic_think(tc: &ToolCallData, plan: &PlanBlock) -> Thi
                 Some(format!("glob {pattern} in {dir}"))
             })
             .unwrap_or_else(|| "glob for candidate files".to_string()),
+        "write_file" => serde_json::from_str::<serde_json::Value>(&tc.arguments)
+            .ok()
+            .and_then(|v| {
+                v.get("path")
+                    .and_then(|x| x.as_str())
+                    .map(|path| format!("write {path}"))
+            })
+            .unwrap_or_else(|| "write the requested file".to_string()),
+        "patch_file" => serde_json::from_str::<serde_json::Value>(&tc.arguments)
+            .ok()
+            .and_then(|v| {
+                v.get("path")
+                    .and_then(|x| x.as_str())
+                    .map(|path| format!("patch {path}"))
+            })
+            .unwrap_or_else(|| "patch the target file".to_string()),
         "done" => "call done immediately".to_string(),
         _ => format!("run {}", tc.name),
     };
