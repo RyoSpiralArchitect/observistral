@@ -8046,6 +8046,7 @@ async fn run_goal_check_command(
     tx: &mpsc::Sender<StreamToken>,
 ) -> GoalCheckExecResult {
     let sig = command_sig(command);
+    let command_for_evidence = compact_one_line(command, 200);
     let _ = tx
         .send(StreamToken::Delta(format!(
             "\n{}\n",
@@ -8100,7 +8101,7 @@ async fn run_goal_check_command(
     let _ = tx.send(StreamToken::Delta(summary)).await;
 
     GoalCheckExecResult {
-        command: sig,
+        command: command_for_evidence,
         passed,
         error_class,
         digest,
@@ -17439,6 +17440,28 @@ verify: exit code is zero\n\
         )
         .expect("runner command");
         assert_eq!(cmd, "cargo test -q");
+    }
+
+    #[test]
+    fn goal_check_result_preserves_verification_command_case_for_evidence() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(td.path().join("demo_repo/.git")).expect("mkdir .git");
+        std::fs::write(td.path().join("demo_repo/README.md"), "# demo\n").expect("write readme");
+        std::fs::write(td.path().join("demo_repo/.gitignore"), "target/\n")
+            .expect("write gitignore");
+        let command =
+            "test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore";
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (_tx, mut _rx) = tokio::sync::mpsc::channel(4);
+        let result = rt.block_on(run_goal_check_command(
+            "repo",
+            command,
+            td.path().to_string_lossy().as_ref(),
+            &_tx,
+        ));
+
+        assert!(result.passed);
+        assert_eq!(result.command, command);
     }
 
     #[test]

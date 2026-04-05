@@ -102,10 +102,22 @@ fn should_use_v1_completions(status: reqwest::StatusCode, body: &str) -> bool {
     false
 }
 
+fn should_retry_empty_bad_request(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST && body.trim().is_empty()
+}
+
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
         || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
+fn format_provider_http_error(label: &str, status: reqwest::StatusCode, body: &str) -> String {
+    if body.trim().is_empty() {
+        format!("{label} API error (HTTP {status})\n(empty response body)")
+    } else {
+        format!("{label} API error (HTTP {status})\n{body}")
+    }
 }
 
 fn retry_after_duration(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -429,15 +441,23 @@ pub async fn stream_openai_compat_json(
                 continue;
             }
 
+            if attempt < max_connect_retries && should_retry_empty_bad_request(status, &body) {
+                let d = backoff_delay(&cfg.provider, Some(status), attempt, ra);
+                emit_retry_telemetry(&tx, &cfg.provider, Some(status), attempt, d, &url).await;
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(d).await;
+                continue;
+            }
+
             if should_use_v1_completions(status, &body) {
                 want_completions = true;
-                last_err = Some(anyhow!("{label} API error (HTTP {status})\n{body}"));
+                last_err = Some(anyhow!(format_provider_http_error(label, status, &body)));
                 break;
             }
 
             // Endpoint mismatch (e.g. Codestral uses /chat/completion). Try next candidate.
             if status == reqwest::StatusCode::NOT_FOUND {
-                last_err = Some(anyhow!("{label} API error (HTTP {status})\n{body}"));
+                last_err = Some(anyhow!(format_provider_http_error(label, status, &body)));
                 break;
             }
 
@@ -449,7 +469,7 @@ pub async fn stream_openai_compat_json(
                 continue;
             }
 
-            return Err(anyhow!("{label} API error (HTTP {status})\n{body}"));
+            return Err(anyhow!(format_provider_http_error(label, status, &body)));
         }
 
         if resp.is_some() || want_completions {
@@ -514,6 +534,14 @@ pub async fn stream_openai_compat_json(
                 continue;
             }
 
+            if attempt < max_connect_retries && should_retry_empty_bad_request(status, &body) {
+                let d = backoff_delay(&cfg.provider, Some(status), attempt, ra);
+                emit_retry_telemetry(&tx, &cfg.provider, Some(status), attempt, d, &url).await;
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(d).await;
+                continue;
+            }
+
             if attempt < max_connect_retries && is_retryable_status(status) {
                 let d = backoff_delay(&cfg.provider, Some(status), attempt, ra);
                 emit_retry_telemetry(&tx, &cfg.provider, Some(status), attempt, d, &url).await;
@@ -522,7 +550,7 @@ pub async fn stream_openai_compat_json(
                 continue;
             }
 
-            return Err(anyhow!("{label} API error (HTTP {status})\n{body}"));
+            return Err(anyhow!(format_provider_http_error(label, status, &body)));
         }
     } else {
         return Err(last_err.unwrap_or_else(|| anyhow!("{label} request failed")));
@@ -874,5 +902,29 @@ mod tests {
             None,
         );
         assert!(d >= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn empty_body_bad_request_is_marked_retryable() {
+        assert!(should_retry_empty_bad_request(
+            reqwest::StatusCode::BAD_REQUEST,
+            ""
+        ));
+        assert!(should_retry_empty_bad_request(
+            reqwest::StatusCode::BAD_REQUEST,
+            "   "
+        ));
+        assert!(!should_retry_empty_bad_request(
+            reqwest::StatusCode::BAD_REQUEST,
+            "tool_choice unsupported"
+        ));
+    }
+
+    #[test]
+    fn format_provider_http_error_mentions_empty_body() {
+        let msg =
+            format_provider_http_error("OpenAI-compatible", reqwest::StatusCode::BAD_REQUEST, "");
+        assert!(msg.contains("HTTP 400 Bad Request"));
+        assert!(msg.contains("empty response body"));
     }
 }
