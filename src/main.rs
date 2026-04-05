@@ -2305,6 +2305,7 @@ async fn run_agent_with_behavior(
     let mut start_checkpoint: Option<String> = None;
     let mut start_cwd: Option<String> = None;
     let mut start_observation_cache: Option<crate::agent_session::ObservationCache> = None;
+    let mut start_session_bridge: Option<crate::agent_session::SessionBridge> = None;
     let mut create_checkpoint = true;
     let mut resuming = false;
 
@@ -2327,6 +2328,7 @@ async fn run_agent_with_behavior(
             start_checkpoint = sess.checkpoint.clone();
             start_cwd = sess.cur_cwd.clone();
             start_observation_cache = sess.observation_cache.clone();
+            start_session_bridge = sess.session_bridge.clone();
             create_checkpoint = sess.checkpoint.is_none();
             start_messages_json = Some(std::mem::take(&mut sess.messages));
             loaded_session = Some(sess);
@@ -2585,6 +2587,7 @@ async fn run_agent_with_behavior(
             checkpoint: checkpoint.clone(),
             cur_cwd: cur_cwd.clone(),
             observation_cache: start_observation_cache.clone(),
+            session_bridge: start_session_bridge.clone(),
             create_checkpoint: create_checkpoint_round,
         };
         create_checkpoint_round = false;
@@ -2717,6 +2720,7 @@ async fn run_agent_with_behavior(
         cur_cwd = end_state.cur_cwd;
         checkpoint = checkpoint.or(end_state.checkpoint);
         start_observation_cache = end_state.observation_cache;
+        start_session_bridge = crate::agent_session::session_bridge_from_messages(&messages_json);
         if let Some(ref tw) = trace {
             let last_reflection =
                 crate::agent_session::last_reflection_summary_from_messages(&messages_json);

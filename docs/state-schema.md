@@ -12,7 +12,7 @@ store state without first choosing the correct owner.
 |---|---|---|---|---|
 | Provider/runtime config | `src/config.rs` | process / launch | CLI args + env | `PartialConfig`, `RunConfig` |
 | Project-local TUI prefs | `src/tui/prefs.rs` | cross-session | `.obstral/tui_prefs.json` | `TuiPrefs`, `PanePrefs`, `coder_realize_preset`, pane model/provider/mode |
-| Session persistence | `src/agent_session.rs` | resumable run | `session.json` | `AgentSession`, `ObservationCache`, recent reflections |
+| Session persistence | `src/agent_session.rs` | resumable run | `session.json` | `AgentSession`, `ObservationCache`, recent reflections, `SessionBridge` |
 | Project-local reflection ledger | `src/reflection_ledger.rs` | cross-session | `.obstral/reflection_ledger.json` | recurring wrong assumptions, next minimal actions, reflection counts |
 | In-memory orchestration state | `src/tui/app.rs` + `src/tui/agent/task_harness.rs` + `src/tui/agent/meta_harness.rs` + `src/tui/agent/evaluator_loop.rs` | live TUI session / live coder loop | memory only | `App`, `pending_auto_fix`, `TaskHarness`, `TaskLane`, `ArtifactMode`, `MetaHarness`, `FailurePattern`, `PolicyDelta`, `EvaluatorLoop`, `EvaluatorFinding`, `PolicyPatch` |
 | Intent state | `src/tui/intent.rs` | live session, optionally persisted later | memory only today | `IntentAnchor`, `IntentUpdateKind`, normalized constraints/success criteria |
@@ -79,6 +79,7 @@ Owns:
 - resumable chat/tool history
 - recent reflection summaries
 - observation-backed memory that is useful across resumes
+- typed resume bridge memory such as last good verification and repeated dead-ends
 
 Examples:
 
@@ -87,12 +88,18 @@ Examples:
 - `ObservationReadCache`
 - `ObservationSearchCache`
 - `ObservationResolutionCache`
+- `SessionBridge`
+- `SessionVerificationMemory`
+- `SessionAcceptedStrategy`
+- `SessionDeadEnd`
 
 This is the right home for typed operational memory such as:
 
 - canonical path resolution
 - evidence-backed observations
 - recent successful commands used for `done` citation
+- accepted strategies that were already matched to successful follow-up actions
+- repeated dead-end commands that should not be retried first after resume
 
 ### 4. Project-local reflection ledger
 

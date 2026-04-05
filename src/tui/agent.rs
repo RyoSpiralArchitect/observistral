@@ -48,6 +48,7 @@ mod memory;
 mod meta_harness;
 mod provider_compat;
 mod read_only;
+mod session_bridge;
 mod task_harness;
 use self::done_gate::{
     build_done_acceptance_recovery_hint, build_post_verify_done_completion_hint,
@@ -86,6 +87,7 @@ use self::read_only::{
     preferred_read_only_search_dir, preferred_read_only_search_pattern, read_only_plan_violation,
     synthetic_read_only_observation_plan, ReadOnlyDiagnoseRescueAction,
 };
+use self::session_bridge::SessionBridgeView;
 use self::task_harness::{
     allows_artifact_creation_during_diagnose, allows_artifact_creation_during_verify,
     build_fix_stage_progress_hint, build_progress_gate_block, coerce_artifact_creation_tool_call,
@@ -98,6 +100,7 @@ pub struct AgenticStartState {
     pub checkpoint: Option<String>,
     pub cur_cwd: Option<String>,
     pub observation_cache: Option<crate::agent_session::ObservationCache>,
+    pub session_bridge: Option<crate::agent_session::SessionBridge>,
     pub create_checkpoint: bool,
 }
 
@@ -4648,6 +4651,7 @@ struct StablePromptCache {
     task_harness_hash: Option<u64>,
     meta_harness_hash: Option<u64>,
     evaluator_loop_hash: Option<u64>,
+    session_bridge_hash: Option<u64>,
     task_contract_hash: Option<u64>,
     working_memory_hash: Option<u64>,
     assumption_ledger_hash: Option<u64>,
@@ -8141,6 +8145,7 @@ pub async fn run_agentic(
         checkpoint: None,
         cur_cwd: None,
         observation_cache: None,
+        session_bridge: None,
         create_checkpoint: true,
     };
     run_agentic_json(
@@ -8280,6 +8285,7 @@ Fix: use --provider openai-compatible (or --provider mistral).",
     let mut observation_evidence = collect_observation_evidence(&messages);
     observation_evidence.merge_session_cache(start.observation_cache.as_ref());
     sync_observation_cache_autosave(&autosaver, &observation_evidence);
+    let session_bridge = SessionBridgeView::resolve(start.session_bridge.as_ref(), &messages);
     let mut prompt_cache = StablePromptCache::default();
     // Rebuild loop governor memory from the existing session so resuming runs doesn't
     // repeat the same failures from scratch.
@@ -8803,6 +8809,23 @@ This is the LAST model call for this run.\n\
                 }),
             )
             .await;
+        }
+
+        if let Some(telemetry) = session_bridge.telemetry_payload() {
+            emit_telemetry_event(&tx, "session_bridge_prompted", telemetry).await;
+        }
+        if let Some(session_bridge_prompt) = session_bridge.prompt() {
+            let compact_prompt = session_bridge
+                .compact_prompt()
+                .unwrap_or_else(|| session_bridge_prompt.clone());
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": render_cached_prompt(
+                    &mut prompt_cache.session_bridge_hash,
+                    session_bridge_prompt,
+                    compact_prompt,
+                ),
+            }));
         }
 
         if let (true, Some(latent), Some(drift)) = (

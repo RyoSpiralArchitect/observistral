@@ -128,6 +128,20 @@ Reason:
 - it keeps the self-critique loop typed and auditable before any future multi-agent orchestration
 - it lets the runtime rewrite its own harness behavior without stuffing more branches into `agent.rs`
 
+### 9. `src/tui/agent/session_bridge.rs`
+
+Move:
+
+- prompt/telemetry rendering for persisted resume memory from `session.json`
+- typed bridge summaries such as last good verification, accepted strategy, repeated dead-end
+- resume-specific guidance that turns prior-session operational memory into live harness context
+
+Reason:
+
+- session persistence owns the data, but the live prompt/rendering layer should not grow `agent.rs`
+- it keeps resumable operational memory explicit and auditable
+- it is the foundation for deeper session-to-session context bridging later
+
 ## Suggested extraction order
 
 1. `done_gate.rs`
@@ -137,7 +151,8 @@ Reason:
 5. `task_harness.rs`
 6. `meta_harness.rs`
 7. `evaluator_loop.rs`
-8. optional `telemetry.rs` if loop instrumentation keeps growing
+8. `session_bridge.rs`
+9. optional `telemetry.rs` if loop instrumentation keeps growing
 
 This order minimizes risk because the first two already have strong eval/replay
 pressure and the clearest ownership boundaries.
