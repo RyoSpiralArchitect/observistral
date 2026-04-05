@@ -43,6 +43,7 @@ use crate::types::ChatMessage;
 use std::path::Path;
 
 mod done_gate;
+mod evaluator_loop;
 mod memory;
 mod meta_harness;
 mod provider_compat;
@@ -57,6 +58,7 @@ use self::done_gate::{
     should_prefer_done_after_verified_action, synthesize_action_done_summary,
     validate_done_acceptance,
 };
+use self::evaluator_loop::EvaluatorLoop;
 use self::memory::{
     canonicalize_evidence_command_with_resolution, normalize_memory_entry, normalize_path_alias,
     remember_recent_unique, remember_repo_map_resolution, rewrite_tool_call_with_resolution,
@@ -4645,6 +4647,7 @@ struct StablePromptCache {
     resolver_hash: Option<u64>,
     task_harness_hash: Option<u64>,
     meta_harness_hash: Option<u64>,
+    evaluator_loop_hash: Option<u64>,
     task_contract_hash: Option<u64>,
     working_memory_hash: Option<u64>,
     assumption_ledger_hash: Option<u64>,
@@ -8704,6 +8707,30 @@ This is the LAST model call for this run.\n\
             }));
         }
 
+        let evaluator_loop = EvaluatorLoop::analyze(
+            task_harness,
+            &meta_harness,
+            &reflection_ledger,
+            last_reflection.as_ref(),
+            test_cmd.as_deref(),
+        );
+        if let Some(telemetry) = evaluator_loop.telemetry_payload(task_harness) {
+            emit_telemetry_event(&tx, "evaluator_loop", telemetry).await;
+        }
+        if let Some(evaluator_prompt) = evaluator_loop.prompt() {
+            let compact_prompt = evaluator_loop
+                .compact_prompt()
+                .unwrap_or_else(|| evaluator_prompt.clone());
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": render_cached_prompt(
+                    &mut prompt_cache.evaluator_loop_hash,
+                    evaluator_prompt,
+                    compact_prompt,
+                ),
+            }));
+        }
+
         let harness_prompt = task_harness.prompt(test_cmd.as_deref());
         msgs_for_call.push(json!({
             "role": "system",
@@ -10278,6 +10305,49 @@ Execute only the new minimal action: {}",
                     "progress_gate_blocked",
                     json!({
                         "lane": task_harness.lane_label(),
+                        "tool": tc.name,
+                    }),
+                )
+                .await;
+
+                push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+
+                pending_system_hint = Some(block);
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
+
+            if let Some(block) = evaluator_loop.build_violation_block(tc) {
+                state = AgentState::Recovery;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "evaluator_loop_blocked",
+                    json!({
+                        "policy_id": evaluator_loop.policy_id(),
                         "tool": tc.name,
                     }),
                 )

@@ -114,6 +114,20 @@ Reason:
 - it should stay deterministic and auditable before any future evaluator-agent loop
 - it lets the runtime change its own guardrails without growing `agent.rs`
 
+### 8. `src/tui/agent/evaluator_loop.rs`
+
+Move:
+
+- deterministic `keep / problem / try_now` findings derived from live trace policy
+- evaluator-side policy patching such as blocked repeated observations vs preferred tools
+- evaluator prompt / telemetry that closes `trace -> finding -> runtime rule update`
+
+Reason:
+
+- this is the next layer above `MetaHarness`, not a provider compat concern
+- it keeps the self-critique loop typed and auditable before any future multi-agent orchestration
+- it lets the runtime rewrite its own harness behavior without stuffing more branches into `agent.rs`
+
 ## Suggested extraction order
 
 1. `done_gate.rs`
@@ -122,7 +136,8 @@ Reason:
 4. `memory.rs`
 5. `task_harness.rs`
 6. `meta_harness.rs`
-7. optional `telemetry.rs` if loop instrumentation keeps growing
+7. `evaluator_loop.rs`
+8. optional `telemetry.rs` if loop instrumentation keeps growing
 
 This order minimizes risk because the first two already have strong eval/replay
 pressure and the clearest ownership boundaries.

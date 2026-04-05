@@ -10,7 +10,7 @@ pub(super) enum FailurePattern {
 }
 
 impl FailurePattern {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             FailurePattern::RepeatedObservationLoop => "repeated_observation_loop",
             FailurePattern::RepoScaffoldDrift => "repo_scaffold_drift",
@@ -26,7 +26,7 @@ pub(super) enum PolicyAction {
 }
 
 impl PolicyAction {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             PolicyAction::MutateExistingNow => "mutate_existing_now",
             PolicyAction::CreateArtifactNow => "create_artifact_now",
@@ -34,7 +34,7 @@ impl PolicyAction {
         }
     }
 
-    fn required_action_hint(self) -> &'static str {
+    pub(super) fn required_action_hint(self) -> &'static str {
         match self {
             PolicyAction::MutateExistingNow => {
                 "Apply the smallest edit now with `patch_file` or `apply_diff`."
@@ -203,6 +203,17 @@ Do NOT spend the next turn on another same-target observation unless new tool ou
             })
             .to_string(),
         })
+    }
+
+    pub(super) fn policy(&self) -> Option<&PolicyDelta> {
+        self.policy.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(policy: PolicyDelta) -> Self {
+        Self {
+            policy: Some(policy),
+        }
     }
 }
 
