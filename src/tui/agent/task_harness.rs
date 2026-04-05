@@ -404,21 +404,12 @@ pub(super) fn coerce_repo_goal_completion_tool_call(
     if harness.artifact_mode != ArtifactMode::NewRepo || !is_observation_tool(tc.name.as_str()) {
         return None;
     }
-    if !latest_goal_check_missing(messages)
-        .iter()
-        .any(|entry| entry == ".git" || entry.ends_with("/.git"))
-    {
+    let goal_check_missing = latest_goal_check_missing(messages);
+    let status = repo_scaffold_status(messages, test_cmd?)?;
+    if goal_check_missing.is_empty() && !has_repo_scaffold_progress(&status) {
         return None;
     }
-    let repo_root = repo_root_from_test_cmd(test_cmd?)?;
-    let rewritten = ToolCallData {
-        id: tc.id.clone(),
-        name: "exec".to_string(),
-        arguments: serde_json::json!({
-            "command": format!("git init {repo_root}")
-        })
-        .to_string(),
-    };
+    let rewritten = next_repo_scaffold_tool_call(tc.id.as_str(), &status)?;
     let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
         .unwrap_or_else(|| {
             format!(
@@ -450,38 +441,7 @@ pub(super) fn repair_repo_scaffold_write_tool_call(
         return None;
     }
     let status = repo_scaffold_status(messages, test_cmd?)?;
-    let rewritten = if !status.has_git {
-        ToolCallData {
-            id: tc.id.clone(),
-            name: "exec".to_string(),
-            arguments: serde_json::json!({
-                "command": format!("git init {}", status.repo_root)
-            })
-            .to_string(),
-        }
-    } else if !status.has_gitignore {
-        ToolCallData {
-            id: tc.id.clone(),
-            name: "write_file".to_string(),
-            arguments: serde_json::json!({
-                "path": format!("{}/.gitignore", status.repo_root),
-                "content": default_repo_gitignore(),
-            })
-            .to_string(),
-        }
-    } else if !status.has_readme {
-        ToolCallData {
-            id: tc.id.clone(),
-            name: "write_file".to_string(),
-            arguments: serde_json::json!({
-                "path": format!("{}/README.md", status.repo_root),
-                "content": default_repo_readme(status.repo_root.as_str()),
-            })
-            .to_string(),
-        }
-    } else {
-        return None;
-    };
+    let rewritten = next_repo_scaffold_tool_call(tc.id.as_str(), &status)?;
     let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
         .unwrap_or_else(|| {
             format!(
@@ -900,6 +860,49 @@ fn repo_root_from_test_cmd(test_cmd: &str) -> Option<String> {
     None
 }
 
+fn has_repo_scaffold_progress(status: &RepoScaffoldStatus) -> bool {
+    status.has_git || status.has_gitignore || status.has_readme
+}
+
+fn next_repo_scaffold_tool_call(
+    tool_call_id: &str,
+    status: &RepoScaffoldStatus,
+) -> Option<ToolCallData> {
+    if !status.has_git {
+        return Some(ToolCallData {
+            id: tool_call_id.to_string(),
+            name: "exec".to_string(),
+            arguments: serde_json::json!({
+                "command": format!("git init {}", status.repo_root)
+            })
+            .to_string(),
+        });
+    }
+    if !status.has_gitignore {
+        return Some(ToolCallData {
+            id: tool_call_id.to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": format!("{}/.gitignore", status.repo_root),
+                "content": default_repo_gitignore(),
+            })
+            .to_string(),
+        });
+    }
+    if !status.has_readme {
+        return Some(ToolCallData {
+            id: tool_call_id.to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": format!("{}/README.md", status.repo_root),
+                "content": default_repo_readme(status.repo_root.as_str()),
+            })
+            .to_string(),
+        });
+    }
+    None
+}
+
 fn default_repo_gitignore() -> &'static str {
     ".DS_Store\n.env\n.venv/\n__pycache__/\n*.py[cod]\nnode_modules/\ndist/\nbuild/\n.idea/\n.vscode/\n*.log\n"
 }
@@ -1194,6 +1197,52 @@ mod tests {
         assert!(rewritten.arguments.contains("git init demo_repo"));
         assert!(original.contains("list_dir"));
         assert_eq!(coerced, "git init demo_repo");
+    }
+
+    #[test]
+    fn coerce_repo_goal_completion_tool_call_advances_to_gitignore_after_git_init() {
+        let messages = vec![
+            json!({
+                "role": "user",
+                "content": "[goal_check]\nThe task is NOT complete yet.\nMissing: .git\nFix it by using exec/write_file. Do NOT stop until the goals are satisfied."
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_init",
+                    "type": "function",
+                    "function": {
+                        "name":"exec",
+                        "arguments":"{\"command\":\"git init demo_repo\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_init",
+                "content": "OK (exit_code: 0)\nInitialized empty Git repository in demo_repo/.git/"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_list".to_string(),
+            name: "list_dir".to_string(),
+            arguments: json!({"dir":"demo_repo","include_hidden":true}).to_string(),
+        };
+
+        let (rewritten, _original, coerced) = coerce_repo_goal_completion_tool_call(
+            TaskHarness {
+                lane: TaskLane::ScaffoldRepo,
+                artifact_mode: ArtifactMode::NewRepo,
+            },
+            &messages,
+            &tc,
+            Some("test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore"),
+        )
+        .expect("rewritten");
+
+        assert_eq!(rewritten.name, "write_file");
+        assert!(rewritten.arguments.contains("demo_repo/.gitignore"));
+        assert!(coerced.contains(".gitignore"));
     }
 
     #[test]
