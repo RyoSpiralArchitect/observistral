@@ -159,6 +159,51 @@ Do NOT spend the next turn on another same-target observation unless new tool ou
             .join("\n"),
         )
     }
+
+    pub(super) fn synthesize_tool_call(&self, iter: usize) -> Option<ToolCallData> {
+        let policy = self.policy.as_ref()?;
+        if policy.action != PolicyAction::AdvanceRepoScaffold {
+            return None;
+        }
+        let target = policy.next_target.as_deref()?.trim();
+        let id = format!("meta_harness_call_{iter}");
+        if let Some(repo_root) = target.strip_suffix("/.git") {
+            return Some(ToolCallData {
+                id,
+                name: "exec".to_string(),
+                arguments: serde_json::json!({
+                    "command": format!("git init {repo_root}")
+                })
+                .to_string(),
+            });
+        }
+        if target.ends_with("/.gitignore") {
+            return Some(ToolCallData {
+                id,
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": target,
+                    "content": default_repo_gitignore(),
+                })
+                .to_string(),
+            });
+        }
+        let repo_name = target
+            .trim_end_matches('/')
+            .rsplit('/')
+            .nth(1)
+            .filter(|segment| !segment.trim().is_empty())
+            .unwrap_or("project");
+        Some(ToolCallData {
+            id,
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": target,
+                "content": format!("# {repo_name}\n"),
+            })
+            .to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -554,6 +599,10 @@ fn required_repo_files_from_test_cmd(test_cmd: &str, repo_root: &str) -> Vec<Str
     out
 }
 
+fn default_repo_gitignore() -> &'static str {
+    ".DS_Store\n.env\n.venv/\n__pycache__/\n*.py[cod]\nnode_modules/\ndist/\nbuild/\n.idea/\n.vscode/\n*.log\n"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,5 +693,24 @@ mod tests {
         assert!(harness.telemetry_payload().expect("telemetry")["action"]
             .as_str()
             .is_some_and(|s| s == "advance_repo_scaffold"));
+    }
+
+    #[test]
+    fn meta_harness_synthesizes_repo_scaffold_tool_call() {
+        let harness = MetaHarness {
+            policy: Some(PolicyDelta {
+                pattern: FailurePattern::RepoScaffoldDrift,
+                action: PolicyAction::AdvanceRepoScaffold,
+                evidence_count: 2,
+                attempted_command: None,
+                next_target: Some("demo_repo/README.md".to_string()),
+            }),
+        };
+
+        let tool_call = harness.synthesize_tool_call(7).expect("tool call");
+
+        assert_eq!(tool_call.name, "write_file");
+        assert!(tool_call.arguments.contains("demo_repo/README.md"));
+        assert!(tool_call.arguments.contains("# demo_repo\\n"));
     }
 }

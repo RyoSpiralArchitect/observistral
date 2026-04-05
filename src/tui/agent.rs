@@ -8942,6 +8942,36 @@ This is the LAST model call for this run.\n\
             break;
         }
 
+        if tool_calls.is_empty() {
+            if let Some(tc) = meta_harness.synthesize_tool_call(iter) {
+                let synthesized =
+                    canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "{}({})",
+                                tc.name,
+                                compact_one_line(tc.arguments.as_str(), 120)
+                            )
+                        });
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[meta_harness] synthesized next scaffold action for stalled no-tool turn: {synthesized}\n"
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "meta_harness_synthesized_tool_call",
+                    json!({
+                        "iter": iter,
+                        "tool": tc.name,
+                        "synthetic": synthesized,
+                    }),
+                )
+                .await;
+                tool_calls.push(tc);
+            }
+        }
+
         if tool_calls.len() == 1 {
             if let Some((rewritten, original, repaired)) =
                 repair_truncated_patch_tool_call_from_recent_mismatch(
