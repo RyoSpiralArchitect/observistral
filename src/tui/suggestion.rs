@@ -23,6 +23,72 @@ impl ObserverSuggestionKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ObserverScoreVector {
+    #[serde(default)]
+    pub correctness: f32,
+    #[serde(default)]
+    pub security: f32,
+    #[serde(default)]
+    pub efficiency: f32,
+    #[serde(default)]
+    pub readability: f32,
+}
+
+impl ObserverScoreVector {
+    pub fn normalize(&mut self) {
+        self.correctness = self.correctness.clamp(0.0, 1.0);
+        self.security = self.security.clamp(0.0, 1.0);
+        self.efficiency = self.efficiency.clamp(0.0, 1.0);
+        self.readability = self.readability.clamp(0.0, 1.0);
+    }
+
+    pub fn focus_axes(&self) -> Vec<&'static str> {
+        let mut axes = Vec::new();
+        if self.correctness <= 0.75 {
+            axes.push("correctness");
+        }
+        if self.security <= 0.75 {
+            axes.push("security");
+        }
+        if self.efficiency <= 0.75 {
+            axes.push("efficiency");
+        }
+        if self.readability <= 0.75 {
+            axes.push("readability");
+        }
+        axes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObserverResponseMode {
+    Accept,
+    Override,
+    Defer,
+}
+
+impl ObserverResponseMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Override => "override",
+            Self::Defer => "defer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ObserverResponseContract {
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub focus_axes: Vec<String>,
+    #[serde(default)]
+    pub note: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObserverSuggestion {
     pub kind: ObserverSuggestionKind,
@@ -44,6 +110,10 @@ pub struct ObserverSuggestionEnvelope {
     pub summary: String,
     #[serde(default)]
     pub primary_blocker: String,
+    #[serde(default)]
+    pub scores: ObserverScoreVector,
+    #[serde(default)]
+    pub response_contract: ObserverResponseContract,
     #[serde(default)]
     pub suggestions: Vec<ObserverSuggestion>,
     #[serde(default)]
@@ -80,6 +150,22 @@ pub fn format_observer_suggestion_envelope(env: &ObserverSuggestionEnvelope) -> 
     }
     if !env.primary_blocker.is_empty() && env.primary_blocker != blocker {
         out.push_str(&format!("primary_blocker: {}\n", env.primary_blocker));
+    }
+
+    out.push_str("--- scores ---\n");
+    out.push_str(&format!(
+        "correctness={:.2} security={:.2} efficiency={:.2} readability={:.2}\n",
+        env.scores.correctness, env.scores.security, env.scores.efficiency, env.scores.readability
+    ));
+    if env.response_contract.required {
+        let focus = if env.response_contract.focus_axes.is_empty() {
+            "current blocker".to_string()
+        } else {
+            env.response_contract.focus_axes.join(", ")
+        };
+        out.push_str(&format!(
+            "response_required: yes ({focus}; choose accept|override|defer on the next coder turn)\n"
+        ));
     }
 
     out.push_str("--- next_actions ---\n");
@@ -136,6 +222,23 @@ pub fn format_observer_suggestion_envelope(env: &ObserverSuggestionEnvelope) -> 
 fn normalize_envelope(env: &mut ObserverSuggestionEnvelope) {
     env.summary = env.summary.trim().to_string();
     env.primary_blocker = env.primary_blocker.trim().to_string();
+    env.scores.normalize();
+    env.response_contract.note = env.response_contract.note.trim().to_string();
+    env.response_contract.focus_axes = env
+        .response_contract
+        .focus_axes
+        .iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect();
+    if env.response_contract.required && env.response_contract.focus_axes.is_empty() {
+        env.response_contract.focus_axes = env
+            .scores
+            .focus_axes()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    }
     env.quickest_check = env.quickest_check.trim().to_string();
     env.why_this_first = env.why_this_first.trim().to_string();
     env.fallback = env.fallback.trim().to_string();
@@ -164,6 +267,10 @@ fn normalize_envelope(env: &mut ObserverSuggestionEnvelope) {
     if env.suggestions.len() > 3 {
         env.suggestions.truncate(3);
     }
+}
+
+pub fn primary_suggestion(env: &ObserverSuggestionEnvelope) -> Option<&ObserverSuggestion> {
+    env.suggestions.first()
 }
 
 fn render_suggestion_line(suggestion: &ObserverSuggestion) -> String {
@@ -227,6 +334,17 @@ observer note
 {
   "summary": "Coder is stuck in diagnose without taking the next concrete read step.",
   "primary_blocker": "missing_concrete_next_step",
+  "scores": {
+    "correctness": 0.82,
+    "security": 0.61,
+    "efficiency": 0.77,
+    "readability": 0.80
+  },
+  "response_contract": {
+    "required": true,
+    "focus_axes": ["security"],
+    "note": "If you do not follow the next step, explicitly choose override or defer."
+  },
   "suggestions": [
     {
       "kind": "read",
@@ -244,6 +362,8 @@ observer note
 "#;
         let parsed = parse_observer_suggestion_envelope(raw).expect("structured suggestion");
         assert_eq!(parsed.primary_blocker, "missing_concrete_next_step");
+        assert!(parsed.response_contract.required);
+        assert_eq!(parsed.response_contract.focus_axes, vec!["security"]);
         assert_eq!(parsed.suggestions.len(), 1);
         assert_eq!(
             parsed.suggestions[0].suggested_tool.as_deref(),
@@ -256,6 +376,17 @@ observer note
         let env = ObserverSuggestionEnvelope {
             summary: "Need one concrete read step.".to_string(),
             primary_blocker: "missing_concrete_next_step".to_string(),
+            scores: ObserverScoreVector {
+                correctness: 0.82,
+                security: 0.61,
+                efficiency: 0.77,
+                readability: 0.80,
+            },
+            response_contract: ObserverResponseContract {
+                required: true,
+                focus_axes: vec!["security".to_string()],
+                note: "Explicitly respond on the next coder turn.".to_string(),
+            },
             suggestions: vec![ObserverSuggestion {
                 kind: ObserverSuggestionKind::Read,
                 reason: "Read the prefs implementation directly.".to_string(),
@@ -271,6 +402,8 @@ observer note
 
         let rendered = format_observer_suggestion_envelope(&env);
         assert!(rendered.contains("--- blocker ---"));
+        assert!(rendered.contains("--- scores ---"));
+        assert!(rendered.contains("response_required: yes"));
         assert!(rendered.contains("[read 0.88] read_file(path=src/tui/prefs.rs)"));
         assert!(rendered.contains("based_on: recent_tool_results"));
     }

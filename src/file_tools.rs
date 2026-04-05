@@ -362,6 +362,17 @@ fn finalize_search_output(
     }
 }
 
+fn display_search_path(path: &Path, search_root: &Path, base: Option<&str>) -> String {
+    if let Some(root) = base {
+        if let Ok(rel) = path.strip_prefix(root) {
+            return rel.to_string_lossy().replace('\\', "/");
+        }
+    }
+    path.strip_prefix(search_root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
 fn search_single_file(
     pattern: &str,
     file_path: &Path,
@@ -511,10 +522,7 @@ pub fn tool_search_files(
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let rel = file_path
-                .strip_prefix(&search_root)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|_| file_path.display().to_string());
+            let rel = display_search_path(file_path, &search_root, base);
 
             for (ln, line) in content.lines().enumerate() {
                 let cmp = if case_insensitive {
@@ -1136,6 +1144,25 @@ mod tests {
         assert!(!err, "{r}");
         assert!(r.contains("src/events.rs:2:"), "{r}");
         assert!(r.contains("scoped to that file"), "{r}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_files_reports_paths_relative_to_tool_root() {
+        let dir = std::env::temp_dir().join("obstral_test_search_tool_root_relative");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("src"));
+        let _ = std::fs::write(
+            dir.join("src").join("config.rs"),
+            "pub struct AppConfig {\n    pub aliases: Vec<String>,\n}\n",
+        );
+        let base = dir.to_string_lossy().into_owned();
+
+        let (r, err) = tool_search_files("aliases", "src", false, Some(&base));
+        assert!(!err, "{r}");
+        assert!(r.contains("src/config.rs:2:"), "{r}");
+        assert!(!r.contains("\nconfig.rs:2:"), "{r}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

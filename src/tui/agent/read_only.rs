@@ -139,10 +139,42 @@ fn task_prefers_agent_flow_path(root_user_text: &str, criterion: &str) -> bool {
                 .any(|term| low.contains(term))
 }
 
+fn task_prefers_failure_mismatch(root_user_text: &str) -> bool {
+    let low = root_user_text.to_ascii_lowercase();
+    (low.contains("failing test") || low.contains("failed test"))
+        || (low.contains("test")
+            && ["mismatch", "fails", "failing", "failure"]
+                .iter()
+                .any(|term| low.contains(term)))
+}
+
+fn ordered_keyword_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for token in text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| part.len() >= 3)
+    {
+        if seen.insert(token.clone()) {
+            out.push(token);
+        }
+    }
+    out
+}
+
 pub(super) fn preferred_read_only_search_pattern(root_user_text: &str) -> String {
     let low = root_user_text.to_ascii_lowercase();
     if let Some(slash) = first_slash_literal(root_user_text) {
         return slash;
+    }
+    if low.contains("failing test")
+        || (low.contains("test")
+            && ["fail", "fails", "failing", "mismatch"]
+                .iter()
+                .any(|term| low.contains(term)))
+    {
+        return "test".to_string();
     }
     if ["pane-scoped", "preferences", "preference", "prefs"]
         .iter()
@@ -176,25 +208,30 @@ pub(super) fn preferred_read_only_search_pattern(root_user_text: &str) -> String
         "preferences",
         "repo_map",
         "fallback",
+        "test",
         "read_file",
         "agent",
         "events",
         "commands",
     ];
-    let tokens = keyword_tokens(root_user_text);
+    let ordered_tokens = ordered_keyword_tokens(root_user_text);
+    let tokens = ordered_tokens
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     for token in PRIORITY {
         if tokens.contains(*token) {
             return (*token).to_string();
         }
     }
-    tokens
+    const GENERIC_STOPWORDS: &[&str] = &[
+        "and", "answer", "anything", "code", "content", "context", "edit", "exact", "explain",
+        "file", "files", "final", "find", "include", "locate", "main", "must", "not", "path",
+        "read", "report", "the", "this", "where", "why", "with", "without",
+    ];
+    ordered_tokens
         .into_iter()
-        .find(|token| {
-            !matches!(
-                token.as_str(),
-                "find" | "where" | "locate" | "main" | "file"
-            )
-        })
+        .find(|token| !GENERIC_STOPWORDS.contains(&token.as_str()))
         .unwrap_or_else(|| "realize".to_string())
 }
 
@@ -228,13 +265,13 @@ pub(super) fn preferred_read_only_search_dir(root_user_text: &str) -> &'static s
     }
 }
 
-pub(super) fn preferred_read_only_read_path_hint(root_user_text: &str) -> &'static str {
+pub(super) fn preferred_read_only_read_path_hint(root_user_text: &str) -> Option<&'static str> {
     if task_prefers_prefs_path(root_user_text, "") {
-        "src/tui/prefs.rs"
+        Some("src/tui/prefs.rs")
     } else if task_prefers_agent_flow_path(root_user_text, "") {
-        "src/tui/agent.rs"
+        Some("src/tui/agent.rs")
     } else {
-        "src/tui/events.rs"
+        None
     }
 }
 
@@ -242,6 +279,9 @@ pub(super) fn synthetic_read_only_goal(root_user_text: &str) -> String {
     let low = root_user_text.to_ascii_lowercase();
     if let Some(slash) = first_slash_literal(root_user_text) {
         return format!("Locate where `{slash}` is handled in the TUI and report the file path.");
+    }
+    if task_prefers_failure_mismatch(root_user_text) {
+        return "Locate the failing test and confirm the exact assertion mismatch.".to_string();
     }
     if task_prefers_prefs_path(root_user_text, "") {
         return "Locate the main file where pane-scoped TUI preferences are serialized and restored."
@@ -262,6 +302,13 @@ pub(super) fn synthetic_read_only_acceptance(root_user_text: &str) -> (String, S
             format!("the file path handling `{slash}` is identified"),
             "the handler branch is confirmed by read_file".to_string(),
             "the command may be matched without the leading slash; the handler may live outside the obvious TUI file".to_string(),
+        );
+    }
+    if task_prefers_failure_mismatch(root_user_text) {
+        return (
+            "the failing test file path is identified".to_string(),
+            "the exact assertion mismatch is confirmed by read_file".to_string(),
+            "the failure context may live in helper code while the assertion sits in a nearby test module".to_string(),
         );
     }
     if task_prefers_prefs_path(root_user_text, "") {
@@ -370,18 +417,29 @@ pub(super) fn best_read_only_followup_read_path(
         .iter()
         .map(|read| normalize_for_signature(&read.path))
         .collect();
-    let criteria_blob = plan.acceptance_criteria.join(" ; ");
-    let mut candidate_paths: Vec<String> = search_paths.to_vec();
-    let preferred_path = preferred_read_only_read_path_hint(root_user_text).to_string();
-    if !candidate_paths.iter().any(|path| {
-        normalize_for_signature(path.as_str()) == normalize_for_signature(preferred_path.as_str())
-    }) {
-        candidate_paths.push(preferred_path.clone());
+    let mut observed_candidates: Vec<String> = Vec::new();
+    for path in search_paths.iter().filter(|path| !path.trim().is_empty()) {
+        if already_read.contains(&normalize_for_signature(path)) {
+            continue;
+        }
+        remember_recent_unique(&mut observed_candidates, path.as_str(), 8, 160);
     }
-    candidate_paths
+    if observed_candidates.len() == 1 {
+        return observed_candidates.into_iter().next();
+    }
+    if let Some(preferred_path) = preferred_read_only_read_path_hint(root_user_text) {
+        if !observed_candidates.iter().any(|path| {
+            normalize_for_signature(path.as_str()) == normalize_for_signature(preferred_path)
+        }) {
+            observed_candidates.push(preferred_path.to_string());
+        }
+    }
+    if observed_candidates.is_empty() {
+        return None;
+    }
+    let criteria_blob = plan.acceptance_criteria.join(" ; ");
+    observed_candidates
         .iter()
-        .filter(|path| !path.trim().is_empty())
-        .filter(|path| !already_read.contains(&normalize_for_signature(path)))
         .map(|path| {
             let mut score =
                 path_prior_score(path, root_user_text, &plan.goal, criteria_blob.as_str());
@@ -403,10 +461,11 @@ pub(super) fn best_read_only_followup_read_path(
                     score = (score - 0.25).clamp(0.0, 1.0);
                 }
             }
-            if normalize_for_signature(path.as_str())
-                == normalize_for_signature(preferred_path.as_str())
-            {
-                score = (score + 0.20).clamp(0.0, 1.0);
+            if let Some(preferred_path) = preferred_read_only_read_path_hint(root_user_text) {
+                if normalize_for_signature(path.as_str()) == normalize_for_signature(preferred_path)
+                {
+                    score = (score + 0.20).clamp(0.0, 1.0);
+                }
             }
             (score, path)
         })
@@ -567,7 +626,6 @@ pub(super) fn build_read_only_plan_rewrite_hint(root_user_text: &str) -> String 
     let pattern = preferred_read_only_search_pattern(root_user_text);
     let dir = preferred_read_only_search_dir(root_user_text);
     let secondary_pattern = preferred_read_only_secondary_search_pattern(root_user_text);
-    let read_path = preferred_read_only_read_path_hint(root_user_text);
     let (accept1, accept2, risks) = synthetic_read_only_acceptance(root_user_text);
     let step1 = format!("search_files(pattern=\"{pattern}\", dir=\"{dir}\")");
     let step2 = secondary_pattern
@@ -587,7 +645,7 @@ assumptions: 1) observation tools are sufficient 2) no edits or behavioral verif
 </plan>\n\
 Then emit <think> and call ONE tool immediately after it.\n\
 Suggested next tool: search_files(pattern=\"{pattern}\", dir=\"{dir}\")\n\
-If you already have a strong hit, use read_file(path=\"{read_path}\") instead."
+If you already have a strong hit, read that matching file instead of searching again."
     )
 }
 
@@ -671,5 +729,242 @@ pub(super) fn coerce_read_only_observation_tool_call(
             rewrite_tool_call_to_search_files(tc, preferred_pattern.as_str(), preferred_dir)
         }
         _ => None,
+    }
+}
+
+pub(super) fn coerce_read_only_followup_read_tool_call(
+    messages: &[serde_json::Value],
+    tc: &ToolCallData,
+    root_user_text: &str,
+    root_read_only: bool,
+    plan: Option<&PlanBlock>,
+    evidence: &ObservationEvidence,
+) -> Option<(ToolCallData, String, String)> {
+    if !root_read_only || !matches!(tc.name.as_str(), "read_file") || !evidence.reads.is_empty() {
+        return None;
+    }
+    let saw_recent_gate_miss = messages
+        .iter()
+        .rev()
+        .take(6)
+        .any(is_missing_gate_governor_block);
+
+    let args = serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()?;
+    let current_path = args
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    if current_path.is_empty() {
+        return None;
+    }
+
+    let fallback_plan;
+    let plan = if let Some(plan) = plan {
+        plan
+    } else {
+        fallback_plan = synthetic_read_only_observation_plan(root_user_text);
+        &fallback_plan
+    };
+
+    let last_search = evidence.searches.last()?;
+    let preferred_path_hint = preferred_read_only_read_path_hint(root_user_text)
+        .map(str::to_string)
+        .filter(|path| !path.trim().is_empty());
+    let handler_candidate = if task_prefers_handler_path(root_user_text, &plan.goal) {
+        last_search
+            .paths
+            .iter()
+            .find(|path| {
+                matches!(
+                    path_filename(path).to_ascii_lowercase().as_str(),
+                    "events.rs" | "commands.rs" | "command.rs" | "handlers.rs" | "handler.rs"
+                )
+            })
+            .cloned()
+    } else {
+        None
+    };
+    if !saw_recent_gate_miss && preferred_path_hint.is_none() && handler_candidate.is_none() {
+        return None;
+    }
+    let best_path = preferred_path_hint
+        .or(handler_candidate)
+        .or_else(|| {
+            best_read_only_followup_read_path(root_user_text, plan, &last_search.paths, evidence)
+        })
+        .or_else(|| {
+            last_search
+                .paths
+                .iter()
+                .find(|path| path.starts_with("src/"))
+                .cloned()
+        })
+        .or_else(|| last_search.paths.first().cloned())?;
+    if normalize_for_signature(current_path) == normalize_for_signature(best_path.as_str()) {
+        return None;
+    }
+
+    let mut rewritten = tc.clone();
+    rewritten.arguments = json!({ "path": best_path }).to_string();
+    Some((rewritten, current_path.to_string(), best_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_observed_search_hit_becomes_followup_read_even_for_generic_task() {
+        let prompt = "Locate where project-local profile aliases are loaded for the greet command.";
+        let plan = synthetic_read_only_observation_plan(prompt);
+
+        let path = best_read_only_followup_read_path(
+            prompt,
+            &plan,
+            &[String::from("src/config.rs")],
+            &ObservationEvidence::default(),
+        );
+
+        assert_eq!(path.as_deref(), Some("src/config.rs"));
+    }
+
+    #[test]
+    fn generic_followup_does_not_invent_repo_specific_runtime_path() {
+        let prompt = "Locate where project-local profile aliases are loaded for the greet command.";
+        let plan = synthetic_read_only_observation_plan(prompt);
+
+        let path =
+            best_read_only_followup_read_path(prompt, &plan, &[], &ObservationEvidence::default());
+
+        assert_eq!(path, None);
+    }
+
+    #[test]
+    fn generic_plan_rewrite_hint_avoids_events_rs_default() {
+        let hint = build_read_only_plan_rewrite_hint(
+            "Locate where project-local profile aliases are loaded for the greet command.",
+        );
+
+        assert!(hint.contains("read that matching file instead of searching again."));
+        assert!(!hint.contains("src/tui/events.rs"));
+    }
+
+    #[test]
+    fn coerce_read_only_followup_read_tool_call_prefers_best_handler_candidate() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"/realize","dir":"src/tui"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"/realize\",\"dir\":\"src/tui\"}"
+            }),
+        ];
+        let plan = synthetic_read_only_observation_plan(
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+        );
+        let evidence = ObservationEvidence {
+            searches: vec![ObservationSearchEvidence {
+                command: "search_files(pattern=/realize, dir=src/tui)".to_string(),
+                pattern: "/realize".to_string(),
+                hit_count: 3,
+                paths: vec![
+                    "src/tui/events.rs".to_string(),
+                    "src/tui/intent.rs".to_string(),
+                    "src/tui/agent.rs".to_string(),
+                ],
+            }],
+            reads: Vec::new(),
+            resolutions: Vec::new(),
+        };
+        let tc = ToolCallData {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: "{\"path\":\"src/tui/intent.rs\"}".to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_read_only_followup_read_tool_call(
+            &messages,
+            &tc,
+            "Locate where the /realize slash command is handled in the TUI. Do not edit anything.",
+            true,
+            Some(&plan),
+            &evidence,
+        )
+        .expect("coerced read");
+
+        assert_eq!(original, "src/tui/intent.rs");
+        assert_eq!(coerced, "src/tui/events.rs");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rewritten.arguments)
+                .ok()
+                .and_then(|args| args
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string))
+                .as_deref(),
+            Some("src/tui/events.rs")
+        );
+    }
+
+    #[test]
+    fn coerce_read_only_followup_read_tool_call_prefers_prefs_owner_hint() {
+        let messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"prefs\",\"dir\":\"src/tui\"}"
+        })];
+        let plan = synthetic_read_only_observation_plan(
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+        );
+        let evidence = ObservationEvidence {
+            searches: vec![ObservationSearchEvidence {
+                command: "search_files(pattern=prefs, dir=src/tui)".to_string(),
+                pattern: "prefs".to_string(),
+                hit_count: 1,
+                paths: vec!["src/tui/events.rs".to_string()],
+            }],
+            reads: Vec::new(),
+            resolutions: Vec::new(),
+        };
+        let tc = ToolCallData {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: "{\"path\":\"src/tui/events.rs\"}".to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_read_only_followup_read_tool_call(
+            &messages,
+            &tc,
+            "Find where pane-scoped TUI preferences are serialized and restored. Do not edit anything.",
+            true,
+            Some(&plan),
+            &evidence,
+        )
+        .expect("coerced read");
+
+        assert_eq!(original, "src/tui/events.rs");
+        assert_eq!(coerced, "src/tui/prefs.rs");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rewritten.arguments)
+                .ok()
+                .and_then(|args| args
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string))
+                .as_deref(),
+            Some("src/tui/prefs.rs")
+        );
     }
 }

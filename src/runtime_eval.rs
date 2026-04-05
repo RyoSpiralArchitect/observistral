@@ -23,6 +23,8 @@ pub struct RuntimeEvalDefaults {
     #[serde(default)]
     pub tool_root: Option<String>,
     #[serde(default)]
+    pub copy_tool_root: bool,
+    #[serde(default)]
     pub lang: Option<String>,
     #[serde(default)]
     pub max_iters: Option<usize>,
@@ -36,6 +38,10 @@ pub struct RuntimeEvalCase {
     pub prompt: String,
     #[serde(default)]
     pub tool_root: Option<String>,
+    #[serde(default)]
+    pub session_seed: Option<String>,
+    #[serde(default)]
+    pub copy_tool_root: Option<bool>,
     #[serde(default)]
     pub lang: Option<String>,
     #[serde(default)]
@@ -95,6 +101,11 @@ pub struct RuntimeEvalMetrics {
     pub provider_retry_histogram: BTreeMap<String, usize>,
     pub provider_retry_total_delay_ms: u64,
     pub provider_retry_max_delay_ms: u64,
+    pub reflection_ledger_entries_last: Option<usize>,
+    pub reflection_ledger_prompt_count: usize,
+    pub reflection_ledger_action_hit_count: usize,
+    pub reflection_ledger_action_hit_histogram: BTreeMap<String, usize>,
+    pub reflection_ledger_remember_count: usize,
     pub recovery_enter_count: usize,
     pub recovery_stage_histogram: BTreeMap<String, usize>,
     pub max_consecutive_failures: usize,
@@ -142,6 +153,8 @@ pub struct RuntimeEvalSummary {
     pub avg_repo_map_fallbacks: f64,
     pub avg_provider_retries: f64,
     pub avg_provider_retry_delay_ms: f64,
+    pub avg_reflection_ledger_prompts: f64,
+    pub avg_reflection_ledger_action_hits: f64,
     pub avg_recovery_enters: f64,
     pub passed_ids: Vec<String>,
     pub failed_ids: Vec<String>,
@@ -282,6 +295,14 @@ pub fn summarize_cases(cases: &[RuntimeEvalCaseReport]) -> RuntimeEvalSummary {
         .iter()
         .map(|c| c.metrics.provider_retry_total_delay_ms as f64)
         .collect());
+    let avg_reflection_ledger_prompts = avg(cases
+        .iter()
+        .map(|c| c.metrics.reflection_ledger_prompt_count as f64)
+        .collect());
+    let avg_reflection_ledger_action_hits = avg(cases
+        .iter()
+        .map(|c| c.metrics.reflection_ledger_action_hit_count as f64)
+        .collect());
     let avg_recovery_enters = avg(cases
         .iter()
         .map(|c| c.metrics.recovery_enter_count as f64)
@@ -306,6 +327,8 @@ pub fn summarize_cases(cases: &[RuntimeEvalCaseReport]) -> RuntimeEvalSummary {
         avg_repo_map_fallbacks,
         avg_provider_retries,
         avg_provider_retry_delay_ms,
+        avg_reflection_ledger_prompts,
+        avg_reflection_ledger_action_hits,
         avg_recovery_enters,
         passed_ids,
         failed_ids,
@@ -431,6 +454,44 @@ fn collect_metrics(
                     .saturating_add(delay_ms);
                 metrics.provider_retry_max_delay_ms =
                     metrics.provider_retry_max_delay_ms.max(delay_ms);
+            }
+            "reflection_ledger_loaded" => {
+                metrics.reflection_ledger_entries_last = line
+                    .data
+                    .get("entries")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+            }
+            "reflection_ledger_prompted" => {
+                metrics.reflection_ledger_prompt_count += 1;
+                if let Some(entries) = line
+                    .data
+                    .get("entries")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                {
+                    metrics.reflection_ledger_entries_last = Some(entries);
+                }
+            }
+            "reflection_ledger_action_hit" => {
+                metrics.reflection_ledger_action_hit_count += 1;
+                if let Some(tool) = line.data.get("tool").and_then(|v| v.as_str()) {
+                    *metrics
+                        .reflection_ledger_action_hit_histogram
+                        .entry(tool.to_string())
+                        .or_insert(0) += 1;
+                }
+            }
+            "reflection_ledger_remembered" => {
+                metrics.reflection_ledger_remember_count += 1;
+                if let Some(entries) = line
+                    .data
+                    .get("entries")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                {
+                    metrics.reflection_ledger_entries_last = Some(entries);
+                }
             }
             "governor_state" => {
                 metrics.governor_events += 1;
@@ -663,6 +724,33 @@ mod tests {
     }
 
     #[test]
+    fn load_spec_parses_copy_tool_root_flags() {
+        let spec: RuntimeEvalSpec = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "defaults": {
+                "tool_root": ".",
+                "copy_tool_root": true
+            },
+            "cases": [
+                {
+                    "id": "copy-case",
+                    "prompt": "do work",
+                    "copy_tool_root": false,
+                    "session_seed": "seed-session.json"
+                }
+            ]
+        }))
+        .expect("spec");
+
+        assert!(spec.defaults.copy_tool_root);
+        assert_eq!(spec.cases[0].copy_tool_root, Some(false));
+        assert_eq!(
+            spec.cases[0].session_seed.as_deref(),
+            Some("seed-session.json")
+        );
+    }
+
+    #[test]
     fn evaluate_case_collects_metrics_and_checks() {
         let dir = tempdir().unwrap();
         let trace_path = dir.path().join("trace.jsonl");
@@ -674,6 +762,10 @@ mod tests {
             concat!(
                 "{\"event\":\"tool_call\",\"data\":{\"name\":\"search_files\"}}\n",
                 "{\"event\":\"tool_call\",\"data\":{\"name\":\"read_file\"}}\n",
+                "{\"event\":\"reflection_ledger_loaded\",\"data\":{\"entries\":2}}\n",
+                "{\"event\":\"reflection_ledger_prompted\",\"data\":{\"entries\":2,\"iter\":1}}\n",
+                "{\"event\":\"reflection_ledger_action_hit\",\"data\":{\"tool\":\"read_file\",\"score\":0.88}}\n",
+                "{\"event\":\"reflection_ledger_remembered\",\"data\":{\"entries\":3,\"count\":2}}\n",
                 "{\"event\":\"provider_retry\",\"data\":{\"provider\":\"mistral\",\"status\":429,\"delay_ms\":5000}}\n",
                 "{\"event\":\"done\",\"data\":{}}\n",
                 "{\"event\":\"agent_end\",\"data\":{\"ok\":true}}\n"
@@ -709,6 +801,8 @@ mod tests {
             id: "realize-events".to_string(),
             prompt: "locate slash command".to_string(),
             tool_root: None,
+            session_seed: None,
+            copy_tool_root: None,
             lang: None,
             max_iters: None,
             autofix: None,
@@ -754,6 +848,17 @@ mod tests {
         assert_eq!(report.metrics.provider_retry_count, 1);
         assert_eq!(report.metrics.provider_retry_total_delay_ms, 5000);
         assert_eq!(report.metrics.provider_retry_max_delay_ms, 5000);
+        assert_eq!(report.metrics.reflection_ledger_entries_last, Some(3));
+        assert_eq!(report.metrics.reflection_ledger_prompt_count, 1);
+        assert_eq!(report.metrics.reflection_ledger_action_hit_count, 1);
+        assert_eq!(report.metrics.reflection_ledger_remember_count, 1);
+        assert_eq!(
+            report
+                .metrics
+                .reflection_ledger_action_hit_histogram
+                .get("read_file"),
+            Some(&1)
+        );
         assert_eq!(
             report.metrics.provider_retry_histogram.get("mistral:429"),
             Some(&1)
@@ -784,6 +889,8 @@ mod tests {
             id: "broken".to_string(),
             prompt: "x".to_string(),
             tool_root: None,
+            session_seed: None,
+            copy_tool_root: None,
             lang: None,
             max_iters: None,
             autofix: None,

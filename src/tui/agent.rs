@@ -43,25 +43,37 @@ use crate::types::ChatMessage;
 use std::path::Path;
 
 mod done_gate;
+mod evaluator_loop;
 mod memory;
+mod meta_harness;
 mod provider_compat;
 mod read_only;
+mod session_bridge;
+mod task_harness;
 use self::done_gate::{
-    build_done_acceptance_recovery_hint, build_read_only_completion_hint,
-    build_read_only_evidence_scores, build_read_only_iteration_cap_final_answer,
-    build_read_only_strong_final_answer, canonicalize_known_acceptance_commands,
-    maybe_build_read_only_auto_final_answer, validate_done_acceptance,
+    build_done_acceptance_recovery_hint, build_post_verify_done_completion_hint,
+    build_read_only_completion_hint, build_read_only_evidence_scores,
+    build_read_only_iteration_cap_final_answer, build_read_only_strong_final_answer,
+    canonicalize_known_acceptance_commands, maybe_build_read_only_auto_final_answer,
+    maybe_build_verified_action_auto_final_answer, rescue_invalid_done_payload_for_verified_action,
+    should_prefer_done_after_verified_action, synthesize_action_done_summary,
+    validate_done_acceptance,
 };
+use self::evaluator_loop::EvaluatorLoop;
 use self::memory::{
     canonicalize_evidence_command_with_resolution, normalize_memory_entry, normalize_path_alias,
     remember_recent_unique, remember_repo_map_resolution, rewrite_tool_call_with_resolution,
     ObservationEvidence, ObservationReadEvidence, ObservationSearchEvidence,
 };
+use self::meta_harness::MetaHarness;
 #[cfg(test)]
 use self::provider_compat::compat_synthetic_think;
 use self::provider_compat::{
     build_mistral_think_only_hint, mistral_observation_tool, normalize_mistral_tool_call,
-    repair_mistral_plan_for_tool_turn, rescue_read_only_missing_plan_for_tool_turn,
+    repair_mistral_plan_for_tool_turn, repair_truncated_patch_tool_call_from_recent_mismatch,
+    rescue_missing_evidence_for_tool_turn, rescue_missing_impact_for_tool_turn,
+    rescue_missing_plan_for_tool_turn, rescue_missing_reflection_for_tool_turn,
+    rescue_missing_think_for_tool_turn, rescue_read_only_missing_plan_for_tool_turn,
     rescue_read_only_missing_think_for_tool_turn, select_think_for_tool_turn,
 };
 #[cfg(test)]
@@ -69,11 +81,17 @@ use self::read_only::best_read_only_followup_read_path;
 use self::read_only::{
     build_first_action_constraint_hint, build_read_only_diagnose_coercion_hint,
     build_read_only_plan_rewrite_hint, build_read_only_search_to_read_hint,
-    choose_read_only_diagnose_rescue_action, coerce_read_only_observation_tool_call,
-    first_action_deadline_iters, is_root_read_only_observation_task, path_prior_score,
-    preferred_read_only_read_path_hint, preferred_read_only_search_dir,
-    preferred_read_only_search_pattern, read_only_plan_violation,
+    choose_read_only_diagnose_rescue_action, coerce_read_only_followup_read_tool_call,
+    coerce_read_only_observation_tool_call, first_action_deadline_iters,
+    is_root_read_only_observation_task, path_prior_score, preferred_read_only_read_path_hint,
+    preferred_read_only_search_dir, preferred_read_only_search_pattern, read_only_plan_violation,
     synthetic_read_only_observation_plan, ReadOnlyDiagnoseRescueAction,
+};
+use self::session_bridge::SessionBridgeView;
+use self::task_harness::{
+    allows_artifact_creation_during_diagnose, allows_artifact_creation_during_verify,
+    build_fix_stage_progress_hint, build_progress_gate_block, coerce_artifact_creation_tool_call,
+    coerce_repo_goal_completion_tool_call, repair_repo_scaffold_write_tool_call, TaskHarness,
 };
 
 #[derive(Debug, Clone)]
@@ -82,6 +100,7 @@ pub struct AgenticStartState {
     pub checkpoint: Option<String>,
     pub cur_cwd: Option<String>,
     pub observation_cache: Option<crate::agent_session::ObservationCache>,
+    pub session_bridge: Option<crate::agent_session::SessionBridge>,
     pub create_checkpoint: bool,
 }
 
@@ -172,6 +191,56 @@ async fn emit_resolution_memory_hit_telemetry(
         }),
     )
     .await;
+}
+
+fn reflection_ledger_action_match<'a>(
+    ledger: &'a crate::reflection_ledger::ReflectionLedger,
+    tc: &ToolCallData,
+) -> Option<(
+    &'a crate::reflection_ledger::ReflectionLedgerEntry,
+    f32,
+    String,
+)> {
+    let action = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| blocked_tool_call_signature(tc.name.as_str(), tc.arguments.as_str()));
+    let action_sig = normalize_for_signature(action.as_str());
+    let action_tokens = keyword_tokens(action.as_str());
+    let tool_name = tc.name.to_ascii_lowercase();
+    let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
+    let primary_target = args
+        .get("path")
+        .or_else(|| args.get("dir"))
+        .or_else(|| args.get("command"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let target_sig = normalize_for_signature(primary_target.as_str());
+
+    let mut best: Option<(&crate::reflection_ledger::ReflectionLedgerEntry, f32)> = None;
+    for entry in &ledger.entries {
+        let next = entry.next_minimal_action.as_str();
+        let next_sig = normalize_for_signature(next);
+        let next_tokens = keyword_tokens(next);
+        let mut score = token_overlap_score(&next_tokens, &action_tokens);
+        if !tool_name.is_empty() && next_sig.contains(tool_name.as_str()) {
+            score += 0.10;
+        }
+        if !target_sig.is_empty() && next_sig.contains(target_sig.as_str()) {
+            score += 0.35;
+        }
+        if next_sig.contains(action_sig.as_str()) || action_sig.contains(next_sig.as_str()) {
+            score += 0.25;
+        }
+        score = score.clamp(0.0, 1.0);
+        if score >= 0.45 {
+            match best {
+                Some((_, best_score)) if best_score >= score => {}
+                _ => best = Some((entry, score)),
+            }
+        }
+    }
+    best.map(|(entry, score)| (entry, score, action))
 }
 
 fn push_blocked_tool_exchange(
@@ -2704,7 +2773,12 @@ impl RecoveryGovernor {
         g
     }
 
-    fn maybe_block_tool(&self, tc: &ToolCallData, test_cmd: Option<&str>) -> Option<String> {
+    fn maybe_block_tool(
+        &self,
+        tc: &ToolCallData,
+        test_cmd: Option<&str>,
+        task_harness: TaskHarness,
+    ) -> Option<String> {
         let Some(stage) = self.stage else {
             return None;
         };
@@ -2723,6 +2797,9 @@ impl RecoveryGovernor {
                         return None;
                     }
                 }
+                if allows_artifact_creation_during_diagnose(task_harness, tc) {
+                    return None;
+                }
                 Some(format!(
                     "[Recovery Gate] stage=diagnose\n\
 You are in recovery mode. Do NOT start new work yet.\n\
@@ -2731,6 +2808,9 @@ Required now: run diagnostics first (e.g. `pwd`, `ls`/`dir`, `git status`, `git 
             }
             RecoveryStage::Fix => None, // allow edits/commands to fix
             RecoveryStage::Verify => {
+                if allows_artifact_creation_during_verify(task_harness, tc) {
+                    return None;
+                }
                 if name == "exec" {
                     let cmd =
                         parse_exec_command_from_args(tc.arguments.as_str()).unwrap_or_default();
@@ -4568,9 +4648,14 @@ struct DoneAcceptanceEvidence {
 #[derive(Debug, Clone, Default)]
 struct StablePromptCache {
     resolver_hash: Option<u64>,
+    task_harness_hash: Option<u64>,
+    meta_harness_hash: Option<u64>,
+    evaluator_loop_hash: Option<u64>,
+    session_bridge_hash: Option<u64>,
     task_contract_hash: Option<u64>,
     working_memory_hash: Option<u64>,
     assumption_ledger_hash: Option<u64>,
+    reflection_ledger_hash: Option<u64>,
     verification_hash: Option<u64>,
 }
 
@@ -7971,6 +8056,7 @@ async fn run_goal_check_command(
     tx: &mpsc::Sender<StreamToken>,
 ) -> GoalCheckExecResult {
     let sig = command_sig(command);
+    let command_for_evidence = compact_one_line(command, 200);
     let _ = tx
         .send(StreamToken::Delta(format!(
             "\n{}\n",
@@ -8025,7 +8111,7 @@ async fn run_goal_check_command(
     let _ = tx.send(StreamToken::Delta(summary)).await;
 
     GoalCheckExecResult {
-        command: sig,
+        command: command_for_evidence,
         passed,
         error_class,
         digest,
@@ -8059,6 +8145,7 @@ pub async fn run_agentic(
         checkpoint: None,
         cur_cwd: None,
         observation_cache: None,
+        session_bridge: None,
         create_checkpoint: true,
     };
     run_agentic_json(
@@ -8138,6 +8225,7 @@ Fix: use --provider openai-compatible (or --provider mistral).",
         .to_string();
     let root_user_text_low = root_user_text.to_ascii_lowercase();
     let root_read_only = is_root_read_only_observation_task(&root_user_text);
+    let task_harness = TaskHarness::infer(&root_user_text, root_read_only);
     let verification_contract = governor_contract::verification();
     let wants_repo_goal =
         text_contains_any(&root_user_text_low, &verification_contract.goal_repo_terms);
@@ -8197,6 +8285,7 @@ Fix: use --provider openai-compatible (or --provider mistral).",
     let mut observation_evidence = collect_observation_evidence(&messages);
     observation_evidence.merge_session_cache(start.observation_cache.as_ref());
     sync_observation_cache_autosave(&autosaver, &observation_evidence);
+    let session_bridge = SessionBridgeView::resolve(start.session_bridge.as_ref(), &messages);
     let mut prompt_cache = StablePromptCache::default();
     // Rebuild loop governor memory from the existing session so resuming runs doesn't
     // repeat the same failures from scratch.
@@ -8254,6 +8343,16 @@ Execute only the new minimal action: {}",
     if realize_cfg.enabled {
         emit_realize_state(&tx, &realize_cfg, None, 0, None, &realize_metrics).await;
     }
+    emit_telemetry_event(
+        &tx,
+        "task_harness",
+        json!({
+            "lane": task_harness.lane_label(),
+            "artifact_mode": task_harness.artifact_mode_label(),
+            "read_only": root_read_only,
+        }),
+    )
+    .await;
 
     // Resolve tool_root once (absolute path) and track cwd across tool calls.
     // This prevents the classic "cd didn't persist, so git add ran in the wrong repo" failure.
@@ -8261,6 +8360,34 @@ Execute only the new minimal action: {}",
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .and_then(absolutize_path);
+    let reflection_ledger_path = tool_root_abs
+        .as_deref()
+        .map(crate::reflection_ledger::path_for_root);
+    let mut reflection_ledger = if let Some(path) = reflection_ledger_path.as_ref() {
+        match crate::reflection_ledger::ReflectionLedger::load(path) {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[reflection_ledger] WARN: {e:#}\n"
+                    )))
+                    .await;
+                crate::reflection_ledger::ReflectionLedger::default()
+            }
+        }
+    } else {
+        crate::reflection_ledger::ReflectionLedger::default()
+    };
+    let mut reflection_ledger_warned = false;
+    emit_telemetry_event(
+        &tx,
+        "reflection_ledger_loaded",
+        json!({
+            "entries": reflection_ledger.entries.len(),
+            "path": reflection_ledger_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        }),
+    )
+    .await;
 
     fn has_system_prefix(messages: &[serde_json::Value], prefix: &str) -> bool {
         messages.iter().any(|m| {
@@ -8567,6 +8694,59 @@ This is the LAST model call for this run.\n\
             ),
         }));
 
+        let meta_harness =
+            MetaHarness::analyze(task_harness, &messages, recovery.stage, test_cmd.as_deref());
+        if let Some(telemetry) = meta_harness.telemetry_payload() {
+            emit_telemetry_event(&tx, "meta_harness_policy", telemetry).await;
+        }
+        if let Some(meta_prompt) = meta_harness.prompt() {
+            let compact_prompt = meta_harness
+                .compact_prompt()
+                .unwrap_or_else(|| meta_prompt.clone());
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": render_cached_prompt(
+                    &mut prompt_cache.meta_harness_hash,
+                    meta_prompt,
+                    compact_prompt,
+                ),
+            }));
+        }
+
+        let evaluator_loop = EvaluatorLoop::analyze(
+            task_harness,
+            &meta_harness,
+            &reflection_ledger,
+            last_reflection.as_ref(),
+            test_cmd.as_deref(),
+        );
+        if let Some(telemetry) = evaluator_loop.telemetry_payload(task_harness) {
+            emit_telemetry_event(&tx, "evaluator_loop", telemetry).await;
+        }
+        if let Some(evaluator_prompt) = evaluator_loop.prompt() {
+            let compact_prompt = evaluator_loop
+                .compact_prompt()
+                .unwrap_or_else(|| evaluator_prompt.clone());
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": render_cached_prompt(
+                    &mut prompt_cache.evaluator_loop_hash,
+                    evaluator_prompt,
+                    compact_prompt,
+                ),
+            }));
+        }
+
+        let harness_prompt = task_harness.prompt(test_cmd.as_deref());
+        msgs_for_call.push(json!({
+            "role": "system",
+            "content": render_cached_prompt(
+                &mut prompt_cache.task_harness_hash,
+                harness_prompt,
+                task_harness.compact_prompt(test_cmd.as_deref()),
+            ),
+        }));
+
         let task_prompt =
             build_task_contract_prompt(&task_contract, active_plan.as_ref(), required_verification);
         msgs_for_call.push(json!({
@@ -8603,6 +8783,46 @@ This is the LAST model call for this run.\n\
                 "content": render_cached_prompt(
                     &mut prompt_cache.assumption_ledger_hash,
                     ledger_prompt,
+                    compact_prompt,
+                ),
+            }));
+        }
+
+        if let Some(reflection_prompt) = reflection_ledger.build_prompt() {
+            let compact_prompt = reflection_ledger
+                .build_compact_prompt()
+                .unwrap_or_else(|| reflection_prompt.clone());
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": render_cached_prompt(
+                    &mut prompt_cache.reflection_ledger_hash,
+                    reflection_prompt,
+                    compact_prompt,
+                ),
+            }));
+            emit_telemetry_event(
+                &tx,
+                "reflection_ledger_prompted",
+                json!({
+                    "entries": reflection_ledger.entries.len(),
+                    "iter": iter,
+                }),
+            )
+            .await;
+        }
+
+        if let Some(telemetry) = session_bridge.telemetry_payload() {
+            emit_telemetry_event(&tx, "session_bridge_prompted", telemetry).await;
+        }
+        if let Some(session_bridge_prompt) = session_bridge.prompt() {
+            let compact_prompt = session_bridge
+                .compact_prompt()
+                .unwrap_or_else(|| session_bridge_prompt.clone());
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": render_cached_prompt(
+                    &mut prompt_cache.session_bridge_hash,
+                    session_bridge_prompt,
                     compact_prompt,
                 ),
             }));
@@ -8772,6 +8992,57 @@ This is the LAST model call for this run.\n\
             break;
         }
 
+        if tool_calls.is_empty() {
+            if let Some(tc) = meta_harness.synthesize_tool_call(iter) {
+                let synthesized =
+                    canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "{}({})",
+                                tc.name,
+                                compact_one_line(tc.arguments.as_str(), 120)
+                            )
+                        });
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[meta_harness] synthesized next scaffold action for stalled no-tool turn: {synthesized}\n"
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "meta_harness_synthesized_tool_call",
+                    json!({
+                        "iter": iter,
+                        "tool": tc.name,
+                        "synthetic": synthesized,
+                    }),
+                )
+                .await;
+                tool_calls.push(tc);
+            }
+        }
+
+        if tool_calls.len() == 1 {
+            if let Some((rewritten, original, repaired)) =
+                repair_truncated_patch_tool_call_from_recent_mismatch(
+                    &messages,
+                    &tool_calls[0],
+                    root_read_only,
+                    goal_wants_actions,
+                    cfg.provider.clone(),
+                    &observation_evidence,
+                )
+            {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[compat] repaired malformed patch tool call from recent mismatch: {} -> {}\n",
+                        original, repaired
+                    )))
+                    .await;
+                tool_calls[0] = rewritten;
+            }
+        }
+
         // ── Reflection enforcement (before any tool call) ─────────────────
         // When reflection is required, the model MUST emit exactly one <reflect> block
         // AND exactly one tool call in the same assistant turn.
@@ -8779,14 +9050,44 @@ This is the LAST model call for this run.\n\
             let reflect = match parse_reflection_block(&assistant_text) {
                 Some(r) => r,
                 None => {
-                    let msg = governor_contract::reflection_missing_message(reason.as_str());
-                    let _ = tx
-                        .send(StreamToken::Delta(format!("\n[reflect] {msg}\n")))
-                        .await;
-                    pending_system_hint = Some(msg);
-                    state = AgentState::Recovery;
-                    reflection_required = Some(reason);
-                    continue;
+                    if tool_calls.len() == 1 {
+                        if let Some(reflect) = rescue_missing_reflection_for_tool_turn(
+                            reason.as_str(),
+                            &tool_calls[0],
+                            root_read_only,
+                            goal_wants_actions,
+                            cfg.provider.clone(),
+                            &mem,
+                            file_tool_consec_failures,
+                        ) {
+                            let _ = tx
+                                .send(StreamToken::Delta(
+                                    "\n[compat] synthesized reflection block for the rescued tool turn\n"
+                                        .to_string(),
+                                ))
+                                .await;
+                            reflect
+                        } else {
+                            let msg =
+                                governor_contract::reflection_missing_message(reason.as_str());
+                            let _ = tx
+                                .send(StreamToken::Delta(format!("\n[reflect] {msg}\n")))
+                                .await;
+                            pending_system_hint = Some(msg);
+                            state = AgentState::Recovery;
+                            reflection_required = Some(reason);
+                            continue;
+                        }
+                    } else {
+                        let msg = governor_contract::reflection_missing_message(reason.as_str());
+                        let _ = tx
+                            .send(StreamToken::Delta(format!("\n[reflect] {msg}\n")))
+                            .await;
+                        pending_system_hint = Some(msg);
+                        state = AgentState::Recovery;
+                        reflection_required = Some(reason);
+                        continue;
+                    }
                 }
             };
 
@@ -8827,6 +9128,43 @@ This is the LAST model call for this run.\n\
             reflection_required = None;
 
             if let Some(ref r) = last_reflection {
+                if reflection_ledger.remember(
+                    r.wrong_assumption.as_str(),
+                    r.next_minimal_action.as_str(),
+                    Some(reason.as_str()),
+                    r.last_outcome.as_str(),
+                    r.goal_delta.as_str(),
+                    r.strategy_change.as_str(),
+                ) {
+                    let remembered_count = reflection_ledger
+                        .find_entry(r.wrong_assumption.as_str(), r.next_minimal_action.as_str())
+                        .map(|entry| entry.count)
+                        .unwrap_or(1);
+                    emit_telemetry_event(
+                        &tx,
+                        "reflection_ledger_remembered",
+                        json!({
+                            "wrong_assumption": r.wrong_assumption,
+                            "next_minimal_action": r.next_minimal_action,
+                            "trigger": reason,
+                            "count": remembered_count,
+                            "entries": reflection_ledger.entries.len(),
+                        }),
+                    )
+                    .await;
+                    if let Some(path) = reflection_ledger_path.as_ref() {
+                        if let Err(e) = reflection_ledger.save_atomic(path) {
+                            if !reflection_ledger_warned {
+                                reflection_ledger_warned = true;
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "\n[reflection_ledger] WARN: {e:#}\n"
+                                    )))
+                                    .await;
+                            }
+                        }
+                    }
+                }
                 if !r.wrong_assumption.trim().is_empty() {
                     assumption_ledger.mark_refuted(
                         r.wrong_assumption.as_str(),
@@ -8878,14 +9216,42 @@ Execute only the new minimal action: {}",
             let impact = match parse_impact_block(&assistant_text) {
                 Some(impact) => impact,
                 None => {
-                    let msg = governor_contract::impact_missing_message(reason.as_str());
-                    let _ = tx
-                        .send(StreamToken::Delta(format!("\n[impact] {msg}\n")))
-                        .await;
-                    pending_system_hint = Some(msg);
-                    state = AgentState::Recovery;
-                    impact_required = Some(reason);
-                    continue;
+                    if tool_calls.len() == 1 {
+                        if let Some(impact) = rescue_missing_impact_for_tool_turn(
+                            reason.as_str(),
+                            &tool_calls[0],
+                            root_read_only,
+                            goal_wants_actions,
+                            cfg.provider.clone(),
+                            impact_plan.as_ref(),
+                        ) {
+                            let _ = tx
+                                .send(StreamToken::Delta(
+                                    "\n[compat] synthesized impact block for the rescued mutation turn\n"
+                                        .to_string(),
+                                ))
+                                .await;
+                            impact
+                        } else {
+                            let msg = governor_contract::impact_missing_message(reason.as_str());
+                            let _ = tx
+                                .send(StreamToken::Delta(format!("\n[impact] {msg}\n")))
+                                .await;
+                            pending_system_hint = Some(msg);
+                            state = AgentState::Recovery;
+                            impact_required = Some(reason);
+                            continue;
+                        }
+                    } else {
+                        let msg = governor_contract::impact_missing_message(reason.as_str());
+                        let _ = tx
+                            .send(StreamToken::Delta(format!("\n[impact] {msg}\n")))
+                            .await;
+                        pending_system_hint = Some(msg);
+                        state = AgentState::Recovery;
+                        impact_required = Some(reason);
+                        continue;
+                    }
                 }
             };
 
@@ -9001,6 +9367,139 @@ Execute only the new minimal action: {}",
             }
         }
 
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) = coerce_read_only_followup_read_tool_call(
+                &messages,
+                tc,
+                &root_user_text,
+                root_read_only,
+                active_plan.as_ref(),
+                &observation_evidence,
+            ) {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[compat] coerced repeated read-only follow-up read: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "read_only_tool_coercion",
+                    json!({
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                        "reason": "best_followup_read",
+                    }),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) =
+                coerce_artifact_creation_tool_call(task_harness, &messages, tc)
+            {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[task_harness] restored blocked artifact action: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "task_harness_tool_coercion",
+                    json!({
+                        "lane": task_harness.lane_label(),
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                    }),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) = coerce_repo_goal_completion_tool_call(
+                task_harness,
+                &messages,
+                tc,
+                test_cmd.as_deref(),
+            ) {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[task_harness] repaired repo goal completion: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "task_harness_tool_coercion",
+                    json!({
+                        "lane": task_harness.lane_label(),
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                        "reason": "goal_check_missing_repo_git",
+                    }),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) = repair_repo_scaffold_write_tool_call(
+                task_harness,
+                &messages,
+                tc,
+                test_cmd.as_deref(),
+            ) {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[task_harness] repaired malformed repo scaffold write: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "task_harness_tool_coercion",
+                    json!({
+                        "lane": task_harness.lane_label(),
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                        "reason": "repair_repo_scaffold_write",
+                    }),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((entry, score, action)) =
+                reflection_ledger_action_match(&reflection_ledger, tc)
+            {
+                emit_telemetry_event(
+                    &tx,
+                    "reflection_ledger_action_hit",
+                    json!({
+                        "tool": tc.name,
+                        "score": score,
+                        "action": action,
+                        "wrong_assumption": entry.wrong_assumption,
+                        "next_minimal_action": entry.next_minimal_action,
+                        "count": entry.count,
+                    }),
+                )
+                .await;
+            }
+        }
+
         if realize_cfg.enabled {
             let materialize_reason =
                 if tool_call_realizes_latent(realize_reason.as_deref(), tool_call.as_ref()) {
@@ -9059,6 +9558,7 @@ Execute only the new minimal action: {}",
         }
 
         if let Some(ref tc) = tool_call {
+            let mut used_general_plan_rescue = false;
             let candidate_plan = match parsed_plan.as_ref() {
                 Some(plan) => {
                     if let Err(e) = validate_plan_for_task_contract(
@@ -9238,6 +9738,74 @@ Execute only the new minimal action: {}",
                                 let _ = tx
                                     .send(StreamToken::Delta(
                                         "\n[compat] rescued repeated read-only plan-gate miss with synthetic observation plan\n"
+                                            .to_string(),
+                                    ))
+                                    .await;
+                                rescued
+                            } else {
+                                state = AgentState::Recovery;
+                                recovery.stage = Some(RecoveryStage::Diagnose);
+                                let block = governor_contract::missing_plan_message();
+
+                                let _ = tx
+                                    .send(StreamToken::Delta(format!(
+                                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                                    )))
+                                    .await;
+
+                                push_blocked_tool_exchange(
+                                    &mut messages,
+                                    &assistant_text_clean,
+                                    tc,
+                                    &block,
+                                );
+                                autosave_best_effort(
+                                    &autosaver,
+                                    &tx,
+                                    tool_root_abs.as_deref(),
+                                    checkpoint.as_deref(),
+                                    cur_cwd.as_deref(),
+                                    &messages,
+                                )
+                                .await;
+
+                                pending_system_hint = Some(block);
+                                let _ = tx
+                                    .send(StreamToken::GovernorState(build_governor_state(
+                                        state,
+                                        &recovery,
+                                        &mem,
+                                        file_tool_consec_failures,
+                                        last_mutation_step,
+                                        last_verify_ok_step,
+                                        last_reflection.as_ref(),
+                                    )))
+                                    .await;
+                                continue;
+                            }
+                        } else if let Some(rescued) = rescue_missing_plan_for_tool_turn(
+                            &messages,
+                            tc,
+                            &root_user_text,
+                            task_harness,
+                            root_read_only,
+                            goal_wants_actions,
+                            cfg.provider.clone(),
+                            required_verification,
+                            test_cmd.as_deref(),
+                        ) {
+                            if validate_plan_for_task_contract(
+                                &rescued,
+                                root_read_only,
+                                &task_contract,
+                                &instruction_resolver,
+                            )
+                            .is_ok()
+                            {
+                                used_general_plan_rescue = true;
+                                let _ = tx
+                                    .send(StreamToken::Delta(
+                                        "\n[compat] rescued repeated plan-gate miss with synthetic action plan\n"
                                             .to_string(),
                                     ))
                                     .await;
@@ -9504,7 +10072,18 @@ Execute only the new minimal action: {}",
                 root_read_only,
                 cfg.provider.clone(),
                 &observation_evidence,
-            );
+            )
+            .or_else(|| {
+                rescue_missing_think_for_tool_turn(
+                    &messages,
+                    tc,
+                    &candidate_plan,
+                    root_read_only,
+                    goal_wants_actions,
+                    cfg.provider.clone(),
+                    used_general_plan_rescue,
+                )
+            });
 
             let (think, used_compat_synth) = select_think_for_tool_turn(
                 parsed_think.as_ref(),
@@ -9558,7 +10137,7 @@ Execute only the new minimal action: {}",
             if used_compat_synth {
                 let _ = tx
                     .send(StreamToken::Delta(
-                        "\n[compat] synthesized think block for read-only observation tool turn\n"
+                        "\n[compat] synthesized think block for the rescued tool turn\n"
                             .to_string(),
                     ))
                     .await;
@@ -9677,48 +10256,210 @@ Execute only the new minimal action: {}",
                 continue;
             }
 
+            let known_acceptance_commands = canonicalize_known_acceptance_commands(
+                &collect_known_acceptance_commands(&messages, &working_mem),
+                &observation_evidence,
+            );
+            if should_prefer_done_after_verified_action(
+                tc,
+                &candidate_plan,
+                &known_acceptance_commands,
+                required_verification,
+                test_cmd.as_deref(),
+                last_mutation_step,
+                last_verify_ok_step,
+            ) {
+                state = AgentState::Recovery;
+                let block = build_post_verify_done_completion_hint(
+                    &candidate_plan,
+                    &known_acceptance_commands,
+                    tc,
+                    required_verification,
+                    test_cmd.as_deref(),
+                );
+
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                    )))
+                    .await;
+
+                push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+
+                pending_system_hint = Some(block);
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
+
+            if let Some(block) = build_progress_gate_block(
+                task_harness,
+                tc,
+                &messages,
+                recovery.stage,
+                test_cmd.as_deref(),
+            ) {
+                state = AgentState::Recovery;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "progress_gate_blocked",
+                    json!({
+                        "lane": task_harness.lane_label(),
+                        "tool": tc.name,
+                    }),
+                )
+                .await;
+
+                push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+
+                pending_system_hint = Some(block);
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
+
+            if let Some(block) = evaluator_loop.build_violation_block(tc) {
+                state = AgentState::Recovery;
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "evaluator_loop_blocked",
+                    json!({
+                        "policy_id": evaluator_loop.policy_id(),
+                        "tool": tc.name,
+                    }),
+                )
+                .await;
+
+                push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+
+                pending_system_hint = Some(block);
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
+
             if mutation_tool_requires_evidence(tc) {
                 let observations = &observation_evidence;
                 let evidence_block = match parse_evidence_block(&assistant_text) {
                     Some(block) => block,
                     None => {
-                        state = AgentState::Recovery;
-                        recovery.stage = Some(RecoveryStage::Diagnose);
-                        let block =
-                            build_evidence_gate_prompt(tc, &observations, &assumption_ledger);
-                        let _ = tx
-                            .send(StreamToken::Delta(format!(
-                                "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
-                            )))
-                            .await;
-                        push_blocked_tool_exchange(
-                            &mut messages,
-                            &assistant_text_clean,
+                        if let Some(block) = rescue_missing_evidence_for_tool_turn(
                             tc,
-                            &block,
-                        );
-                        autosave_best_effort(
-                            &autosaver,
-                            &tx,
-                            tool_root_abs.as_deref(),
-                            checkpoint.as_deref(),
-                            cur_cwd.as_deref(),
-                            &messages,
-                        )
-                        .await;
-                        pending_system_hint = Some(block);
-                        let _ = tx
-                            .send(StreamToken::GovernorState(build_governor_state(
-                                state,
-                                &recovery,
-                                &mem,
-                                file_tool_consec_failures,
-                                last_mutation_step,
-                                last_verify_ok_step,
-                                last_reflection.as_ref(),
-                            )))
+                            root_read_only,
+                            goal_wants_actions,
+                            cfg.provider.clone(),
+                            observations,
+                        ) {
+                            let _ = tx
+                                .send(StreamToken::Delta(
+                                    "\n[compat] synthesized evidence block for the rescued mutation turn\n"
+                                        .to_string(),
+                                ))
+                                .await;
+                            block
+                        } else {
+                            state = AgentState::Recovery;
+                            recovery.stage = Some(RecoveryStage::Diagnose);
+                            let block =
+                                build_evidence_gate_prompt(tc, &observations, &assumption_ledger);
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                                )))
+                                .await;
+                            push_blocked_tool_exchange(
+                                &mut messages,
+                                &assistant_text_clean,
+                                tc,
+                                &block,
+                            );
+                            autosave_best_effort(
+                                &autosaver,
+                                &tx,
+                                tool_root_abs.as_deref(),
+                                checkpoint.as_deref(),
+                                cur_cwd.as_deref(),
+                                &messages,
+                            )
                             .await;
-                        continue;
+                            pending_system_hint = Some(block);
+                            let _ = tx
+                                .send(StreamToken::GovernorState(build_governor_state(
+                                    state,
+                                    &recovery,
+                                    &mem,
+                                    file_tool_consec_failures,
+                                    last_mutation_step,
+                                    last_verify_ok_step,
+                                    last_reflection.as_ref(),
+                                )))
+                                .await;
+                            continue;
+                        }
                     }
                 };
                 if let Err(e) = validate_evidence_block(&evidence_block, tc, &observations) {
@@ -11501,9 +12242,10 @@ Required now: {}",
 
             let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
             let summary = args["summary"].as_str().unwrap_or("").trim();
-            let completed_acceptance = parse_string_list_arg(&args["completed_acceptance"]);
-            let remaining_acceptance = parse_string_list_arg(&args["remaining_acceptance"]);
-            let acceptance_evidence = parse_done_acceptance_evidence(&args["acceptance_evidence"]);
+            let mut completed_acceptance = parse_string_list_arg(&args["completed_acceptance"]);
+            let mut remaining_acceptance = parse_string_list_arg(&args["remaining_acceptance"]);
+            let mut acceptance_evidence =
+                parse_done_acceptance_evidence(&args["acceptance_evidence"]);
             let next_steps = args["next_steps"].as_str().unwrap_or("").trim();
             let done_plan = validated_plan_for_turn.as_ref().or(active_plan.as_ref());
             let known_acceptance_commands = canonicalize_known_acceptance_commands(
@@ -11534,114 +12276,160 @@ Required now: {}",
             ) {
                 Ok(rows) => rows,
                 Err(e) => {
-                    if root_read_only {
-                        if let Some(plan) = done_plan {
-                            if let Some(final_text) = build_read_only_strong_final_answer(
-                                &root_user_text,
-                                plan,
+                    let rescued_rows =
+                        if let Some((rescued_completed, rescued_remaining, rescued_evidence)) =
+                            rescue_invalid_done_payload_for_verified_action(
+                                done_plan,
+                                &known_acceptance_commands,
                                 &observation_evidence,
-                                &messages,
-                                &working_mem,
+                                required_verification,
+                                test_cmd.as_deref(),
+                                last_mutation_step,
+                                last_verify_ok_step,
+                            )
+                        {
+                            if let Ok(rows) = validate_done_acceptance(
+                                done_plan,
+                                &rescued_completed,
+                                &rescued_remaining,
+                                &rescued_evidence,
+                                &known_acceptance_commands,
+                                &observation_evidence,
                             ) {
-                                state = AgentState::Done;
-                                messages.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tc.id,
-                                    "content": "OK: done"
-                                }));
-                                messages.push(
-                                    json!({"role": "assistant", "content": final_text.clone()}),
-                                );
-                                autosave_best_effort(
-                                    &autosaver,
-                                    &tx,
-                                    tool_root_abs.as_deref(),
-                                    checkpoint.as_deref(),
-                                    cur_cwd.as_deref(),
+                                completed_acceptance = rescued_completed;
+                                remaining_acceptance = rescued_remaining;
+                                acceptance_evidence = rescued_evidence;
+                                Some(rows)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                    if let Some(rows) = rescued_rows {
+                        let _ = tx
+                            .send(StreamToken::Delta(
+                                "\n[compat] repaired done acceptance payload from current plan and known commands\n"
+                                    .to_string(),
+                            ))
+                            .await;
+                        rows
+                    } else {
+                        if root_read_only {
+                            if let Some(plan) = done_plan {
+                                if let Some(final_text) = build_read_only_strong_final_answer(
+                                    &root_user_text,
+                                    plan,
+                                    &observation_evidence,
                                     &messages,
-                                )
-                                .await;
-                                let _ = tx
-                                    .send(StreamToken::GovernorState(build_governor_state(
-                                        state,
-                                        &recovery,
-                                        &mem,
-                                        file_tool_consec_failures,
-                                        last_mutation_step,
-                                        last_verify_ok_step,
-                                        last_reflection.as_ref(),
-                                    )))
+                                    &working_mem,
+                                ) {
+                                    state = AgentState::Done;
+                                    messages.push(json!({
+                                        "role": "tool",
+                                        "tool_call_id": tc.id,
+                                        "content": "OK: done"
+                                    }));
+                                    messages.push(
+                                        json!({"role": "assistant", "content": final_text.clone()}),
+                                    );
+                                    autosave_best_effort(
+                                        &autosaver,
+                                        &tx,
+                                        tool_root_abs.as_deref(),
+                                        checkpoint.as_deref(),
+                                        cur_cwd.as_deref(),
+                                        &messages,
+                                    )
                                     .await;
-                                let _ = tx
-                                    .send(StreamToken::Delta(format!(
-                                        "\n[agent] strong read-only evidence rescued invalid done gate; auto-finalized instead.\n\n{final_text}\n"
-                                    )))
-                                    .await;
-                                break;
+                                    let _ = tx
+                                        .send(StreamToken::GovernorState(build_governor_state(
+                                            state,
+                                            &recovery,
+                                            &mem,
+                                            file_tool_consec_failures,
+                                            last_mutation_step,
+                                            last_verify_ok_step,
+                                            last_reflection.as_ref(),
+                                        )))
+                                        .await;
+                                    let _ = tx
+                                        .send(StreamToken::Delta(format!(
+                                            "\n[agent] strong read-only evidence rescued invalid done gate; auto-finalized instead.\n\n{final_text}\n"
+                                        )))
+                                        .await;
+                                    break;
+                                }
                             }
                         }
+                        state = AgentState::Recovery;
+                        recovery.stage = Some(if root_read_only {
+                            RecoveryStage::Diagnose
+                        } else {
+                            RecoveryStage::Verify
+                        });
+                        let hint = build_done_acceptance_recovery_hint(
+                            &e.to_string(),
+                            &known_acceptance_commands,
+                            &read_only_scores,
+                        );
+                        let block = format!(
+                            "{}{}",
+                            governor_contract::done_invalid_acceptance_message(&e.to_string()),
+                            hint
+                        );
+
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                            )))
+                            .await;
+
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": format!(
+                                "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                                tc.name, tc.arguments
+                            ),
+                        }));
+                        autosave_best_effort(
+                            &autosaver,
+                            &tx,
+                            tool_root_abs.as_deref(),
+                            checkpoint.as_deref(),
+                            cur_cwd.as_deref(),
+                            &messages,
+                        )
+                        .await;
+
+                        pending_system_hint = Some(block);
+                        let _ = tx
+                            .send(StreamToken::GovernorState(build_governor_state(
+                                state,
+                                &recovery,
+                                &mem,
+                                file_tool_consec_failures,
+                                last_mutation_step,
+                                last_verify_ok_step,
+                                last_reflection.as_ref(),
+                            )))
+                            .await;
+                        continue;
                     }
-                    state = AgentState::Recovery;
-                    recovery.stage = Some(if root_read_only {
-                        RecoveryStage::Diagnose
-                    } else {
-                        RecoveryStage::Verify
-                    });
-                    let hint = build_done_acceptance_recovery_hint(
-                        &e.to_string(),
-                        &known_acceptance_commands,
-                        &read_only_scores,
-                    );
-                    let block = format!(
-                        "{}{}",
-                        governor_contract::done_invalid_acceptance_message(&e.to_string()),
-                        hint
-                    );
-
-                    let _ = tx
-                        .send(StreamToken::Delta(format!(
-                            "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
-                        )))
-                        .await;
-
-                    messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": format!(
-                            "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
-                            tc.name, tc.arguments
-                        ),
-                    }));
-                    autosave_best_effort(
-                        &autosaver,
-                        &tx,
-                        tool_root_abs.as_deref(),
-                        checkpoint.as_deref(),
-                        cur_cwd.as_deref(),
-                        &messages,
-                    )
-                    .await;
-
-                    pending_system_hint = Some(block);
-                    let _ = tx
-                        .send(StreamToken::GovernorState(build_governor_state(
-                            state,
-                            &recovery,
-                            &mem,
-                            file_tool_consec_failures,
-                            last_mutation_step,
-                            last_verify_ok_step,
-                            last_reflection.as_ref(),
-                        )))
-                        .await;
-                    continue;
                 }
+            };
+
+            let summary_text = if summary.is_empty() {
+                synthesize_action_done_summary(done_plan, &messages).unwrap_or_default()
+            } else {
+                summary.to_string()
             };
 
             let mut final_text = String::new();
             final_text.push_str("[DONE]\n");
-            if !summary.is_empty() {
-                final_text.push_str(summary);
+            if !summary_text.is_empty() {
+                final_text.push_str(summary_text.as_str());
             }
             final_text.push_str("\n\nAcceptance:\n");
             let evidence_by_idx: std::collections::HashMap<usize, String> =
@@ -11698,7 +12486,7 @@ Required now: {}",
         // ── apply_diff tool ───────────────────────────────────────────────
         // Recovery gate: while recovering from failures, enforce a strict
         // Diagnose -> Fix -> Verify workflow to prevent phase drift.
-        if let Some(block) = recovery.maybe_block_tool(&tc, test_cmd.as_deref()) {
+        if let Some(block) = recovery.maybe_block_tool(&tc, test_cmd.as_deref(), task_harness) {
             state = AgentState::Recovery;
             let _ = tx
                 .send(StreamToken::Delta(format!(
@@ -11947,6 +12735,16 @@ Required now: {}",
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
+            if !is_error && !root_read_only {
+                if let Some(hint) = build_fix_stage_progress_hint(
+                    task_harness,
+                    &messages,
+                    recovery.stage,
+                    test_cmd.as_deref(),
+                ) {
+                    pending_system_hint = Some(hint);
+                }
+            }
             if !is_error && root_read_only {
                 if let Some(plan) = active_plan.as_ref() {
                     if iter + 1 == max_iters {
@@ -12119,6 +12917,16 @@ Required now: {}",
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
+            if !is_error && !root_read_only {
+                if let Some(hint) = build_fix_stage_progress_hint(
+                    task_harness,
+                    &messages,
+                    recovery.stage,
+                    test_cmd.as_deref(),
+                ) {
+                    pending_system_hint = Some(hint);
+                }
+            }
             if !is_error && root_read_only {
                 if let Some(plan) = active_plan.as_ref() {
                     if iter + 1 == max_iters {
@@ -12280,6 +13088,16 @@ Required now: {}",
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
+            if !is_error && !root_read_only {
+                if let Some(hint) = build_fix_stage_progress_hint(
+                    task_harness,
+                    &messages,
+                    recovery.stage,
+                    test_cmd.as_deref(),
+                ) {
+                    pending_system_hint = Some(hint);
+                }
+            }
             if !is_error && root_read_only {
                 if let Some(plan) = active_plan.as_ref() {
                     if iter + 1 == max_iters {
@@ -12950,9 +13768,55 @@ Action required: call read_file(path) first to confirm current contents, then re
                 "tool_call_id": tc.id,
                 "content": history_result,
             }));
+            if !is_error && !root_read_only {
+                if let Some(hint) = build_fix_stage_progress_hint(
+                    task_harness,
+                    &messages,
+                    recovery.stage,
+                    test_cmd.as_deref(),
+                ) {
+                    pending_system_hint = Some(hint);
+                }
+            }
             if !is_error && root_read_only && tc.name.as_str() == "read_file" {
                 if let Some(plan) = active_plan.as_ref() {
-                    if iter + 1 == max_iters {
+                    if let Some(final_text) = maybe_build_read_only_auto_final_answer(
+                        true,
+                        &root_user_text,
+                        Some(plan),
+                        &observation_evidence,
+                        &messages,
+                        &working_mem,
+                    ) {
+                        state = AgentState::Done;
+                        messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+                        autosave_best_effort(
+                            &autosaver,
+                            &tx,
+                            tool_root_abs.as_deref(),
+                            checkpoint.as_deref(),
+                            cur_cwd.as_deref(),
+                            &messages,
+                        )
+                        .await;
+                        let _ = tx
+                            .send(StreamToken::GovernorState(build_governor_state(
+                                state,
+                                &recovery,
+                                &mem,
+                                file_tool_consec_failures,
+                                last_mutation_step,
+                                last_verify_ok_step,
+                                last_reflection.as_ref(),
+                            )))
+                            .await;
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "\n[agent] auto-finalized read-only inspection after sufficient observation.\n\n{final_text}\n"
+                            )))
+                            .await;
+                        break;
+                    } else if iter + 1 == max_iters {
                         if let Some(final_text) = build_read_only_iteration_cap_final_answer(
                             &root_user_text,
                             plan,
@@ -13084,6 +13948,7 @@ Action required: call read_file(path) first to confirm current contents, then re
                 state
             )))
             .await;
+        let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
 
         if let Some(block) = should_block_git_landmines(&command, tool_root_abs.as_deref()) {
             state = AgentState::Recovery;
@@ -13502,6 +14367,36 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
                 )))
                 .await;
         }
+    }
+
+    if let Some(final_text) = maybe_build_verified_action_auto_final_answer(
+        active_plan.as_ref(),
+        &messages,
+        &canonicalize_known_acceptance_commands(
+            &collect_known_acceptance_commands(&messages, &working_mem),
+            &observation_evidence,
+        ),
+        &observation_evidence,
+        required_verification,
+        test_cmd.as_deref(),
+        last_mutation_step,
+        last_verify_ok_step,
+    ) {
+        messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+        autosave_best_effort(
+            &autosaver,
+            &tx,
+            tool_root_abs.as_deref(),
+            checkpoint.as_deref(),
+            cur_cwd.as_deref(),
+            &messages,
+        )
+        .await;
+        let _ = tx
+            .send(StreamToken::Delta(format!(
+                "\n[agent] auto-finalized verified action task at session end.\n\n{final_text}\n"
+            )))
+            .await;
     }
 
     if realize_cfg.enabled {
@@ -14773,6 +15668,31 @@ remaining_gap: still need to run cargo test\n\
     }
 
     #[test]
+    fn preferred_read_only_search_pattern_ignores_instruction_stopwords() {
+        let pattern = preferred_read_only_search_pattern(
+            "Find the failing test and explain why it fails. Do not edit anything. Final answer must include the file path and the exact mismatch.",
+        );
+        assert_eq!(pattern, "test");
+    }
+
+    #[test]
+    fn synthetic_read_only_observation_plan_captures_failure_mismatch_tasks() {
+        let plan = synthetic_read_only_observation_plan(
+            "Find the failing test and explain why it fails. Do not edit anything. Final answer must include the file path and the exact mismatch.",
+        );
+        assert!(plan.goal.contains("failing test"));
+        assert!(plan.goal.contains("assertion mismatch"));
+        assert!(plan
+            .acceptance_criteria
+            .iter()
+            .any(|item| item.contains("failing test file path")));
+        assert!(plan
+            .acceptance_criteria
+            .iter()
+            .any(|item| item.contains("exact assertion mismatch")));
+    }
+
+    #[test]
     fn compact_success_tool_result_for_history_keeps_exec_signal() {
         let content = "OK (exit_code: 0)\nduration_ms: 150\ncwd: /tmp/demo\nstdout:\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\n[auto-test] ✓ PASSED (exit 0)\nfinished";
         let compact = compact_success_tool_result_for_history("exec", content);
@@ -15522,6 +16442,543 @@ verify: exit code is zero\n\
     }
 
     #[test]
+    fn rescue_missing_plan_for_tool_turn_after_repeated_blocks_for_openai_actions() {
+        let tc = ToolCallData {
+            id: "call_2".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"Cargo.toml"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": serde_json::json!({"path":"Cargo.toml"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nread_file\narguments:\n{\"path\":\"Cargo.toml\"}"
+            }),
+        ];
+
+        let rescued = rescue_missing_plan_for_tool_turn(
+            &messages,
+            &tc,
+            "Fix the failing test with the smallest code change. Run tests before you finish.",
+            TaskHarness::infer(
+                "Fix the failing test with the smallest code change. Run tests before you finish.",
+                false,
+            ),
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+        )
+        .expect("synthetic action plan");
+
+        assert!(rescued.goal.contains("Fix the failing test"));
+        assert!(rescued
+            .steps
+            .iter()
+            .any(|step| step.contains("read_file(path=Cargo.toml)")));
+        assert!(rescued
+            .steps
+            .iter()
+            .any(|step| step.contains("cargo test 2>&1")));
+        assert!(rescued
+            .acceptance_criteria
+            .iter()
+            .all(|item| item.contains("behavioral verification")));
+    }
+
+    #[test]
+    fn general_plan_rescue_pairs_with_valid_synthetic_think() {
+        let tc = ToolCallData {
+            id: "call_2".to_string(),
+            name: "search_files".to_string(),
+            arguments: serde_json::json!({"pattern":"test","dir":"src"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": serde_json::json!({"pattern":"test","dir":"src"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nsearch_files\narguments:\n{\"pattern\":\"test\",\"dir\":\"src\"}"
+            }),
+        ];
+
+        let plan = rescue_missing_plan_for_tool_turn(
+            &messages,
+            &tc,
+            "Fix the failing test with the smallest code change. Run tests before you finish.",
+            TaskHarness::infer(
+                "Fix the failing test with the smallest code change. Run tests before you finish.",
+                false,
+            ),
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+        )
+        .expect("synthetic action plan");
+        let think = compat_synthetic_think(&tc, &plan);
+
+        validate_think(&think, &plan, &tc).expect("valid synthetic think");
+        assert_eq!(think.tool, "search_files");
+        assert!(think.next.contains("search"));
+    }
+
+    #[test]
+    fn rescue_missing_plan_for_create_file_accepts_write_file_turn() {
+        let prompt =
+            "Create `notes/todo.txt` containing exactly `ship it`. Verify it before you finish.";
+        let tc = ToolCallData {
+            id: "call_write_retry".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path":"notes/todo.txt",
+                "content":"ship it\n"
+            })
+            .to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_write_1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": serde_json::json!({
+                            "path":"notes/todo.txt",
+                            "content":"ship it\n"
+                        }).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_write_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nwrite_file\narguments:\n{\"path\":\"notes/todo.txt\",\"content\":\"ship it\\n\"}"
+            }),
+        ];
+
+        let rescued = rescue_missing_plan_for_tool_turn(
+            &messages,
+            &tc,
+            prompt,
+            TaskHarness::infer(prompt, false),
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            VerificationLevel::Behavioral,
+            Some("test -f notes/todo.txt && grep -Fx \"ship it\" notes/todo.txt"),
+        )
+        .expect("synthetic create-file plan");
+
+        assert!(rescued
+            .steps
+            .first()
+            .is_some_and(|step| step.contains("write_file(") && step.contains("notes/todo.txt")));
+        assert!(rescued
+            .acceptance_criteria
+            .iter()
+            .any(|item| item.contains("artifact")));
+        assert!(rescued
+            .acceptance_criteria
+            .iter()
+            .any(|item| item.contains("behavioral verification")));
+    }
+
+    #[test]
+    fn rescue_missing_think_for_tool_turn_after_repeated_blocks_for_openai_actions() {
+        let tc = ToolCallData {
+            id: "call_2".to_string(),
+            name: "list_dir".to_string(),
+            arguments: serde_json::json!({"dir":"."}).to_string(),
+        };
+        let plan = rescue_missing_plan_for_tool_turn(
+            &[json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": serde_json::json!({"path":"Cargo.toml"}).to_string()
+                    }
+                }]
+            }), json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nread_file\narguments:\n{\"path\":\"Cargo.toml\"}"
+            })],
+            &ToolCallData {
+                id: "call_plan".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path":"Cargo.toml"}).to_string(),
+            },
+            "Fix the failing test with the smallest code change. Run tests before you finish.",
+            TaskHarness::infer(
+                "Fix the failing test with the smallest code change. Run tests before you finish.",
+                false,
+            ),
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+        )
+        .expect("synthetic action plan");
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "list_dir",
+                        "arguments": serde_json::json!({"dir":"."}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\nlist_dir\narguments:\n{\"dir\":\".\"}"
+            }),
+        ];
+
+        let rescued = rescue_missing_think_for_tool_turn(
+            &messages,
+            &tc,
+            &plan,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            false,
+        )
+        .expect("synthetic think");
+
+        validate_think(&rescued, &plan, &tc).expect("valid synthetic think");
+        assert_eq!(rescued.tool, "list_dir");
+    }
+
+    #[test]
+    fn rescue_missing_think_for_tool_turn_is_immediate_for_patch_file() {
+        let tc = ToolCallData {
+            id: "call_patch".to_string(),
+            name: "patch_file".to_string(),
+            arguments: serde_json::json!({
+                "path":"src/lib.rs",
+                "search":"Hello, {}?",
+                "replace":"Hello, {}!"
+            })
+            .to_string(),
+        };
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented and confirmed by a passing behavioral verification command".to_string(),
+                "the final result cites the exact passing behavioral verification command".to_string(),
+            ],
+            risks: "wrong file or speculative fix; the chosen test may miss the requested behavior".to_string(),
+            assumptions: "the current repo state matches the task and the configured verification command is relevant".to_string(),
+        };
+        let messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call_patch",
+            "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\npatch_file\narguments:\n{\"path\":\"src/lib.rs\",\"search\":\"Hello, {}?\",\"replace\":\"Hello, {}!\"}"
+        })];
+
+        let rescued = rescue_missing_think_for_tool_turn(
+            &messages,
+            &tc,
+            &plan,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            false,
+        )
+        .expect("synthetic think");
+
+        validate_think(&rescued, &plan, &tc).expect("valid synthetic think");
+        assert_eq!(rescued.tool, "patch_file");
+    }
+
+    #[test]
+    fn rescue_missing_think_for_tool_turn_is_immediate_for_exec() {
+        let tc = ToolCallData {
+            id: "call_exec".to_string(),
+            name: "exec".to_string(),
+            arguments: serde_json::json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented and confirmed by a passing behavioral verification command".to_string(),
+                "the final result cites the exact passing behavioral verification command".to_string(),
+            ],
+            risks: "wrong file or speculative fix; the chosen test may miss the requested behavior".to_string(),
+            assumptions: "the current repo state matches the task and the configured verification command is relevant".to_string(),
+        };
+        let messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call_exec",
+            "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\nexec\narguments:\n{\"command\":\"cargo test 2>&1\"}"
+        })];
+
+        let rescued = rescue_missing_think_for_tool_turn(
+            &messages,
+            &tc,
+            &plan,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            false,
+        )
+        .expect("synthetic think");
+
+        validate_think(&rescued, &plan, &tc).expect("valid synthetic think");
+        assert_eq!(rescued.tool, "exec");
+    }
+
+    #[test]
+    fn rescue_missing_think_for_tool_turn_is_immediate_for_done() {
+        let tc = ToolCallData {
+            id: "call_done".to_string(),
+            name: "done".to_string(),
+            arguments: serde_json::json!({
+                "summary":"Fixed the bug and verified it.",
+                "completed_acceptance":["1) the requested change is implemented"],
+                "remaining_acceptance":["2) the final result cites the exact passing behavioral verification command"],
+                "acceptance_evidence":[{"criterion":"1) the requested change is implemented","command":"cargo test 2>&1"}]
+            })
+            .to_string(),
+        };
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented and confirmed by a passing behavioral verification command".to_string(),
+                "the final result cites the exact passing behavioral verification command".to_string(),
+            ],
+            risks: "wrong file or speculative fix; the chosen test may miss the requested behavior".to_string(),
+            assumptions: "the current repo state matches the task and the configured verification command is relevant".to_string(),
+        };
+
+        let rescued = rescue_missing_think_for_tool_turn(
+            &[],
+            &tc,
+            &plan,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            false,
+        )
+        .expect("synthetic think");
+
+        validate_think(&rescued, &plan, &tc).expect("valid synthetic think");
+        assert_eq!(rescued.tool, "done");
+        assert!(rescued.next.contains("done"));
+    }
+
+    #[test]
+    fn rescue_missing_reflection_for_tool_turn_synthesizes_valid_reflection_for_patch() {
+        let tc = ToolCallData {
+            id: "call_patch".to_string(),
+            name: "patch_file".to_string(),
+            arguments: serde_json::json!({
+                "path":"src/lib.rs",
+                "search":"Hello, {}?",
+                "replace":"Hello, {}!"
+            })
+            .to_string(),
+        };
+        let mut mem = FailureMemory::default();
+        mem.consecutive_failures = 1;
+
+        let reflect = rescue_missing_reflection_for_tool_turn(
+            "⚠ LOGIC ERROR: The code ran but produced wrong results.",
+            &tc,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            &mem,
+            0,
+        )
+        .expect("synthetic reflection");
+
+        validate_reflection(&reflect, &mem, 0).expect("valid synthetic reflection");
+        assert_eq!(reflect.last_outcome, "failure");
+        assert_eq!(reflect.strategy_change, StrategyChange::Adjust);
+        assert!(reflect.next_minimal_action.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn rescue_missing_impact_for_tool_turn_synthesizes_valid_impact_after_patch() {
+        let tc = ToolCallData {
+            id: "call_exec".to_string(),
+            name: "exec".to_string(),
+            arguments: serde_json::json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented and confirmed by a passing behavioral verification command".to_string(),
+                "the final result cites the exact passing behavioral verification command".to_string(),
+            ],
+            risks: "wrong file or speculative fix; the chosen test may miss the requested behavior".to_string(),
+            assumptions: "the current repo state matches the task and the configured verification command is relevant".to_string(),
+        };
+
+        let impact = rescue_missing_impact_for_tool_turn(
+            "successful mutation via patch_file: src/lib.rs",
+            &tc,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            Some(&plan),
+        )
+        .expect("synthetic impact");
+
+        validate_impact(&impact, Some(&plan)).expect("valid synthetic impact");
+        assert!(impact.changed.contains("src/lib.rs"));
+        assert!(impact.progress.contains("step 2"));
+        assert!(impact.remaining_gap.contains("cargo test 2>&1"));
+    }
+
+    #[test]
+    fn rescue_missing_evidence_for_tool_turn_synthesizes_valid_evidence_for_patch() {
+        let tc = ToolCallData {
+            id: "call_patch".to_string(),
+            name: "patch_file".to_string(),
+            arguments: serde_json::json!({
+                "path":"src/lib.rs",
+                "search":"Hello, {}?",
+                "replace":"Hello, {}!"
+            })
+            .to_string(),
+        };
+        let observations = ObservationEvidence {
+            reads: vec![ObservationReadEvidence {
+                command: "read_file(path=src/lib.rs)".to_string(),
+                path: "src/lib.rs".to_string(),
+            }],
+            searches: Vec::new(),
+            resolutions: Vec::new(),
+        };
+
+        let evidence = rescue_missing_evidence_for_tool_turn(
+            &tc,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            &observations,
+        )
+        .expect("synthetic evidence");
+
+        validate_evidence_block(&evidence, &tc, &observations).expect("valid synthetic evidence");
+        assert_eq!(evidence.target_files, vec!["src/lib.rs".to_string()]);
+        assert!(evidence.evidence.contains("read_file(path=src/lib.rs)"));
+    }
+
+    #[test]
+    fn repair_truncated_patch_tool_call_from_recent_mismatch_recovers_smoke_fix() {
+        let tc = ToolCallData {
+            id: "call_patch".to_string(),
+            name: "patch_file".to_string(),
+            arguments: "{\"path\":\"src/lib.rs\",\"search\":\"pub fn greet(name: &str) -> String {\\n    format!(\\\"Hello, {}?\\\", name)\\n}\\n\",\"replace\":\"".to_string(),
+        };
+        let messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call_exec",
+            "content": "thread 'tests::greet_is_excited' panicked at src/lib.rs:12:9:\nassertion `left == right` failed\n  left: \"Hello, Ada?\"\n right: \"Hello, Ada!\""
+        })];
+        let observations = ObservationEvidence {
+            reads: vec![ObservationReadEvidence {
+                command: "read_file(path=src/lib.rs)".to_string(),
+                path: "src/lib.rs".to_string(),
+            }],
+            searches: Vec::new(),
+            resolutions: Vec::new(),
+        };
+
+        let (rewritten, original, repaired) =
+            repair_truncated_patch_tool_call_from_recent_mismatch(
+                &messages,
+                &tc,
+                false,
+                true,
+                ProviderKind::OpenAiCompatible,
+                &observations,
+            )
+            .expect("repair malformed patch tool call");
+
+        assert!(original.starts_with("patch_file"));
+        assert!(original.contains("\"replace\":\""));
+        assert!(repaired.starts_with("patch_file("));
+        assert!(repaired.contains("Hello, {}!"));
+        assert_eq!(rewritten.name, "patch_file");
+        let rewritten_args =
+            serde_json::from_str::<serde_json::Value>(&rewritten.arguments).expect("valid json");
+        assert_eq!(
+            rewritten_args.get("path").and_then(|v| v.as_str()),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            rewritten_args.get("replace").and_then(|v| v.as_str()),
+            Some("pub fn greet(name: &str) -> String {\n    format!(\"Hello, {}!\", name)\n}\n")
+        );
+    }
+
+    #[test]
     fn consecutive_missing_think_blocks_for_tool_counts_same_observation_tool() {
         let tc = ToolCallData {
             id: "call_3".to_string(),
@@ -16048,6 +17505,34 @@ verify: exit code is zero\n\
     }
 
     #[test]
+    fn recovery_gate_allows_new_file_write_during_diagnose() {
+        let recovery = RecoveryGovernor {
+            stage: Some(RecoveryStage::Diagnose),
+            required_verification: VerificationLevel::Behavioral,
+        };
+        let tc = ToolCallData {
+            id: "call_write".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path":"notes/todo.txt",
+                "content":"ship it\n"
+            })
+            .to_string(),
+        };
+
+        assert!(recovery
+            .maybe_block_tool(
+                &tc,
+                Some("test -f notes/todo.txt && grep -Fx \"ship it\" notes/todo.txt"),
+                TaskHarness::infer(
+                    "Create `notes/todo.txt` containing exactly `ship it`.",
+                    false,
+                ),
+            )
+            .is_none());
+    }
+
+    #[test]
     fn verification_requirement_prompt_is_idle_when_no_verify_pressure() {
         let recovery = RecoveryGovernor::default();
         let goal_checks = GoalCheckTracker::default();
@@ -16100,6 +17585,28 @@ verify: exit code is zero\n\
         )
         .expect("runner command");
         assert_eq!(cmd, "cargo test -q");
+    }
+
+    #[test]
+    fn goal_check_result_preserves_verification_command_case_for_evidence() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(td.path().join("demo_repo/.git")).expect("mkdir .git");
+        std::fs::write(td.path().join("demo_repo/README.md"), "# demo\n").expect("write readme");
+        std::fs::write(td.path().join("demo_repo/.gitignore"), "target/\n")
+            .expect("write gitignore");
+        let command =
+            "test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore";
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (_tx, mut _rx) = tokio::sync::mpsc::channel(4);
+        let result = rt.block_on(run_goal_check_command(
+            "repo",
+            command,
+            td.path().to_string_lossy().as_ref(),
+            &_tx,
+        ));
+
+        assert!(result.passed);
+        assert_eq!(result.command, command);
     }
 
     #[test]
@@ -16380,6 +17887,45 @@ verify: exit code is zero\n\
             &plan,
             &tc,
             ProviderKind::Mistral,
+        );
+        assert!(used_synth);
+        assert_eq!(selected.expect("selected think").goal, plan.goal);
+    }
+
+    #[test]
+    fn select_think_for_tool_turn_prefers_synth_over_invalid_last_for_openai_compatible() {
+        let plan = PlanBlock {
+            goal: "Locate the failing test".to_string(),
+            steps: vec![
+                "search for the test".to_string(),
+                "read the matching file".to_string(),
+            ],
+            acceptance_criteria: vec!["report the file path".to_string()],
+            risks: "wrong file".to_string(),
+            assumptions: "observation tools are sufficient".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_3".to_string(),
+            name: "search_files".to_string(),
+            arguments: "{\"pattern\":\"test\",\"dir\":\"src\"}".to_string(),
+        };
+        let invalid_last = ThinkBlock {
+            goal: String::new(),
+            step: 1,
+            tool: "search_files".to_string(),
+            risk: "r".to_string(),
+            doubt: "d".to_string(),
+            next: "search".to_string(),
+            verify: "confirm".to_string(),
+        };
+        let synth = compat_synthetic_think(&tc, &plan);
+        let (selected, used_synth) = select_think_for_tool_turn(
+            None,
+            Some(&invalid_last),
+            Some(&synth),
+            &plan,
+            &tc,
+            ProviderKind::OpenAiCompatible,
         );
         assert!(used_synth);
         assert_eq!(selected.expect("selected think").goal, plan.goal);

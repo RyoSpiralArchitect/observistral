@@ -27,6 +27,26 @@ fn criterion_prefers_read_confirmation(criterion: &str) -> bool {
     .any(|term| low.contains(term))
 }
 
+fn single_observed_read_target(evidence: &ObservationEvidence) -> Option<String> {
+    let observed_paths = evidence
+        .searches
+        .iter()
+        .flat_map(|search| search.paths.iter())
+        .map(|path| normalize_path_alias(path))
+        .filter(|path| !path.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    if observed_paths.len() != 1 {
+        return None;
+    }
+    let target_sig = observed_paths.into_iter().next()?;
+    evidence
+        .reads
+        .iter()
+        .rev()
+        .find(|read| normalize_path_alias(read.path.as_str()) == target_sig)
+        .map(|read| read.path.clone())
+}
+
 pub(super) fn build_read_only_strong_final_answer(
     root_user_text: &str,
     plan: &PlanBlock,
@@ -195,10 +215,29 @@ pub(super) fn build_read_only_completion_hint(
     }
 
     let scores = build_read_only_evidence_scores(root_user_text, plan, evidence);
+    let single_target = single_observed_read_target(evidence);
+    let medium_threshold = if single_target.is_some() { 0.55 } else { 0.60 };
     let strong: Vec<&CriterionEvidenceScore> =
         scores.iter().filter(|score| score.total >= 0.85).collect();
-    let medium_or_better = scores.iter().filter(|score| score.total >= 0.60).count();
-    if strong.is_empty() || medium_or_better < 2 {
+    let medium_or_better = scores
+        .iter()
+        .filter(|score| score.total >= medium_threshold)
+        .count();
+    let completed_scores: Vec<&CriterionEvidenceScore> =
+        if !strong.is_empty() && medium_or_better >= 2 {
+            strong
+        } else if single_target.is_some() && medium_or_better >= 2 {
+            scores
+                .iter()
+                .filter(|score| score.total >= medium_threshold)
+                .collect()
+        } else if single_target.is_some() {
+            scores.iter().collect()
+        } else {
+            return None;
+        };
+
+    if completed_scores.is_empty() {
         return None;
     }
 
@@ -206,11 +245,11 @@ pub(super) fn build_read_only_completion_hint(
         &collect_known_acceptance_commands(messages, working_mem),
         evidence,
     );
-    let cite_commands: Vec<String> = strong
+    let cite_commands: Vec<String> = completed_scores
         .iter()
         .filter_map(|score| preferred_done_command_for_score(score, &known_commands, evidence))
         .chain(
-            strong
+            completed_scores
                 .iter()
                 .flat_map(|score| score.suggested_commands.iter().cloned()),
         )
@@ -227,7 +266,7 @@ pub(super) fn build_read_only_completion_hint(
             acc
         });
 
-    let completed_lines = strong
+    let completed_lines = completed_scores
         .iter()
         .take(2)
         .map(|score| {
@@ -279,8 +318,14 @@ pub(super) fn build_read_only_iteration_cap_final_answer(
     }
 
     let scores = build_read_only_evidence_scores(root_user_text, plan, evidence);
-    let medium_or_better = scores.iter().filter(|score| score.total >= 0.60).count();
-    if medium_or_better < 2 {
+    let single_target = single_observed_read_target(evidence);
+    let medium_threshold = if single_target.is_some() { 0.55 } else { 0.60 };
+    let completion_threshold = if single_target.is_some() { 0.55 } else { 0.70 };
+    let medium_or_better = scores
+        .iter()
+        .filter(|score| score.total >= medium_threshold)
+        .count();
+    if medium_or_better < 2 && single_target.is_none() {
         return None;
     }
 
@@ -290,7 +335,7 @@ pub(super) fn build_read_only_iteration_cap_final_answer(
     );
     let mut completed_rows: Vec<(usize, String)> = scores
         .iter()
-        .filter(|score| score.total >= 0.70)
+        .filter(|score| single_target.is_some() || score.total >= completion_threshold)
         .filter_map(|score| {
             let command = preferred_done_command_for_score(score, &known_commands, evidence)?;
             Some((score.idx, command))
@@ -383,16 +428,44 @@ pub(super) fn canonicalize_known_acceptance_commands(
     known_commands: &[String],
     evidence: &ObservationEvidence,
 ) -> Vec<String> {
-    known_commands.iter().fold(Vec::new(), |mut acc, command| {
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+
+    for command in known_commands {
+        let display = compact_one_line(command.as_str(), 200);
+        if display == "-" {
+            continue;
+        }
         let canonical = canonicalize_evidence_command_with_resolution(command.as_str(), evidence);
-        let chosen = if canonical.is_empty() {
-            compact_one_line(command.as_str(), 200)
+        let sig = if canonical.is_empty() {
+            normalize_memory_entry(display.as_str())
         } else {
-            canonical
+            normalize_memory_entry(canonical.as_str())
         };
-        remember_recent_unique(&mut acc, chosen.as_str(), 16, 200);
-        acc
-    })
+        if sig.is_empty() {
+            continue;
+        }
+        let shown = if !canonical.is_empty()
+            && parse_named_command_signature(canonical.as_str()).is_some()
+        {
+            canonical
+        } else {
+            display
+        };
+        if let Some(pos) = seen.iter().position(|existing| existing == &sig) {
+            seen.remove(pos);
+            out.remove(pos);
+        }
+        seen.push(sig);
+        out.push(shown);
+        if out.len() > 16 {
+            let drop_n = out.len() - 16;
+            out.drain(0..drop_n);
+            seen.drain(0..drop_n);
+        }
+    }
+
+    out
 }
 
 fn resolve_known_acceptance_command<'a>(
@@ -697,6 +770,410 @@ pub(super) fn build_done_acceptance_recovery_hint(
     }
 }
 
+fn finalization_step_hint(step: &str) -> bool {
+    let low = step.to_ascii_lowercase();
+    [
+        "done",
+        "final",
+        "finalize",
+        "summary",
+        "summarize",
+        "report",
+        "handoff",
+        "wrap up",
+        "finish",
+    ]
+    .iter()
+    .any(|term| low.contains(term))
+}
+
+fn known_commands_have_required_verification(
+    known_commands: &[String],
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+) -> bool {
+    known_commands.iter().any(|command| {
+        classify_verify_level(command.as_str(), test_cmd)
+            .map(|level| level.satisfies(required_verification))
+            .unwrap_or(false)
+    })
+}
+
+pub(super) fn should_prefer_done_after_verified_action(
+    tc: &ToolCallData,
+    plan: &PlanBlock,
+    known_commands: &[String],
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+    last_mutation_step: Option<usize>,
+    last_verify_ok_step: Option<usize>,
+) -> bool {
+    if tc.name.as_str() == "done" {
+        return false;
+    }
+
+    let last_mutation = last_mutation_step.unwrap_or(0);
+    let last_verify_ok = last_verify_ok_step.unwrap_or(0);
+    if last_mutation == 0 || last_verify_ok < last_mutation {
+        return false;
+    }
+
+    if !plan.steps.iter().any(|step| finalization_step_hint(step)) {
+        return false;
+    }
+
+    if !known_commands_have_required_verification(known_commands, required_verification, test_cmd) {
+        return false;
+    }
+
+    match tc.name.as_str() {
+        "read_file" | "search_files" | "list_dir" | "glob" => true,
+        "exec" => {
+            let command = parse_exec_command_from_args(tc.arguments.as_str()).unwrap_or_default();
+            classify_verify_level(command.as_str(), test_cmd)
+                .map(|level| level.satisfies(required_verification))
+                .unwrap_or_else(|| is_diagnostic_command(command.as_str()))
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn build_post_verify_done_completion_hint(
+    plan: &PlanBlock,
+    known_commands: &[String],
+    tc: &ToolCallData,
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+) -> String {
+    let attempted = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| blocked_tool_call_signature(tc.name.as_str(), tc.arguments.as_str()));
+    let verification_commands = known_commands
+        .iter()
+        .filter(|command| {
+            classify_verify_level(command.as_str(), test_cmd)
+                .map(|level| level.satisfies(required_verification))
+                .unwrap_or(false)
+        })
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut out = format!(
+        "[Completion Gate]\n\
+Required verification already passed after the latest mutation.\n\
+Attempted next action: {attempted}\n\
+Do NOT reopen inspection or rerun verification now.\n\
+Next assistant turn: emit a <think> block with `tool: done`, then call `done` immediately.\n\
+If any acceptance criterion is not fully proven, keep it in `remaining_acceptance` instead of gathering unrelated evidence.\n"
+    );
+    if !plan.acceptance_criteria.is_empty() {
+        out.push_str("Current acceptance criteria:\n");
+        for (idx, criterion) in plan.acceptance_criteria.iter().enumerate().take(4) {
+            out.push_str(&format!(
+                "- acceptance {}: {}\n",
+                idx + 1,
+                compact_one_line(criterion.as_str(), 160)
+            ));
+        }
+    }
+    if !verification_commands.is_empty() {
+        out.push_str("Known successful verification commands you can cite now:\n");
+        for command in verification_commands {
+            out.push_str("- ");
+            out.push_str(&compact_one_line(command.as_str(), 200));
+            out.push('\n');
+        }
+    }
+    out.push_str(
+        "If you still need to explain remaining work, use `next_steps` in `done`; do not read unrelated files now.",
+    );
+    out
+}
+
+fn preferred_action_verification_command(
+    known_commands: &[String],
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+) -> Option<String> {
+    known_commands.iter().rev().find_map(|command| {
+        classify_verify_level(command.as_str(), test_cmd)
+            .filter(|level| level.satisfies(required_verification))
+            .map(|_| command.clone())
+    })
+}
+
+fn preferred_action_observation_command(
+    known_commands: &[String],
+    observation_evidence: &ObservationEvidence,
+) -> Option<String> {
+    for prefix in ["read_file(", "search_files(", "glob(", "list_dir("] {
+        if let Some(command) = known_commands.iter().rev().find(|command| {
+            canonicalize_evidence_command_with_resolution(command.as_str(), observation_evidence)
+                .starts_with(prefix)
+        }) {
+            return Some(command.clone());
+        }
+    }
+    None
+}
+
+fn criterion_prefers_verification_proof(criterion: &str) -> bool {
+    let low = criterion.to_ascii_lowercase();
+    [
+        "implement",
+        "implemented",
+        "change",
+        "fix",
+        "verify",
+        "verification",
+        "behavioral",
+        "build",
+        "lint",
+        "test",
+        "pass",
+        "passes",
+        "final result",
+        "final answer",
+        "cite",
+        "command",
+        "summary",
+        "report",
+    ]
+    .iter()
+    .any(|term| low.contains(term))
+}
+
+fn criterion_prefers_observation_proof(criterion: &str) -> bool {
+    let low = criterion.to_ascii_lowercase();
+    [
+        "file", "path", "read", "context", "handler", "symbol", "location", "line",
+    ]
+    .iter()
+    .any(|term| low.contains(term))
+}
+
+fn latest_successful_mutation_path(messages: &[serde_json::Value]) -> Option<(String, String)> {
+    let mut pending_by_id: std::collections::BTreeMap<String, (String, String)> =
+        std::collections::BTreeMap::new();
+    let mut latest: Option<(String, String)> = None;
+
+    for msg in messages {
+        match msg.get("role").and_then(|v| v.as_str()).unwrap_or("") {
+            "assistant" => {
+                let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for tc in tool_calls {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let name = tc
+                        .get("function")
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if id.is_empty() || !matches!(name, "write_file" | "patch_file" | "apply_diff")
+                    {
+                        continue;
+                    }
+                    let Some(arguments) = tc
+                        .get("function")
+                        .and_then(|v| v.get("arguments"))
+                        .and_then(|v| v.as_str())
+                    else {
+                        continue;
+                    };
+                    let path = serde_json::from_str::<serde_json::Value>(arguments)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|path| !path.is_empty())
+                                .map(ToString::to_string)
+                        });
+                    let Some(path) = path else {
+                        continue;
+                    };
+                    pending_by_id.insert(id.to_string(), (name.to_string(), path));
+                }
+            }
+            "tool" => {
+                let id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if !looks_like_successful_mutation_result(content) {
+                    continue;
+                }
+                if let Some(entry) = pending_by_id.get(id) {
+                    latest = Some(entry.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    latest
+}
+
+fn looks_like_successful_mutation_result(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("OK: wrote '")
+        || trimmed.starts_with("OK: patched '")
+        || trimmed.starts_with("OK: applied ")
+}
+
+pub(super) fn synthesize_action_done_summary(
+    plan: Option<&PlanBlock>,
+    messages: &[serde_json::Value],
+) -> Option<String> {
+    if let Some((tool, path)) = latest_successful_mutation_path(messages) {
+        let path = compact_one_line(path.as_str(), 160);
+        return Some(match tool.as_str() {
+            "write_file" => format!("Created `{path}` and verified it."),
+            "patch_file" | "apply_diff" => {
+                format!("Updated `{path}` and verified the requested change.")
+            }
+            _ => format!("Completed the requested change in `{path}` and verified it."),
+        });
+    }
+
+    plan.map(|plan| {
+        let goal = compact_one_line(plan.goal.as_str(), 180);
+        if goal == "-" {
+            "Completed the requested task and verified it.".to_string()
+        } else {
+            format!("Completed and verified: {goal}")
+        }
+    })
+}
+
+pub(super) fn maybe_build_verified_action_auto_final_answer(
+    plan: Option<&PlanBlock>,
+    messages: &[serde_json::Value],
+    known_commands: &[String],
+    observation_evidence: &ObservationEvidence,
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+    last_mutation_step: Option<usize>,
+    last_verify_ok_step: Option<usize>,
+) -> Option<String> {
+    let plan = plan?;
+    let (completed_acceptance, remaining_acceptance, acceptance_evidence) =
+        rescue_invalid_done_payload_for_verified_action(
+            Some(plan),
+            known_commands,
+            observation_evidence,
+            required_verification,
+            test_cmd,
+            last_mutation_step,
+            last_verify_ok_step,
+        )?;
+    let evidence_rows = validate_done_acceptance(
+        Some(plan),
+        &completed_acceptance,
+        &remaining_acceptance,
+        &acceptance_evidence,
+        known_commands,
+        observation_evidence,
+    )
+    .ok()?;
+    let evidence_by_idx: std::collections::HashMap<usize, String> =
+        evidence_rows.into_iter().collect();
+    let summary = synthesize_action_done_summary(Some(plan), messages).unwrap_or_default();
+
+    let mut final_text = String::from("[DONE]\n");
+    if !summary.is_empty() {
+        final_text.push_str(summary.as_str());
+    }
+    final_text.push_str("\n\nAcceptance:\n");
+    for item in &completed_acceptance {
+        let idx = resolve_acceptance_reference(item, plan)?;
+        final_text.push_str("- done: ");
+        final_text.push_str(acceptance_reference_label(plan, idx).as_str());
+        if let Some(command) = evidence_by_idx.get(&idx) {
+            final_text.push_str(" via `");
+            final_text.push_str(command.as_str());
+            final_text.push('`');
+        }
+        final_text.push('\n');
+    }
+    for item in &remaining_acceptance {
+        let idx = resolve_acceptance_reference(item, plan)?;
+        final_text.push_str("- remaining: ");
+        final_text.push_str(acceptance_reference_label(plan, idx).as_str());
+        final_text.push('\n');
+    }
+    Some(final_text)
+}
+
+pub(super) fn rescue_invalid_done_payload_for_verified_action(
+    plan: Option<&PlanBlock>,
+    known_commands: &[String],
+    observation_evidence: &ObservationEvidence,
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+    last_mutation_step: Option<usize>,
+    last_verify_ok_step: Option<usize>,
+) -> Option<(Vec<String>, Vec<String>, Vec<DoneAcceptanceEvidence>)> {
+    let plan = plan?;
+    let last_mutation = last_mutation_step.unwrap_or(0);
+    let last_verify_ok = last_verify_ok_step.unwrap_or(0);
+    if last_mutation == 0 || last_verify_ok < last_mutation {
+        return None;
+    }
+
+    let verify_command =
+        preferred_action_verification_command(known_commands, required_verification, test_cmd);
+    let observation_command =
+        preferred_action_observation_command(known_commands, observation_evidence);
+
+    let mut completed_acceptance = Vec::new();
+    let mut remaining_acceptance = Vec::new();
+    let mut acceptance_evidence = Vec::new();
+
+    for (idx, criterion) in plan.acceptance_criteria.iter().enumerate() {
+        let label = acceptance_reference_label(plan, idx);
+        let command = if criterion_prefers_verification_proof(criterion) {
+            verify_command
+                .clone()
+                .or_else(|| observation_command.clone())
+        } else if criterion_prefers_observation_proof(criterion) {
+            observation_command
+                .clone()
+                .or_else(|| verify_command.clone())
+        } else {
+            None
+        };
+
+        if let Some(command) = command {
+            completed_acceptance.push(label.clone());
+            acceptance_evidence.push(DoneAcceptanceEvidence {
+                criterion: label,
+                command,
+            });
+        } else {
+            remaining_acceptance.push(label);
+        }
+    }
+
+    if completed_acceptance.is_empty() {
+        return None;
+    }
+
+    Some((
+        completed_acceptance,
+        remaining_acceptance,
+        acceptance_evidence,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +1282,383 @@ mod tests {
                 (1, "read_file(path=src/tui/agent.rs)".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn completion_hint_accepts_single_observed_generic_target_after_read() {
+        let plan = synthetic_read_only_observation_plan(
+            "Locate where project-local profile aliases are loaded for the greet command. Do not edit anything.",
+        );
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"aliases\",\"dir\":\"src\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: 'aliases' — 7 match(es)]\nsrc/config.rs:7:     pub aliases: BTreeMap<String, String>,"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/config.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/config.rs] (39 lines, 1136 bytes)\npub fn resolve_profile_alias(root: &Path, requested: Option<&str>, config: &AppConfig) -> String {"
+            }),
+        ];
+        let evidence = collect_observation_evidence(&messages);
+
+        let hint = build_read_only_completion_hint(
+            "Locate where project-local profile aliases are loaded for the greet command. Do not edit anything.",
+            &plan,
+            &evidence,
+            &messages,
+            &WorkingMemory::default(),
+        )
+        .expect("completion hint");
+
+        assert!(hint.contains("call done directly now"));
+        assert!(hint.contains("src/config.rs"));
+    }
+
+    #[test]
+    fn iteration_cap_final_answer_supports_single_observed_generic_target() {
+        let plan = synthetic_read_only_observation_plan(
+            "Locate where project-local profile aliases are loaded for the greet command. Do not edit anything.",
+        );
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": "{\"pattern\":\"aliases\",\"dir\":\"src\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search",
+                "content": "[search_files: 'aliases' — 7 match(es)]\nsrc/config.rs:7:     pub aliases: BTreeMap<String, String>,"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/config.rs\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/config.rs] (39 lines, 1136 bytes)\npub fn resolve_profile_alias(root: &Path, requested: Option<&str>, config: &AppConfig) -> String {"
+            }),
+        ];
+        let evidence = collect_observation_evidence(&messages);
+
+        let final_text = build_read_only_iteration_cap_final_answer(
+            "Locate where project-local profile aliases are loaded for the greet command. Do not edit anything.",
+            &plan,
+            &evidence,
+            &messages,
+            &WorkingMemory::default(),
+        )
+        .expect("final answer");
+
+        assert!(final_text.contains("src/config.rs"));
+        assert!(final_text.contains("read_file(path=src/config.rs)"));
+    }
+
+    #[test]
+    fn should_prefer_done_after_verified_action_blocks_post_verify_reads() {
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented".to_string(),
+                "cargo test 2>&1 passes".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "cargo test is relevant".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"Cargo.toml"}).to_string(),
+        };
+        let known_commands = vec!["cargo test 2>&1".to_string()];
+
+        assert!(should_prefer_done_after_verified_action(
+            &tc,
+            &plan,
+            &known_commands,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+            Some(4),
+            Some(5),
+        ));
+    }
+
+    #[test]
+    fn should_prefer_done_after_verified_action_accepts_verified_patch_auto_test() {
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented".to_string(),
+                "cargo test 2>&1 passes".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "cargo test is relevant".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_exec".to_string(),
+            name: "exec".to_string(),
+            arguments: serde_json::json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+        let known_commands = vec!["cargo test 2>&1".to_string()];
+
+        assert!(should_prefer_done_after_verified_action(
+            &tc,
+            &plan,
+            &known_commands,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+            Some(4),
+            Some(4),
+        ));
+    }
+
+    #[test]
+    fn should_prefer_done_after_verified_action_requires_known_verification_command() {
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented".to_string(),
+                "cargo test 2>&1 passes".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "cargo test is relevant".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"Cargo.toml"}).to_string(),
+        };
+
+        assert!(!should_prefer_done_after_verified_action(
+            &tc,
+            &plan,
+            &[],
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+            Some(4),
+            Some(4),
+        ));
+    }
+
+    #[test]
+    fn post_verify_done_completion_hint_mentions_done_and_verification() {
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented".to_string(),
+                "cargo test 2>&1 passes".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "cargo test is relevant".to_string(),
+        };
+        let tc = ToolCallData {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"Cargo.toml"}).to_string(),
+        };
+        let hint = build_post_verify_done_completion_hint(
+            &plan,
+            &["cargo test 2>&1".to_string()],
+            &tc,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+        );
+
+        assert!(hint.contains("[Completion Gate]"));
+        assert!(hint.contains("tool: done"));
+        assert!(hint.contains("cargo test 2>&1"));
+    }
+
+    #[test]
+    fn rescue_invalid_done_payload_for_verified_action_repairs_smoke_acceptance() {
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "inspect the failing code path".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+                "call done with verified results".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented and confirmed by a passing behavioral verification command".to_string(),
+                "the final result cites the exact passing behavioral verification command".to_string(),
+            ],
+            risks: "wrong file".to_string(),
+            assumptions: "cargo test is relevant".to_string(),
+        };
+        let observation_evidence = ObservationEvidence {
+            reads: vec![ObservationReadEvidence {
+                command: "read_file(path=src/lib.rs)".to_string(),
+                path: "src/lib.rs".to_string(),
+            }],
+            searches: Vec::new(),
+            resolutions: Vec::new(),
+        };
+
+        let (completed, remaining, evidence) = rescue_invalid_done_payload_for_verified_action(
+            Some(&plan),
+            &[
+                "read_file(path=src/lib.rs)".to_string(),
+                "cargo test 2>&1".to_string(),
+            ],
+            &observation_evidence,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+            Some(3),
+            Some(3),
+        )
+        .expect("rescued done payload");
+
+        assert_eq!(
+            completed,
+            vec![
+                acceptance_reference_label(&plan, 0),
+                acceptance_reference_label(&plan, 1)
+            ]
+        );
+        assert!(remaining.is_empty());
+        assert_eq!(evidence.len(), 2);
+        assert!(evidence.iter().all(|row| row.command == "cargo test 2>&1"));
+    }
+
+    #[test]
+    fn synthesize_action_done_summary_prefers_created_file_path() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_write",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments": "{\"path\":\"notes/todo.txt\",\"content\":\"ship it\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_write",
+                "content": "OK: wrote 'notes/todo.txt' (1 lines, 8 bytes)\n[auto-test] ✓ PASSED (exit 0)"
+            }),
+        ];
+
+        let summary = synthesize_action_done_summary(None, &messages).expect("summary");
+        assert!(summary.contains("notes/todo.txt"));
+        assert!(summary.contains("Created"));
+    }
+
+    #[test]
+    fn verified_action_auto_final_answer_uses_repo_artifact_evidence() {
+        let plan = PlanBlock {
+            goal: "Create a new git repo in demo_repo with starter files.".to_string(),
+            steps: vec![
+                "create demo_repo".to_string(),
+                "verify repo artifacts".to_string(),
+                "call done".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested artifact is created and confirmed by a passing build/check/lint verification command".to_string(),
+                "the final result cites the exact passing build/check/lint verification command".to_string(),
+            ],
+            risks: "wrong path".to_string(),
+            assumptions: "the configured verification command is relevant".to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_write",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments":"{\"path\":\"demo_repo/.gitignore\",\"content\":\"target/\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_write",
+                "content": "OK: wrote 'demo_repo/.gitignore' (1 lines, 8 bytes)\n[auto-test] ✓ PASSED (exit 0)"
+            }),
+        ];
+
+        let final_text = maybe_build_verified_action_auto_final_answer(
+            Some(&plan),
+            &messages,
+            &["test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore".to_string()],
+            &ObservationEvidence::default(),
+            VerificationLevel::Build,
+            Some("test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore"),
+            Some(6),
+            Some(6),
+        )
+        .expect("auto final");
+
+        assert!(final_text.contains("demo_repo/.gitignore"));
+        assert!(final_text.contains("Acceptance:"));
+        assert!(final_text.contains("test -d demo_repo/.git"));
+        assert!(final_text.contains("README.md"));
     }
 }

@@ -86,13 +86,73 @@ Keep as the orchestration entrypoint:
 
 This file should become thinner over time and mostly coordinate modules.
 
+### 6. `src/tui/agent/task_harness.rs`
+
+Move:
+
+- task-lane inference such as `fix` / `create_file` / `init_repo`
+- artifact-shape hints that tell the runtime what “progress” looks like
+- progress-gate policy for repeated observation loops in action tasks
+
+Reason:
+
+- this is typed runtime state, not provider compatibility
+- it should stay auditable and testable without growing the main loop
+- action-task harnessing is now a distinct policy surface with its own eval cases
+
+### 7. `src/tui/agent/meta_harness.rs`
+
+Move:
+
+- trace-derived failure pattern detection
+- typed policy deltas such as `mutate_now` / `create_artifact_now`
+- runtime-updated harness prompts that tighten behavior after loops drift
+
+Reason:
+
+- this is the bridge between replay/eval evidence and live orchestration policy
+- it should stay deterministic and auditable before any future evaluator-agent loop
+- it lets the runtime change its own guardrails without growing `agent.rs`
+
+### 8. `src/tui/agent/evaluator_loop.rs`
+
+Move:
+
+- deterministic `keep / problem / try_now` findings derived from live trace policy
+- evaluator-side policy patching such as blocked repeated observations vs preferred tools
+- evaluator prompt / telemetry that closes `trace -> finding -> runtime rule update`
+
+Reason:
+
+- this is the next layer above `MetaHarness`, not a provider compat concern
+- it keeps the self-critique loop typed and auditable before any future multi-agent orchestration
+- it lets the runtime rewrite its own harness behavior without stuffing more branches into `agent.rs`
+
+### 9. `src/tui/agent/session_bridge.rs`
+
+Move:
+
+- prompt/telemetry rendering for persisted resume memory from `session.json`
+- typed bridge summaries such as last good verification, accepted strategy, repeated dead-end
+- resume-specific guidance that turns prior-session operational memory into live harness context
+
+Reason:
+
+- session persistence owns the data, but the live prompt/rendering layer should not grow `agent.rs`
+- it keeps resumable operational memory explicit and auditable
+- it is the foundation for deeper session-to-session context bridging later
+
 ## Suggested extraction order
 
 1. `done_gate.rs`
 2. `read_only.rs`
 3. `provider_compat.rs`
 4. `memory.rs`
-5. optional `telemetry.rs` if loop instrumentation keeps growing
+5. `task_harness.rs`
+6. `meta_harness.rs`
+7. `evaluator_loop.rs`
+8. `session_bridge.rs`
+9. optional `telemetry.rs` if loop instrumentation keeps growing
 
 This order minimizes risk because the first two already have strong eval/replay
 pressure and the clearest ownership boundaries.
@@ -107,4 +167,3 @@ Each extraction should preserve:
 
 Do not extract purely for aesthetics. Extract around ownership boundaries and
 keep the tests close to the new module.
-

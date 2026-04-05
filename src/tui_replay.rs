@@ -70,6 +70,7 @@ pub enum TuiReplayMessageRole {
 pub enum TuiReplayCheck {
     SuggestionParsed,
     HintQueued,
+    ContractQueued,
     ObserverContains { value: String },
     CoderSystemContains { value: String },
     TargetMessageContains { value: String },
@@ -89,6 +90,7 @@ pub struct TuiReplayArtifacts {
 pub struct TuiReplayMetrics {
     pub suggestion_parsed: bool,
     pub hint_queued: bool,
+    pub contract_queued: bool,
     pub observer_message_count: usize,
     pub coder_preview_system_count: usize,
     pub target_message_id: Option<String>,
@@ -294,6 +296,7 @@ fn run_case(
     let metrics = TuiReplayMetrics {
         suggestion_parsed: outcome.parsed_suggestion.is_some(),
         hint_queued: outcome.pending_observer_hint.is_some(),
+        contract_queued: outcome.pending_observer_contract.is_some(),
         observer_message_count: app.observer.messages.len(),
         coder_preview_system_count: outcome
             .coder_preview_messages
@@ -413,6 +416,11 @@ fn evaluate_checks(
                 label: "hint_queued".to_string(),
                 ok: metrics.hint_queued,
                 detail: format!("hint_queued={}", metrics.hint_queued),
+            },
+            TuiReplayCheck::ContractQueued => TuiReplayCheckResult {
+                label: "contract_queued".to_string(),
+                ok: metrics.contract_queued,
+                detail: format!("contract_queued={}", metrics.contract_queued),
             },
             TuiReplayCheck::ObserverContains { value } => {
                 let observed = outcome

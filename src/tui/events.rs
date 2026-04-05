@@ -1418,8 +1418,11 @@ fn handle_coder_token(token: StreamToken, app: &mut App) {
             app.coder.push_delta(&s);
             // scroll = 0 means pinned; don't disturb if user has scrolled up.
         }
-        StreamToken::ToolCall(_) => {
+        StreamToken::ToolCall(call) => {
             app.coder_iter = app.coder_iter.saturating_add(1);
+            if app.active_observer_contract.is_some() && app.active_observer_first_tool.is_none() {
+                app.active_observer_first_tool = Some((call.name, call.arguments));
+            }
         }
         StreamToken::GovernorState(s) => {
             app.coder_governor = Some(s);
@@ -1430,6 +1433,7 @@ fn handle_coder_token(token: StreamToken, app: &mut App) {
         StreamToken::Telemetry(_) => {}
         StreamToken::Done => {
             app.coder.finish_stream();
+            finalize_active_observer_contract(app);
             if let Some(ref state) = app.coder_realize_state {
                 if should_report_realize_summary(state) {
                     app.coder.push_tool(realize_state_summary_line(state));
@@ -1444,6 +1448,118 @@ fn handle_coder_token(token: StreamToken, app: &mut App) {
             app.last_git_checkpoint = Some(hash);
         }
     }
+}
+
+fn explicit_observer_response_decision(text: &str) -> Option<suggestion::ObserverResponseMode> {
+    let lower = text.to_ascii_lowercase();
+    for line in lower.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("decision:") {
+            return parse_observer_response_mode(rest.trim());
+        }
+        if let Some(rest) = trimmed.strip_prefix("observer_response:") {
+            return parse_observer_response_mode(rest.trim());
+        }
+        if trimmed.starts_with("[observer response]") {
+            if trimmed.contains("override") {
+                return Some(suggestion::ObserverResponseMode::Override);
+            }
+            if trimmed.contains("defer") {
+                return Some(suggestion::ObserverResponseMode::Defer);
+            }
+            if trimmed.contains("accept") {
+                return Some(suggestion::ObserverResponseMode::Accept);
+            }
+        }
+    }
+    None
+}
+
+fn parse_observer_response_mode(raw: &str) -> Option<suggestion::ObserverResponseMode> {
+    let t = raw.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "accept" => Some(suggestion::ObserverResponseMode::Accept),
+        "override" => Some(suggestion::ObserverResponseMode::Override),
+        "defer" => Some(suggestion::ObserverResponseMode::Defer),
+        _ => None,
+    }
+}
+
+fn tool_call_matches_observer_suggestion(
+    call_name: &str,
+    call_args_json: &str,
+    primary: &suggestion::ObserverSuggestion,
+) -> bool {
+    let Some(tool) = primary.suggested_tool.as_deref() else {
+        return false;
+    };
+    if tool != call_name {
+        return false;
+    }
+    let expected = match primary.suggested_args.as_object() {
+        Some(obj) if !obj.is_empty() => obj,
+        _ => return true,
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(call_args_json).ok();
+    let Some(actual) = parsed.as_ref().and_then(|v| v.as_object()) else {
+        return false;
+    };
+    expected
+        .iter()
+        .all(|(key, value)| actual.get(key) == Some(value))
+}
+
+fn finalize_active_observer_contract(app: &mut App) {
+    let Some(env) = app.active_observer_contract.take() else {
+        app.active_observer_first_tool = None;
+        return;
+    };
+    let explicit = app
+        .coder
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::Assistant) && m.complete && !m.content.trim().is_empty())
+        .and_then(|m| explicit_observer_response_decision(&m.content));
+    let inferred = match (
+        suggestion::primary_suggestion(&env),
+        app.active_observer_first_tool.as_ref(),
+    ) {
+        (Some(primary), Some((tool, args)))
+            if tool_call_matches_observer_suggestion(tool, args, primary) =>
+        {
+            Some(suggestion::ObserverResponseMode::Accept)
+        }
+        (Some(_), Some(_)) => Some(suggestion::ObserverResponseMode::Override),
+        _ => None,
+    };
+    let decision = explicit
+        .or(inferred)
+        .unwrap_or(suggestion::ObserverResponseMode::Defer);
+    let focus = if env.response_contract.focus_axes.is_empty() {
+        "current blocker".to_string()
+    } else {
+        env.response_contract.focus_axes.join(", ")
+    };
+    let note = match decision {
+        suggestion::ObserverResponseMode::Accept => {
+            "(observer contract) coder accepted the latest observer suggestion."
+        }
+        suggestion::ObserverResponseMode::Override => {
+            "(observer contract) coder overrode the latest observer suggestion."
+        }
+        suggestion::ObserverResponseMode::Defer => {
+            "(observer contract) coder deferred the latest observer suggestion."
+        }
+    };
+    app.last_observer_contract_outcome = Some(format!(
+        "{} focus={} blocker={}",
+        decision.label(),
+        focus,
+        env.primary_blocker
+    ));
+    app.coder.push_tool(format!("{note} focus: {focus}"));
+    app.active_observer_first_tool = None;
 }
 
 fn handle_observer_token(token: StreamToken, app: &mut App) {
@@ -1671,6 +1787,7 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
         intent::apply_intent_update(app.coder_intent_anchor.as_ref(), intent_update, &text);
     let intent_anchor_message = intent::render_intent_anchor(&intent_anchor);
     let observer_soft_hint = app.pending_observer_hint.take();
+    let observer_contract = app.pending_observer_contract.take();
     if intent_anchor.requires_human_confirmation {
         app.coder.push_tool(
             "[intent] ambiguous update detected; keeping current scope until clarified."
@@ -1686,6 +1803,14 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
             "(observer suggestion) advisory applied to this coder continuation turn.".to_string(),
         );
     }
+    if observer_contract.is_some() {
+        app.coder.push_tool(
+            "(observer contract) next coder turn should explicitly accept, override, or defer the latest high-confidence observer suggestion."
+                .to_string(),
+        );
+    }
+    app.active_observer_contract = observer_contract.clone();
+    app.active_observer_first_tool = None;
 
     // Expand @file references: read files and collect system messages to inject.
     let at_refs = parse_at_refs(&text);
@@ -1729,6 +1854,9 @@ async fn send_coder_with_text(app: &mut App, tx: &mpsc::Sender<StreamToken>, tex
         &history,
         intent_anchor_message,
         observer_soft_hint,
+        observer_contract
+            .as_ref()
+            .map(build_observer_response_contract_message),
         &at_ref_messages,
         &text,
         persona_prompt,
@@ -1786,6 +1914,7 @@ fn build_coder_request_messages(
     history: &[ChatMessage],
     intent_anchor_message: String,
     observer_soft_hint: Option<String>,
+    observer_response_contract: Option<String>,
     at_ref_messages: &[ChatMessage],
     user_text: &str,
     persona_prompt: &str,
@@ -1803,6 +1932,12 @@ fn build_coder_request_messages(
         messages.push(ChatMessage {
             role: "system".to_string(),
             content: observer_hint,
+        });
+    }
+    if let Some(observer_contract) = observer_response_contract {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: observer_contract,
         });
     }
     let hist_len = history.len();
@@ -2367,6 +2502,17 @@ fn build_tui_next_action_prompt(
     let schema = json!({
         "summary": format!("{lang_name} summary of the blocker"),
         "primary_blocker": "missing_concrete_next_step",
+        "scores": {
+            "correctness": 0.82,
+            "security": 0.61,
+            "efficiency": 0.77,
+            "readability": 0.80
+        },
+        "response_contract": {
+            "required": true,
+            "focus_axes": ["security"],
+            "note": format!("{lang_name} note about when to accept, override, or defer")
+        },
         "suggestions": [{
             "kind": "read",
             "reason": format!("{lang_name} reason"),
@@ -2396,6 +2542,10 @@ Rules:\n\
 - If the blocker is instruction/harness/tooling, say so directly.\n\
 - Do not broaden into a full review.\n\
 - If evidence is weak, make quickest_check purely diagnostic.\n\
+- scores must be normalized 0..1 floats for: correctness, security, efficiency, readability\n\
+- response_contract.required should be true when the next coder turn must explicitly accept, override, or defer your primary suggestion\n\
+- response_contract.focus_axes should name the dimensions that most need attention (correctness|security|efficiency|readability)\n\
+- response_contract.note should briefly explain when override/defer is acceptable\n\
 - suggestions.kind must be exactly one of: search | read | done | clarify | abandon_path\n\
 - suggestions.suggested_args must be an object (or empty object)\n\
 - suggestions.based_on should cite coarse facts only: intent_anchor, recent_tool_results, recovery_stage, failure_kind\n\
@@ -2421,6 +2571,7 @@ pub(crate) struct TuiNextActionReplayOutcome {
     pub observer_raw_response: String,
     pub parsed_suggestion: Option<suggestion::ObserverSuggestionEnvelope>,
     pub pending_observer_hint: Option<String>,
+    pub pending_observer_contract: Option<suggestion::ObserverSuggestionEnvelope>,
     pub coder_preview_messages: Vec<ChatMessage>,
 }
 
@@ -2448,17 +2599,20 @@ fn finalize_observer_next_action_suggestion(app: &mut App) {
         }
         if let Some(hint) = build_observer_suggestion_soft_hint(&parsed) {
             app.pending_observer_hint = Some(hint);
+            app.pending_observer_contract = build_observer_response_contract(&parsed);
             app.coder.push_tool(
                 "(observer suggestion) queued an advisory next step for the next coder continuation."
                     .to_string(),
             );
         } else {
             app.pending_observer_hint = None;
+            app.pending_observer_contract = None;
         }
         app.last_observer_suggestion = Some(parsed);
     } else {
         app.last_observer_suggestion = None;
         app.pending_observer_hint = None;
+        app.pending_observer_contract = None;
         app.observer.push_tool(
             "(next-action) structured parse failed; raw Observer output was preserved.".to_string(),
         );
@@ -2491,6 +2645,7 @@ pub(crate) fn replay_observer_next_action_case(
     app.observer_next_action_mode = true;
     app.last_observer_suggestion = None;
     app.pending_observer_hint = None;
+    app.pending_observer_contract = None;
     app.ignore_observer_tokens = false;
     app.observer.streaming = true;
     app.observer
@@ -2513,6 +2668,7 @@ pub(crate) fn replay_observer_next_action_case(
         observer_raw_response: observer_response.to_string(),
         parsed_suggestion: app.last_observer_suggestion.clone(),
         pending_observer_hint: app.pending_observer_hint.clone(),
+        pending_observer_contract: app.pending_observer_contract.clone(),
         coder_preview_messages: preview_messages,
     })
 }
@@ -2533,6 +2689,9 @@ fn preview_coder_continuation_messages(app: &App, text: &str) -> Vec<ChatMessage
         &history,
         intent_anchor_message,
         app.pending_observer_hint.clone(),
+        app.pending_observer_contract
+            .as_ref()
+            .map(build_observer_response_contract_message),
         &[],
         text,
         persona_prompt,
@@ -2542,7 +2701,7 @@ fn preview_coder_continuation_messages(app: &App, text: &str) -> Vec<ChatMessage
 fn build_observer_suggestion_soft_hint(
     env: &suggestion::ObserverSuggestionEnvelope,
 ) -> Option<String> {
-    let primary = env.suggestions.first()?;
+    let primary = suggestion::primary_suggestion(env)?;
     if primary.confidence < 0.75 {
         return None;
     }
@@ -2570,6 +2729,64 @@ If you are still stuck, prefer this next step before widening search:\n\
 {action}\n\
 Why: {reason}"
     ))
+}
+
+fn build_observer_response_contract(
+    env: &suggestion::ObserverSuggestionEnvelope,
+) -> Option<suggestion::ObserverSuggestionEnvelope> {
+    let primary = suggestion::primary_suggestion(env)?;
+    if primary.confidence < 0.75 || !env.response_contract.required {
+        return None;
+    }
+    Some(env.clone())
+}
+
+fn build_observer_response_contract_message(
+    env: &suggestion::ObserverSuggestionEnvelope,
+) -> String {
+    let focus = if env.response_contract.focus_axes.is_empty() {
+        "current blocker".to_string()
+    } else {
+        env.response_contract.focus_axes.join(", ")
+    };
+    let quickest = if env.quickest_check.trim().is_empty() {
+        suggestion::primary_suggestion(env)
+            .map(|primary| {
+                if let Some(tool) = primary.suggested_tool.as_deref() {
+                    let args = render_observer_suggestion_args(&primary.suggested_args);
+                    if args.is_empty() {
+                        tool.to_string()
+                    } else {
+                        format!("{tool}({args})")
+                    }
+                } else {
+                    primary.reason.clone()
+                }
+            })
+            .unwrap_or_else(|| "the primary observer suggestion".to_string())
+    } else {
+        env.quickest_check.clone()
+    };
+    let note = if env.response_contract.note.is_empty() {
+        "If you do not follow the observer's next step on this turn, explicitly choose override or defer and give a short reason."
+            .to_string()
+    } else {
+        env.response_contract.note.clone()
+    };
+    format!(
+        "[Observer response contract]\n\
+On this coder turn, explicitly address the latest high-confidence observer suggestion before finishing.\n\
+Choose one: accept | override | defer.\n\
+If you accept, follow this next step: {quickest}\n\
+If you override, justify the divergence briefly and keep scope narrow.\n\
+If you defer, explain what missing evidence blocks action.\n\
+Focus axes: {focus}\n\
+Note: {note}\n\
+Suggested plain-text block:\n\
+[Observer response]\n\
+decision: accept|override|defer\n\
+reason: short justification"
+    )
 }
 
 fn render_observer_suggestion_args(args: &serde_json::Value) -> String {
@@ -2808,6 +3025,7 @@ async fn send_next_action_assist(
     app.observer_next_action_mode = true;
     app.last_observer_suggestion = None;
     app.pending_observer_hint = None;
+    app.pending_observer_contract = None;
     app.ignore_observer_tokens = false;
     app.observer_loop_retry_budget = 0;
     app.observer_loop_pending = None;
@@ -3069,6 +3287,8 @@ mod tests {
         let prompt = build_tui_next_action_prompt(&packet, "en", "missing_think");
         assert!(prompt.contains("Return JSON only."));
         assert!(prompt.contains("\"suggestions\""));
+        assert!(prompt.contains("\"scores\""));
+        assert!(prompt.contains("\"response_contract\""));
         assert!(prompt.contains("search | read | done | clarify | abandon_path"));
     }
 
@@ -3090,6 +3310,17 @@ mod tests {
         msg.content = serde_json::json!({
             "summary": "Coder has enough evidence and should read the prefs file directly.",
             "primary_blocker": "missing_concrete_next_step",
+            "scores": {
+                "correctness": 0.84,
+                "security": 0.62,
+                "efficiency": 0.79,
+                "readability": 0.81
+            },
+            "response_contract": {
+                "required": true,
+                "focus_axes": ["security"],
+                "note": "If you do not take the read step now, explicitly override or defer it."
+            },
             "suggestions": [{
                 "kind": "read",
                 "reason": "The latest search already narrowed the scope to prefs storage.",
@@ -3114,8 +3345,10 @@ mod tests {
             .expect("structured suggestion should be stored");
         assert_eq!(stored.primary_blocker, "missing_concrete_next_step");
         assert!(app.pending_observer_hint.is_some());
+        assert!(app.pending_observer_contract.is_some());
         let last = app.observer.messages.last().expect("observer response");
         assert!(last.content.contains("--- blocker ---"));
+        assert!(last.content.contains("--- scores ---"));
         assert!(last.content.contains("read_file(path=src/tui/prefs.rs)"));
     }
 
@@ -3124,6 +3357,8 @@ mod tests {
         let low = suggestion::ObserverSuggestionEnvelope {
             summary: "Need a better next step.".to_string(),
             primary_blocker: "missing_concrete_next_step".to_string(),
+            scores: suggestion::ObserverScoreVector::default(),
+            response_contract: suggestion::ObserverResponseContract::default(),
             suggestions: vec![suggestion::ObserverSuggestion {
                 kind: suggestion::ObserverSuggestionKind::Read,
                 reason: "Read the prefs file next.".to_string(),
@@ -3141,6 +3376,17 @@ mod tests {
         let high = suggestion::ObserverSuggestionEnvelope {
             summary: "The next step is clear.".to_string(),
             primary_blocker: "missing_concrete_next_step".to_string(),
+            scores: suggestion::ObserverScoreVector {
+                correctness: 0.84,
+                security: 0.62,
+                efficiency: 0.79,
+                readability: 0.81,
+            },
+            response_contract: suggestion::ObserverResponseContract {
+                required: true,
+                focus_axes: vec!["security".to_string()],
+                note: "Explicitly accept, override, or defer.".to_string(),
+            },
             suggestions: vec![suggestion::ObserverSuggestion {
                 kind: suggestion::ObserverSuggestionKind::Read,
                 reason: "Read the prefs file next.".to_string(),
@@ -3156,6 +3402,10 @@ mod tests {
         let hint = build_observer_suggestion_soft_hint(&high).expect("high-confidence hint");
         assert!(hint.contains("[Observer advisory"));
         assert!(hint.contains("read_file(path=src/tui/prefs.rs)"));
+        let contract = build_observer_response_contract(&high).expect("contract");
+        let contract_msg = build_observer_response_contract_message(&contract);
+        assert!(contract_msg.contains("[Observer response contract]"));
+        assert!(contract_msg.contains("accept | override | defer"));
     }
 
     #[test]
@@ -3174,6 +3424,7 @@ mod tests {
                 "[Observer advisory — soft hint only]\nPrefer read_file(path=src/tui/prefs.rs)."
                     .to_string(),
             ),
+            Some("[Observer response contract]\ndecision: accept|override|defer".to_string()),
             &[],
             "Continue.",
             "",
@@ -3181,6 +3432,76 @@ mod tests {
 
         assert!(messages.iter().any(|m| {
             m.role == "system" && m.content.contains("[Observer advisory — soft hint only]")
+        }));
+        assert!(messages
+            .iter()
+            .any(|m| { m.role == "system" && m.content.contains("[Observer response contract]") }));
+    }
+
+    #[test]
+    fn handle_coder_token_records_observer_contract_accept() {
+        let mut app = App::new(
+            test_cfg(Mode::Jikkyo),
+            test_cfg(Mode::Observer),
+            test_cfg(Mode::Chat),
+            None,
+            Some(isolated_prefs_root()),
+            false,
+            "en".to_string(),
+            None,
+        );
+        app.active_observer_contract = Some(suggestion::ObserverSuggestionEnvelope {
+            summary: "Read the prefs file next.".to_string(),
+            primary_blocker: "missing_concrete_next_step".to_string(),
+            scores: suggestion::ObserverScoreVector {
+                correctness: 0.84,
+                security: 0.62,
+                efficiency: 0.79,
+                readability: 0.81,
+            },
+            response_contract: suggestion::ObserverResponseContract {
+                required: true,
+                focus_axes: vec!["security".to_string()],
+                note: "Explicitly respond on this turn.".to_string(),
+            },
+            suggestions: vec![suggestion::ObserverSuggestion {
+                kind: suggestion::ObserverSuggestionKind::Read,
+                reason: "Read the prefs file next.".to_string(),
+                confidence: 0.92,
+                suggested_tool: Some("read_file".to_string()),
+                suggested_args: serde_json::json!({"path": "src/tui/prefs.rs"}),
+                based_on: vec!["recent_tool_results".to_string()],
+            }],
+            quickest_check: "read_file(path=src/tui/prefs.rs)".to_string(),
+            why_this_first: "It confirms the prefs storage path.".to_string(),
+            fallback: "Inspect events.rs next.".to_string(),
+        });
+        app.coder.streaming = true;
+        let mut msg = Message::new_streaming(Role::Assistant);
+        msg.content =
+            "[Observer response]\ndecision: accept\nreason: The read matches the current scope."
+                .to_string();
+        app.coder.messages.push(msg);
+
+        handle_coder_token(
+            StreamToken::ToolCall(crate::streaming::ToolCallData {
+                id: "tool-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "src/tui/prefs.rs"}).to_string(),
+            }),
+            &mut app,
+        );
+        handle_coder_token(StreamToken::Done, &mut app);
+
+        assert!(app.active_observer_contract.is_none());
+        assert_eq!(
+            app.last_observer_contract_outcome.as_deref(),
+            Some("accept focus=security blocker=missing_concrete_next_step")
+        );
+        assert!(app.coder.messages.iter().any(|m| {
+            matches!(m.role, Role::Tool)
+                && m.content
+                    .contains("accepted the latest observer suggestion")
         }));
     }
 

@@ -3,7 +3,8 @@
   "defaults": {
     "tool_root": ".",
     "lang": "en",
-    "max_iters": 8
+    "max_iters": 8,
+    "copy_tool_root": false
   },
   "cases": [
     {
@@ -37,6 +38,83 @@
         { "kind": "error_free" },
         { "kind": "tool_call_seen", "name": "read_file" },
         { "kind": "assistant_contains", "value": "src/tui/agent.rs" }
+      ]
+    },
+    {
+      "id": "sandbox-config-alias-loading",
+      "tool_root": "tests/fixtures/mini-rust-cli",
+      "tags": ["sandbox", "rust", "config", "read-only"],
+      "prompt": "Locate where project-local profile aliases are loaded for the greet command. Do not edit anything. Final answer must include the main file path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "assistant_contains", "value": "src/config.rs" }
+      ]
+    },
+    {
+      "id": "create-single-file",
+      "tool_root": "tests/fixtures/runtime-create-file",
+      "copy_tool_root": true,
+      "max_iters": 14,
+      "tags": ["action", "create", "file"],
+      "prompt": "Create `notes/todo.txt` containing exactly `ship it`. Verify it before you finish. Final answer must include the created file path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "write_file" },
+        { "kind": "assistant_contains", "value": "notes/todo.txt" },
+        { "kind": "trace_event_seen", "event": "task_harness" }
+      ]
+    },
+    {
+      "id": "init-repo-artifact",
+      "tool_root": "tests/fixtures/runtime-init-repo",
+      "copy_tool_root": true,
+      "max_iters": 14,
+      "tags": ["action", "repo", "init"],
+      "prompt": "Create a new git repo in `demo_repo/` with a README.md and `.gitignore`. Verify those artifacts before you finish. Final answer must include the repo path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "exec" },
+        { "kind": "tool_call_seen", "name": "write_file" },
+        { "kind": "assistant_contains", "value": "demo_repo" },
+        { "kind": "assistant_contains", "value": ".gitignore" },
+        { "kind": "trace_event_seen", "event": "task_harness" },
+        { "kind": "trace_event_seen", "event": "meta_harness_policy" },
+        { "kind": "trace_event_seen", "event": "evaluator_loop" }
+      ]
+    },
+    {
+      "id": "fix-failing-rust-test",
+      "tool_root": "tests/fixtures/runtime-fix-rust",
+      "copy_tool_root": true,
+      "max_iters": 14,
+      "tags": ["action", "fix", "rust", "tests"],
+      "prompt": "Fix the failing test with the smallest code change. Run tests before you finish. Final answer must include the changed file path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "tool_call_seen", "name": "patch_file" },
+        { "kind": "trace_event_seen", "event": "task_harness" }
+      ]
+    },
+    {
+      "id": "resume-session-bridge-fix",
+      "tool_root": "tests/fixtures/runtime-fix-rust",
+      "session_seed": "session_bridge_resume_seed.json",
+      "copy_tool_root": true,
+      "max_iters": 6,
+      "tags": ["action", "resume", "session", "bridge", "rust"],
+      "prompt": "Continue from the previous session state. Finish the smallest safe fix and run tests before you finish. Final answer must include the changed file path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "trace_event_seen", "event": "session_bridge_prompted" },
+        { "kind": "tool_call_seen", "name": "patch_file" },
+        { "kind": "assistant_contains", "value": "src/lib.rs" }
       ]
     }
   ]

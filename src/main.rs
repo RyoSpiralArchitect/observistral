@@ -14,6 +14,7 @@ mod pending_edits;
 mod personas;
 mod project;
 mod providers;
+mod reflection_ledger;
 mod repl;
 mod repo_map;
 mod runtime_eval;
@@ -1166,6 +1167,7 @@ fn build_inventory_state(root: &Path) -> Result<serde_json::Value> {
     let state_schema_path = root.join("docs/state-schema.md");
     let session_example_path = root.join(".tmp/obstral_session.json");
     let prefs_path = root.join(".obstral/tui_prefs.json");
+    let reflection_ledger_path = root.join(".obstral/reflection_ledger.json");
     let runtime_spec_path = root.join(".obstral/runtime_eval.json");
     let replay_spec_path = root.join(".obstral/tui_replay.json");
 
@@ -1201,6 +1203,17 @@ fn build_inventory_state(root: &Path) -> Result<serde_json::Value> {
             "owner_present": root.join("src/agent_session.rs").exists(),
             "backing_present": session_example_path.exists(),
             "status": if root.join("src/agent_session.rs").exists() { "implemented" } else { "missing" },
+        }),
+        json!({
+            "key": "reflection_ledger",
+            "owner": "src/reflection_ledger.rs",
+            "lifetime": "cross-session",
+            "backing_store": ".obstral/reflection_ledger.json",
+            "persisted": true,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/reflection_ledger.rs").exists(),
+            "backing_present": reflection_ledger_path.exists(),
+            "status": if root.join("src/reflection_ledger.rs").exists() && reflection_ledger_path.exists() { "implemented" } else if root.join("src/reflection_ledger.rs").exists() { "partial" } else { "missing" },
         }),
         json!({
             "key": "in_memory_app",
@@ -2292,6 +2305,7 @@ async fn run_agent_with_behavior(
     let mut start_checkpoint: Option<String> = None;
     let mut start_cwd: Option<String> = None;
     let mut start_observation_cache: Option<crate::agent_session::ObservationCache> = None;
+    let mut start_session_bridge: Option<crate::agent_session::SessionBridge> = None;
     let mut create_checkpoint = true;
     let mut resuming = false;
 
@@ -2314,6 +2328,7 @@ async fn run_agent_with_behavior(
             start_checkpoint = sess.checkpoint.clone();
             start_cwd = sess.cur_cwd.clone();
             start_observation_cache = sess.observation_cache.clone();
+            start_session_bridge = sess.session_bridge.clone();
             create_checkpoint = sess.checkpoint.is_none();
             start_messages_json = Some(std::mem::take(&mut sess.messages));
             loaded_session = Some(sess);
@@ -2572,6 +2587,7 @@ async fn run_agent_with_behavior(
             checkpoint: checkpoint.clone(),
             cur_cwd: cur_cwd.clone(),
             observation_cache: start_observation_cache.clone(),
+            session_bridge: start_session_bridge.clone(),
             create_checkpoint: create_checkpoint_round,
         };
         create_checkpoint_round = false;
@@ -2704,6 +2720,7 @@ async fn run_agent_with_behavior(
         cur_cwd = end_state.cur_cwd;
         checkpoint = checkpoint.or(end_state.checkpoint);
         start_observation_cache = end_state.observation_cache;
+        start_session_bridge = crate::agent_session::session_bridge_from_messages(&messages_json);
         if let Some(ref tw) = trace {
             let last_reflection =
                 crate::agent_session::last_reflection_summary_from_messages(&messages_json);
@@ -2907,11 +2924,40 @@ fn resolve_eval_path(path: PathBuf, base_dir: &std::path::Path) -> PathBuf {
     }
 }
 
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dst)
+        .with_context(|| format!("failed to create eval case dir: {}", dst.display()))?;
+    let rd = std::fs::read_dir(src)
+        .with_context(|| format!("failed to read eval fixture dir: {}", src.display()))?;
+    for entry in rd {
+        let entry =
+            entry.with_context(|| format!("failed to read entry under {}", src.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to read file type for {}", entry.path().display()))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&from, &to).with_context(|| {
+                format!(
+                    "failed to copy eval fixture file {} -> {}",
+                    from.display(),
+                    to.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn resolve_eval_case_root(
+    case_dir: &std::path::Path,
     base_root: &std::path::Path,
     defaults: &crate::runtime_eval::RuntimeEvalDefaults,
     case: &crate::runtime_eval::RuntimeEvalCase,
-) -> String {
+) -> Result<String> {
     let raw = case
         .tool_root
         .as_deref()
@@ -2925,8 +2971,36 @@ fn resolve_eval_case_root(
             base_root.join(pb)
         }
     };
-    normalize_tool_root(Some(root.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+    let should_copy = case.copy_tool_root.unwrap_or(defaults.copy_tool_root);
+    let effective_root = if should_copy {
+        let copied_root = case_dir.join("tool_root");
+        if root.exists() {
+            copy_dir_recursive(&root, &copied_root)?;
+        } else {
+            std::fs::create_dir_all(&copied_root).with_context(|| {
+                format!(
+                    "failed to create copied eval tool_root: {}",
+                    copied_root.display()
+                )
+            })?;
+        }
+        copied_root
+    } else {
+        root
+    };
+    Ok(
+        normalize_tool_root(Some(effective_root.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| effective_root.to_string_lossy().into_owned()),
+    )
+}
+
+fn resolve_eval_session_seed(case_root: &str, seed: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(seed);
+    if path.is_absolute() {
+        path
+    } else {
+        std::path::PathBuf::from(case_root).join(path)
+    }
 }
 
 async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
@@ -3012,7 +3086,18 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
         let session_path = case_dir.join("session.json");
         let json_path = case_dir.join("final.json");
         let graph_path = case_dir.join("graph.json");
-        let case_root = resolve_eval_case_root(&base_root_path, &spec_data.defaults, case);
+        let case_root =
+            resolve_eval_case_root(&case_dir, &base_root_path, &spec_data.defaults, case)?;
+        if let Some(seed) = case.session_seed.as_deref() {
+            let seed_path = resolve_eval_session_seed(&case_root, seed);
+            std::fs::copy(&seed_path, &session_path).with_context(|| {
+                format!(
+                    "failed to copy runtime eval session seed {} -> {}",
+                    seed_path.display(),
+                    session_path.display()
+                )
+            })?;
+        }
         let case_lang = case
             .lang
             .clone()
@@ -3035,7 +3120,7 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
                 no_command_approval: false,
                 no_edit_approval: false,
                 session: Some(session_path.clone()),
-                new_session: true,
+                new_session: case.session_seed.is_none(),
                 autofix: case_autofix,
                 trace_out: Some(trace_path.clone()),
                 json_out: Some(json_path.clone()),
