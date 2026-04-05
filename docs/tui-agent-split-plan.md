@@ -100,6 +100,20 @@ Reason:
 - it should stay auditable and testable without growing the main loop
 - action-task harnessing is now a distinct policy surface with its own eval cases
 
+### 7. `src/tui/agent/meta_harness.rs`
+
+Move:
+
+- trace-derived failure pattern detection
+- typed policy deltas such as `mutate_now` / `create_artifact_now`
+- runtime-updated harness prompts that tighten behavior after loops drift
+
+Reason:
+
+- this is the bridge between replay/eval evidence and live orchestration policy
+- it should stay deterministic and auditable before any future evaluator-agent loop
+- it lets the runtime change its own guardrails without growing `agent.rs`
+
 ## Suggested extraction order
 
 1. `done_gate.rs`
@@ -107,7 +121,8 @@ Reason:
 3. `provider_compat.rs`
 4. `memory.rs`
 5. `task_harness.rs`
-6. optional `telemetry.rs` if loop instrumentation keeps growing
+6. `meta_harness.rs`
+7. optional `telemetry.rs` if loop instrumentation keeps growing
 
 This order minimizes risk because the first two already have strong eval/replay
 pressure and the clearest ownership boundaries.

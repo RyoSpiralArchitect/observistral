@@ -44,6 +44,7 @@ use std::path::Path;
 
 mod done_gate;
 mod memory;
+mod meta_harness;
 mod provider_compat;
 mod read_only;
 mod task_harness;
@@ -61,6 +62,7 @@ use self::memory::{
     remember_recent_unique, remember_repo_map_resolution, rewrite_tool_call_with_resolution,
     ObservationEvidence, ObservationReadEvidence, ObservationSearchEvidence,
 };
+use self::meta_harness::MetaHarness;
 #[cfg(test)]
 use self::provider_compat::compat_synthetic_think;
 use self::provider_compat::{
@@ -4642,6 +4644,7 @@ struct DoneAcceptanceEvidence {
 struct StablePromptCache {
     resolver_hash: Option<u64>,
     task_harness_hash: Option<u64>,
+    meta_harness_hash: Option<u64>,
     task_contract_hash: Option<u64>,
     working_memory_hash: Option<u64>,
     assumption_ledger_hash: Option<u64>,
@@ -8681,6 +8684,25 @@ This is the LAST model call for this run.\n\
                 ),
             ),
         }));
+
+        let meta_harness =
+            MetaHarness::analyze(task_harness, &messages, recovery.stage, test_cmd.as_deref());
+        if let Some(telemetry) = meta_harness.telemetry_payload() {
+            emit_telemetry_event(&tx, "meta_harness_policy", telemetry).await;
+        }
+        if let Some(meta_prompt) = meta_harness.prompt() {
+            let compact_prompt = meta_harness
+                .compact_prompt()
+                .unwrap_or_else(|| meta_prompt.clone());
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": render_cached_prompt(
+                    &mut prompt_cache.meta_harness_hash,
+                    meta_prompt,
+                    compact_prompt,
+                ),
+            }));
+        }
 
         let harness_prompt = task_harness.prompt(test_cmd.as_deref());
         msgs_for_call.push(json!({

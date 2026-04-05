@@ -81,7 +81,8 @@
         { "kind": "tool_call_seen", "name": "write_file" },
         { "kind": "assistant_contains", "value": "demo_repo" },
         { "kind": "assistant_contains", "value": ".gitignore" },
-        { "kind": "trace_event_seen", "event": "task_harness" }
+        { "kind": "trace_event_seen", "event": "task_harness" },
+        { "kind": "trace_event_seen", "event": "meta_harness_policy" }
       ]
     },
     {
