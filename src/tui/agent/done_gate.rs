@@ -428,16 +428,44 @@ pub(super) fn canonicalize_known_acceptance_commands(
     known_commands: &[String],
     evidence: &ObservationEvidence,
 ) -> Vec<String> {
-    known_commands.iter().fold(Vec::new(), |mut acc, command| {
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+
+    for command in known_commands {
+        let display = compact_one_line(command.as_str(), 200);
+        if display == "-" {
+            continue;
+        }
         let canonical = canonicalize_evidence_command_with_resolution(command.as_str(), evidence);
-        let chosen = if canonical.is_empty() {
-            compact_one_line(command.as_str(), 200)
+        let sig = if canonical.is_empty() {
+            normalize_memory_entry(display.as_str())
         } else {
-            canonical
+            normalize_memory_entry(canonical.as_str())
         };
-        remember_recent_unique(&mut acc, chosen.as_str(), 16, 200);
-        acc
-    })
+        if sig.is_empty() {
+            continue;
+        }
+        let shown = if !canonical.is_empty()
+            && parse_named_command_signature(canonical.as_str()).is_some()
+        {
+            canonical
+        } else {
+            display
+        };
+        if let Some(pos) = seen.iter().position(|existing| existing == &sig) {
+            seen.remove(pos);
+            out.remove(pos);
+        }
+        seen.push(sig);
+        out.push(shown);
+        if out.len() > 16 {
+            let drop_n = out.len() - 16;
+            out.drain(0..drop_n);
+            seen.drain(0..drop_n);
+        }
+    }
+
+    out
 }
 
 fn resolve_known_acceptance_command<'a>(
@@ -1631,5 +1659,6 @@ mod tests {
         assert!(final_text.contains("demo_repo/.gitignore"));
         assert!(final_text.contains("Acceptance:"));
         assert!(final_text.contains("test -d demo_repo/.git"));
+        assert!(final_text.contains("README.md"));
     }
 }
