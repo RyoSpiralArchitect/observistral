@@ -1026,6 +1026,65 @@ pub(super) fn synthesize_action_done_summary(
     })
 }
 
+pub(super) fn maybe_build_verified_action_auto_final_answer(
+    plan: Option<&PlanBlock>,
+    messages: &[serde_json::Value],
+    known_commands: &[String],
+    observation_evidence: &ObservationEvidence,
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+    last_mutation_step: Option<usize>,
+    last_verify_ok_step: Option<usize>,
+) -> Option<String> {
+    let plan = plan?;
+    let (completed_acceptance, remaining_acceptance, acceptance_evidence) =
+        rescue_invalid_done_payload_for_verified_action(
+            Some(plan),
+            known_commands,
+            observation_evidence,
+            required_verification,
+            test_cmd,
+            last_mutation_step,
+            last_verify_ok_step,
+        )?;
+    let evidence_rows = validate_done_acceptance(
+        Some(plan),
+        &completed_acceptance,
+        &remaining_acceptance,
+        &acceptance_evidence,
+        known_commands,
+        observation_evidence,
+    )
+    .ok()?;
+    let evidence_by_idx: std::collections::HashMap<usize, String> =
+        evidence_rows.into_iter().collect();
+    let summary = synthesize_action_done_summary(Some(plan), messages).unwrap_or_default();
+
+    let mut final_text = String::from("[DONE]\n");
+    if !summary.is_empty() {
+        final_text.push_str(summary.as_str());
+    }
+    final_text.push_str("\n\nAcceptance:\n");
+    for item in &completed_acceptance {
+        let idx = resolve_acceptance_reference(item, plan)?;
+        final_text.push_str("- done: ");
+        final_text.push_str(acceptance_reference_label(plan, idx).as_str());
+        if let Some(command) = evidence_by_idx.get(&idx) {
+            final_text.push_str(" via `");
+            final_text.push_str(command.as_str());
+            final_text.push('`');
+        }
+        final_text.push('\n');
+    }
+    for item in &remaining_acceptance {
+        let idx = resolve_acceptance_reference(item, plan)?;
+        final_text.push_str("- remaining: ");
+        final_text.push_str(acceptance_reference_label(plan, idx).as_str());
+        final_text.push('\n');
+    }
+    Some(final_text)
+}
+
 pub(super) fn rescue_invalid_done_payload_for_verified_action(
     plan: Option<&PlanBlock>,
     known_commands: &[String],
@@ -1520,5 +1579,57 @@ mod tests {
         let summary = synthesize_action_done_summary(None, &messages).expect("summary");
         assert!(summary.contains("notes/todo.txt"));
         assert!(summary.contains("Created"));
+    }
+
+    #[test]
+    fn verified_action_auto_final_answer_uses_repo_artifact_evidence() {
+        let plan = PlanBlock {
+            goal: "Create a new git repo in demo_repo with starter files.".to_string(),
+            steps: vec![
+                "create demo_repo".to_string(),
+                "verify repo artifacts".to_string(),
+                "call done".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested artifact is created and confirmed by a passing build/check/lint verification command".to_string(),
+                "the final result cites the exact passing build/check/lint verification command".to_string(),
+            ],
+            risks: "wrong path".to_string(),
+            assumptions: "the configured verification command is relevant".to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_write",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments":"{\"path\":\"demo_repo/.gitignore\",\"content\":\"target/\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_write",
+                "content": "OK: wrote 'demo_repo/.gitignore' (1 lines, 8 bytes)\n[auto-test] ✓ PASSED (exit 0)"
+            }),
+        ];
+
+        let final_text = maybe_build_verified_action_auto_final_answer(
+            Some(&plan),
+            &messages,
+            &["test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore".to_string()],
+            &ObservationEvidence::default(),
+            VerificationLevel::Build,
+            Some("test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore"),
+            Some(6),
+            Some(6),
+        )
+        .expect("auto final");
+
+        assert!(final_text.contains("demo_repo/.gitignore"));
+        assert!(final_text.contains("Acceptance:"));
+        assert!(final_text.contains("test -d demo_repo/.git"));
     }
 }

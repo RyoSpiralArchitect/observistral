@@ -52,8 +52,9 @@ use self::done_gate::{
     build_read_only_completion_hint, build_read_only_evidence_scores,
     build_read_only_iteration_cap_final_answer, build_read_only_strong_final_answer,
     canonicalize_known_acceptance_commands, maybe_build_read_only_auto_final_answer,
-    rescue_invalid_done_payload_for_verified_action, should_prefer_done_after_verified_action,
-    synthesize_action_done_summary, validate_done_acceptance,
+    maybe_build_verified_action_auto_final_answer, rescue_invalid_done_payload_for_verified_action,
+    should_prefer_done_after_verified_action, synthesize_action_done_summary,
+    validate_done_acceptance,
 };
 use self::memory::{
     canonicalize_evidence_command_with_resolution, normalize_memory_entry, normalize_path_alias,
@@ -13772,6 +13773,7 @@ Action required: call read_file(path) first to confirm current contents, then re
                 state
             )))
             .await;
+        let _ = tx.send(StreamToken::ToolCall(tc.clone())).await;
 
         if let Some(block) = should_block_git_landmines(&command, tool_root_abs.as_deref()) {
             state = AgentState::Recovery;
@@ -14190,6 +14192,36 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
                 )))
                 .await;
         }
+    }
+
+    if let Some(final_text) = maybe_build_verified_action_auto_final_answer(
+        active_plan.as_ref(),
+        &messages,
+        &canonicalize_known_acceptance_commands(
+            &collect_known_acceptance_commands(&messages, &working_mem),
+            &observation_evidence,
+        ),
+        &observation_evidence,
+        required_verification,
+        test_cmd.as_deref(),
+        last_mutation_step,
+        last_verify_ok_step,
+    ) {
+        messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+        autosave_best_effort(
+            &autosaver,
+            &tx,
+            tool_root_abs.as_deref(),
+            checkpoint.as_deref(),
+            cur_cwd.as_deref(),
+            &messages,
+        )
+        .await;
+        let _ = tx
+            .send(StreamToken::Delta(format!(
+                "\n[agent] auto-finalized verified action task at session end.\n\n{final_text}\n"
+            )))
+            .await;
     }
 
     if realize_cfg.enabled {
