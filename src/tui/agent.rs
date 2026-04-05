@@ -85,7 +85,7 @@ use self::read_only::{
 use self::task_harness::{
     allows_artifact_creation_during_diagnose, allows_artifact_creation_during_verify,
     build_fix_stage_progress_hint, build_progress_gate_block, coerce_artifact_creation_tool_call,
-    coerce_repo_goal_completion_tool_call, TaskHarness,
+    coerce_repo_goal_completion_tool_call, repair_repo_scaffold_write_tool_call, TaskHarness,
 };
 
 #[derive(Debug, Clone)]
@@ -9341,6 +9341,35 @@ Execute only the new minimal action: {}",
                         "to": coerced,
                         "tool": rewritten.name,
                         "reason": "goal_check_missing_repo_git",
+                    }),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) = repair_repo_scaffold_write_tool_call(
+                task_harness,
+                &messages,
+                tc,
+                test_cmd.as_deref(),
+            ) {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[task_harness] repaired malformed repo scaffold write: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "task_harness_tool_coercion",
+                    json!({
+                        "lane": task_harness.lane_label(),
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                        "reason": "repair_repo_scaffold_write",
                     }),
                 )
                 .await;
