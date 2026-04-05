@@ -39,6 +39,8 @@ pub struct RuntimeEvalCase {
     #[serde(default)]
     pub tool_root: Option<String>,
     #[serde(default)]
+    pub session_seed: Option<String>,
+    #[serde(default)]
     pub copy_tool_root: Option<bool>,
     #[serde(default)]
     pub lang: Option<String>,
@@ -733,7 +735,8 @@ mod tests {
                 {
                     "id": "copy-case",
                     "prompt": "do work",
-                    "copy_tool_root": false
+                    "copy_tool_root": false,
+                    "session_seed": "seed-session.json"
                 }
             ]
         }))
@@ -741,6 +744,10 @@ mod tests {
 
         assert!(spec.defaults.copy_tool_root);
         assert_eq!(spec.cases[0].copy_tool_root, Some(false));
+        assert_eq!(
+            spec.cases[0].session_seed.as_deref(),
+            Some("seed-session.json")
+        );
     }
 
     #[test]
@@ -794,6 +801,7 @@ mod tests {
             id: "realize-events".to_string(),
             prompt: "locate slash command".to_string(),
             tool_root: None,
+            session_seed: None,
             copy_tool_root: None,
             lang: None,
             max_iters: None,
@@ -881,6 +889,7 @@ mod tests {
             id: "broken".to_string(),
             prompt: "x".to_string(),
             tool_root: None,
+            session_seed: None,
             copy_tool_root: None,
             lang: None,
             max_iters: None,

@@ -2994,6 +2994,15 @@ fn resolve_eval_case_root(
     )
 }
 
+fn resolve_eval_session_seed(case_root: &str, seed: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(seed);
+    if path.is_absolute() {
+        path
+    } else {
+        std::path::PathBuf::from(case_root).join(path)
+    }
+}
+
 async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
     let EvalArgs {
         tool_root,
@@ -3079,6 +3088,16 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
         let graph_path = case_dir.join("graph.json");
         let case_root =
             resolve_eval_case_root(&case_dir, &base_root_path, &spec_data.defaults, case)?;
+        if let Some(seed) = case.session_seed.as_deref() {
+            let seed_path = resolve_eval_session_seed(&case_root, seed);
+            std::fs::copy(&seed_path, &session_path).with_context(|| {
+                format!(
+                    "failed to copy runtime eval session seed {} -> {}",
+                    seed_path.display(),
+                    session_path.display()
+                )
+            })?;
+        }
         let case_lang = case
             .lang
             .clone()
@@ -3101,7 +3120,7 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
                 no_command_approval: false,
                 no_edit_approval: false,
                 session: Some(session_path.clone()),
-                new_session: true,
+                new_session: case.session_seed.is_none(),
                 autofix: case_autofix,
                 trace_out: Some(trace_path.clone()),
                 json_out: Some(json_path.clone()),

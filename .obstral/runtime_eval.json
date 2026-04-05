@@ -100,6 +100,22 @@
         { "kind": "tool_call_seen", "name": "patch_file" },
         { "kind": "trace_event_seen", "event": "task_harness" }
       ]
+    },
+    {
+      "id": "resume-session-bridge-fix",
+      "tool_root": "tests/fixtures/runtime-fix-rust",
+      "session_seed": "session_bridge_resume_seed.json",
+      "copy_tool_root": true,
+      "max_iters": 6,
+      "tags": ["action", "resume", "session", "bridge", "rust"],
+      "prompt": "Continue from the previous session state. Finish the smallest safe fix and run tests before you finish. Final answer must include the changed file path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "trace_event_seen", "event": "session_bridge_prompted" },
+        { "kind": "tool_call_seen", "name": "patch_file" },
+        { "kind": "assistant_contains", "value": "src/lib.rs" }
+      ]
     }
   ]
 }

@@ -211,6 +211,9 @@ Owns:
 This layer should never become a substitute for runtime state. It is the place
 to measure behavior, not to drive live orchestration.
 
+Runtime eval cases may seed `session.json` when a regression only appears after
+resume. Keep those seed sessions small, typed, and reviewable.
+
 ## Rules for adding new state
 
 Before adding a field, answer these questions:
