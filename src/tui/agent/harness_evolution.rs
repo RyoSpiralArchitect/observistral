@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 const MAX_PROPOSALS: usize = 16;
+const MAX_PROMOTED_POLICIES: usize = 16;
 
 fn now_ms() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -140,13 +141,13 @@ pub(super) struct ProposalUpdate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct HarnessEvolutionQueue {
+pub(crate) struct HarnessEvolutionQueue {
     #[serde(default = "default_version")]
     pub version: u32,
     #[serde(default)]
     pub updated_at_ms: u128,
     #[serde(default)]
-    pub proposals: Vec<ContractPatchProposal>,
+    proposals: Vec<ContractPatchProposal>,
 }
 
 fn default_version() -> u32 {
@@ -155,6 +156,10 @@ fn default_version() -> u32 {
 
 impl HarnessEvolutionQueue {
     pub const VERSION: u32 = 1;
+
+    pub(crate) fn proposal_count(&self) -> usize {
+        self.proposals.len()
+    }
 
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
@@ -326,6 +331,297 @@ pub(super) struct RuntimePolicyOverlay {
     pub promotion_ready_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PromotedPolicyPatch {
+    pub id: String,
+    pub policy_id: String,
+    pub lane: String,
+    pub artifact_mode: String,
+    pub pattern: String,
+    pub policy_action: String,
+    pub required_action: String,
+    pub preferred_tools: Vec<String>,
+    pub blocked_tools: Vec<String>,
+    pub blocked_scope: String,
+    #[serde(default)]
+    pub blocked_command_display: Option<String>,
+    #[serde(default)]
+    pub next_target: Option<String>,
+    pub exit_hint: String,
+    #[serde(default)]
+    pub support_note: Option<String>,
+    #[serde(default)]
+    pub evidence_count: usize,
+    #[serde(default)]
+    pub seen_count: u32,
+    #[serde(default)]
+    pub applied_count: u32,
+    #[serde(default)]
+    pub green_case_ids: Vec<String>,
+    #[serde(default)]
+    pub promoted_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct GovernorContractOverlay {
+    #[serde(default = "default_overlay_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub updated_at_ms: u128,
+    #[serde(default)]
+    pub promoted_policies: Vec<PromotedPolicyPatch>,
+}
+
+fn default_overlay_version() -> u32 {
+    1
+}
+
+impl GovernorContractOverlay {
+    pub const VERSION: u32 = 1;
+
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "failed to read governor contract overlay: {}",
+                path.display()
+            )
+        })?;
+        let mut overlay: Self = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "failed to parse governor contract overlay: {}",
+                path.display()
+            )
+        })?;
+        if overlay.version != Self::VERSION {
+            anyhow::bail!(
+                "unsupported governor contract overlay version {} (expected {})",
+                overlay.version,
+                Self::VERSION
+            );
+        }
+        overlay.sort_entries();
+        Ok(overlay)
+    }
+
+    pub fn save_atomic(&self, path: &Path) -> Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .context("failed to serialize governor contract overlay")?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create governor contract overlay dir: {}",
+                parent.display()
+            )
+        })?;
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, json.as_bytes()).with_context(|| {
+            format!(
+                "failed to write temp governor contract overlay: {}",
+                tmp.display()
+            )
+        })?;
+        std::fs::rename(&tmp, path).with_context(|| {
+            format!(
+                "failed to replace governor contract overlay {} -> {}",
+                tmp.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn promote_from_queue(
+        &mut self,
+        queue: &HarnessEvolutionQueue,
+        case_id: &str,
+    ) -> bool {
+        let now = now_ms();
+        let mut changed = false;
+        for proposal in queue
+            .proposals
+            .iter()
+            .filter(|proposal| proposal.promotion_ready)
+        {
+            if let Some(existing) = self
+                .promoted_policies
+                .iter_mut()
+                .find(|policy| policy.id == proposal.id)
+            {
+                existing.policy_id = proposal.policy_id.clone();
+                existing.lane = proposal.lane.clone();
+                existing.artifact_mode = proposal.artifact_mode.clone();
+                existing.pattern = proposal.pattern.clone();
+                existing.policy_action = proposal.policy_action.clone();
+                existing.required_action = proposal.required_action.clone();
+                existing.preferred_tools = proposal.preferred_tools.clone();
+                existing.blocked_tools = proposal.blocked_tools.clone();
+                existing.blocked_scope = proposal.blocked_scope.clone();
+                existing.blocked_command_display = proposal.blocked_command_display.clone();
+                existing.next_target = proposal.next_target.clone();
+                existing.exit_hint = proposal.exit_hint.clone();
+                existing.support_note = proposal.support_note.clone();
+                existing.evidence_count = existing.evidence_count.max(proposal.evidence_count);
+                existing.seen_count = existing.seen_count.max(proposal.seen_count);
+                existing.applied_count = existing.applied_count.max(proposal.applied_count);
+                if !existing.green_case_ids.iter().any(|id| id == case_id) {
+                    existing.green_case_ids.push(case_id.to_string());
+                    existing.green_case_ids.sort();
+                }
+                existing.promoted_at_ms = now;
+                changed = true;
+            } else {
+                self.promoted_policies.push(PromotedPolicyPatch {
+                    id: proposal.id.clone(),
+                    policy_id: proposal.policy_id.clone(),
+                    lane: proposal.lane.clone(),
+                    artifact_mode: proposal.artifact_mode.clone(),
+                    pattern: proposal.pattern.clone(),
+                    policy_action: proposal.policy_action.clone(),
+                    required_action: proposal.required_action.clone(),
+                    preferred_tools: proposal.preferred_tools.clone(),
+                    blocked_tools: proposal.blocked_tools.clone(),
+                    blocked_scope: proposal.blocked_scope.clone(),
+                    blocked_command_display: proposal.blocked_command_display.clone(),
+                    next_target: proposal.next_target.clone(),
+                    exit_hint: proposal.exit_hint.clone(),
+                    support_note: proposal.support_note.clone(),
+                    evidence_count: proposal.evidence_count,
+                    seen_count: proposal.seen_count,
+                    applied_count: proposal.applied_count,
+                    green_case_ids: vec![case_id.to_string()],
+                    promoted_at_ms: now,
+                });
+                changed = true;
+            }
+        }
+        if changed {
+            self.updated_at_ms = now;
+            self.sort_entries();
+        }
+        changed
+    }
+
+    pub(super) fn telemetry_payload(&self, task_harness: TaskHarness) -> Option<Value> {
+        let lane = task_harness.lane_label();
+        let active_count = self
+            .promoted_policies
+            .iter()
+            .filter(|policy| policy.lane == lane)
+            .count();
+        if active_count == 0 {
+            return None;
+        }
+        Some(serde_json::json!({
+            "lane": lane,
+            "active_count": active_count,
+            "promoted_policies": self.promoted_policies.len(),
+        }))
+    }
+
+    pub(super) fn prompt(&self, task_harness: TaskHarness) -> Option<String> {
+        let lane = task_harness.lane_label();
+        let mut entries: Vec<&PromotedPolicyPatch> = self
+            .promoted_policies
+            .iter()
+            .filter(|policy| policy.lane == lane)
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        entries.sort_by_key(|policy| {
+            (
+                std::cmp::Reverse(policy.green_case_ids.len()),
+                std::cmp::Reverse(policy.seen_count),
+                std::cmp::Reverse(policy.applied_count),
+                std::cmp::Reverse(policy.promoted_at_ms),
+            )
+        });
+        entries.truncate(2);
+        let mut full = String::from("[Harness Evolution Promoted Overlay]\n");
+        full.push_str(
+            "These guardrails were promoted after passing runtime eval cases.\n\
+Treat them as high-confidence defaults unless current tool output contradicts them.\n",
+        );
+        for policy in entries {
+            full.push_str(&format!(
+                "- promoted_id: {}\n  policy_id: {}\n  pattern: {}\n  action: {}\n  required_now: {}\n  preferred_tools: {}\n  blocked_tools: {}\n  blocked_scope: {}\n  exit_hint: {}\n  green_cases: {}\n",
+                policy.id,
+                policy.policy_id,
+                policy.pattern,
+                policy.policy_action,
+                compact_one_line(policy.required_action.as_str(), 180),
+                policy.preferred_tools.join(", "),
+                policy.blocked_tools.join(", "),
+                policy.blocked_scope,
+                compact_one_line(policy.exit_hint.as_str(), 180),
+                policy.green_case_ids.join(", "),
+            ));
+            if let Some(command) = policy.blocked_command_display.as_deref() {
+                full.push_str(&format!(
+                    "  blocked_repeat: {}\n",
+                    compact_one_line(command, 180)
+                ));
+            }
+            if let Some(target) = policy.next_target.as_deref() {
+                full.push_str(&format!(
+                    "  next_target: {}\n",
+                    compact_one_line(target, 180)
+                ));
+            }
+        }
+        Some(full)
+    }
+
+    pub(super) fn compact_prompt(&self, task_harness: TaskHarness) -> Option<String> {
+        let lane = task_harness.lane_label();
+        let mut entries: Vec<&PromotedPolicyPatch> = self
+            .promoted_policies
+            .iter()
+            .filter(|policy| policy.lane == lane)
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        entries.sort_by_key(|policy| {
+            (
+                std::cmp::Reverse(policy.green_case_ids.len()),
+                std::cmp::Reverse(policy.promoted_at_ms),
+            )
+        });
+        let mut lines = vec![
+            "[Harness Evolution promoted cache]".to_string(),
+            format!("lane: {lane}"),
+            format!("promoted: {}", entries.len()),
+        ];
+        for policy in entries.into_iter().take(2) {
+            lines.push(format!(
+                "- {} => {} (green_cases={})",
+                policy.policy_id,
+                policy.preferred_tools.join(", "),
+                policy.green_case_ids.len()
+            ));
+        }
+        Some(lines.join("\n"))
+    }
+
+    fn sort_entries(&mut self) {
+        self.promoted_policies.sort_by_key(|policy| {
+            (
+                std::cmp::Reverse(policy.green_case_ids.len()),
+                std::cmp::Reverse(policy.seen_count),
+                std::cmp::Reverse(policy.applied_count),
+                std::cmp::Reverse(policy.promoted_at_ms),
+            )
+        });
+        if self.promoted_policies.len() > MAX_PROMOTED_POLICIES {
+            self.promoted_policies.truncate(MAX_PROMOTED_POLICIES);
+        }
+    }
+}
+
 impl RuntimePolicyOverlay {
     fn from_entries(entries: Vec<&ContractPatchProposal>, current_id: Option<&str>) -> Self {
         let mut full = String::from("[Harness Evolution Overlay]\n");
@@ -419,8 +715,22 @@ impl Default for HarnessEvolutionQueue {
     }
 }
 
+impl Default for GovernorContractOverlay {
+    fn default() -> Self {
+        Self {
+            version: Self::VERSION,
+            updated_at_ms: 0,
+            promoted_policies: Vec::new(),
+        }
+    }
+}
+
 pub(crate) fn path_for_root(root: &str) -> PathBuf {
     Path::new(root).join(".obstral/policy_patch_queue.json")
+}
+
+pub(crate) fn overlay_path_for_root(root: &str) -> PathBuf {
+    Path::new(root).join(".obstral/governor_contract.overlay.json")
 }
 
 #[cfg(test)]
@@ -557,5 +867,27 @@ mod tests {
         assert!(!overlay
             .full_prompt
             .contains("advance_repo_scaffold_artifact"));
+    }
+
+    #[test]
+    fn promoted_overlay_roundtrip_and_prompt() {
+        let path = temp_path("promoted");
+        let mut queue = HarnessEvolutionQueue::default();
+        let proposal = repo_proposal();
+        let proposal_id = proposal.id.clone();
+        queue.remember(proposal.clone());
+        assert!(queue.mark_prompted(std::slice::from_ref(&proposal_id)));
+        let promoted = queue.remember(proposal);
+        assert!(promoted.proposal.promotion_ready);
+
+        let mut overlay = GovernorContractOverlay::default();
+        assert!(overlay.promote_from_queue(&queue, "init-repo-artifact"));
+        overlay.save_atomic(&path).expect("save promoted overlay");
+
+        let loaded = GovernorContractOverlay::load(&path).expect("load promoted overlay");
+        assert_eq!(loaded.promoted_policies.len(), 1);
+        let prompt = loaded.prompt(init_repo_harness()).expect("prompt");
+        assert!(prompt.contains("Harness Evolution Promoted Overlay"));
+        assert!(prompt.contains("init-repo-artifact"));
     }
 }

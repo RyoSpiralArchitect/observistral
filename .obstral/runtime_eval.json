@@ -86,7 +86,8 @@
         { "kind": "trace_event_seen", "event": "evaluator_loop" },
         { "kind": "trace_event_seen", "event": "harness_evolution_loaded" },
         { "kind": "trace_event_seen", "event": "harness_evolution_patch_proposed" },
-        { "kind": "trace_event_seen", "event": "harness_evolution_overlay_prompted" }
+        { "kind": "trace_event_seen", "event": "harness_evolution_overlay_prompted" },
+        { "kind": "tool_root_file_exists", "path": ".obstral/governor_contract.overlay.json" }
       ]
     },
     {

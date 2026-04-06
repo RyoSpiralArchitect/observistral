@@ -112,6 +112,8 @@ Current code:
 - `src/tui/agent/harness_evolution.rs` (`ContractPatchProposal`, `HarnessEvolutionQueue`, runtime overlay prompt)
 - `.obstral/policy_patch_queue.json` (project-local overlay queue)
 - `src/tui/agent.rs` (load/save wiring, telemetry, prompt injection)
+- `.obstral/governor_contract.overlay.json` (eval-gated promoted overlay rules)
+- `src/main.rs::run_eval` (promotion step from passing eval case to promoted overlay)
 
 ### 6) Tool Router
 

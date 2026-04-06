@@ -148,7 +148,7 @@ Move:
 
 - cross-session storage for runtime-only harness patch proposals
 - overlay prompt rendering that turns deterministic failure findings into durable policy bias
-- promotion-readiness bookkeeping for replay/eval-gated contract updates later
+- promotion-readiness bookkeeping plus eval-gated promoted overlay files for contract updates later
 
 Reason:
 

@@ -15,6 +15,7 @@ store state without first choosing the correct owner.
 | Session persistence | `src/agent_session.rs` | resumable run | `session.json` | `AgentSession`, `ObservationCache`, recent reflections, `SessionBridge` |
 | Project-local reflection ledger | `src/reflection_ledger.rs` | cross-session | `.obstral/reflection_ledger.json` | recurring wrong assumptions, next minimal actions, reflection counts |
 | Project-local harness evolution queue | `src/tui/agent/harness_evolution.rs` | cross-session | `.obstral/policy_patch_queue.json` | trace-derived runtime overlay proposals, seen/applied counts, promotion readiness |
+| Project-local promoted governor overlay | `src/tui/agent/harness_evolution.rs` | cross-session | `.obstral/governor_contract.overlay.json` | eval-gated promoted harness policies, green case IDs, stable overlay defaults |
 | In-memory orchestration state | `src/tui/app.rs` + `src/tui/agent/task_harness.rs` + `src/tui/agent/meta_harness.rs` + `src/tui/agent/evaluator_loop.rs` | live TUI session / live coder loop | memory only | `App`, `pending_auto_fix`, `TaskHarness`, `TaskLane`, `ArtifactMode`, `MetaHarness`, `FailurePattern`, `PolicyDelta`, `EvaluatorLoop`, `EvaluatorFinding`, `PolicyPatch` |
 | Intent state | `src/tui/intent.rs` | live session, optionally persisted later | memory only today | `IntentAnchor`, `IntentUpdateKind`, normalized constraints/success criteria |
 | Replay/eval fixtures | `.obstral/*.json` + `src/runtime_eval.rs` + `src/tui_replay.rs` | versioned test input/output | repo files + `.tmp/` artifacts | runtime eval spec, TUI replay spec, reports |
@@ -190,6 +191,27 @@ Important rule:
 - this layer may bias the live runtime with overlay prompts
 - it must not directly rewrite `shared/governor_contract.json` during a normal run
 - promotion into a source contract should stay gated by replay/eval health
+
+### 5c. Project-local promoted governor overlay
+
+Code:
+
+- `src/tui/agent/harness_evolution.rs`
+
+File:
+
+- `.obstral/governor_contract.overlay.json`
+
+Owns:
+
+- harness policies that already passed replay/eval gating
+- stable per-lane defaults that should load before the next live run starts drifting
+- green eval case IDs that justify each promoted overlay rule
+
+Important rule:
+
+- this layer is stronger than the raw patch queue, but still weaker than current contradictory tool output
+- it is the bridge between runtime-learned policy and eventual source-contract promotion
 
 ### 6. Intent state
 

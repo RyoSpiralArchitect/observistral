@@ -61,7 +61,15 @@ use self::done_gate::{
     validate_done_acceptance,
 };
 use self::evaluator_loop::EvaluatorLoop;
-use self::harness_evolution::{ContractPatchProposal, HarnessEvolutionQueue};
+pub(crate) use self::harness_evolution::{
+    overlay_path_for_root as harness_evolution_overlay_path_for_root,
+    path_for_root as harness_evolution_queue_path_for_root,
+    GovernorContractOverlay as HarnessGovernorContractOverlay,
+    HarnessEvolutionQueue as PersistentHarnessEvolutionQueue,
+};
+use self::harness_evolution::{
+    ContractPatchProposal, GovernorContractOverlay, HarnessEvolutionQueue,
+};
 use self::memory::{
     canonicalize_evidence_command_with_resolution, normalize_memory_entry, normalize_path_alias,
     remember_recent_unique, remember_repo_map_resolution, rewrite_tool_call_with_resolution,
@@ -4653,6 +4661,7 @@ struct StablePromptCache {
     task_harness_hash: Option<u64>,
     meta_harness_hash: Option<u64>,
     evaluator_loop_hash: Option<u64>,
+    harness_evolution_promoted_hash: Option<u64>,
     harness_evolution_hash: Option<u64>,
     session_bridge_hash: Option<u64>,
     task_contract_hash: Option<u64>,
@@ -8290,7 +8299,6 @@ Fix: use --provider openai-compatible (or --provider mistral).",
     sync_observation_cache_autosave(&autosaver, &observation_evidence);
     let session_bridge = SessionBridgeView::resolve(start.session_bridge.as_ref(), &messages);
     let mut prompt_cache = StablePromptCache::default();
-    let mut proposed_harness_overlay_ids = std::collections::BTreeSet::new();
     let mut prompted_harness_overlay_ids = std::collections::BTreeSet::new();
     // Rebuild loop governor memory from the existing session so resuming runs doesn't
     // repeat the same failures from scratch.
@@ -8393,6 +8401,33 @@ Execute only the new minimal action: {}",
         }),
     )
     .await;
+    let harness_promoted_overlay_path = tool_root_abs
+        .as_deref()
+        .map(self::harness_evolution::overlay_path_for_root);
+    let harness_promoted_overlay = if let Some(path) = harness_promoted_overlay_path.as_ref() {
+        match GovernorContractOverlay::load(path) {
+            Ok(overlay) => overlay,
+            Err(e) => {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[harness_evolution_promoted] WARN: {e:#}\n"
+                    )))
+                    .await;
+                GovernorContractOverlay::default()
+            }
+        }
+    } else {
+        GovernorContractOverlay::default()
+    };
+    emit_telemetry_event(
+        &tx,
+        "harness_evolution_promoted_loaded",
+        json!({
+            "policies": harness_promoted_overlay.promoted_policies.len(),
+            "path": harness_promoted_overlay_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        }),
+    )
+    .await;
     let harness_evolution_path = tool_root_abs
         .as_deref()
         .map(self::harness_evolution::path_for_root);
@@ -8416,7 +8451,7 @@ Execute only the new minimal action: {}",
         &tx,
         "harness_evolution_loaded",
         json!({
-            "proposals": harness_evolution_queue.proposals.len(),
+            "proposals": harness_evolution_queue.proposal_count(),
             "path": harness_evolution_path.as_ref().map(|p| p.to_string_lossy().to_string()),
         }),
     )
@@ -8770,27 +8805,42 @@ This is the LAST model call for this run.\n\
             }));
         }
 
+        if let Some(telemetry) = harness_promoted_overlay.telemetry_payload(task_harness) {
+            emit_telemetry_event(&tx, "harness_evolution_promoted_prompted", telemetry).await;
+        }
+        if let Some(promoted_prompt) = harness_promoted_overlay.prompt(task_harness) {
+            let compact_prompt = harness_promoted_overlay
+                .compact_prompt(task_harness)
+                .unwrap_or_else(|| promoted_prompt.clone());
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": render_cached_prompt(
+                    &mut prompt_cache.harness_evolution_promoted_hash,
+                    promoted_prompt,
+                    compact_prompt,
+                ),
+            }));
+        }
+
         let current_harness_proposal =
             ContractPatchProposal::from_signals(task_harness, &meta_harness, &evaluator_loop);
         if let Some(proposal) = current_harness_proposal.as_ref() {
-            if proposed_harness_overlay_ids.insert(proposal.id.clone()) {
-                let update = harness_evolution_queue.remember(proposal.clone());
-                emit_telemetry_event(
-                    &tx,
-                    "harness_evolution_patch_proposed",
-                    update.proposal.telemetry_payload(update.was_new),
-                )
-                .await;
-                if let Some(path) = harness_evolution_path.as_ref() {
-                    if let Err(e) = harness_evolution_queue.save_atomic(path) {
-                        if !harness_evolution_warned {
-                            harness_evolution_warned = true;
-                            let _ = tx
-                                .send(StreamToken::Delta(format!(
-                                    "\n[harness_evolution] WARN: {e:#}\n"
-                                )))
-                                .await;
-                        }
+            let update = harness_evolution_queue.remember(proposal.clone());
+            emit_telemetry_event(
+                &tx,
+                "harness_evolution_patch_proposed",
+                update.proposal.telemetry_payload(update.was_new),
+            )
+            .await;
+            if let Some(path) = harness_evolution_path.as_ref() {
+                if let Err(e) = harness_evolution_queue.save_atomic(path) {
+                    if !harness_evolution_warned {
+                        harness_evolution_warned = true;
+                        let _ = tx
+                            .send(StreamToken::Delta(format!(
+                                "\n[harness_evolution] WARN: {e:#}\n"
+                            )))
+                            .await;
                     }
                 }
             }

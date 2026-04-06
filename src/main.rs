@@ -3003,6 +3003,24 @@ fn resolve_eval_session_seed(case_root: &str, seed: &str) -> std::path::PathBuf 
     }
 }
 
+fn maybe_promote_harness_overlay(
+    case_root: &str,
+    case_id: &str,
+) -> Result<Option<std::path::PathBuf>> {
+    let queue_path = crate::tui::agent::harness_evolution_queue_path_for_root(case_root);
+    if !queue_path.exists() {
+        return Ok(None);
+    }
+    let queue = crate::tui::agent::PersistentHarnessEvolutionQueue::load(&queue_path)?;
+    let overlay_path = crate::tui::agent::harness_evolution_overlay_path_for_root(case_root);
+    let mut overlay = crate::tui::agent::HarnessGovernorContractOverlay::load(&overlay_path)?;
+    if !overlay.promote_from_queue(&queue, case_id) {
+        return Ok(None);
+    }
+    overlay.save_atomic(&overlay_path)?;
+    Ok(Some(overlay_path))
+}
+
 async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
     let EvalArgs {
         tool_root,
@@ -3135,6 +3153,36 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
         .await;
         let duration_ms = started.elapsed().as_millis();
         let run_error = run_result.err().map(|e| format!("{e:#}"));
+        let mut precheck_case = case.clone();
+        precheck_case.checks.retain(|check| {
+            !matches!(
+                check,
+                crate::runtime_eval::RuntimeEvalCheck::ToolRootFileExists { .. }
+            )
+        });
+
+        let precheck_report = crate::runtime_eval::evaluate_case(
+            &precheck_case,
+            &case_root,
+            crate::runtime_eval::RuntimeEvalArtifacts {
+                case_dir: case_dir.clone(),
+                trace_path: trace_path.clone(),
+                session_path: session_path.clone(),
+                json_path: json_path.clone(),
+                graph_path: graph_path.clone(),
+            },
+            duration_ms,
+            run_error.clone(),
+        )?;
+        if precheck_report.ok {
+            if let Some(path) = maybe_promote_harness_overlay(&case_root, &case.id)? {
+                eprintln!(
+                    "[eval] promoted harness overlay for {} -> {}",
+                    case.id,
+                    path.display()
+                );
+            }
+        }
         let report = crate::runtime_eval::evaluate_case(
             case,
             &case_root,
