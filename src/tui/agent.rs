@@ -44,6 +44,7 @@ use std::path::Path;
 
 mod done_gate;
 mod evaluator_loop;
+mod harness_evolution;
 mod memory;
 mod meta_harness;
 mod provider_compat;
@@ -60,6 +61,7 @@ use self::done_gate::{
     validate_done_acceptance,
 };
 use self::evaluator_loop::EvaluatorLoop;
+use self::harness_evolution::{ContractPatchProposal, HarnessEvolutionQueue};
 use self::memory::{
     canonicalize_evidence_command_with_resolution, normalize_memory_entry, normalize_path_alias,
     remember_recent_unique, remember_repo_map_resolution, rewrite_tool_call_with_resolution,
@@ -4651,6 +4653,7 @@ struct StablePromptCache {
     task_harness_hash: Option<u64>,
     meta_harness_hash: Option<u64>,
     evaluator_loop_hash: Option<u64>,
+    harness_evolution_hash: Option<u64>,
     session_bridge_hash: Option<u64>,
     task_contract_hash: Option<u64>,
     working_memory_hash: Option<u64>,
@@ -8287,6 +8290,8 @@ Fix: use --provider openai-compatible (or --provider mistral).",
     sync_observation_cache_autosave(&autosaver, &observation_evidence);
     let session_bridge = SessionBridgeView::resolve(start.session_bridge.as_ref(), &messages);
     let mut prompt_cache = StablePromptCache::default();
+    let mut proposed_harness_overlay_ids = std::collections::BTreeSet::new();
+    let mut prompted_harness_overlay_ids = std::collections::BTreeSet::new();
     // Rebuild loop governor memory from the existing session so resuming runs doesn't
     // repeat the same failures from scratch.
     let mut mem = FailureMemory::from_recent_messages(&messages);
@@ -8385,6 +8390,34 @@ Execute only the new minimal action: {}",
         json!({
             "entries": reflection_ledger.entries.len(),
             "path": reflection_ledger_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        }),
+    )
+    .await;
+    let harness_evolution_path = tool_root_abs
+        .as_deref()
+        .map(self::harness_evolution::path_for_root);
+    let mut harness_evolution_queue = if let Some(path) = harness_evolution_path.as_ref() {
+        match HarnessEvolutionQueue::load(path) {
+            Ok(queue) => queue,
+            Err(e) => {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[harness_evolution] WARN: {e:#}\n"
+                    )))
+                    .await;
+                HarnessEvolutionQueue::default()
+            }
+        }
+    } else {
+        HarnessEvolutionQueue::default()
+    };
+    let mut harness_evolution_warned = false;
+    emit_telemetry_event(
+        &tx,
+        "harness_evolution_loaded",
+        json!({
+            "proposals": harness_evolution_queue.proposals.len(),
+            "path": harness_evolution_path.as_ref().map(|p| p.to_string_lossy().to_string()),
         }),
     )
     .await;
@@ -8733,6 +8766,77 @@ This is the LAST model call for this run.\n\
                     &mut prompt_cache.evaluator_loop_hash,
                     evaluator_prompt,
                     compact_prompt,
+                ),
+            }));
+        }
+
+        let current_harness_proposal =
+            ContractPatchProposal::from_signals(task_harness, &meta_harness, &evaluator_loop);
+        if let Some(proposal) = current_harness_proposal.as_ref() {
+            if proposed_harness_overlay_ids.insert(proposal.id.clone()) {
+                let update = harness_evolution_queue.remember(proposal.clone());
+                emit_telemetry_event(
+                    &tx,
+                    "harness_evolution_patch_proposed",
+                    update.proposal.telemetry_payload(update.was_new),
+                )
+                .await;
+                if let Some(path) = harness_evolution_path.as_ref() {
+                    if let Err(e) = harness_evolution_queue.save_atomic(path) {
+                        if !harness_evolution_warned {
+                            harness_evolution_warned = true;
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "\n[harness_evolution] WARN: {e:#}\n"
+                                )))
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut harness_overlay =
+            harness_evolution_queue.build_overlay(task_harness, current_harness_proposal.as_ref());
+        if let Some(overlay) = harness_overlay.as_ref() {
+            let newly_prompted_ids: Vec<String> = overlay
+                .active_ids
+                .iter()
+                .filter(|id| prompted_harness_overlay_ids.insert((*id).clone()))
+                .cloned()
+                .collect();
+            if !newly_prompted_ids.is_empty()
+                && harness_evolution_queue.mark_prompted(&newly_prompted_ids)
+            {
+                if let Some(path) = harness_evolution_path.as_ref() {
+                    if let Err(e) = harness_evolution_queue.save_atomic(path) {
+                        if !harness_evolution_warned {
+                            harness_evolution_warned = true;
+                            let _ = tx
+                                .send(StreamToken::Delta(format!(
+                                    "\n[harness_evolution] WARN: {e:#}\n"
+                                )))
+                                .await;
+                        }
+                    }
+                }
+                harness_overlay = harness_evolution_queue
+                    .build_overlay(task_harness, current_harness_proposal.as_ref());
+            }
+        }
+        if let Some(overlay) = harness_overlay {
+            emit_telemetry_event(
+                &tx,
+                "harness_evolution_overlay_prompted",
+                overlay.telemetry_payload(),
+            )
+            .await;
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": render_cached_prompt(
+                    &mut prompt_cache.harness_evolution_hash,
+                    overlay.full_prompt,
+                    overlay.compact_prompt,
                 ),
             }));
         }

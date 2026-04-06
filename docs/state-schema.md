@@ -14,6 +14,7 @@ store state without first choosing the correct owner.
 | Project-local TUI prefs | `src/tui/prefs.rs` | cross-session | `.obstral/tui_prefs.json` | `TuiPrefs`, `PanePrefs`, `coder_realize_preset`, pane model/provider/mode |
 | Session persistence | `src/agent_session.rs` | resumable run | `session.json` | `AgentSession`, `ObservationCache`, recent reflections, `SessionBridge` |
 | Project-local reflection ledger | `src/reflection_ledger.rs` | cross-session | `.obstral/reflection_ledger.json` | recurring wrong assumptions, next minimal actions, reflection counts |
+| Project-local harness evolution queue | `src/tui/agent/harness_evolution.rs` | cross-session | `.obstral/policy_patch_queue.json` | trace-derived runtime overlay proposals, seen/applied counts, promotion readiness |
 | In-memory orchestration state | `src/tui/app.rs` + `src/tui/agent/task_harness.rs` + `src/tui/agent/meta_harness.rs` + `src/tui/agent/evaluator_loop.rs` | live TUI session / live coder loop | memory only | `App`, `pending_auto_fix`, `TaskHarness`, `TaskLane`, `ArtifactMode`, `MetaHarness`, `FailurePattern`, `PolicyDelta`, `EvaluatorLoop`, `EvaluatorFinding`, `PolicyPatch` |
 | Intent state | `src/tui/intent.rs` | live session, optionally persisted later | memory only today | `IntentAnchor`, `IntentUpdateKind`, normalized constraints/success criteria |
 | Replay/eval fixtures | `.obstral/*.json` + `src/runtime_eval.rs` + `src/tui_replay.rs` | versioned test input/output | repo files + `.tmp/` artifacts | runtime eval spec, TUI replay spec, reports |
@@ -162,6 +163,33 @@ Examples:
 
 This layer should stay transient. If a field must survive restart/resume, it
 likely belongs in prefs or session persistence instead.
+
+### 5b. Project-local harness evolution queue
+
+Code:
+
+- `src/tui/agent/harness_evolution.rs`
+
+File:
+
+- `.obstral/policy_patch_queue.json`
+
+Owns:
+
+- trace-derived runtime policy overlay proposals that are not yet promoted into the source contract
+- per-policy seen/applied counts and promotion readiness
+- cross-session memory of which deterministic harness patches are repeatedly paying off
+
+Examples:
+
+- `fix_existing_files::force_mutation_after_observation_loop`
+- `init_repo::advance_repo_scaffold_artifact`
+
+Important rule:
+
+- this layer may bias the live runtime with overlay prompts
+- it must not directly rewrite `shared/governor_contract.json` during a normal run
+- promotion into a source contract should stay gated by replay/eval health
 
 ### 6. Intent state
 

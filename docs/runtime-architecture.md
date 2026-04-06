@@ -101,6 +101,18 @@ Current code:
 - `web/core/exec.js` (bash→PowerShell normalization, dangerous command guard)
 - `web/app.js` (loop governor + goal_check probes + recent-runs memory)
 
+### 5b) Harness Evolution Overlay
+
+Responsibilities:
+- persist trace-derived runtime policy overlays outside the ephemeral loop
+- feed deterministic `MetaHarness` / `EvaluatorLoop` findings back into later turns
+- keep "overlay first, source-contract later" promotion boundaries explicit
+
+Current code:
+- `src/tui/agent/harness_evolution.rs` (`ContractPatchProposal`, `HarnessEvolutionQueue`, runtime overlay prompt)
+- `.obstral/policy_patch_queue.json` (project-local overlay queue)
+- `src/tui/agent.rs` (load/save wiring, telemetry, prompt injection)
+
 ### 6) Tool Router
 
 Responsibilities:

@@ -245,6 +245,10 @@ Exit hint: {}\n\
     pub(super) fn policy_id(&self) -> Option<&'static str> {
         self.patch.as_ref().map(|patch| patch.id)
     }
+
+    pub(super) fn patch(&self) -> Option<&PolicyPatch> {
+        self.patch.as_ref()
+    }
 }
 
 fn keep_finding(
