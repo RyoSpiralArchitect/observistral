@@ -5,6 +5,7 @@ mod config;
 mod exec;
 mod file_tools;
 mod governor_contract;
+mod harness_promotion;
 mod lang_detect;
 mod loop_detect;
 mod modes;
@@ -78,6 +79,9 @@ enum Command {
 
     /// Print an internal manifest / parity / replay inventory for this repo
     Inventory(InventoryArgs),
+
+    /// Generate a governor-contract promotion candidate from eval-gated harness overlays
+    PromoteHarness(PromoteHarnessArgs),
 
     /// Review `git diff` with Observer (or diff批評) and print critique
     Review(ReviewArgs),
@@ -285,6 +289,33 @@ struct InventoryArgs {
     fail_on: InventoryFailOn,
 }
 
+#[derive(Args, Debug, Clone)]
+struct PromoteHarnessArgs {
+    /// Directory to inspect (defaults to current directory)
+    #[arg(long, short = 'C', alias = "root")]
+    tool_root: Option<String>,
+
+    /// Source governor contract JSON file (defaults to <cwd>/shared/governor_contract.json)
+    #[arg(long)]
+    contract: Option<PathBuf>,
+
+    /// Promoted overlay JSON file to read
+    #[arg(long)]
+    overlay: Option<PathBuf>,
+
+    /// Output candidate JSON file
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Minimum number of green eval cases required before a promotion is eligible
+    #[arg(long, default_value_t = 1)]
+    min_green_cases: usize,
+
+    /// Emit machine-readable JSON instead of plain text
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(ValueEnum, Clone, Debug)]
 enum InventoryWhat {
     Health,
@@ -308,6 +339,10 @@ const INVENTORY_CLI_COMMANDS: &[(&str, &str)] = &[
     ("eval", "fixture-driven runtime eval harness"),
     ("tui-replay", "deterministic TUI stuck-case replay"),
     ("inventory", "repo/runtime manifest and parity surfaces"),
+    (
+        "promote-harness",
+        "generate governor-contract promotion candidates from harness overlays",
+    ),
     ("review", "Observer review over git diff"),
     ("init", "write .obstral.md template"),
     ("repl", "interactive REPL"),
@@ -491,6 +526,7 @@ async fn main() -> Result<()> {
         Some(Command::Eval(args)) => run_eval(args, cli.common).await,
         Some(Command::TuiReplay(args)) => tui_replay::run(args, cli.common).await,
         Some(Command::Inventory(args)) => run_inventory(args).await,
+        Some(Command::PromoteHarness(args)) => run_promote_harness(args).await,
         Some(Command::Review(args)) => run_review(args, cli.common).await,
         Some(Command::Init(args)) => run_init(args, cli.common).await,
         Some(Command::Repl) => repl::run(cli.common.to_partial_config()).await,
@@ -582,6 +618,83 @@ async fn run_inventory(args: InventoryArgs) -> Result<()> {
     if args.ci {
         enforce_inventory_ci(&args, &value)?;
     }
+    Ok(())
+}
+
+async fn run_promote_harness(args: PromoteHarnessArgs) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let root = args
+        .tool_root
+        .clone()
+        .or_else(|| Some(cwd.to_string_lossy().into_owned()));
+    let root = normalize_tool_root(root).unwrap_or_else(|| ".".to_string());
+    let overlay_path = args
+        .overlay
+        .map(|path| resolve_session_path(path, Some(root.as_str())))
+        .unwrap_or_else(|| crate::tui::agent::harness_evolution_overlay_path_for_root(&root));
+    let out_path = args
+        .out
+        .map(|path| resolve_session_path(path, Some(root.as_str())))
+        .unwrap_or_else(|| crate::harness_promotion::candidate_path_for_root(&root));
+    let contract_path = args
+        .contract
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        })
+        .unwrap_or_else(|| cwd.join("shared/governor_contract.json"));
+
+    let overlay = crate::tui::agent::HarnessGovernorContractOverlay::load(&overlay_path)
+        .with_context(|| {
+            format!(
+                "failed to load promoted harness overlay: {}",
+                overlay_path.display()
+            )
+        })?;
+    let contract = crate::governor_contract::load_from_path(&contract_path)?;
+    let candidate = crate::harness_promotion::build_promotion_candidate(
+        &contract,
+        &overlay,
+        &contract_path,
+        &overlay_path,
+        &out_path,
+        args.min_green_cases,
+    );
+    candidate.save_atomic(&out_path)?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&candidate)
+                .context("failed to serialize promotion candidate json")?
+        );
+    } else {
+        println!("promotion candidate: {}", out_path.display());
+        println!(
+            "summary: total={} eligible={} add={} update={} noop={} hold={} invalid={}",
+            candidate.summary.total,
+            candidate.summary.eligible,
+            candidate.summary.add,
+            candidate.summary.update,
+            candidate.summary.noop,
+            candidate.summary.hold,
+            candidate.summary.invalid
+        );
+        if candidate.candidates.is_empty() {
+            println!("no promoted harness policies found");
+        } else {
+            for entry in candidate.candidates.iter().take(6) {
+                println!(
+                    "- {} [{}] {}",
+                    entry.display.title, entry.display.badge, entry.display.subtitle
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1168,6 +1281,9 @@ fn build_inventory_state(root: &Path) -> Result<serde_json::Value> {
     let session_example_path = root.join(".tmp/obstral_session.json");
     let prefs_path = root.join(".obstral/tui_prefs.json");
     let reflection_ledger_path = root.join(".obstral/reflection_ledger.json");
+    let harness_queue_path = root.join(".obstral/policy_patch_queue.json");
+    let harness_overlay_path = root.join(".obstral/governor_contract.overlay.json");
+    let harness_promotion_path = root.join(".obstral/governor_contract.promotion.json");
     let runtime_spec_path = root.join(".obstral/runtime_eval.json");
     let replay_spec_path = root.join(".obstral/tui_replay.json");
 
@@ -1214,6 +1330,39 @@ fn build_inventory_state(root: &Path) -> Result<serde_json::Value> {
             "owner_present": root.join("src/reflection_ledger.rs").exists(),
             "backing_present": reflection_ledger_path.exists(),
             "status": if root.join("src/reflection_ledger.rs").exists() && reflection_ledger_path.exists() { "implemented" } else if root.join("src/reflection_ledger.rs").exists() { "partial" } else { "missing" },
+        }),
+        json!({
+            "key": "harness_evolution_queue",
+            "owner": "src/tui/agent/harness_evolution.rs",
+            "lifetime": "cross-session",
+            "backing_store": ".obstral/policy_patch_queue.json",
+            "persisted": true,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/tui/agent/harness_evolution.rs").exists(),
+            "backing_present": harness_queue_path.exists(),
+            "status": if root.join("src/tui/agent/harness_evolution.rs").exists() && harness_queue_path.exists() { "implemented" } else if root.join("src/tui/agent/harness_evolution.rs").exists() { "partial" } else { "missing" },
+        }),
+        json!({
+            "key": "promoted_governor_overlay",
+            "owner": "src/tui/agent/harness_evolution.rs",
+            "lifetime": "cross-session",
+            "backing_store": ".obstral/governor_contract.overlay.json",
+            "persisted": true,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/tui/agent/harness_evolution.rs").exists(),
+            "backing_present": harness_overlay_path.exists(),
+            "status": if root.join("src/tui/agent/harness_evolution.rs").exists() && harness_overlay_path.exists() { "implemented" } else if root.join("src/tui/agent/harness_evolution.rs").exists() { "partial" } else { "missing" },
+        }),
+        json!({
+            "key": "governor_contract_promotion",
+            "owner": "src/harness_promotion.rs",
+            "lifetime": "generated candidate artifact",
+            "backing_store": ".obstral/governor_contract.promotion.json",
+            "persisted": true,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/harness_promotion.rs").exists(),
+            "backing_present": harness_promotion_path.exists(),
+            "status": if root.join("src/harness_promotion.rs").exists() && harness_promotion_path.exists() { "implemented" } else if root.join("src/harness_promotion.rs").exists() { "partial" } else { "missing" },
         }),
         json!({
             "key": "in_memory_app",
@@ -1291,6 +1440,9 @@ fn build_inventory_state(root: &Path) -> Result<serde_json::Value> {
             let key = entry.get("key").and_then(|v| v.as_str()).unwrap_or("unknown");
             let next = match key {
                 "tui_prefs" => "load/save a project-local .obstral/tui_prefs.json at least once to confirm persistence",
+                "harness_evolution_queue" => "run a loop-triggering eval case to seed .obstral/policy_patch_queue.json",
+                "promoted_governor_overlay" => "run `obstral eval` on a loop-triggering case so promoted overlays are written",
+                "governor_contract_promotion" => "run `obstral promote-harness --json` to generate a UI-ready promotion candidate",
                 "runtime_eval_fixture" => "keep .obstral/runtime_eval.json in sync with current regression cases",
                 "tui_replay_fixture" => "keep .obstral/tui_replay.json aligned with observer stuck-case coverage",
                 _ => "add missing owner or backing store",

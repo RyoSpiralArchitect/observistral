@@ -678,6 +678,7 @@
       "  and propose a completely different strategy. Never repeat a failing command."
     ]
   },
+  "runtime_overlay_templates": {},
   "messages": {
     "multiple_tool_calls": "Multiple tool calls detected ({count}). Only ONE tool call per turn is supported.\nFix: call exactly one tool in your next assistant message.",
     "plan_invalid": "[Plan Gate] Invalid <plan>: {error}\nRequired now: emit a valid <plan> with {plan_fields}, then emit <think>, then call ONE tool.",

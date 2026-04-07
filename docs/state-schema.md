@@ -16,6 +16,7 @@ store state without first choosing the correct owner.
 | Project-local reflection ledger | `src/reflection_ledger.rs` | cross-session | `.obstral/reflection_ledger.json` | recurring wrong assumptions, next minimal actions, reflection counts |
 | Project-local harness evolution queue | `src/tui/agent/harness_evolution.rs` | cross-session | `.obstral/policy_patch_queue.json` | trace-derived runtime overlay proposals, seen/applied counts, promotion readiness |
 | Project-local promoted governor overlay | `src/tui/agent/harness_evolution.rs` | cross-session | `.obstral/governor_contract.overlay.json` | eval-gated promoted harness policies, green case IDs, stable overlay defaults |
+| Project-local contract promotion candidate | `src/harness_promotion.rs` | generated artifact | `.obstral/governor_contract.promotion.json` | UI-ready candidate list, patch previews, promotion decisions for `shared/governor_contract.json` |
 | In-memory orchestration state | `src/tui/app.rs` + `src/tui/agent/task_harness.rs` + `src/tui/agent/meta_harness.rs` + `src/tui/agent/evaluator_loop.rs` | live TUI session / live coder loop | memory only | `App`, `pending_auto_fix`, `TaskHarness`, `TaskLane`, `ArtifactMode`, `MetaHarness`, `FailurePattern`, `PolicyDelta`, `EvaluatorLoop`, `EvaluatorFinding`, `PolicyPatch` |
 | Intent state | `src/tui/intent.rs` | live session, optionally persisted later | memory only today | `IntentAnchor`, `IntentUpdateKind`, normalized constraints/success criteria |
 | Replay/eval fixtures | `.obstral/*.json` + `src/runtime_eval.rs` + `src/tui_replay.rs` | versioned test input/output | repo files + `.tmp/` artifacts | runtime eval spec, TUI replay spec, reports |
@@ -212,6 +213,27 @@ Important rule:
 
 - this layer is stronger than the raw patch queue, but still weaker than current contradictory tool output
 - it is the bridge between runtime-learned policy and eventual source-contract promotion
+
+### 5d. Project-local contract promotion candidate
+
+Code:
+
+- `src/harness_promotion.rs`
+
+File:
+
+- `.obstral/governor_contract.promotion.json`
+
+Owns:
+
+- the reviewable candidate artifact that maps promoted overlays onto `shared/governor_contract.json`
+- UI/TUI-friendly display cards, decision states, and patch previews
+- the last generated promotion snapshot for humans or future GUI/TUI approval flows
+
+Important rule:
+
+- this file is candidate output, not live runtime policy
+- it may be regenerated at any time from the promoted overlay plus the current source contract
 
 ### 6. Intent state
 

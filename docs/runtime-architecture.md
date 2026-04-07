@@ -34,6 +34,11 @@ The point of the layering is to make failures legible and prevent the classic ag
 - phase drift (polish advice during core failures)
 - approvals and actions getting entangled
 
+The new rule of thumb is:
+- runtime overlays learn quickly
+- promoted overlays require green eval proof
+- source-contract promotion happens through a reviewable candidate artifact, not a silent live rewrite
+
 Related docs:
 
 - `docs/state-schema.md` — typed state ownership and persistence boundaries
@@ -114,6 +119,7 @@ Current code:
 - `src/tui/agent.rs` (load/save wiring, telemetry, prompt injection)
 - `.obstral/governor_contract.overlay.json` (eval-gated promoted overlay rules)
 - `src/main.rs::run_eval` (promotion step from passing eval case to promoted overlay)
+- `src/harness_promotion.rs` + `obstral promote-harness` (reviewable promotion candidate artifact for GUI/TUI or human approval)
 
 ### 6) Tool Router
 
