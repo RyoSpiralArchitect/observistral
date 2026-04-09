@@ -308,6 +308,7 @@ pub async fn run(args: ServeArgs, defaults: PartialConfig) -> Result<()> {
 struct HttpRequest {
     method: String,
     path: String,
+    target: String,
     /// Value of the `Origin:` header, if present.
     origin: Option<String>,
     body: Vec<u8>,
@@ -429,8 +430,18 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/apply_diff") => api_apply_diff(&mut stream, state, &req.body).await,
         ("POST", "/api/stat_path") => api_stat_path(&mut stream, state, &req.body).await,
         ("POST", "/api/rollback") => api_rollback(&mut stream, state, &req.body).await,
-        ("GET", "/api/governor_contract") => api_governor_contract(&mut stream).await,
-        ("GET", p) if p.starts_with("/api/project/scan") => api_project_scan(&mut stream, p).await,
+        ("GET", "/api/governor_contract") => api_governor_contract(&mut stream, state).await,
+        ("GET", "/api/harness_promotions") => api_harness_promotions(&mut stream, state).await,
+        ("POST", "/api/harness_promotions/approve") => {
+            api_harness_promotions_approve(&mut stream, state, &req.body).await
+        }
+        ("POST", "/api/harness_promotions/hold") => {
+            api_harness_promotions_hold(&mut stream, state, &req.body).await
+        }
+        ("POST", "/api/harness_promotions/apply") => {
+            api_harness_promotions_apply(&mut stream, state, &req.body).await
+        }
+        ("GET", "/api/project/scan") => api_project_scan(&mut stream, req.target.as_str()).await,
         _ => {
             write_text(
                 &mut stream,
@@ -447,8 +458,8 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_meta_diagnose_timestamp, is_localhost_origin, is_safe_meta_artifact_name,
-        meta_artifact_slug,
+        compact_meta_diagnose_timestamp, extract_query_param, is_localhost_origin,
+        is_safe_meta_artifact_name, meta_artifact_slug,
     };
 
     #[test]
@@ -493,6 +504,14 @@ mod tests {
         assert!(!is_safe_meta_artifact_name("../secret.json"));
         assert!(!is_safe_meta_artifact_name("nested/file.json"));
         assert!(!is_safe_meta_artifact_name("/abs.json"));
+    }
+
+    #[test]
+    fn extract_query_param_reads_root_from_request_target() {
+        assert_eq!(
+            extract_query_param("/api/project/scan?root=.tmp/thread-1", "root"),
+            Some(".tmp/thread-1")
+        );
     }
 }
 
@@ -1511,8 +1530,111 @@ async fn api_pending_commands(stream: &mut TcpStream, state: AppState) -> Result
     write_json(stream, 200, "OK", &Res { pending }).await
 }
 
-async fn api_governor_contract(stream: &mut TcpStream) -> Result<()> {
-    write_json(stream, 200, "OK", crate::governor_contract::contract()).await
+async fn api_governor_contract(stream: &mut TcpStream, state: AppState) -> Result<()> {
+    let path = state.workspace_root.join("shared/governor_contract.json");
+    if let Ok(contract) = crate::governor_contract::load_from_path(&path) {
+        write_json(stream, 200, "OK", &contract).await
+    } else {
+        write_json(stream, 200, "OK", crate::governor_contract::contract()).await
+    }
+}
+
+async fn api_harness_promotions(stream: &mut TcpStream, state: AppState) -> Result<()> {
+    match crate::harness_gate::load_board(&state.workspace_root) {
+        Ok(board) => write_json(stream, 200, "OK", &board).await,
+        Err(e) => {
+            write_json(
+                stream,
+                500,
+                "Internal Server Error",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn api_harness_promotions_approve(
+    stream: &mut TcpStream,
+    state: AppState,
+    body: &[u8],
+) -> Result<()> {
+    api_harness_promotions_action(stream, state, body, crate::harness_gate::approve).await
+}
+
+async fn api_harness_promotions_hold(
+    stream: &mut TcpStream,
+    state: AppState,
+    body: &[u8],
+) -> Result<()> {
+    api_harness_promotions_action(stream, state, body, crate::harness_gate::hold).await
+}
+
+async fn api_harness_promotions_apply(
+    stream: &mut TcpStream,
+    state: AppState,
+    body: &[u8],
+) -> Result<()> {
+    api_harness_promotions_action(stream, state, body, crate::harness_gate::apply_to_contract).await
+}
+
+async fn api_harness_promotions_action(
+    stream: &mut TcpStream,
+    state: AppState,
+    body: &[u8],
+    action: fn(
+        &std::path::Path,
+        &str,
+    ) -> anyhow::Result<crate::harness_gate::HarnessPromotionActionResponse>,
+) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        id: String,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
+        }
+    };
+    let id = req.id.trim();
+    if id.is_empty() {
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "id is required".into(),
+            },
+        )
+        .await;
+    }
+
+    match action(&state.workspace_root, id) {
+        Ok(response) => write_json(stream, 200, "OK", &response).await,
+        Err(e) => {
+            write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
+    }
 }
 
 async fn api_queue_command(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
@@ -4487,13 +4609,11 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         .next()
         .ok_or_else(|| anyhow!("invalid request line"))?
         .to_string();
-    let path = start_parts
+    let target = start_parts
         .next()
         .ok_or_else(|| anyhow!("invalid request line"))?
-        .split('?')
-        .next()
-        .unwrap_or("/")
         .to_string();
+    let path = target.split('?').next().unwrap_or("/").to_string();
 
     let mut content_length: usize = 0;
     let mut origin: Option<String> = None;
@@ -4532,6 +4652,7 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     Ok(HttpRequest {
         method,
         path,
+        target,
         origin,
         body,
     })

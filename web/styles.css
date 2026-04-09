@@ -111,6 +111,8 @@ a {
   display: flex;
   gap: 10px;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .btn {
@@ -212,6 +214,270 @@ a {
 
 .panel-body {
   padding: 14px;
+}
+
+.panel-header-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.panel-subtitle {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.panel-review {
+  border-color: rgba(129, 140, 248, 0.30);
+  background:
+    linear-gradient(180deg, rgba(129, 140, 248, 0.10), rgba(255, 255, 255, 0.04)),
+    var(--panel);
+}
+
+.btn-review {
+  border-color: rgba(129, 140, 248, 0.58);
+  background: rgba(129, 140, 248, 0.14);
+  color: rgba(230, 232, 255, 0.96);
+}
+
+.btn-review:hover {
+  border-color: rgba(129, 140, 248, 0.90);
+  background: rgba(129, 140, 248, 0.22);
+}
+
+.approval-jump {
+  white-space: nowrap;
+}
+
+.review-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.review-summary {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.review-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.review-group {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  overflow: hidden;
+}
+
+.review-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.review-group-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.84);
+}
+
+.review-group-count {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.review-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+
+.review-card {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.review-card.needs_review {
+  border-color: rgba(251, 191, 36, 0.45);
+  background: rgba(251, 191, 36, 0.08);
+}
+
+.review-card.approved {
+  border-color: rgba(74, 222, 128, 0.42);
+  background: rgba(74, 222, 128, 0.08);
+}
+
+.review-card.held {
+  border-color: rgba(248, 113, 113, 0.42);
+  background: rgba(248, 113, 113, 0.07);
+}
+
+.review-card.applied {
+  border-color: rgba(45, 212, 191, 0.42);
+  background: rgba(45, 212, 191, 0.08);
+}
+
+.review-card.blocked,
+.review-card.up_to_date {
+  border-color: rgba(148, 163, 184, 0.28);
+  background: rgba(148, 163, 184, 0.05);
+}
+
+.review-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.review-card-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 320px;
+}
+
+.review-card-title {
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.review-card-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.review-card-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.review-card-reasons {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.review-card-reason {
+  font-size: 12px;
+  color: var(--faint);
+  line-height: 1.35;
+}
+
+.review-card-path {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 84px;
+  overflow: auto;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(0, 0, 0, 0.18);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.82);
+}
+
+.approval-board {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.approval-group {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  overflow: hidden;
+  min-width: 0;
+}
+
+.approval-group-body {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.approval-card {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.04);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.approval-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.approval-card-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.approval-card-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.approval-card-path {
+  font-size: 12px;
+  color: var(--faint);
+  word-break: break-word;
+}
+
+.approval-card-preview {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 100px;
+  overflow: auto;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(0, 0, 0, 0.18);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.82);
 }
 
 .grid2 {
@@ -977,6 +1243,9 @@ body.looping .bubble.assistant {
 
 @media (max-width: 980px) {
   .main {
+    grid-template-columns: 1fr;
+  }
+  .approval-board {
     grid-template-columns: 1fr;
   }
   .arena {

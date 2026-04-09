@@ -142,6 +142,20 @@ Reason:
 - it keeps resumable operational memory explicit and auditable
 - it is the foundation for deeper session-to-session context bridging later
 
+### 10. `src/tui/agent/harness_evolution.rs`
+
+Move:
+
+- cross-session storage for runtime-only harness patch proposals
+- overlay prompt rendering that turns deterministic failure findings into durable policy bias
+- promotion-readiness bookkeeping plus eval-gated promoted overlay files for contract updates later
+
+Reason:
+
+- this is persistent policy memory, not ephemeral orchestration state
+- it lets the runtime carry forward learned guardrails without editing the source contract on the fly
+- it keeps the self-evolution loop explicit and testable outside `agent.rs`
+
 ## Suggested extraction order
 
 1. `done_gate.rs`
@@ -152,7 +166,8 @@ Reason:
 6. `meta_harness.rs`
 7. `evaluator_loop.rs`
 8. `session_bridge.rs`
-9. optional `telemetry.rs` if loop instrumentation keeps growing
+9. `harness_evolution.rs`
+10. optional `telemetry.rs` if loop instrumentation keeps growing
 
 This order minimizes risk because the first two already have strong eval/replay
 pressure and the clearest ownership boundaries.

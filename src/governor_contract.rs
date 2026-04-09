@@ -1,4 +1,6 @@
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -49,6 +51,34 @@ pub struct PromptLayout {
     pub done_args_template: String,
     pub error_title: String,
     pub error_rules: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeOverlayTemplate {
+    #[serde(default)]
+    pub lane: String,
+    #[serde(default)]
+    pub artifact_mode: String,
+    #[serde(default)]
+    pub pattern: String,
+    #[serde(default)]
+    pub policy_action: String,
+    #[serde(default)]
+    pub required_action: String,
+    #[serde(default)]
+    pub preferred_tools: Vec<String>,
+    #[serde(default)]
+    pub blocked_tools: Vec<String>,
+    #[serde(default)]
+    pub blocked_scope: String,
+    #[serde(default)]
+    pub blocked_command_display: Option<String>,
+    #[serde(default)]
+    pub next_target: Option<String>,
+    #[serde(default)]
+    pub exit_hint: String,
+    #[serde(default)]
+    pub support_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +294,8 @@ pub struct GovernorContract {
     pub verification: VerificationContract,
     pub instruction_resolver: InstructionResolverContract,
     pub prompt_layout: PromptLayout,
+    #[serde(default)]
+    pub runtime_overlay_templates: BTreeMap<String, RuntimeOverlayTemplate>,
     pub messages: GovernorMessages,
 }
 
@@ -274,6 +306,44 @@ static CONTRACT: Lazy<GovernorContract> = Lazy::new(|| {
 
 pub fn contract() -> &'static GovernorContract {
     &CONTRACT
+}
+
+pub fn load_from_path(path: &Path) -> Result<GovernorContract> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read governor contract: {}", path.display()))?;
+    let contract: GovernorContract = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse governor contract: {}", path.display()))?;
+    Ok(contract)
+}
+
+pub fn save_to_path(contract: &GovernorContract, path: &Path) -> Result<()> {
+    let json =
+        serde_json::to_string_pretty(contract).context("failed to serialize governor contract")?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create governor contract dir: {}",
+            parent.display()
+        )
+    })?;
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    std::fs::write(&tmp, json.as_bytes())
+        .with_context(|| format!("failed to write temp governor contract: {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "failed to replace governor contract {} -> {}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 pub fn browser_fallback_script() -> String {

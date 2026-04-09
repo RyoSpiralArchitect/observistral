@@ -34,6 +34,11 @@ The point of the layering is to make failures legible and prevent the classic ag
 - phase drift (polish advice during core failures)
 - approvals and actions getting entangled
 
+The new rule of thumb is:
+- runtime overlays learn quickly
+- promoted overlays require green eval proof
+- source-contract promotion happens through a reviewable candidate artifact, not a silent live rewrite
+
 Related docs:
 
 - `docs/state-schema.md` — typed state ownership and persistence boundaries
@@ -100,6 +105,23 @@ Current code:
 - `src/exec.rs` (dangerous command checks, cwd validation)
 - `web/core/exec.js` (bash→PowerShell normalization, dangerous command guard)
 - `web/app.js` (loop governor + goal_check probes + recent-runs memory)
+
+### 5b) Harness Evolution Overlay
+
+Responsibilities:
+- persist trace-derived runtime policy overlays outside the ephemeral loop
+- feed deterministic `MetaHarness` / `EvaluatorLoop` findings back into later turns
+- keep "overlay first, source-contract later" promotion boundaries explicit
+
+Current code:
+- `src/tui/agent/harness_evolution.rs` (`ContractPatchProposal`, `HarnessEvolutionQueue`, runtime overlay prompt)
+- `.obstral/policy_patch_queue.json` (project-local overlay queue)
+- `src/tui/agent.rs` (load/save wiring, telemetry, prompt injection)
+- `.obstral/governor_contract.overlay.json` (eval-gated promoted overlay rules)
+- `src/main.rs::run_eval` (promotion step from passing eval case to promoted overlay)
+- `src/harness_promotion.rs` + `obstral promote-harness` (reviewable promotion candidate artifact for GUI/TUI or human approval)
+- `src/harness_gate.rs` + `.obstral/governor_contract.promotion_gate.json` (human-gated approve / hold / apply-to-contract state shared by TUI and GUI)
+- `src/server.rs` + `web/app.js` + `src/tui/promotion_gate.rs` (review surfaces that consume the same board artifact and gate file)
 
 ### 6) Tool Router
 

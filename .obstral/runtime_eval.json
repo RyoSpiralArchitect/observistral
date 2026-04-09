@@ -83,7 +83,11 @@
         { "kind": "assistant_contains", "value": ".gitignore" },
         { "kind": "trace_event_seen", "event": "task_harness" },
         { "kind": "trace_event_seen", "event": "meta_harness_policy" },
-        { "kind": "trace_event_seen", "event": "evaluator_loop" }
+        { "kind": "trace_event_seen", "event": "evaluator_loop" },
+        { "kind": "trace_event_seen", "event": "harness_evolution_loaded" },
+        { "kind": "trace_event_seen", "event": "harness_evolution_patch_proposed" },
+        { "kind": "trace_event_seen", "event": "harness_evolution_overlay_prompted" },
+        { "kind": "tool_root_file_exists", "path": ".obstral/governor_contract.overlay.json" }
       ]
     },
     {
@@ -98,7 +102,8 @@
         { "kind": "error_free" },
         { "kind": "tool_call_seen", "name": "read_file" },
         { "kind": "tool_call_seen", "name": "patch_file" },
-        { "kind": "trace_event_seen", "event": "task_harness" }
+        { "kind": "trace_event_seen", "event": "task_harness" },
+        { "kind": "trace_event_seen", "event": "harness_evolution_loaded" }
       ]
     },
     {

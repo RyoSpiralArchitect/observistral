@@ -54,6 +54,7 @@
       commandApproval: "Command approval",
       autoObserve: "Auto-observe",
       observerHint: "Type a message below to start observing, or enable Auto-observe in settings.",
+      settingsHint: "Providers, models, approvals policy, and runtime defaults.",
       forceAgent: "Agent mode",
       toolRoot: "Tool root",
       workdir: "Workdir",
@@ -63,7 +64,24 @@
       pendingCommands: "Pending commands",
       approvals: "Approvals",
       openApprovals: "Open approvals",
+      runtimeApprovals: "Runtime approvals",
+      openRuntimeApprovals: "Open runtime approvals",
+      harnessReviews: "Harness reviews",
+      openHarnessReviews: "Open harness reviews",
       approve: "Approve",
+      hold: "Hold",
+      applyToContract: "Apply to contract",
+      harnessPromotions: "Harness promotions",
+      harnessReviewHint: "Eval-green policy promotions waiting for a human decision before they reach shared/governor_contract.json.",
+      runtimeApprovalHint: "Pending edits and commands that need a human decision before execution can continue.",
+      greenCases: "green case(s)",
+      nothingPending: "Nothing pending.",
+      needsReview: "needs review",
+      held: "held",
+      applied: "applied",
+      upToDate: "up to date",
+      blocked: "blocked",
+      promotionNone: "No promotion candidates yet.",
       reject: "Reject",
       send: "Send",
       stop: "Stop",
@@ -225,6 +243,7 @@
       deep: "本格",
       autoObserve: "自動実況",
       observerHint: "下の入力欄にメッセージを送信するか、設定で「自動実況」をONにしてください。",
+      settingsHint: "provider / model / 承認ポリシー / runtime 既定値をまとめています。",
       forceAgent: "エージェント常時ON",
       toolRoot: "作業ルート",
       workdir: "作業ディレクトリ",
@@ -277,7 +296,24 @@
       pendingCommands: "保留中のコマンド",
       approvals: "承認",
       openApprovals: "保留中の承認",
+      runtimeApprovals: "ランタイム承認",
+      openRuntimeApprovals: "ランタイム承認を開く",
+      harnessReviews: "ハーネスレビュー",
+      openHarnessReviews: "ハーネスレビューを開く",
       approve: "承認",
+      hold: "保留",
+      applyToContract: "contractへ反映",
+      harnessPromotions: "ハーネス昇格候補",
+      harnessReviewHint: "eval を通った policy 昇格候補を、人間の判断で shared/governor_contract.json に上げるための受け皿です。",
+      runtimeApprovalHint: "実行継続の前に人間判断が必要な edits / commands をまとめています。",
+      greenCases: "green case",
+      nothingPending: "保留中の項目はありません。",
+      needsReview: "要レビュー",
+      held: "保留中",
+      applied: "反映済み",
+      upToDate: "最新",
+      blocked: "ブロック中",
+      promotionNone: "昇格候補はまだありません。",
       reject: "却下",
       metaDiagnose: "メタ診断",
       metaBadge: "META",
@@ -347,7 +383,24 @@
       pendingCommands: "Commandes en attente",
       approvals: "Approbations",
       openApprovals: "Approbations en attente",
+      runtimeApprovals: "Approbations runtime",
+      openRuntimeApprovals: "Ouvrir les approbations runtime",
+      harnessReviews: "Revues du harnais",
+      openHarnessReviews: "Ouvrir les revues du harnais",
       approve: "Approuver",
+      hold: "Mettre en attente",
+      applyToContract: "Appliquer au contrat",
+      harnessPromotions: "Promotions du harnais",
+      harnessReviewHint: "Promotions de policy passées au vert par l'eval et en attente d'une décision humaine avant d'atteindre shared/governor_contract.json.",
+      runtimeApprovalHint: "Éditions et commandes qui demandent une décision humaine avant la reprise de l'exécution.",
+      greenCases: "cas verts",
+      nothingPending: "Rien en attente.",
+      needsReview: "à revoir",
+      held: "en attente",
+      applied: "appliqué",
+      upToDate: "à jour",
+      blocked: "bloqué",
+      promotionNone: "Aucun candidat de promotion pour le moment.",
       reject: "Rejeter",
       send: "Envoyer",
       stop: "Stop",
@@ -405,6 +458,7 @@
       hide: "masquer",
       autoObserve: "Auto-commenter",
       observerHint: "Tapez un message ci-dessous pour commencer, ou activez Auto-commenter dans les paramètres.",
+      settingsHint: "Fournisseurs, modèles, politique d'approbation et valeurs runtime par défaut.",
       forceAgent: "Mode agent (toujours)",
       serverOutdated: "Serveur obsolète",
       more: "Afficher plus",
@@ -3704,6 +3758,9 @@
     const [pendingEdits, setPendingEdits] = useState([]);
     const [pendingCommands, setPendingCommands] = useState([]);
     const [pendingBusy, setPendingBusy] = useState(false);
+    const [harnessPromotions, setHarnessPromotions] = useState(null);
+    const [promotionBusy, setPromotionBusy] = useState(false);
+    const [promotionGateError, setPromotionGateError] = useState("");
     const [metaBusy, setMetaBusy] = useState(false);
     const [observerSubTab, setObserverSubTab] = useState("analysis"); // "analysis" | "chat" | "meta"
     const [metaArtifacts, setMetaArtifacts] = useState([]);
@@ -3725,7 +3782,8 @@
     const [projectScanLoading, setProjectScanLoading] = useState(false);
     const projectScanRootRef = useRef("");
     const settingsPanelRef = useRef(null);
-    const approvalsSectionRef = useRef(null);
+    const promotionsPanelRef = useRef(null);
+    const runtimeApprovalsRef = useRef(null);
     const [gitCheckpoint, setGitCheckpoint] = useState(null);
 
     const [threadState, setThreadState] = useState(() => {
@@ -4065,9 +4123,11 @@
       refreshStatus();
       refreshPendingEdits();
       refreshPendingCommands();
+      refreshHarnessPromotions();
       const t = setInterval(() => {
         refreshPendingEdits();
         refreshPendingCommands();
+        refreshHarnessPromotions();
       }, 3000);
       return () => clearInterval(t);
     }, []);
@@ -4157,10 +4217,30 @@
         .catch(() => {});
     };
 
-    const pendingApprovalCount = (pendingEdits ? pendingEdits.length : 0) + (pendingCommands ? pendingCommands.length : 0);
+    const refreshHarnessPromotions = () => {
+      fetch("/api/harness_promotions")
+        .then((r) => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+        .then((j) => {
+          setHarnessPromotions(j && typeof j === "object" ? j : null);
+          setPromotionGateError("");
+        })
+        .catch((err) => {
+          setPromotionGateError(String((err && err.message) || err || ""));
+        });
+    };
 
-    const jumpToPendingApprovals = () => {
-      const target = approvalsSectionRef.current || settingsPanelRef.current;
+    const promotionReviewCount = harnessPromotions && harnessPromotions.summary
+      ? Number(harnessPromotions.summary.needs_review || 0)
+      : 0;
+    const promotionInboxCount = harnessPromotions && harnessPromotions.summary
+      ? Number(harnessPromotions.summary.needs_review || 0) + Number(harnessPromotions.summary.approved || 0)
+      : 0;
+    const runtimeApprovalCount =
+      (pendingEdits ? pendingEdits.length : 0)
+      + (pendingCommands ? pendingCommands.length : 0);
+
+    const scrollToPanel = (ref, fallbackRef) => {
+      const target = ref.current || (fallbackRef ? fallbackRef.current : null);
       if (!target || typeof target.scrollIntoView !== "function") return;
       try {
         target.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -4168,6 +4248,9 @@
         target.scrollIntoView();
       }
     };
+
+    const jumpToHarnessReviews = () => scrollToPanel(promotionsPanelRef, settingsPanelRef);
+    const jumpToRuntimeApprovals = () => scrollToPanel(runtimeApprovalsRef, settingsPanelRef);
 
     useEffect(() => {
       if (observerSubTab !== "meta") return;
@@ -4228,6 +4311,37 @@
       } finally {
         setPendingBusy(false);
         refreshPendingCommands();
+      }
+    };
+
+    const resolveHarnessPromotion = async (id, action) => {
+      const pid = String(id || "").trim();
+      const act = String(action || "").trim().toLowerCase();
+      if (!pid || !act || promotionBusy) return;
+      const endpoint = act === "approve"
+        ? "/api/harness_promotions/approve"
+        : act === "hold"
+        ? "/api/harness_promotions/hold"
+        : act === "apply"
+        ? "/api/harness_promotions/apply"
+        : "";
+      if (!endpoint) return;
+      setPromotionBusy(true);
+      try {
+        const resp = await postJson(endpoint, { id: pid });
+        if (resp && resp.board) {
+          setHarnessPromotions(resp.board);
+          setPromotionGateError("");
+          if (act === "apply") {
+            governorContractCache = null;
+            governorContractPromise = null;
+          }
+        }
+      } catch (err) {
+        setPromotionGateError(String((err && err.message) || err || ""));
+      } finally {
+        setPromotionBusy(false);
+        refreshHarnessPromotions();
       }
     };
 
@@ -9940,6 +10054,186 @@ state: ${agentState}`);
       return (b.score || 50) - (a.score || 50);
     });
 
+    const promotionStatusLabel = (status) => {
+      const s = String(status || "").trim();
+      if (s === "needs_review") return tr(lang, "needsReview");
+      if (s === "approved") return tr(lang, "approved");
+      if (s === "held") return tr(lang, "held");
+      if (s === "applied") return tr(lang, "applied");
+      if (s === "up_to_date") return tr(lang, "upToDate");
+      if (s === "blocked") return tr(lang, "blocked");
+      return s || tr(lang, "promotionNone");
+    };
+
+    const promotionStatusKey = (entry) => {
+      const raw = String((entry && (entry.review_badge || entry.review_status)) || "").trim();
+      if (
+        raw === "needs_review"
+        || raw === "approved"
+        || raw === "held"
+        || raw === "applied"
+        || raw === "up_to_date"
+        || raw === "blocked"
+      ) {
+        return raw;
+      }
+      return "blocked";
+    };
+
+    const groupedHarnessPromotions = (() => {
+      const source = harnessPromotions && Array.isArray(harnessPromotions.entries)
+        ? harnessPromotions.entries
+        : [];
+      const order = ["needs_review", "approved", "held", "applied", "blocked", "up_to_date"];
+      const buckets = new Map(order.map((status) => [status, []]));
+      source.forEach((entry) => {
+        const status = promotionStatusKey(entry);
+        buckets.get(status).push(entry);
+      });
+      return order
+        .map((status) => ({ status, entries: buckets.get(status) || [] }))
+        .filter((group) => group.entries.length > 0);
+    })();
+
+    const renderPromotionCard = (entry) => {
+      const status = promotionStatusKey(entry);
+      return e(
+        "div",
+        {
+          key: String(entry.id || `${status}-${entry.title || ""}`),
+          className: `review-card ${status}`,
+        },
+        e(
+          "div",
+          { className: "review-card-head" },
+          e(
+            "div",
+            { className: "review-card-copy" },
+            e("div", { className: "review-card-title" }, String(entry.title || entry.id || "")),
+            e(
+              "div",
+              { className: "review-card-meta" },
+              e("span", { className: "pill" }, String(entry.badge || "")),
+              e("span", { className: "pill" }, promotionStatusLabel(status)),
+              e("span", { className: "pill" }, `${Number(entry.green_case_ids ? entry.green_case_ids.length : 0)} ${tr(lang, "greenCases")}`)
+            ),
+            entry.subtitle
+              ? e("div", { className: "panel-subtitle" }, String(entry.subtitle || ""))
+              : null
+          ),
+          e(
+            "div",
+            { className: "review-card-actions" },
+            entry.can_approve
+              ? e(
+                  "button",
+                  {
+                    className: "btn btn-primary",
+                    type: "button",
+                    disabled: promotionBusy,
+                    onClick: () => resolveHarnessPromotion(entry.id, "approve"),
+                  },
+                  tr(lang, "approve")
+                )
+              : null,
+            entry.can_hold
+              ? e(
+                  "button",
+                  {
+                    className: "btn btn-warn",
+                    type: "button",
+                    disabled: promotionBusy,
+                    onClick: () => resolveHarnessPromotion(entry.id, "hold"),
+                  },
+                  tr(lang, "hold")
+                )
+              : null,
+            entry.can_apply
+              ? e(
+                  "button",
+                  {
+                    className: "btn btn-accent",
+                    type: "button",
+                    disabled: promotionBusy,
+                    onClick: () => resolveHarnessPromotion(entry.id, "apply"),
+                  },
+                  tr(lang, "applyToContract")
+                )
+              : null
+          )
+        ),
+        entry.reasons && entry.reasons.length
+          ? e(
+              "div",
+              { className: "review-card-reasons" },
+              entry.reasons.slice(0, 3).map((reason, idx) =>
+                e("div", { key: `${entry.id}-reason-${idx}`, className: "review-card-reason" }, "• " + String(reason || ""))
+              )
+            )
+          : null,
+        entry.patch_path
+          ? e("pre", { className: "review-card-path" }, String(entry.patch_path || ""))
+          : null
+      );
+    };
+
+    const renderApprovalCard = (kind, it) => {
+      const pending = String(it.status || "") === "pending";
+      const preview = kind === "edit"
+        ? String(it.diff || it.preview || "")
+        : String(it.preview || it.command || "");
+      return e(
+        "div",
+        {
+          key: String(it.id || `${kind}-${preview}`),
+          className: "approval-card",
+        },
+        e(
+          "div",
+          { className: "approval-card-head" },
+          e(
+            "div",
+            { className: "approval-card-meta" },
+            e("code", null, String(kind === "edit" ? (it.action || "") : (it.id || ""))),
+            e("span", { className: "pill" }, String(it.status || "")),
+            kind === "edit" && it.path
+              ? e("span", { className: "approval-card-path" }, String(it.path || ""))
+              : null,
+            kind === "command" && it.cwd
+              ? e("span", { className: "approval-card-path" }, String(it.cwd || ""))
+              : null
+          ),
+          pending
+            ? e(
+                "div",
+                { className: "approval-card-actions" },
+                e(
+                  "button",
+                  {
+                    className: "btn btn-primary",
+                    type: "button",
+                    disabled: pendingBusy,
+                    onClick: () => kind === "edit" ? resolvePendingEdit(it.id, true) : resolvePendingCommand(it.id, true),
+                  },
+                  tr(lang, "approve")
+                ),
+                e(
+                  "button",
+                  {
+                    className: "btn btn-warn",
+                    type: "button",
+                    disabled: pendingBusy,
+                    onClick: () => kind === "edit" ? resolvePendingEdit(it.id, false) : resolvePendingCommand(it.id, false),
+                  },
+                  tr(lang, "reject")
+                )
+              )
+            : null
+        ),
+        preview ? e("pre", { className: "approval-card-preview" }, preview) : null
+      );
+    };
+
     return e(
       "div",
       { className: "app" },
@@ -9980,9 +10274,9 @@ state: ${agentState}`);
               " A"
             )
           ),
-          e(
-            "div",
-            { className: "top-actions" },
+            e(
+              "div",
+              { className: "top-actions" },
             e(
               "div",
               { className: "seg" },
@@ -9991,16 +10285,28 @@ state: ${agentState}`);
               e("button", { className: "seg-btn " + (lang === "fr" ? "active" : ""), onClick: () => setLang("fr") }, "FR")
             ),
             e("button", { className: "btn", onClick: refreshStatus, type: "button" }, tr(lang, "refresh")),
-            pendingApprovalCount
+            promotionInboxCount
               ? e(
                   "button",
                   {
-                    className: "btn btn-warn",
-                    onClick: jumpToPendingApprovals,
+                    className: "btn btn-review approval-jump",
+                    onClick: jumpToHarnessReviews,
                     type: "button",
-                    title: tr(lang, "openApprovals"),
+                    title: tr(lang, "openHarnessReviews"),
                   },
-                  `${tr(lang, "approvals")} ${pendingApprovalCount}`
+                  `${tr(lang, "harnessReviews")} ${promotionInboxCount}`
+                )
+              : null,
+            runtimeApprovalCount
+              ? e(
+                  "button",
+                  {
+                    className: "btn btn-warn approval-jump",
+                    onClick: jumpToRuntimeApprovals,
+                    type: "button",
+                    title: tr(lang, "openRuntimeApprovals"),
+                  },
+                  `${tr(lang, "runtimeApprovals")} ${runtimeApprovalCount}`
                 )
               : null,
             e("button", {
@@ -10127,14 +10433,146 @@ state: ${agentState}`);
           ),
           e(
             "div",
+            { className: "panel panel-review", ref: promotionsPanelRef },
+            e(
+              "div",
+              { className: "panel-header" },
+              e(
+                "div",
+                { className: "panel-header-copy" },
+                e("h2", null, tr(lang, "harnessReviews")),
+                e("p", { className: "panel-subtitle" }, tr(lang, "harnessReviewHint"))
+              ),
+              e(
+                "div",
+                { className: "review-summary" },
+                e("span", { className: "pill" }, `${tr(lang, "needsReview")}: ${promotionReviewCount}`),
+                harnessPromotions && harnessPromotions.summary
+                  ? e("span", { className: "pill" }, `${tr(lang, "approved")}: ${Number(harnessPromotions.summary.approved || 0)}`)
+                  : null,
+                harnessPromotions && harnessPromotions.summary
+                  ? e("span", { className: "pill" }, `${tr(lang, "applied")}: ${Number(harnessPromotions.summary.applied || 0)}`)
+                  : null,
+                e(
+                  "button",
+                  {
+                    className: "btn",
+                    type: "button",
+                    disabled: promotionBusy,
+                    onClick: refreshHarnessPromotions,
+                  },
+                  tr(lang, "refresh")
+                )
+              )
+            ),
+            e(
+              "div",
+              { className: "panel-body" },
+              promotionGateError
+                ? e("div", { className: "hint", style: { color: "var(--warn)" } }, promotionGateError)
+                : null,
+              harnessPromotions && harnessPromotions.status_message
+                ? e("div", { className: "hint" }, String(harnessPromotions.status_message))
+                : null,
+              groupedHarnessPromotions.length
+                ? e(
+                    "div",
+                    { className: "review-groups" },
+                    groupedHarnessPromotions.map((group) =>
+                      e(
+                        "div",
+                        { key: group.status, className: "review-group" },
+                        e(
+                          "div",
+                          { className: "review-group-header" },
+                          e("div", { className: "review-group-title" }, promotionStatusLabel(group.status)),
+                          e("div", { className: "review-group-count" }, `${group.entries.length} / ${Number((harnessPromotions && harnessPromotions.summary && harnessPromotions.summary.total) || 0)}`)
+                        ),
+                        e(
+                          "div",
+                          { className: "review-card-list" },
+                          group.entries.map((entry) => renderPromotionCard(entry))
+                        )
+                      )
+                    )
+                  )
+                : e("div", { className: "hint" }, tr(lang, "promotionNone"))
+            )
+          ),
+          e(
+            "div",
+            { className: "panel", ref: runtimeApprovalsRef },
+            e(
+              "div",
+              { className: "panel-header" },
+              e(
+                "div",
+                { className: "panel-header-copy" },
+                e("h2", null, tr(lang, "runtimeApprovals")),
+                e("p", { className: "panel-subtitle" }, tr(lang, "runtimeApprovalHint"))
+              ),
+              e(
+                "div",
+                { className: "review-summary" },
+                e("span", { className: "pill" }, `${tr(lang, "pendingEdits")}: ${Number((pendingEdits && pendingEdits.length) || 0)}`),
+                e("span", { className: "pill" }, `${tr(lang, "pendingCommands")}: ${Number((pendingCommands && pendingCommands.length) || 0)}`)
+              )
+            ),
+            e(
+              "div",
+              { className: "panel-body" },
+              e(
+                "div",
+                { className: "approval-board" },
+                e(
+                  "div",
+                  { className: "approval-group" },
+                  e(
+                    "div",
+                    { className: "review-group-header" },
+                    e("div", { className: "review-group-title" }, tr(lang, "pendingEdits")),
+                    e("div", { className: "review-group-count" }, String((pendingEdits && pendingEdits.length) || 0))
+                  ),
+                  e(
+                    "div",
+                    { className: "approval-group-body" },
+                    pendingEdits && pendingEdits.length
+                      ? pendingEdits.map((it) => renderApprovalCard("edit", it))
+                      : e("div", { className: "hint" }, tr(lang, "nothingPending"))
+                  )
+                ),
+                e(
+                  "div",
+                  { className: "approval-group" },
+                  e(
+                    "div",
+                    { className: "review-group-header" },
+                    e("div", { className: "review-group-title" }, tr(lang, "pendingCommands")),
+                    e("div", { className: "review-group-count" }, String((pendingCommands && pendingCommands.length) || 0))
+                  ),
+                  e(
+                    "div",
+                    { className: "approval-group-body" },
+                    pendingCommands && pendingCommands.length
+                      ? pendingCommands.map((it) => renderApprovalCard("command", it))
+                      : e("div", { className: "hint" }, tr(lang, "nothingPending"))
+                  )
+                )
+              )
+            )
+          ),
+          e(
+            "div",
             { className: "panel", ref: settingsPanelRef },
             e(
               "div",
               { className: "panel-header" },
-              e("h2", null, tr(lang, "settings")),
-              pendingApprovalCount
-                ? e("span", { className: "pill", title: tr(lang, "openApprovals") }, `${tr(lang, "approvals")}: ${pendingApprovalCount}`)
-                : null
+              e(
+                "div",
+                { className: "panel-header-copy" },
+                e("h2", null, tr(lang, "settings")),
+                e("p", { className: "panel-subtitle" }, tr(lang, "settingsHint"))
+              )
             ),
             e(
               "div",
@@ -10821,138 +11259,6 @@ state: ${agentState}`);
                   onChange: (ev) => setObserverApiKey(ev.target.value),
                   placeholder: "env",
                 })
-              ),
-              e(
-                "div",
-                { className: "field", style: { marginTop: "10px" }, ref: approvalsSectionRef },
-                e("label", null, tr(lang, "pendingEdits")),
-                pendingEdits && pendingEdits.length
-                  ? e(
-                      "div",
-                      { style: { display: "flex", flexDirection: "column", gap: 8, maxHeight: 160, overflow: "auto" } },
-                      pendingEdits.map((it) =>
-                        e(
-                          "div",
-                          {
-                            key: String(it.id || Math.random()),
-                            style: {
-                              border: "1px solid rgba(255,255,255,0.15)",
-                              borderRadius: 8,
-                              padding: "8px 10px",
-                              background: "rgba(255,255,255,0.03)",
-                            },
-                          },
-                          e(
-                            "div",
-                            { style: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" } },
-                            e("code", null, String(it.action || "")),
-                            e("span", { className: "pill" }, String(it.status || "")),
-                            e("span", { style: { color: "var(--faint)", fontSize: 12 } }, String(it.path || "")),
-                            String(it.status || "") === "pending"
-                              ? e(
-                                  "div",
-                                  { style: { marginLeft: "auto", display: "flex", gap: 6 } },
-                                  e(
-                                    "button",
-                                    {
-                                      className: "btn btn-primary",
-                                      type: "button",
-                                      disabled: pendingBusy,
-                                      onClick: () => resolvePendingEdit(it.id, true),
-                                    },
-                                    tr(lang, "approve")
-                                  ),
-                                  e(
-                                    "button",
-                                    {
-                                      className: "btn btn-warn",
-                                      type: "button",
-                                      disabled: pendingBusy,
-                                      onClick: () => resolvePendingEdit(it.id, false),
-                                    },
-                                    tr(lang, "reject")
-                                  )
-                                )
-                              : null
-                          ),
-                          it.preview
-                            ? e(
-                                "pre",
-                                { style: { marginTop: 6, maxHeight: 100, overflow: "auto" } },
-                                String(it.diff || it.preview)
-                              )
-                            : null
-                        )
-                      )
-                    )
-                  : e("div", { className: "hint" }, "none")
-              ),
-              e(
-                "div",
-                { className: "field", style: { marginTop: "10px" } },
-                e("label", null, tr(lang, "pendingCommands")),
-                pendingCommands && pendingCommands.length
-                  ? e(
-                      "div",
-                      { style: { display: "flex", flexDirection: "column", gap: 8, maxHeight: 160, overflow: "auto" } },
-                      pendingCommands.map((it) =>
-                        e(
-                          "div",
-                          {
-                            key: String(it.id || Math.random()),
-                            style: {
-                              border: "1px solid rgba(255,255,255,0.15)",
-                              borderRadius: 8,
-                              padding: "8px 10px",
-                              background: "rgba(255,255,255,0.03)",
-                            },
-                          },
-                          e(
-                            "div",
-                            { style: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" } },
-                            e("code", null, String(it.id || "")),
-                            e("span", { className: "pill" }, String(it.status || "")),
-                            it.cwd
-                              ? e("span", { style: { color: "var(--faint)", fontSize: 12 } }, String(it.cwd || ""))
-                              : null,
-                            String(it.status || "") === "pending"
-                              ? e(
-                                  "div",
-                                  { style: { marginLeft: "auto", display: "flex", gap: 6 } },
-                                  e(
-                                    "button",
-                                    {
-                                      className: "btn btn-primary",
-                                      type: "button",
-                                      disabled: pendingBusy,
-                                      onClick: () => resolvePendingCommand(it.id, true),
-                                    },
-                                    tr(lang, "approve")
-                                  ),
-                                  e(
-                                    "button",
-                                    {
-                                      className: "btn btn-warn",
-                                      type: "button",
-                                      disabled: pendingBusy,
-                                      onClick: () => resolvePendingCommand(it.id, false),
-                                    },
-                                    tr(lang, "reject")
-                                  )
-                                )
-                              : null
-                          ),
-                          (it.preview || it.command)
-                            ? e(
-                                "pre",
-                                { style: { marginTop: 6, maxHeight: 100, overflow: "auto" } },
-                                String(it.preview || it.command || "")
-                              )
-                            : null
-                        )
-                      )
-                    )
-                  : e("div", { className: "hint" }, "none")
               ),
               e(
                 "div",

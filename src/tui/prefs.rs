@@ -121,6 +121,7 @@ fn right_tab_label(tab: RightTab) -> &'static str {
         RightTab::Observer => "observer",
         RightTab::Chat => "chat",
         RightTab::Tasks => "tasks",
+        RightTab::Promotions => "promotions",
     }
 }
 
@@ -129,6 +130,7 @@ fn parse_right_tab(raw: &str) -> Option<RightTab> {
         "observer" | "observe" => Some(RightTab::Observer),
         "chat" => Some(RightTab::Chat),
         "tasks" | "task" => Some(RightTab::Tasks),
+        "promotions" | "promotion" | "promote" => Some(RightTab::Promotions),
         _ => None,
     }
 }

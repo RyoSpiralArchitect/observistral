@@ -64,6 +64,7 @@ pub enum RuntimeEvalCheck {
     ToolCallSeen { name: String },
     ToolCallMin { name: String, min: usize },
     TraceEventSeen { event: String },
+    ToolRootFileExists { path: String },
     MessagesMin { min: usize },
     GraphNodesMin { min: usize },
 }
@@ -250,7 +251,7 @@ pub fn evaluate_case(
 ) -> Result<RuntimeEvalCaseReport> {
     let trace_lines = load_trace_lines(&artifacts.trace_path)?;
     let metrics = collect_metrics(&trace_lines, &artifacts)?;
-    let checks = evaluate_checks(case, &metrics, run_error.as_deref());
+    let checks = evaluate_checks(case, root, &artifacts, &metrics, run_error.as_deref());
     let ok = checks.iter().all(|c| c.ok) && run_error.is_none();
     Ok(RuntimeEvalCaseReport {
         id: case.id.clone(),
@@ -618,6 +619,8 @@ fn load_graph_value(path: &Path) -> Result<Value> {
 
 fn evaluate_checks(
     case: &RuntimeEvalCase,
+    root: &str,
+    artifacts: &RuntimeEvalArtifacts,
     metrics: &RuntimeEvalMetrics,
     run_error: Option<&str>,
 ) -> Vec<RuntimeEvalCheckResult> {
@@ -628,12 +631,14 @@ fn evaluate_checks(
     };
     checks
         .iter()
-        .map(|check| evaluate_check(check, metrics, run_error))
+        .map(|check| evaluate_check(check, root, artifacts, metrics, run_error))
         .collect()
 }
 
 fn evaluate_check(
     check: &RuntimeEvalCheck,
+    root: &str,
+    _artifacts: &RuntimeEvalArtifacts,
     metrics: &RuntimeEvalMetrics,
     run_error: Option<&str>,
 ) -> RuntimeEvalCheckResult {
@@ -693,6 +698,22 @@ fn evaluate_check(
                 label: format!("trace_event_seen:{event}"),
                 ok: count > 0,
                 detail: format!("count={count}"),
+            }
+        }
+        RuntimeEvalCheck::ToolRootFileExists { path } => {
+            let resolved = {
+                let raw = PathBuf::from(path);
+                if raw.is_absolute() {
+                    raw
+                } else {
+                    Path::new(root).join(raw)
+                }
+            };
+            let exists = resolved.exists();
+            RuntimeEvalCheckResult {
+                label: format!("tool_root_file_exists:{path}"),
+                ok: exists,
+                detail: format!("resolved={} exists={exists}", resolved.display()),
             }
         }
         RuntimeEvalCheck::MessagesMin { min } => RuntimeEvalCheckResult {
@@ -820,14 +841,18 @@ mod tests {
                     name: "search_files".to_string(),
                     min: 1,
                 },
+                RuntimeEvalCheck::ToolRootFileExists {
+                    path: "created.flag".to_string(),
+                },
                 RuntimeEvalCheck::MessagesMin { min: 2 },
                 RuntimeEvalCheck::GraphNodesMin { min: 2 },
             ],
         };
+        std::fs::write(dir.path().join("created.flag"), "ok").unwrap();
 
         let report = evaluate_case(
             &case,
-            ".",
+            dir.path().to_str().unwrap(),
             RuntimeEvalArtifacts {
                 case_dir: dir.path().to_path_buf(),
                 trace_path,

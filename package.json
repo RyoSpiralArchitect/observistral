@@ -1,0 +1,11 @@
+{
+  "name": "observistral-ui-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "ui:smoke": "node scripts/ui-smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.55.0"
+  }
+}
