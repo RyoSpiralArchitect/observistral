@@ -3,6 +3,7 @@ pub mod app;
 pub mod events;
 pub mod intent;
 pub mod prefs;
+pub mod promotion_gate;
 pub mod suggestion;
 pub mod ui;
 
@@ -260,6 +261,9 @@ Tip: you can still use Anthropic/HF for other panes via `--observer-provider` / 
     );
     if let Ok(prefs) = prefs::load_prefs(prefs_root.as_deref()) {
         prefs::apply_prefs_to_app(&mut app, &prefs);
+    }
+    if let Err(err) = promotion_gate::refresh_promotions(&mut app) {
+        app.harness_promotions_status = Some(format!("promotions refresh failed: {err:#}"));
     }
     let result = events::run_event_loop(&mut app, &mut terminal).await;
 

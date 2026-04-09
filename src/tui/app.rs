@@ -2,6 +2,7 @@ use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 
 use crate::config::RunConfig;
+use crate::harness_gate::HarnessPromotionBoard;
 use crate::streaming::{GovernorState, RealizeState};
 
 use super::agent::RealizePreset;
@@ -19,6 +20,7 @@ pub enum RightTab {
     Observer,
     Chat,
     Tasks,
+    Promotions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +247,9 @@ pub struct App {
     pub planning_tasks: bool,
     pub tasks: Vec<Task>,
     pub tasks_cursor: usize,
+    pub harness_promotions: HarnessPromotionBoard,
+    pub harness_promotions_cursor: usize,
+    pub harness_promotions_status: Option<String>,
 }
 
 impl App {
@@ -313,6 +318,9 @@ impl App {
             planning_tasks: false,
             tasks: Vec::new(),
             tasks_cursor: 0,
+            harness_promotions: HarnessPromotionBoard::default(),
+            harness_promotions_cursor: 0,
+            harness_promotions_status: None,
         }
     }
 
@@ -323,7 +331,7 @@ impl App {
                 RightTab::Observer => &mut self.observer,
                 RightTab::Chat => &mut self.chat,
                 // Tasks tab is read-only; fall back to Observer for generic actions (copy, clear, etc.).
-                RightTab::Tasks => &mut self.observer,
+                RightTab::Tasks | RightTab::Promotions => &mut self.observer,
             },
         }
     }
@@ -339,7 +347,8 @@ impl App {
         self.right_tab = match self.right_tab {
             RightTab::Observer => RightTab::Chat,
             RightTab::Chat => RightTab::Tasks,
-            RightTab::Tasks => RightTab::Observer,
+            RightTab::Tasks => RightTab::Promotions,
+            RightTab::Promotions => RightTab::Observer,
         };
     }
 

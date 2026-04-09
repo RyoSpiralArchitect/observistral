@@ -5,6 +5,7 @@ mod config;
 mod exec;
 mod file_tools;
 mod governor_contract;
+mod harness_gate;
 mod harness_promotion;
 mod lang_detect;
 mod loop_detect;
@@ -630,11 +631,11 @@ async fn run_promote_harness(args: PromoteHarnessArgs) -> Result<()> {
     let root = normalize_tool_root(root).unwrap_or_else(|| ".".to_string());
     let overlay_path = args
         .overlay
-        .map(|path| resolve_session_path(path, Some(root.as_str())))
+        .map(|path| resolve_promote_path(path, &cwd, Some(root.as_str())))
         .unwrap_or_else(|| crate::tui::agent::harness_evolution_overlay_path_for_root(&root));
     let out_path = args
         .out
-        .map(|path| resolve_session_path(path, Some(root.as_str())))
+        .map(|path| resolve_promote_path(path, &cwd, Some(root.as_str())))
         .unwrap_or_else(|| crate::harness_promotion::candidate_path_for_root(&root));
     let contract_path = args
         .contract
@@ -1284,6 +1285,7 @@ fn build_inventory_state(root: &Path) -> Result<serde_json::Value> {
     let harness_queue_path = root.join(".obstral/policy_patch_queue.json");
     let harness_overlay_path = root.join(".obstral/governor_contract.overlay.json");
     let harness_promotion_path = root.join(".obstral/governor_contract.promotion.json");
+    let harness_gate_path = root.join(".obstral/governor_contract.promotion_gate.json");
     let runtime_spec_path = root.join(".obstral/runtime_eval.json");
     let replay_spec_path = root.join(".obstral/tui_replay.json");
 
@@ -1365,6 +1367,17 @@ fn build_inventory_state(root: &Path) -> Result<serde_json::Value> {
             "status": if root.join("src/harness_promotion.rs").exists() && harness_promotion_path.exists() { "implemented" } else if root.join("src/harness_promotion.rs").exists() { "partial" } else { "missing" },
         }),
         json!({
+            "key": "governor_contract_promotion_gate",
+            "owner": "src/harness_gate.rs",
+            "lifetime": "cross-session",
+            "backing_store": ".obstral/governor_contract.promotion_gate.json",
+            "persisted": true,
+            "doc_present": state_schema_path.exists(),
+            "owner_present": root.join("src/harness_gate.rs").exists(),
+            "backing_present": harness_gate_path.exists(),
+            "status": if root.join("src/harness_gate.rs").exists() && harness_gate_path.exists() { "implemented" } else if root.join("src/harness_gate.rs").exists() { "partial" } else { "missing" },
+        }),
+        json!({
             "key": "in_memory_app",
             "owner": "src/tui/app.rs",
             "lifetime": "live TUI session",
@@ -1443,6 +1456,7 @@ fn build_inventory_state(root: &Path) -> Result<serde_json::Value> {
                 "harness_evolution_queue" => "run a loop-triggering eval case to seed .obstral/policy_patch_queue.json",
                 "promoted_governor_overlay" => "run `obstral eval` on a loop-triggering case so promoted overlays are written",
                 "governor_contract_promotion" => "run `obstral promote-harness --json` to generate a UI-ready promotion candidate",
+                "governor_contract_promotion_gate" => "review a promotion candidate in TUI/GUI or call the harness gate API so .obstral/governor_contract.promotion_gate.json is created",
                 "runtime_eval_fixture" => "keep .obstral/runtime_eval.json in sync with current regression cases",
                 "tui_replay_fixture" => "keep .obstral/tui_replay.json aligned with observer stuck-case coverage",
                 _ => "add missing owner or backing store",
@@ -2407,6 +2421,24 @@ fn resolve_session_path(session_path: PathBuf, tool_root: Option<&str>) -> PathB
         return session_path;
     };
     std::path::PathBuf::from(root).join(session_path)
+}
+
+fn resolve_promote_path(path: PathBuf, cwd: &Path, tool_root: Option<&str>) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+
+    let cwd_path = cwd.join(&path);
+    if cwd_path.exists()
+        || cwd_path
+            .parent()
+            .map(|parent| parent.exists())
+            .unwrap_or(false)
+    {
+        return cwd_path;
+    }
+
+    resolve_session_path(path, tool_root)
 }
 
 async fn run_agent(args: AgentArgs, common: CommonArgs) -> Result<()> {
@@ -3460,4 +3492,59 @@ fn read_stdin_to_string() -> Result<String> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_promote_path;
+    use std::path::{Path, PathBuf};
+
+    fn temp_dir() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "obstral_main_tests_{}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn resolve_promote_path_prefers_existing_cwd_path() {
+        let cwd = temp_dir();
+        let root = cwd.join("tool_root");
+        let overlay = cwd.join("tool_root/.obstral/governor_contract.overlay.json");
+        std::fs::create_dir_all(overlay.parent().unwrap()).expect("create overlay parent");
+        std::fs::write(&overlay, b"{}").expect("write overlay");
+
+        let resolved = resolve_promote_path(
+            PathBuf::from("tool_root/.obstral/governor_contract.overlay.json"),
+            &cwd,
+            Some(root.to_str().expect("root utf8")),
+        );
+        assert_eq!(resolved, overlay);
+    }
+
+    #[test]
+    fn resolve_promote_path_falls_back_to_tool_root_for_new_output() {
+        let cwd = temp_dir();
+        let root = cwd.join("tool_root");
+        std::fs::create_dir_all(root.join(".obstral")).expect("create tool_root");
+
+        let resolved = resolve_promote_path(
+            PathBuf::from(".obstral/governor_contract.promotion.json"),
+            &cwd,
+            Some(root.to_str().expect("root utf8")),
+        );
+        assert_eq!(
+            resolved,
+            Path::new(&root).join(".obstral/governor_contract.promotion.json")
+        );
+    }
 }

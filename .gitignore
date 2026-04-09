@@ -29,6 +29,9 @@ __pycache__/
 *.pyo
 *.egg-info/
 
+# Node / browser automation artifacts
+node_modules/
+
 # Local dev / sandbox artifacts
 .venv/
 .tmp/

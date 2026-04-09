@@ -10,8 +10,10 @@ use crate::config::{
     provider_preset_for_run, provider_preset_keys, representative_models_for_run, ProviderKind,
     RunConfig,
 };
+use crate::harness_gate::HarnessPromotionBoardStatus;
 
 use super::app::{App, Focus, Message, RightTab, Role, TaskPhase, TaskTarget};
+use super::promotion_gate;
 
 // ── Brand palette (mirrors web UI) ────────────────────────────────────────────
 
@@ -21,6 +23,7 @@ const ACCENT: Color = Color::Rgb(45, 212, 191); // teal-400
 const WARN: Color = Color::Rgb(251, 191, 36); // amber-400
 const DANGER: Color = Color::Rgb(248, 113, 113); // red-400
 const SUCCESS: Color = Color::Rgb(74, 222, 128); // green-400
+const PROMO: Color = Color::Rgb(129, 140, 248); // indigo-400
 const MUTED: Color = Color::Rgb(100, 116, 139); // slate-500
 const TEXT_BODY: Color = Color::Rgb(226, 232, 240); // slate-200
 const BG_DARK: Color = Color::Rgb(15, 23, 42); // slate-950
@@ -106,7 +109,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     String::new()
                 },
-                "TABS:[OBS] CHAT TASKS".to_string(),
+                "TABS:[OBS] CHAT TASKS PROMO".to_string(),
                 OBS_MAG,
             ),
             RightTab::Chat => (
@@ -119,7 +122,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     String::new()
                 },
-                "TABS: OBS [CHAT] TASKS".to_string(),
+                "TABS: OBS [CHAT] TASKS PROMO".to_string(),
                 ACCENT,
             ),
             RightTab::Tasks => (
@@ -132,8 +135,21 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     String::new()
                 },
-                "TABS: OBS CHAT [TASKS]".to_string(),
+                "TABS: OBS CHAT [TASKS] PROMO".to_string(),
                 WARN,
+            ),
+            RightTab::Promotions => (
+                "REVIEW",
+                format!(
+                    "{} queued",
+                    app.harness_promotions.summary.needs_review
+                        + app.harness_promotions.summary.approved
+                ),
+                "---",
+                "human-gate".to_string(),
+                String::new(),
+                "TABS: OBS CHAT TASKS [REVIEW]".to_string(),
+                PROMO,
             ),
         };
     let key_badge = if active_key_missing(app) {
@@ -256,7 +272,7 @@ fn active_key_missing(app: &App) -> bool {
         Focus::Right => match app.right_tab {
             RightTab::Observer => &app.observer_cfg,
             RightTab::Chat => &app.chat_cfg,
-            RightTab::Tasks => return false,
+            RightTab::Tasks | RightTab::Promotions => return false,
         },
     };
     provider_requires_key(&cfg.provider) && cfg.api_key.is_none()
@@ -308,6 +324,9 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App) {
         RightTab::Tasks => {
             render_tasks_pane(frame, right[1], app, right_focused);
         }
+        RightTab::Promotions => {
+            render_promotions_pane(frame, right[1], app, right_focused);
+        }
     }
 }
 
@@ -328,6 +347,21 @@ fn render_right_tab_bar(frame: &mut Frame, area: Rect, app: &App, focused: bool)
         Span::styled("[Chat]", style_for(RightTab::Chat, ACCENT)),
         Span::raw("  "),
         Span::styled("[Tasks]", style_for(RightTab::Tasks, WARN)),
+        Span::raw("  "),
+        Span::styled(
+            if app.harness_promotions.summary.needs_review + app.harness_promotions.summary.approved
+                > 0
+            {
+                format!(
+                    "[Review {}]",
+                    app.harness_promotions.summary.needs_review
+                        + app.harness_promotions.summary.approved
+                )
+            } else {
+                "[Review]".to_string()
+            },
+            style_for(RightTab::Promotions, PROMO),
+        ),
         Span::styled("   Ctrl+R or /tab", Style::default().fg(MUTED)),
     ]);
     frame.render_widget(
@@ -684,6 +718,102 @@ fn render_tasks_pane(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+fn promotion_status_style(status: HarnessPromotionBoardStatus, selected: bool) -> Style {
+    let color = match status {
+        HarnessPromotionBoardStatus::NeedsReview => WARN,
+        HarnessPromotionBoardStatus::Approved => SUCCESS,
+        HarnessPromotionBoardStatus::Held => DANGER,
+        HarnessPromotionBoardStatus::Applied => PROMO,
+        HarnessPromotionBoardStatus::UpToDate => ACCENT,
+        HarnessPromotionBoardStatus::Blocked => MUTED,
+    };
+    let style = Style::default().fg(color);
+    if selected {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+fn render_promotions_pane(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
+    let border_style = if focused {
+        Style::default().fg(PROMO)
+    } else {
+        Style::default().fg(UNFOCUSED)
+    };
+    let summary = &app.harness_promotions.summary;
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "REVIEW INBOX",
+            Style::default().fg(PROMO).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  review:{} approved:{} applied:{}",
+                summary.needs_review, summary.approved, summary.applied
+            ),
+            Style::default().fg(MUTED),
+        ),
+        Span::raw(" "),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style);
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if app.harness_promotions.entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                app.harness_promotions
+                    .status_message
+                    .clone()
+                    .unwrap_or_else(|| "no promotion candidates yet".to_string())
+            ),
+            Style::default().fg(MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Run `obstral promote-harness` to generate a candidate artifact.",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        let total = app.harness_promotions.entries.len();
+        let cur = app.harness_promotions_cursor.min(total.saturating_sub(1));
+        let (start, end) =
+            promotion_gate::visible_window(&app.harness_promotions, cur, inner.height as usize);
+
+        for i in start..end {
+            let entry = &app.harness_promotions.entries[i];
+            let selected = i == cur;
+            let prefix = if selected { ">" } else { " " };
+            let mut title = entry.title.clone();
+            if title.chars().count() > 34 {
+                title = title.chars().take(34).collect::<String>() + "...";
+            }
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {prefix}[{}] {:<6} {}",
+                    entry.review_badge, entry.badge, title
+                ),
+                promotion_status_style(entry.review_status, selected),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("   {}", entry.subtitle),
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 fn key_row(key: &'static str, desc: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {key:<18}"), Style::default().fg(ACCENT)),
@@ -697,13 +827,13 @@ fn render_welcome(frame: &mut Frame, area: Rect, app: &App, view: PaneView) {
             CODER_BLUE,
             " ◈ CODER",
             "Describe the coding task, then press Enter.",
-            "Chat lives on the right pane by default. Use Ctrl+R or /tab observer|chat|tasks.",
+            "Chat lives on the right pane by default. Use Ctrl+R or /tab observer|chat|tasks|promotions.",
             &app.coder_cfg,
             "Coder defaults to a coding-first mode in the TUI.",
             [
                 "1) Run /keys if your provider needs an API key",
                 "2) Type the task here and press Enter",
-                "3) Use Ctrl+R for Chat / Observer / Tasks",
+                "3) Use Ctrl+R for Chat / Observer / Tasks / Review",
             ],
         ),
         PaneView::Observer => (
@@ -723,13 +853,13 @@ fn render_welcome(frame: &mut Frame, area: Rect, app: &App, view: PaneView) {
             ACCENT,
             " ◈ CHAT",
             "Use Chat for brainstorming or quick questions, then press Enter.",
-            "Ctrl+R cycles Observer / Chat / Tasks on the right pane.",
+            "Ctrl+R cycles Observer / Chat / Tasks / Review on the right pane.",
             &app.chat_cfg,
             "Chat does not execute tools.",
             [
                 "1) Use Chat for brainstorming or clarification",
                 "2) Move to Coder when you want execution",
-                "3) Use /tab observer|tasks to inspect the runtime",
+                "3) Use /tab observer|tasks|promotions to inspect the runtime",
             ],
         ),
     };
@@ -1560,6 +1690,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
             RightTab::Observer => ("OBSERVER", OBS_MAG, app.observer.streaming, false),
             RightTab::Chat => ("CHAT", ACCENT, app.chat.streaming, false),
             RightTab::Tasks => ("TASKS", WARN, false, true),
+            RightTab::Promotions => ("REVIEW", PROMO, false, true),
         },
     };
 
@@ -1573,7 +1704,11 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let hint = if is_streaming {
         "Ctrl+K=cancel"
     } else if read_only {
-        "Enter=dispatch  Space=done  Ctrl+R=tab"
+        match app.right_tab {
+            RightTab::Tasks => "Enter=dispatch  Space=done  Ctrl+R=tab",
+            RightTab::Promotions => "Enter=primary  A=approve  H=hold  P=apply  R=refresh",
+            RightTab::Observer | RightTab::Chat => "Ctrl+R=tab",
+        }
     } else if active_picker.is_some() {
         "Up/Down=select  Enter=apply"
     } else if slash_items.is_some() {
@@ -1608,29 +1743,104 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
 
     if read_only {
         let mut lines: Vec<Line> = Vec::new();
-        if app.tasks.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  (no tasks)",
-                Style::default().fg(MUTED),
-            )));
-        } else {
-            let idx = app.tasks_cursor.min(app.tasks.len().saturating_sub(1));
-            let t = &app.tasks[idx];
-            lines.push(Line::from(Span::styled(
-                format!("  {}", t.title),
-                Style::default().fg(TEXT_BODY).add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(Span::styled(
-                format!("  priority: {}", t.priority),
-                Style::default().fg(MUTED),
-            )));
-            lines.push(Line::default());
-            for l in t.body.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("  {l}"),
-                    Style::default().fg(TEXT_BODY),
-                )));
+        match app.right_tab {
+            RightTab::Tasks => {
+                if app.tasks.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  (no tasks)",
+                        Style::default().fg(MUTED),
+                    )));
+                } else {
+                    let idx = app.tasks_cursor.min(app.tasks.len().saturating_sub(1));
+                    let t = &app.tasks[idx];
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", t.title),
+                        Style::default().fg(TEXT_BODY).add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        format!("  priority: {}", t.priority),
+                        Style::default().fg(MUTED),
+                    )));
+                    lines.push(Line::default());
+                    for l in t.body.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {l}"),
+                            Style::default().fg(TEXT_BODY),
+                        )));
+                    }
+                }
             }
+            RightTab::Promotions => {
+                if app.harness_promotions.entries.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  {}",
+                            app.harness_promotions
+                                .status_message
+                                .clone()
+                                .unwrap_or_else(|| "no promotion candidates".to_string())
+                        ),
+                        Style::default().fg(MUTED),
+                    )));
+                } else {
+                    let idx = app
+                        .harness_promotions_cursor
+                        .min(app.harness_promotions.entries.len().saturating_sub(1));
+                    let entry = &app.harness_promotions.entries[idx];
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", entry.title),
+                        Style::default().fg(TEXT_BODY).add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  status:{}  decision:{}  green_cases:{}",
+                            entry.review_badge,
+                            entry.badge,
+                            entry.green_case_ids.len()
+                        ),
+                        Style::default().fg(MUTED),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  primary:{}  contract:{}",
+                            promotion_gate::primary_action_hint(entry),
+                            entry.contract_path
+                        ),
+                        Style::default().fg(MUTED),
+                    )));
+                    if let Some(status) = app.harness_promotions_status.as_deref() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  note: {status}"),
+                            Style::default().fg(ACCENT),
+                        )));
+                    }
+                    lines.push(Line::default());
+                    for reason in &entry.reasons {
+                        lines.push(Line::from(Span::styled(
+                            format!("  - {reason}"),
+                            Style::default().fg(TEXT_BODY),
+                        )));
+                    }
+                    if let Some(path) = entry.patch_path.as_deref() {
+                        lines.push(Line::default());
+                        lines.push(Line::from(Span::styled(
+                            format!("  patch: {path}"),
+                            Style::default().fg(MUTED),
+                        )));
+                    }
+                    lines.push(Line::default());
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  keys: enter=primary  a=approve ({})  h=hold ({})  p=apply ({})  r=refresh",
+                            if entry.can_approve { "ready" } else { "locked" },
+                            if entry.can_hold { "ready" } else { "locked" },
+                            if entry.can_apply { "ready" } else { "locked" }
+                        ),
+                        Style::default().fg(MUTED),
+                    )));
+                }
+            }
+            RightTab::Observer | RightTab::Chat => {}
         }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         return;
@@ -1679,7 +1889,7 @@ fn current_input_text(app: &App) -> String {
         Focus::Right => match app.right_tab {
             RightTab::Observer => app.observer.textarea.lines().join("\n"),
             RightTab::Chat => app.chat.textarea.lines().join("\n"),
-            RightTab::Tasks => String::new(),
+            RightTab::Tasks | RightTab::Promotions => String::new(),
         },
     }
 }
@@ -1795,7 +2005,7 @@ fn render_active_textarea(frame: &mut Frame, area: Rect, app: &App) {
         Focus::Right => match app.right_tab {
             RightTab::Observer => frame.render_widget(&app.observer.textarea, area),
             RightTab::Chat => frame.render_widget(&app.chat.textarea, area),
-            RightTab::Tasks => {}
+            RightTab::Tasks | RightTab::Promotions => {}
         },
     }
 }
@@ -1806,7 +2016,7 @@ fn active_pane(app: &App) -> &super::app::Pane {
         Focus::Right => match app.right_tab {
             RightTab::Observer => &app.observer,
             RightTab::Chat => &app.chat,
-            RightTab::Tasks => &app.observer,
+            RightTab::Tasks | RightTab::Promotions => &app.observer,
         },
     }
 }
@@ -1817,7 +2027,7 @@ fn active_run_config(app: &App) -> &crate::config::RunConfig {
         Focus::Right => match app.right_tab {
             RightTab::Observer => &app.observer_cfg,
             RightTab::Chat => &app.chat_cfg,
-            RightTab::Tasks => &app.observer_cfg,
+            RightTab::Tasks | RightTab::Promotions => &app.observer_cfg,
         },
     }
 }
@@ -1828,7 +2038,7 @@ fn input_placeholder(app: &App) -> &'static str {
         Focus::Right => match app.right_tab {
             RightTab::Observer => "Ask for critique, diagnosis, or /meta-diagnose…",
             RightTab::Chat => "Ask a question or brainstorm…",
-            RightTab::Tasks => "",
+            RightTab::Tasks | RightTab::Promotions => "",
         },
     }
 }
@@ -1840,6 +2050,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             RightTab::Observer => "Observer",
             RightTab::Chat => "Chat",
             RightTab::Tasks => "Tasks",
+            RightTab::Promotions => "Promotions",
         },
     };
     let line = Line::from(vec![

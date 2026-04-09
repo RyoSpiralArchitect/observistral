@@ -43,7 +43,7 @@ pub enum PromotionDecision {
 }
 
 impl PromotionDecision {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             PromotionDecision::Add => "add",
             PromotionDecision::Update => "update",
@@ -110,6 +110,29 @@ pub struct GovernorContractPromotionCandidate {
 impl GovernorContractPromotionCandidate {
     pub const VERSION: u32 = 1;
 
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "failed to read governor contract promotion candidate: {}",
+                path.display()
+            )
+        })?;
+        let candidate: Self = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "failed to parse governor contract promotion candidate: {}",
+                path.display()
+            )
+        })?;
+        if candidate.version != Self::VERSION {
+            anyhow::bail!(
+                "unsupported governor contract promotion candidate version {} (expected {})",
+                candidate.version,
+                Self::VERSION
+            );
+        }
+        Ok(candidate)
+    }
+
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)
             .context("failed to serialize governor contract promotion candidate")?;
@@ -120,7 +143,7 @@ impl GovernorContractPromotionCandidate {
                 parent.display()
             )
         })?;
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), now_ms()));
         std::fs::write(&tmp, json.as_bytes()).with_context(|| {
             format!(
                 "failed to write temp governor contract promotion candidate: {}",
