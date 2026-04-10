@@ -3,7 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "ui:smoke": "node scripts/ui-smoke.mjs"
+    "ui:smoke": "node scripts/ui-smoke.mjs --scenario all",
+    "ui:smoke:baseline": "node scripts/ui-smoke.mjs --scenario baseline",
+    "ui:smoke:review-flow": "node scripts/ui-smoke.mjs --scenario harness-review-flow",
+    "ui:smoke:runtime-flow": "node scripts/ui-smoke.mjs --scenario runtime-approval-flow"
   },
   "devDependencies": {
     "playwright": "^1.55.0"

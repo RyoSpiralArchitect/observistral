@@ -19,6 +19,20 @@ OBSTRAL fixes this by running Coder and Observer in **completely separate contex
 
 ---
 
+## UI Preview
+
+These screenshots come from the Playwright smoke flows that exercise the Web UI end-to-end.
+
+| Overview | Harness review gate |
+|---|---|
+| ![OBSTRAL web overview](docs/screenshots/web-overview.png) | ![Harness review flow](docs/screenshots/harness-review-flow.png) |
+
+| Runtime approvals |
+|---|
+| ![Runtime approvals flow](docs/screenshots/runtime-approval-flow.png) |
+
+---
+
 ## Why OBSTRAL Exists
 
 Most LLM tools optimize for conversation.
