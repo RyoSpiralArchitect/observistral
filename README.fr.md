@@ -19,6 +19,20 @@ OBSTRAL resout ca en faisant tourner Coder et Observer dans des **contextes enti
 
 ---
 
+## UI Preview
+
+Ces captures proviennent des smoke tests Playwright qui parcourent l'UI Web de bout en bout.
+
+| Overview | Harness review gate |
+|---|---|
+| ![OBSTRAL web overview](docs/screenshots/web-overview.png) | ![Harness review flow](docs/screenshots/harness-review-flow.png) |
+
+| Runtime approvals |
+|---|
+| ![Runtime approvals flow](docs/screenshots/runtime-approval-flow.png) |
+
+---
+
 ## Pourquoi OBSTRAL existe
 
 La plupart des outils LLM optimisent la conversation.

@@ -4235,9 +4235,16 @@
     const promotionInboxCount = harnessPromotions && harnessPromotions.summary
       ? Number(harnessPromotions.summary.needs_review || 0) + Number(harnessPromotions.summary.approved || 0)
       : 0;
+    const isPendingApprovalItem = (item) => String((item && item.status) || "").trim() === "pending";
+    const pendingEditCount = Array.isArray(pendingEdits)
+      ? pendingEdits.filter(isPendingApprovalItem).length
+      : 0;
+    const pendingCommandCount = Array.isArray(pendingCommands)
+      ? pendingCommands.filter(isPendingApprovalItem).length
+      : 0;
     const runtimeApprovalCount =
-      (pendingEdits ? pendingEdits.length : 0)
-      + (pendingCommands ? pendingCommands.length : 0);
+      pendingEditCount
+      + pendingCommandCount;
 
     const scrollToPanel = (ref, fallbackRef) => {
       const target = ref.current || (fallbackRef ? fallbackRef.current : null);
@@ -5343,8 +5350,8 @@
       const toolResults = deriveMetaToolResultSnapshots(baseMsgs);
       const loopSignals = buildMetaLoopSignals(toolCalls, toolResults, baseMsgs.filter((m) => m.role === "assistant" && !m.streaming).slice(-4));
       const approvalSignals = [];
-      if (pendingEdits.length) approvalSignals.push(`pending_edit_approvals=${pendingEdits.length}`);
-      if (pendingCommands.length) approvalSignals.push(`pending_command_approvals=${pendingCommands.length}`);
+      if (pendingEditCount) approvalSignals.push(`pending_edit_approvals=${pendingEditCount}`);
+      if (pendingCommandCount) approvalSignals.push(`pending_command_approvals=${pendingCommandCount}`);
       if (/rejected by user/i.test(String(target.content || ""))) approvalSignals.push("user_rejected_action");
       const projectBits = [];
       if (projectScan && projectScan.stack_label) projectBits.push(String(projectScan.stack_label));
@@ -6060,7 +6067,7 @@
         parts.push(
           `observer: sending=${sendingObserver ? "yes" : "no"} mode=${String(config.observerMode || "")} persona=${String(config.observerPersona || "")} intensity=${String(config.observerIntensity || "")} phase=${String(observerPhase || "")} loop_depth=${(loopInfo && loopInfo.depth) ? loopInfo.depth : 0}`
         );
-        parts.push(`pending_approvals: edits=${pendingEdits.length} commands=${pendingCommands.length}`);
+        parts.push(`pending_approvals: edits=${pendingEditCount} commands=${pendingCommandCount}`);
         if (tasks.length) {
           parts.push(
             "tasks:\n- " +
@@ -10514,8 +10521,8 @@ state: ${agentState}`);
               e(
                 "div",
                 { className: "review-summary" },
-                e("span", { className: "pill" }, `${tr(lang, "pendingEdits")}: ${Number((pendingEdits && pendingEdits.length) || 0)}`),
-                e("span", { className: "pill" }, `${tr(lang, "pendingCommands")}: ${Number((pendingCommands && pendingCommands.length) || 0)}`)
+                e("span", { className: "pill" }, `${tr(lang, "pendingEdits")}: ${pendingEditCount}`),
+                e("span", { className: "pill" }, `${tr(lang, "pendingCommands")}: ${pendingCommandCount}`)
               )
             ),
             e(
@@ -10531,7 +10538,7 @@ state: ${agentState}`);
                     "div",
                     { className: "review-group-header" },
                     e("div", { className: "review-group-title" }, tr(lang, "pendingEdits")),
-                    e("div", { className: "review-group-count" }, String((pendingEdits && pendingEdits.length) || 0))
+                    e("div", { className: "review-group-count" }, String(pendingEditCount))
                   ),
                   e(
                     "div",
@@ -10548,7 +10555,7 @@ state: ${agentState}`);
                     "div",
                     { className: "review-group-header" },
                     e("div", { className: "review-group-title" }, tr(lang, "pendingCommands")),
-                    e("div", { className: "review-group-count" }, String((pendingCommands && pendingCommands.length) || 0))
+                    e("div", { className: "review-group-count" }, String(pendingCommandCount))
                   ),
                   e(
                     "div",
