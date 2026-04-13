@@ -49,16 +49,17 @@ mod memory;
 mod meta_harness;
 mod provider_compat;
 mod read_only;
+mod repo_scaffold;
 mod session_bridge;
 mod task_harness;
 use self::done_gate::{
     build_done_acceptance_recovery_hint, build_post_verify_done_completion_hint,
     build_read_only_completion_hint, build_read_only_evidence_scores,
     build_read_only_iteration_cap_final_answer, build_read_only_strong_final_answer,
-    canonicalize_known_acceptance_commands, maybe_build_read_only_auto_final_answer,
-    maybe_build_verified_action_auto_final_answer, rescue_invalid_done_payload_for_verified_action,
-    should_prefer_done_after_verified_action, synthesize_action_done_summary,
-    validate_done_acceptance,
+    canonicalize_known_acceptance_commands, latest_assistant_message_is_done,
+    maybe_build_read_only_auto_final_answer, maybe_build_verified_action_auto_final_answer,
+    rescue_invalid_done_payload_for_verified_action, should_prefer_done_after_verified_action,
+    synthesize_action_done_summary, validate_done_acceptance,
 };
 use self::evaluator_loop::EvaluatorLoop;
 pub(crate) use self::harness_evolution::{
@@ -8762,8 +8763,13 @@ This is the LAST model call for this run.\n\
             ),
         }));
 
-        let meta_harness =
-            MetaHarness::analyze(task_harness, &messages, recovery.stage, test_cmd.as_deref());
+        let meta_harness = MetaHarness::analyze(
+            task_harness,
+            &messages,
+            recovery.stage,
+            test_cmd.as_deref(),
+            tool_root_abs.as_deref(),
+        );
         if let Some(telemetry) = meta_harness.telemetry_payload() {
             emit_telemetry_event(&tx, "meta_harness_policy", telemetry).await;
         }
@@ -9582,6 +9588,7 @@ Execute only the new minimal action: {}",
                 &messages,
                 tc,
                 test_cmd.as_deref(),
+                tool_root_abs.as_deref(),
             ) {
                 let _ = tx
                     .send(StreamToken::Delta(format!(
@@ -9611,6 +9618,7 @@ Execute only the new minimal action: {}",
                 &messages,
                 tc,
                 test_cmd.as_deref(),
+                tool_root_abs.as_deref(),
             ) {
                 let _ = tx
                     .send(StreamToken::Delta(format!(
@@ -10218,6 +10226,101 @@ Execute only the new minimal action: {}",
                 }
             }
 
+            let known_acceptance_commands = canonicalize_known_acceptance_commands(
+                &collect_known_acceptance_commands(&messages, &working_mem),
+                &observation_evidence,
+            );
+            if should_prefer_done_after_verified_action(
+                tc,
+                &candidate_plan,
+                &known_acceptance_commands,
+                required_verification,
+                test_cmd.as_deref(),
+                last_mutation_step,
+                last_verify_ok_step,
+            ) {
+                if let Some(final_text) = maybe_build_verified_action_auto_final_answer(
+                    Some(&candidate_plan),
+                    &messages,
+                    &known_acceptance_commands,
+                    &observation_evidence,
+                    required_verification,
+                    test_cmd.as_deref(),
+                    last_mutation_step,
+                    last_verify_ok_step,
+                ) {
+                    state = AgentState::Done;
+                    messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+                    autosave_best_effort(
+                        &autosaver,
+                        &tx,
+                        tool_root_abs.as_deref(),
+                        checkpoint.as_deref(),
+                        cur_cwd.as_deref(),
+                        &messages,
+                    )
+                    .await;
+                    let _ = tx
+                        .send(StreamToken::GovernorState(build_governor_state(
+                            state,
+                            &recovery,
+                            &mem,
+                            file_tool_consec_failures,
+                            last_mutation_step,
+                            last_verify_ok_step,
+                            last_reflection.as_ref(),
+                        )))
+                        .await;
+                    let _ = tx
+                        .send(StreamToken::Delta(format!(
+                            "\n[agent] auto-finalized verified action instead of executing redundant post-verify {}.\n\n{final_text}\n",
+                            tc.name
+                        )))
+                        .await;
+                    break;
+                }
+
+                state = AgentState::Recovery;
+                let block = build_post_verify_done_completion_hint(
+                    &candidate_plan,
+                    &known_acceptance_commands,
+                    tc,
+                    required_verification,
+                    test_cmd.as_deref(),
+                );
+
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                    )))
+                    .await;
+
+                push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+
+                pending_system_hint = Some(block);
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
+
             let compat_synth_think = rescue_read_only_missing_think_for_tool_turn(
                 &messages,
                 tc,
@@ -10377,60 +10480,6 @@ Execute only the new minimal action: {}",
                 state = AgentState::Recovery;
                 recovery.stage = Some(RecoveryStage::Diagnose);
                 let block = conflict.render();
-
-                let _ = tx
-                    .send(StreamToken::Delta(format!(
-                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
-                    )))
-                    .await;
-
-                push_blocked_tool_exchange(&mut messages, &assistant_text_clean, tc, &block);
-                autosave_best_effort(
-                    &autosaver,
-                    &tx,
-                    tool_root_abs.as_deref(),
-                    checkpoint.as_deref(),
-                    cur_cwd.as_deref(),
-                    &messages,
-                )
-                .await;
-
-                pending_system_hint = Some(block);
-                let _ = tx
-                    .send(StreamToken::GovernorState(build_governor_state(
-                        state,
-                        &recovery,
-                        &mem,
-                        file_tool_consec_failures,
-                        last_mutation_step,
-                        last_verify_ok_step,
-                        last_reflection.as_ref(),
-                    )))
-                    .await;
-                continue;
-            }
-
-            let known_acceptance_commands = canonicalize_known_acceptance_commands(
-                &collect_known_acceptance_commands(&messages, &working_mem),
-                &observation_evidence,
-            );
-            if should_prefer_done_after_verified_action(
-                tc,
-                &candidate_plan,
-                &known_acceptance_commands,
-                required_verification,
-                test_cmd.as_deref(),
-                last_mutation_step,
-                last_verify_ok_step,
-            ) {
-                state = AgentState::Recovery;
-                let block = build_post_verify_done_completion_hint(
-                    &candidate_plan,
-                    &known_acceptance_commands,
-                    tc,
-                    required_verification,
-                    test_cmd.as_deref(),
-                );
 
                 let _ = tx
                     .send(StreamToken::Delta(format!(
@@ -14523,34 +14572,36 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
         }
     }
 
-    if let Some(final_text) = maybe_build_verified_action_auto_final_answer(
-        active_plan.as_ref(),
-        &messages,
-        &canonicalize_known_acceptance_commands(
-            &collect_known_acceptance_commands(&messages, &working_mem),
-            &observation_evidence,
-        ),
-        &observation_evidence,
-        required_verification,
-        test_cmd.as_deref(),
-        last_mutation_step,
-        last_verify_ok_step,
-    ) {
-        messages.push(json!({"role": "assistant", "content": final_text.clone()}));
-        autosave_best_effort(
-            &autosaver,
-            &tx,
-            tool_root_abs.as_deref(),
-            checkpoint.as_deref(),
-            cur_cwd.as_deref(),
+    if !latest_assistant_message_is_done(&messages) {
+        if let Some(final_text) = maybe_build_verified_action_auto_final_answer(
+            active_plan.as_ref(),
             &messages,
-        )
-        .await;
-        let _ = tx
-            .send(StreamToken::Delta(format!(
-                "\n[agent] auto-finalized verified action task at session end.\n\n{final_text}\n"
-            )))
+            &canonicalize_known_acceptance_commands(
+                &collect_known_acceptance_commands(&messages, &working_mem),
+                &observation_evidence,
+            ),
+            &observation_evidence,
+            required_verification,
+            test_cmd.as_deref(),
+            last_mutation_step,
+            last_verify_ok_step,
+        ) {
+            messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
             .await;
+            let _ = tx
+                .send(StreamToken::Delta(format!(
+                    "\n[agent] auto-finalized verified action task at session end.\n\n{final_text}\n"
+                )))
+                .await;
+        }
     }
 
     if realize_cfg.enabled {

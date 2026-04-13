@@ -578,12 +578,7 @@ fn collect_metrics(
         .unwrap_or(Value::Null);
     if let Some(messages) = session_value.get("messages").and_then(|v| v.as_array()) {
         metrics.messages_len = messages.len();
-        metrics.last_assistant = messages
-            .iter()
-            .rev()
-            .find(|msg| msg.get("role").and_then(|v| v.as_str()) == Some("assistant"))
-            .and_then(|msg| msg.get("content").and_then(|v| v.as_str()))
-            .map(|s| s.to_string());
+        metrics.last_assistant = select_terminal_assistant_message(messages);
     }
 
     let graph_value = load_graph_value(&artifacts.graph_path).unwrap_or(Value::Null);
@@ -615,6 +610,25 @@ fn load_graph_value(path: &Path) -> Result<Value> {
     let value: Value = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse graph artifact: {}", path.display()))?;
     Ok(value)
+}
+
+fn select_terminal_assistant_message(messages: &[Value]) -> Option<String> {
+    let mut last_assistant = None;
+    let mut last_done = None;
+    for msg in messages {
+        if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = msg.get("content").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let content = content.to_string();
+        if content.trim_start().starts_with("[DONE]") {
+            last_done = Some(content.clone());
+        }
+        last_assistant = Some(content);
+    }
+    last_done.or(last_assistant)
 }
 
 fn evaluate_checks(
@@ -769,6 +783,21 @@ mod tests {
             spec.cases[0].session_seed.as_deref(),
             Some("seed-session.json")
         );
+    }
+
+    #[test]
+    fn select_terminal_assistant_message_prefers_latest_done_summary() {
+        let messages = vec![
+            serde_json::json!({"role":"assistant","content":"intermediate summary"}),
+            serde_json::json!({"role":"assistant","content":"[DONE]\nCreated `maze_game/src/lib.rs` and verified it."}),
+            serde_json::json!({"role":"assistant","content":"generic postscript"}),
+        ];
+
+        let selected =
+            select_terminal_assistant_message(&messages).expect("terminal assistant summary");
+
+        assert!(selected.contains("maze_game/src/lib.rs"));
+        assert!(selected.starts_with("[DONE]"));
     }
 
     #[test]
