@@ -3,6 +3,11 @@ use super::*;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::repo_scaffold::{
+    default_repo_gitignore, repo_root_from_test_cmd, required_repo_files_from_test_cmd,
+    resolve_repo_file_path, resolve_repo_scaffold_path, scaffold_repo_file_content,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FailurePattern {
     RepeatedObservationLoop,
@@ -69,8 +74,11 @@ impl MetaHarness {
         messages: &[Value],
         recovery_stage: Option<RecoveryStage>,
         test_cmd: Option<&str>,
+        tool_root: Option<&str>,
     ) -> Self {
-        if let Some(policy) = detect_repo_scaffold_drift(task_harness, messages, test_cmd) {
+        if let Some(policy) =
+            detect_repo_scaffold_drift(task_harness, messages, test_cmd, tool_root)
+        {
             return Self {
                 policy: Some(policy),
             };
@@ -188,18 +196,12 @@ Do NOT spend the next turn on another same-target observation unless new tool ou
                 .to_string(),
             });
         }
-        let repo_name = target
-            .trim_end_matches('/')
-            .rsplit('/')
-            .nth(1)
-            .filter(|segment| !segment.trim().is_empty())
-            .unwrap_or("project");
         Some(ToolCallData {
             id,
             name: "write_file".to_string(),
             arguments: serde_json::json!({
                 "path": target,
-                "content": format!("# {repo_name}\n"),
+                "content": scaffold_repo_file_content(target),
             })
             .to_string(),
         })
@@ -285,12 +287,13 @@ fn detect_repo_scaffold_drift(
     task_harness: TaskHarness,
     messages: &[Value],
     test_cmd: Option<&str>,
+    tool_root: Option<&str>,
 ) -> Option<PolicyDelta> {
     if task_harness.artifact_mode != ArtifactMode::NewRepo {
         return None;
     }
 
-    let progress = repo_scaffold_progress(messages, test_cmd?)?;
+    let progress = repo_scaffold_progress(messages, test_cmd?, tool_root)?;
     let missing_git_goal = latest_goal_check_missing(messages)
         .iter()
         .any(|entry| entry == ".git" || entry.ends_with("/.git"));
@@ -449,7 +452,11 @@ fn successful_observation(intent: &PendingToolIntent, content: &str) -> bool {
     trimmed.starts_with('[') && !trimmed.starts_with("[RESULT")
 }
 
-fn repo_scaffold_progress(messages: &[Value], test_cmd: &str) -> Option<RepoScaffoldProgress> {
+fn repo_scaffold_progress(
+    messages: &[Value],
+    test_cmd: &str,
+    tool_root: Option<&str>,
+) -> Option<RepoScaffoldProgress> {
     let repo_root = repo_root_from_test_cmd(test_cmd)?;
     let required_files = required_repo_files_from_test_cmd(test_cmd, repo_root.as_str());
     let mut pending: BTreeMap<String, PendingToolIntent> = BTreeMap::new();
@@ -549,6 +556,16 @@ fn repo_scaffold_progress(messages: &[Value], test_cmd: &str) -> Option<RepoScaf
         }
     }
 
+    if let Some(root) = tool_root {
+        let repo_path = resolve_repo_scaffold_path(root, repo_root.as_str());
+        progress.has_git |= repo_path.join(".git").exists();
+        for required_path in progress.required_files.clone() {
+            if resolve_repo_file_path(root, required_path.as_str()).exists() {
+                progress.present_files.insert(required_path);
+            }
+        }
+    }
+
     Some(progress)
 }
 
@@ -577,47 +594,11 @@ fn latest_goal_check_missing(messages: &[Value]) -> Vec<String> {
     Vec::new()
 }
 
-fn repo_root_from_test_cmd(test_cmd: &str) -> Option<String> {
-    for segment in test_cmd.split("&&") {
-        let trimmed = segment.trim();
-        let Some(path) = trimmed.strip_prefix("test -d ") else {
-            continue;
-        };
-        let path = path.trim().trim_matches('\'').trim_matches('"').trim();
-        let Some(root) = path.strip_suffix("/.git") else {
-            continue;
-        };
-        let root = root.trim();
-        if !root.is_empty() {
-            return Some(root.to_string());
-        }
-    }
-    None
-}
-
-fn required_repo_files_from_test_cmd(test_cmd: &str, repo_root: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for segment in test_cmd.split("&&") {
-        let trimmed = segment.trim();
-        let Some(path) = trimmed.strip_prefix("test -f ") else {
-            continue;
-        };
-        let path = path.trim().trim_matches('\'').trim_matches('"').trim();
-        if path.starts_with(&format!("{repo_root}/")) {
-            out.push(path.to_string());
-        }
-    }
-    out
-}
-
-fn default_repo_gitignore() -> &'static str {
-    ".DS_Store\n.env\n.venv/\n__pycache__/\n*.py[cod]\nnode_modules/\ndist/\nbuild/\n.idea/\n.vscode/\n*.log\n"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use tempfile::tempdir;
 
     #[test]
     fn meta_harness_detects_fix_observation_loop() {
@@ -658,6 +639,7 @@ mod tests {
             &messages,
             Some(RecoveryStage::Fix),
             Some("cargo test 2>&1"),
+            None,
         );
 
         let prompt = harness.prompt().expect("prompt");
@@ -696,6 +678,7 @@ mod tests {
             Some(
                 "test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore",
             ),
+            None,
         );
 
         let prompt = harness.prompt().expect("prompt");
@@ -723,5 +706,50 @@ mod tests {
         assert_eq!(tool_call.name, "write_file");
         assert!(tool_call.arguments.contains("demo_repo/README.md"));
         assert!(tool_call.arguments.contains("# demo_repo\\n"));
+    }
+
+    #[test]
+    fn meta_harness_synthesizes_rust_scaffold_files() {
+        let cargo = scaffold_repo_file_content("maze_game/Cargo.toml");
+        assert!(cargo.contains("name = \"maze_game\""));
+
+        let lib = scaffold_repo_file_content("maze_game/src/lib.rs");
+        assert!(lib.contains("pub struct MazeGame"));
+        assert!(lib.contains("fn player_can_reach_exit"));
+
+        let main = scaffold_repo_file_content("maze_game/src/main.rs");
+        assert!(main.contains("use maze_game::{MazeGame, Move};"));
+    }
+
+    #[test]
+    fn meta_harness_detects_missing_lib_after_binary_crate_generation_from_filesystem() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("maze_game");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"maze_game\"\n").unwrap();
+        std::fs::write(repo.join("README.md"), "# maze_game\n").unwrap();
+        std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let harness = MetaHarness::analyze(
+            TaskHarness {
+                lane: super::task_harness::TaskLane::ScaffoldRepo,
+                artifact_mode: ArtifactMode::NewRepo,
+            },
+            &[],
+            Some(RecoveryStage::Diagnose),
+            Some(
+                "test -d maze_game/.git && test -f maze_game/README.md && test -f maze_game/Cargo.toml && test -f maze_game/src/lib.rs && test -f maze_game/src/main.rs && cd maze_game && cargo test 2>&1",
+            ),
+            Some(dir.path().to_str().unwrap()),
+        );
+
+        let telemetry = harness.telemetry_payload().expect("telemetry");
+        assert_eq!(telemetry["pattern"].as_str(), Some("repo_scaffold_drift"));
+        assert_eq!(
+            telemetry["next_target"].as_str(),
+            Some("maze_game/src/lib.rs")
+        );
     }
 }

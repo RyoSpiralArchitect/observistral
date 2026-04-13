@@ -1,7 +1,11 @@
+use super::repo_scaffold::{
+    default_repo_gitignore, repo_root_from_test_cmd, required_repo_files_from_test_cmd,
+    resolve_repo_file_path, resolve_repo_scaffold_path, scaffold_repo_file_content,
+};
 use super::{canonicalize_tool_call_command, compact_one_line, RecoveryStage};
 use crate::streaming::ToolCallData;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TaskLane {
@@ -400,12 +404,13 @@ pub(super) fn coerce_repo_goal_completion_tool_call(
     messages: &[Value],
     tc: &ToolCallData,
     test_cmd: Option<&str>,
+    tool_root: Option<&str>,
 ) -> Option<(ToolCallData, String, String)> {
     if harness.artifact_mode != ArtifactMode::NewRepo || !is_observation_tool(tc.name.as_str()) {
         return None;
     }
     let goal_check_missing = latest_goal_check_missing(messages);
-    let status = repo_scaffold_status(messages, test_cmd?)?;
+    let status = repo_scaffold_status(messages, test_cmd?, tool_root)?;
     if goal_check_missing.is_empty() && !has_repo_scaffold_progress(&status) {
         return None;
     }
@@ -433,6 +438,7 @@ pub(super) fn repair_repo_scaffold_write_tool_call(
     messages: &[Value],
     tc: &ToolCallData,
     test_cmd: Option<&str>,
+    tool_root: Option<&str>,
 ) -> Option<(ToolCallData, String, String)> {
     if harness.artifact_mode != ArtifactMode::NewRepo || tc.name != "write_file" {
         return None;
@@ -440,7 +446,7 @@ pub(super) fn repair_repo_scaffold_write_tool_call(
     if !write_file_looks_malformed(tc) {
         return None;
     }
-    let status = repo_scaffold_status(messages, test_cmd?)?;
+    let status = repo_scaffold_status(messages, test_cmd?, tool_root)?;
     let rewritten = next_repo_scaffold_tool_call(tc.id.as_str(), &status)?;
     let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
         .unwrap_or_else(|| {
@@ -719,13 +725,21 @@ struct RepoScaffoldStatus {
     has_git: bool,
     has_gitignore: bool,
     has_readme: bool,
+    required_files: Vec<String>,
+    present_files: BTreeSet<String>,
 }
 
-fn repo_scaffold_status(messages: &[Value], test_cmd: &str) -> Option<RepoScaffoldStatus> {
+fn repo_scaffold_status(
+    messages: &[Value],
+    test_cmd: &str,
+    tool_root: Option<&str>,
+) -> Option<RepoScaffoldStatus> {
     let repo_root = repo_root_from_test_cmd(test_cmd)?;
+    let required_files = required_repo_files_from_test_cmd(test_cmd, repo_root.as_str());
     let mut pending_by_id: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut status = RepoScaffoldStatus {
         repo_root: repo_root.clone(),
+        required_files,
         ..RepoScaffoldStatus::default()
     };
 
@@ -801,6 +815,9 @@ fn repo_scaffold_status(messages: &[Value], test_cmd: &str) -> Option<RepoScaffo
                 };
                 match kind.as_str() {
                     "write_file" if content.trim_start().starts_with("OK: wrote '") => {
+                        if payload.starts_with(&format!("{repo_root}/")) {
+                            status.present_files.insert(payload.clone());
+                        }
                         if payload.ends_with("/README.md") {
                             status.has_readme = true;
                         }
@@ -817,6 +834,24 @@ fn repo_scaffold_status(messages: &[Value], test_cmd: &str) -> Option<RepoScaffo
                 }
             }
             _ => {}
+        }
+    }
+
+    if let Some(root) = tool_root {
+        let repo_path = resolve_repo_scaffold_path(root, repo_root.as_str());
+        status.has_git |= repo_path.join(".git").exists();
+        status.has_gitignore |= repo_path.join(".gitignore").exists();
+        status.has_readme |= repo_path.join("README.md").exists();
+        for required_path in status.required_files.clone() {
+            if resolve_repo_file_path(root, required_path.as_str()).exists() {
+                if required_path.ends_with("/README.md") {
+                    status.has_readme = true;
+                }
+                if required_path.ends_with("/.gitignore") {
+                    status.has_gitignore = true;
+                }
+                status.present_files.insert(required_path);
+            }
         }
     }
 
@@ -842,26 +877,8 @@ fn write_file_looks_malformed(tc: &ToolCallData) -> bool {
         || path.ends_with("/.git")
 }
 
-fn repo_root_from_test_cmd(test_cmd: &str) -> Option<String> {
-    for segment in test_cmd.split("&&") {
-        let trimmed = segment.trim();
-        let Some(path) = trimmed.strip_prefix("test -d ") else {
-            continue;
-        };
-        let path = path.trim().trim_matches('\'').trim_matches('"').trim();
-        let Some(root) = path.strip_suffix("/.git") else {
-            continue;
-        };
-        let root = root.trim();
-        if !root.is_empty() {
-            return Some(root.to_string());
-        }
-    }
-    None
-}
-
 fn has_repo_scaffold_progress(status: &RepoScaffoldStatus) -> bool {
-    status.has_git || status.has_gitignore || status.has_readme
+    status.has_git || status.has_gitignore || status.has_readme || !status.present_files.is_empty()
 }
 
 fn next_repo_scaffold_tool_call(
@@ -878,6 +895,22 @@ fn next_repo_scaffold_tool_call(
             .to_string(),
         });
     }
+    if let Some(target) = preferred_missing_repo_required_file(status) {
+        let content = if target.ends_with("/.gitignore") {
+            default_repo_gitignore().to_string()
+        } else {
+            scaffold_repo_file_content(target)
+        };
+        return Some(ToolCallData {
+            id: tool_call_id.to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": target,
+                "content": content,
+            })
+            .to_string(),
+        });
+    }
     if !status.has_gitignore {
         return Some(ToolCallData {
             id: tool_call_id.to_string(),
@@ -890,12 +923,14 @@ fn next_repo_scaffold_tool_call(
         });
     }
     if !status.has_readme {
+        let readme_path = format!("{}/README.md", status.repo_root);
+        let readme_content = scaffold_repo_file_content(readme_path.as_str());
         return Some(ToolCallData {
             id: tool_call_id.to_string(),
             name: "write_file".to_string(),
             arguments: serde_json::json!({
-                "path": format!("{}/README.md", status.repo_root),
-                "content": default_repo_readme(status.repo_root.as_str()),
+                "path": readme_path,
+                "content": readme_content,
             })
             .to_string(),
         });
@@ -903,17 +938,20 @@ fn next_repo_scaffold_tool_call(
     None
 }
 
-fn default_repo_gitignore() -> &'static str {
-    ".DS_Store\n.env\n.venv/\n__pycache__/\n*.py[cod]\nnode_modules/\ndist/\nbuild/\n.idea/\n.vscode/\n*.log\n"
-}
+fn preferred_missing_repo_required_file(status: &RepoScaffoldStatus) -> Option<&str> {
+    if let Some(gitignore) = status
+        .required_files
+        .iter()
+        .find(|path| path.ends_with("/.gitignore") && !status.present_files.contains(*path))
+    {
+        return Some(gitignore.as_str());
+    }
 
-fn default_repo_readme(repo_root: &str) -> String {
-    let repo_name = repo_root
-        .rsplit('/')
-        .next()
-        .filter(|segment| !segment.trim().is_empty())
-        .unwrap_or("project");
-    format!("# {repo_name}\n")
+    status
+        .required_files
+        .iter()
+        .find(|path| !status.present_files.contains(*path))
+        .map(String::as_str)
 }
 
 fn text_contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -942,6 +980,7 @@ fn prompt_mentions_path_literal(text: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tempfile::tempdir;
 
     #[test]
     fn infer_task_harness_detects_fix_lane() {
@@ -1190,6 +1229,7 @@ mod tests {
             &messages,
             &tc,
             Some("test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore"),
+            None,
         )
         .expect("rewritten");
 
@@ -1237,12 +1277,88 @@ mod tests {
             &messages,
             &tc,
             Some("test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore"),
+            None,
         )
         .expect("rewritten");
 
         assert_eq!(rewritten.name, "write_file");
         assert!(rewritten.arguments.contains("demo_repo/.gitignore"));
         assert!(coerced.contains(".gitignore"));
+    }
+
+    #[test]
+    fn coerce_repo_goal_completion_tool_call_prefers_filesystem_progress_over_stale_goal_check() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("maze_game");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(repo.join("README.md"), "# Maze Game\n").unwrap();
+
+        let messages = vec![json!({
+            "role": "user",
+            "content": "[goal_check]\nThe task is NOT complete yet.\nMissing: .git\nFix it by using exec/write_file. Do NOT stop until the goals are satisfied."
+        })];
+        let tc = ToolCallData {
+            id: "call_list".to_string(),
+            name: "list_dir".to_string(),
+            arguments: json!({"dir":"maze_game","include_hidden":true}).to_string(),
+        };
+
+        let rewritten = coerce_repo_goal_completion_tool_call(
+            TaskHarness {
+                lane: TaskLane::ScaffoldRepo,
+                artifact_mode: ArtifactMode::NewRepo,
+            },
+            &messages,
+            &tc,
+            Some(
+                "test -d maze_game/.git && test -f maze_game/README.md && test -f maze_game/.gitignore",
+            ),
+            Some(dir.path().to_str().unwrap()),
+        );
+
+        assert!(rewritten.is_none());
+    }
+
+    #[test]
+    fn coerce_repo_goal_completion_tool_call_advances_to_missing_required_file_after_binary_crate()
+    {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("maze_game");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"maze_game\"\n").unwrap();
+        std::fs::write(repo.join("README.md"), "# Maze Game\n").unwrap();
+        std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let messages = vec![json!({
+            "role": "user",
+            "content": "[goal_check]\nThe task is NOT complete yet.\nMissing: .git\nFix it by using exec/write_file. Do NOT stop until the goals are satisfied."
+        })];
+        let tc = ToolCallData {
+            id: "call_list".to_string(),
+            name: "list_dir".to_string(),
+            arguments: json!({"dir":"maze_game","include_hidden":true}).to_string(),
+        };
+
+        let (rewritten, _original, coerced) = coerce_repo_goal_completion_tool_call(
+            TaskHarness {
+                lane: TaskLane::ScaffoldRepo,
+                artifact_mode: ArtifactMode::NewRepo,
+            },
+            &messages,
+            &tc,
+            Some(
+                "test -d maze_game/.git && test -f maze_game/README.md && test -f maze_game/Cargo.toml && test -f maze_game/src/lib.rs && test -f maze_game/src/main.rs && cd maze_game && cargo test 2>&1",
+            ),
+            Some(dir.path().to_str().unwrap()),
+        )
+        .expect("rewritten");
+
+        assert_eq!(rewritten.name, "write_file");
+        assert!(rewritten.arguments.contains("maze_game/src/lib.rs"));
+        assert!(coerced.contains("maze_game/src/lib.rs"));
     }
 
     #[test]
@@ -1279,6 +1395,7 @@ mod tests {
             &messages,
             &tc,
             Some("test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore"),
+            None,
         )
         .expect("rewritten");
 
@@ -1337,6 +1454,7 @@ mod tests {
             &messages,
             &tc,
             Some("test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore"),
+            None,
         )
         .expect("rewritten");
 
@@ -1396,6 +1514,7 @@ mod tests {
             &messages,
             &tc,
             Some("test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore"),
+            None,
         )
         .expect("rewritten");
 

@@ -952,10 +952,10 @@ fn criterion_prefers_observation_proof(criterion: &str) -> bool {
     .any(|term| low.contains(term))
 }
 
-fn latest_successful_mutation_path(messages: &[serde_json::Value]) -> Option<(String, String)> {
+fn successful_mutation_paths(messages: &[serde_json::Value]) -> Vec<(String, String)> {
     let mut pending_by_id: std::collections::BTreeMap<String, (String, String)> =
         std::collections::BTreeMap::new();
-    let mut latest: Option<(String, String)> = None;
+    let mut successes = Vec::new();
 
     for msg in messages {
         match msg.get("role").and_then(|v| v.as_str()).unwrap_or("") {
@@ -1012,14 +1012,18 @@ fn latest_successful_mutation_path(messages: &[serde_json::Value]) -> Option<(St
                     continue;
                 }
                 if let Some(entry) = pending_by_id.get(id) {
-                    latest = Some(entry.clone());
+                    successes.push(entry.clone());
                 }
             }
             _ => {}
         }
     }
 
-    latest
+    successes
+}
+
+fn latest_successful_mutation_path(messages: &[serde_json::Value]) -> Option<(String, String)> {
+    successful_mutation_paths(messages).into_iter().last()
 }
 
 fn looks_like_successful_mutation_result(content: &str) -> bool {
@@ -1029,10 +1033,42 @@ fn looks_like_successful_mutation_result(content: &str) -> bool {
         || trimmed.starts_with("OK: applied ")
 }
 
+pub(super) fn latest_assistant_message_is_done(messages: &[serde_json::Value]) -> bool {
+    messages
+        .iter()
+        .rev()
+        .find(|msg| msg.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+        .and_then(|msg| msg.get("content").and_then(|v| v.as_str()))
+        .map(|content| content.trim_start().starts_with("[DONE]"))
+        .unwrap_or(false)
+}
+
 pub(super) fn synthesize_action_done_summary(
     plan: Option<&PlanBlock>,
     messages: &[serde_json::Value],
 ) -> Option<String> {
+    let successes = successful_mutation_paths(messages);
+    if let Some((_, lib_path)) = successes
+        .iter()
+        .rev()
+        .find(|(_, path)| path.ends_with("/src/lib.rs"))
+    {
+        let lib_path = compact_one_line(lib_path.as_str(), 160);
+        let repo_root = lib_path
+            .strip_suffix("/src/lib.rs")
+            .map(str::to_string)
+            .unwrap_or_else(|| "the repository".to_string());
+        let main_path = format!("{repo_root}/src/main.rs");
+        let has_main = successes.iter().any(|(_, path)| path == &main_path);
+        return Some(if has_main {
+            format!(
+                "Created minimal repository at `{repo_root}/` with gameplay logic in `{lib_path}` and runnable entrypoint in `{main_path}`."
+            )
+        } else {
+            format!("Created repository logic in `{lib_path}` and verified it.")
+        });
+    }
+
     if let Some((tool, path)) = latest_successful_mutation_path(messages) {
         let path = compact_one_line(path.as_str(), 160);
         return Some(match tool.as_str() {
@@ -1610,6 +1646,66 @@ mod tests {
     }
 
     #[test]
+    fn synthesize_action_done_summary_prefers_repo_logic_over_late_gitignore() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_lib",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments":"{\"path\":\"maze_game/src/lib.rs\",\"content\":\"pub fn demo() {}\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_lib",
+                "content": "OK: wrote 'maze_game/src/lib.rs' (1 lines, 17 bytes)"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_main",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments":"{\"path\":\"maze_game/src/main.rs\",\"content\":\"fn main() {}\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_main",
+                "content": "OK: wrote 'maze_game/src/main.rs' (1 lines, 13 bytes)"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_gitignore",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments":"{\"path\":\"maze_game/.gitignore\",\"content\":\"target/\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_gitignore",
+                "content": "OK: wrote 'maze_game/.gitignore' (1 lines, 8 bytes)"
+            }),
+        ];
+
+        let summary = synthesize_action_done_summary(None, &messages).expect("summary");
+        assert!(summary.contains("maze_game/"));
+        assert!(summary.contains("maze_game/src/lib.rs"));
+        assert!(summary.contains("maze_game/src/main.rs"));
+        assert!(!summary.contains(".gitignore"));
+    }
+
+    #[test]
     fn verified_action_auto_final_answer_uses_repo_artifact_evidence() {
         let plan = PlanBlock {
             goal: "Create a new git repo in demo_repo with starter files.".to_string(),
@@ -1660,5 +1756,29 @@ mod tests {
         assert!(final_text.contains("Acceptance:"));
         assert!(final_text.contains("test -d demo_repo/.git"));
         assert!(final_text.contains("README.md"));
+    }
+
+    #[test]
+    fn latest_assistant_message_is_done_ignores_prior_done_when_newer_message_exists() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "[DONE]\nCreated `demo_repo/.gitignore` and verified it."
+            }),
+            json!({
+                "role": "assistant",
+                "content": "Still working through one more verification step."
+            }),
+        ];
+
+        assert!(!latest_assistant_message_is_done(&messages));
+
+        let mut completed = messages;
+        completed.push(json!({
+            "role": "assistant",
+            "content": "[DONE]\nCreated `demo_repo/README.md` and verified it."
+        }));
+
+        assert!(latest_assistant_message_is_done(&completed));
     }
 }
