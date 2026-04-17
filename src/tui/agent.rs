@@ -5212,6 +5212,37 @@ fn collect_known_acceptance_commands(
     commands
 }
 
+fn maybe_build_verified_action_closeout_text(
+    plan: Option<&PlanBlock>,
+    messages: &[serde_json::Value],
+    working_mem: &WorkingMemory,
+    observation_evidence: &ObservationEvidence,
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+    last_mutation_step: Option<usize>,
+    last_verify_ok_step: Option<usize>,
+) -> Option<String> {
+    if latest_assistant_message_is_done(messages) {
+        return None;
+    }
+
+    let known_acceptance_commands = canonicalize_known_acceptance_commands(
+        &collect_known_acceptance_commands(messages, working_mem),
+        observation_evidence,
+    );
+
+    maybe_build_verified_action_auto_final_answer(
+        plan,
+        messages,
+        &known_acceptance_commands,
+        observation_evidence,
+        required_verification,
+        test_cmd,
+        last_mutation_step,
+        last_verify_ok_step,
+    )
+}
+
 fn build_impact_prompt(
     reason: &str,
     plan: Option<&PlanBlock>,
@@ -8576,6 +8607,46 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
             }),
         )
         .await;
+
+        if let Some(final_text) = maybe_build_verified_action_closeout_text(
+            active_plan.as_ref(),
+            &messages,
+            &working_mem,
+            &observation_evidence,
+            required_verification,
+            test_cmd.as_deref(),
+            last_mutation_step,
+            last_verify_ok_step,
+        ) {
+            state = AgentState::Done;
+            messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
+            let _ = tx
+                .send(StreamToken::GovernorState(build_governor_state(
+                    state,
+                    &recovery,
+                    &mem,
+                    file_tool_consec_failures,
+                    last_mutation_step,
+                    last_verify_ok_step,
+                    last_reflection.as_ref(),
+                )))
+                .await;
+            let _ = tx
+                .send(StreamToken::Delta(format!(
+                    "\n[agent] auto-finalized verified action before another model turn.\n\n{final_text}\n"
+                )))
+                .await;
+            break;
+        }
 
         // C — Token budget guardian: warn once when context grows large.
         let approx_tokens = approx_tokens_messages(&messages);
@@ -14572,36 +14643,31 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
         }
     }
 
-    if !latest_assistant_message_is_done(&messages) {
-        if let Some(final_text) = maybe_build_verified_action_auto_final_answer(
-            active_plan.as_ref(),
+    if let Some(final_text) = maybe_build_verified_action_closeout_text(
+        active_plan.as_ref(),
+        &messages,
+        &working_mem,
+        &observation_evidence,
+        required_verification,
+        test_cmd.as_deref(),
+        last_mutation_step,
+        last_verify_ok_step,
+    ) {
+        messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+        autosave_best_effort(
+            &autosaver,
+            &tx,
+            tool_root_abs.as_deref(),
+            checkpoint.as_deref(),
+            cur_cwd.as_deref(),
             &messages,
-            &canonicalize_known_acceptance_commands(
-                &collect_known_acceptance_commands(&messages, &working_mem),
-                &observation_evidence,
-            ),
-            &observation_evidence,
-            required_verification,
-            test_cmd.as_deref(),
-            last_mutation_step,
-            last_verify_ok_step,
-        ) {
-            messages.push(json!({"role": "assistant", "content": final_text.clone()}));
-            autosave_best_effort(
-                &autosaver,
-                &tx,
-                tool_root_abs.as_deref(),
-                checkpoint.as_deref(),
-                cur_cwd.as_deref(),
-                &messages,
-            )
+        )
+        .await;
+        let _ = tx
+            .send(StreamToken::Delta(format!(
+                "\n[agent] auto-finalized verified action task at session end.\n\n{final_text}\n"
+            )))
             .await;
-            let _ = tx
-                .send(StreamToken::Delta(format!(
-                    "\n[agent] auto-finalized verified action task at session end.\n\n{final_text}\n"
-                )))
-                .await;
-        }
     }
 
     if realize_cfg.enabled {
@@ -15780,6 +15846,98 @@ remaining_gap: still need to run cargo test\n\
 
         assert!(final_text.starts_with("[DONE]"));
         assert!(final_text.contains("src/tui/events.rs"));
+    }
+
+    #[test]
+    fn maybe_build_verified_action_closeout_text_finalizes_pygame_repo_after_verify() {
+        let plan = PlanBlock {
+            goal: "Create a small pygame maze game repo and verify it.".to_string(),
+            steps: vec![
+                "initialize the repo".to_string(),
+                "write the pygame gameplay files".to_string(),
+                "run the unittest smoke".to_string(),
+                "call done with verification evidence".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "maze_game_pygame/README.md explains the controls".to_string(),
+                "maze_game_pygame/game.py contains the maze gameplay logic".to_string(),
+                "maze_game_pygame/main.py launches the game loop".to_string(),
+                "maze_game_pygame/test_game.py passes under SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1".to_string(),
+            ],
+            risks: "wrong repo layout".to_string(),
+            assumptions: "pygame is available".to_string(),
+        };
+        let verify_command = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_game",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"maze_game_pygame/game.py\",\"content\":\"class MazeGame:\\n    pass\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_game",
+                "content": "OK: wrote 'maze_game_pygame/game.py' (2 lines, 25 bytes)"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"maze_game_pygame/main.py\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[maze_game_pygame/main.py] (10 lines, 210 bytes)\nfrom game import MazeGame\n\nif __name__ == \"__main__\":\n    MazeGame().run()"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_verify",
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "arguments": format!("{{\"command\":{}}}", serde_json::to_string(verify_command).expect("json"))
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_verify",
+                "content": "OK (exit_code: 0)\nstdout:\nRan 3 tests in 0.002s\n\nOK"
+            }),
+        ];
+        let mut working_mem = WorkingMemory::default();
+        working_mem.remember_successful_verification(verify_command);
+        let observation_evidence = collect_observation_evidence(&messages);
+
+        let final_text = maybe_build_verified_action_closeout_text(
+            Some(&plan),
+            &messages,
+            &working_mem,
+            &observation_evidence,
+            VerificationLevel::Behavioral,
+            Some("SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"),
+            Some(7),
+            Some(7),
+        )
+        .expect("auto final answer");
+
+        assert!(final_text.starts_with("[DONE]"));
+        assert!(final_text.contains("maze_game_pygame/game.py"));
+        assert!(final_text.contains("maze_game_pygame/main.py"));
+        assert!(final_text.contains("SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"));
     }
 
     #[test]
