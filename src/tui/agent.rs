@@ -5198,12 +5198,81 @@ fn collect_successful_observation_commands(messages: &[serde_json::Value]) -> Ve
     commands
 }
 
+fn collect_successful_mutation_commands(messages: &[serde_json::Value]) -> Vec<String> {
+    let mut pending: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut commands = Vec::new();
+
+    for msg in messages {
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if role == "assistant" {
+            let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for tc in tool_calls {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if !matches!(name, "write_file" | "patch_file" | "apply_diff") {
+                    continue;
+                }
+                let arguments = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let Some(signature) = canonicalize_tool_call_command(name, arguments) else {
+                    continue;
+                };
+                pending.insert(id.to_string(), signature);
+            }
+            continue;
+        }
+
+        if role != "tool" {
+            continue;
+        }
+
+        let tool_call_id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if tool_call_id.is_empty() {
+            continue;
+        }
+        let Some(signature) = pending.remove(tool_call_id) else {
+            continue;
+        };
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if non_exec_tool_succeeded(content) {
+            remember_recent_unique(&mut commands, signature.as_str(), 12, 200);
+        }
+    }
+
+    commands
+}
+
 fn collect_known_acceptance_commands(
     messages: &[serde_json::Value],
     working_mem: &WorkingMemory,
 ) -> Vec<String> {
     let mut commands = Vec::new();
     for command in &working_mem.successful_verifications {
+        remember_recent_unique(&mut commands, command.as_str(), 16, 200);
+    }
+    for command in collect_successful_mutation_commands(messages) {
         remember_recent_unique(&mut commands, command.as_str(), 16, 200);
     }
     for command in collect_successful_observation_commands(messages) {
@@ -15888,18 +15957,18 @@ remaining_gap: still need to run cargo test\n\
             json!({
                 "role": "assistant",
                 "tool_calls": [{
-                    "id": "call_read",
+                    "id": "call_main",
                     "type": "function",
                     "function": {
-                        "name": "read_file",
-                        "arguments": "{\"path\":\"maze_game_pygame/main.py\"}"
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"maze_game_pygame/main.py\",\"content\":\"from game import MazeGame\\n\\nif __name__ == \\\"__main__\\\":\\n    MazeGame().run()\\n\"}"
                     }
                 }]
             }),
             json!({
                 "role": "tool",
-                "tool_call_id": "call_read",
-                "content": "[maze_game_pygame/main.py] (10 lines, 210 bytes)\nfrom game import MazeGame\n\nif __name__ == \"__main__\":\n    MazeGame().run()"
+                "tool_call_id": "call_main",
+                "content": "OK: wrote 'maze_game_pygame/main.py' (4 lines, 67 bytes)"
             }),
             json!({
                 "role": "assistant",
@@ -15920,13 +15989,12 @@ remaining_gap: still need to run cargo test\n\
         ];
         let mut working_mem = WorkingMemory::default();
         working_mem.remember_successful_verification(verify_command);
-        let observation_evidence = collect_observation_evidence(&messages);
 
         let final_text = maybe_build_verified_action_closeout_text(
             Some(&plan),
             &messages,
             &working_mem,
-            &observation_evidence,
+            &ObservationEvidence::default(),
             VerificationLevel::Behavioral,
             Some("SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"),
             Some(7),

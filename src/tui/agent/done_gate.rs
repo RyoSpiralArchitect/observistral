@@ -917,6 +917,21 @@ fn preferred_action_observation_command(
     None
 }
 
+fn preferred_action_artifact_command(
+    known_commands: &[String],
+    observation_evidence: &ObservationEvidence,
+) -> Option<String> {
+    for prefix in ["write_file(", "patch_file(", "apply_diff("] {
+        if let Some(command) = known_commands.iter().rev().find(|command| {
+            canonicalize_evidence_command_with_resolution(command.as_str(), observation_evidence)
+                .starts_with(prefix)
+        }) {
+            return Some(command.clone());
+        }
+    }
+    None
+}
+
 fn criterion_prefers_verification_proof(criterion: &str) -> bool {
     let low = criterion.to_ascii_lowercase();
     [
@@ -1169,6 +1184,7 @@ pub(super) fn rescue_invalid_done_payload_for_verified_action(
         preferred_action_verification_command(known_commands, required_verification, test_cmd);
     let observation_command =
         preferred_action_observation_command(known_commands, observation_evidence);
+    let artifact_command = preferred_action_artifact_command(known_commands, observation_evidence);
 
     let mut completed_acceptance = Vec::new();
     let mut remaining_acceptance = Vec::new();
@@ -1179,10 +1195,12 @@ pub(super) fn rescue_invalid_done_payload_for_verified_action(
         let command = if criterion_prefers_verification_proof(criterion) {
             verify_command
                 .clone()
+                .or_else(|| artifact_command.clone())
                 .or_else(|| observation_command.clone())
         } else if criterion_prefers_observation_proof(criterion) {
             observation_command
                 .clone()
+                .or_else(|| artifact_command.clone())
                 .or_else(|| verify_command.clone())
         } else {
             None
@@ -1756,6 +1774,59 @@ mod tests {
         assert!(final_text.contains("Acceptance:"));
         assert!(final_text.contains("test -d demo_repo/.git"));
         assert!(final_text.contains("README.md"));
+    }
+
+    #[test]
+    fn verified_action_auto_final_answer_accepts_successful_write_as_artifact_proof() {
+        let plan = PlanBlock {
+            goal: "Create a pygame maze repo and verify it.".to_string(),
+            steps: vec![
+                "initialize the repo".to_string(),
+                "write the pygame files".to_string(),
+                "run the unittest smoke".to_string(),
+                "call done".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "maze_game_pygame/README.md explains the controls".to_string(),
+                "maze_game_pygame/game.py contains the maze gameplay logic".to_string(),
+                "maze_game_pygame/main.py launches the game loop".to_string(),
+                "maze_game_pygame/test_game.py passes under SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1".to_string(),
+            ],
+            risks: "wrong repo layout".to_string(),
+            assumptions: "pygame is available".to_string(),
+        };
+        let verify_command = "SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+        let final_text = maybe_build_verified_action_auto_final_answer(
+            Some(&plan),
+            &[json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_main",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments":"{\"path\":\"maze_game_pygame/main.py\",\"content\":\"print('maze')\\n\"}"
+                    }
+                }]
+            }), json!({
+                "role": "tool",
+                "tool_call_id": "call_main",
+                "content": "OK: wrote 'maze_game_pygame/main.py' (1 lines, 13 bytes)\n[auto-test] ✓ PASSED (exit 0)"
+            })],
+            &[
+                verify_command.to_string(),
+                "write_file(path=maze_game_pygame/main.py)".to_string(),
+            ],
+            &ObservationEvidence::default(),
+            VerificationLevel::Behavioral,
+            Some(verify_command),
+            Some(7),
+            Some(7),
+        )
+        .expect("auto final");
+
+        assert!(final_text.contains("maze_game_pygame/main.py"));
+        assert!(final_text.contains("SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"));
     }
 
     #[test]
