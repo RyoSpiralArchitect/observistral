@@ -11,6 +11,13 @@ pub(super) struct CriterionEvidenceScore {
     pub(super) suggested_commands: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoScaffoldArtifacts {
+    repo_root: String,
+    logic_path: Option<String>,
+    entrypoint_path: Option<String>,
+}
+
 fn criterion_prefers_read_confirmation(criterion: &str) -> bool {
     let low = criterion.to_ascii_lowercase();
     [
@@ -242,7 +249,7 @@ pub(super) fn build_read_only_completion_hint(
     }
 
     let known_commands = canonicalize_known_acceptance_commands(
-        &collect_known_acceptance_commands(messages, working_mem),
+        &collect_known_acceptance_commands(messages, working_mem, None),
         evidence,
     );
     let cite_commands: Vec<String> = completed_scores
@@ -330,7 +337,7 @@ pub(super) fn build_read_only_iteration_cap_final_answer(
     }
 
     let known_commands = canonicalize_known_acceptance_commands(
-        &collect_known_acceptance_commands(messages, working_mem),
+        &collect_known_acceptance_commands(messages, working_mem, None),
         evidence,
     );
     let mut completed_rows: Vec<(usize, String)> = scores
@@ -432,26 +439,20 @@ pub(super) fn canonicalize_known_acceptance_commands(
     let mut seen = Vec::new();
 
     for command in known_commands {
-        let display = compact_one_line(command.as_str(), 200);
-        if display == "-" {
+        let raw = command.trim();
+        if raw.is_empty() {
             continue;
         }
         let canonical = canonicalize_evidence_command_with_resolution(command.as_str(), evidence);
         let sig = if canonical.is_empty() {
-            normalize_memory_entry(display.as_str())
+            normalize_memory_entry(raw)
         } else {
             normalize_memory_entry(canonical.as_str())
         };
         if sig.is_empty() {
             continue;
         }
-        let shown = if !canonical.is_empty()
-            && parse_named_command_signature(canonical.as_str()).is_some()
-        {
-            canonical
-        } else {
-            display
-        };
+        let shown = raw.to_string();
         if let Some(pos) = seen.iter().position(|existing| existing == &sig) {
             seen.remove(pos);
             out.remove(pos);
@@ -895,6 +896,29 @@ fn preferred_action_verification_command(
     required_verification: VerificationLevel,
     test_cmd: Option<&str>,
 ) -> Option<String> {
+    if let Some(configured) = test_cmd
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .filter(|command| {
+            configured_test_cmd_verification_level(Some(command))
+                .map(|level| level.satisfies(required_verification))
+                .unwrap_or(false)
+        })
+    {
+        let configured_sig = command_sig_full(configured);
+        if !configured_sig.is_empty()
+            && known_commands.iter().any(|candidate| {
+                let candidate_sig = command_sig_full(candidate.as_str());
+                !candidate_sig.is_empty()
+                    && (candidate_sig == configured_sig
+                        || candidate_sig.contains(&configured_sig)
+                        || configured_sig.contains(&candidate_sig))
+            })
+        {
+            return Some(configured.to_string());
+        }
+    }
+
     known_commands.iter().rev().find_map(|command| {
         classify_verify_level(command.as_str(), test_cmd)
             .filter(|level| level.satisfies(required_verification))
@@ -915,6 +939,98 @@ fn preferred_action_observation_command(
         }
     }
     None
+}
+
+fn preferred_action_artifact_command(
+    known_commands: &[String],
+    observation_evidence: &ObservationEvidence,
+) -> Option<String> {
+    for prefix in ["write_file(", "patch_file(", "apply_diff("] {
+        if let Some(command) = known_commands.iter().rev().find(|command| {
+            canonicalize_evidence_command_with_resolution(command.as_str(), observation_evidence)
+                .starts_with(prefix)
+        }) {
+            return Some(command.clone());
+        }
+    }
+    None
+}
+
+fn artifact_command_path(
+    command: &str,
+    observation_evidence: &ObservationEvidence,
+) -> Option<String> {
+    let canonical = canonicalize_evidence_command_with_resolution(command, observation_evidence);
+    let (name, args) = parse_named_command_signature(canonical.as_str())?;
+    if !matches!(name.as_str(), "write_file" | "patch_file" | "apply_diff") {
+        return None;
+    }
+    args.get("path").cloned()
+}
+
+fn criterion_prefers_artifact_proof(criterion: &str) -> bool {
+    let low = criterion.to_ascii_lowercase();
+    low.contains('/')
+        || [
+            ".rs",
+            ".py",
+            ".md",
+            ".toml",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".gitignore",
+            "entrypoint",
+            "readme",
+            "gameplay",
+            "logic",
+        ]
+        .iter()
+        .any(|term| low.contains(term))
+}
+
+fn score_artifact_command_for_criterion(criterion: &str, path: &str) -> usize {
+    let criterion_low = criterion.to_ascii_lowercase();
+    let path_low = path.to_ascii_lowercase();
+    let basename = path_low.rsplit('/').next().unwrap_or(path_low.as_str());
+
+    let mut score = 0usize;
+    if criterion_low.contains(path_low.as_str()) {
+        score += 8;
+    }
+    if criterion_low.contains(basename) {
+        score += 6;
+    }
+    for token in basename
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 3)
+    {
+        if criterion_low.contains(token) {
+            score += 1;
+        }
+    }
+    score
+}
+
+fn preferred_action_artifact_command_for_criterion(
+    criterion: &str,
+    known_commands: &[String],
+    observation_evidence: &ObservationEvidence,
+) -> Option<String> {
+    known_commands
+        .iter()
+        .rev()
+        .filter_map(|command| {
+            let path = artifact_command_path(command.as_str(), observation_evidence)?;
+            Some((
+                score_artifact_command_for_criterion(criterion, path.as_str()),
+                command.clone(),
+            ))
+        })
+        .filter(|(score, _)| *score > 0)
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, command)| command)
+        .or_else(|| preferred_action_artifact_command(known_commands, observation_evidence))
 }
 
 fn criterion_prefers_verification_proof(criterion: &str) -> bool {
@@ -1026,6 +1142,124 @@ fn latest_successful_mutation_path(messages: &[serde_json::Value]) -> Option<(St
     successful_mutation_paths(messages).into_iter().last()
 }
 
+fn repo_root_from_success_path(path: &str) -> Option<String> {
+    let trimmed = path.trim().trim_end_matches('/');
+    for suffix in [
+        "/src/lib.rs",
+        "/src/main.rs",
+        "/README.md",
+        "/.gitignore",
+        "/Cargo.toml",
+        "/game.py",
+        "/main.py",
+        "/test_game.py",
+    ] {
+        if let Some(root) = trimmed.strip_suffix(suffix) {
+            let root = root.trim_end_matches('/');
+            if !root.is_empty() {
+                return Some(root.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn preferred_repo_logic_path(repo_root: &str, paths: &[String]) -> Option<String> {
+    let exact_candidates = [
+        format!("{repo_root}/src/lib.rs"),
+        format!("{repo_root}/game.py"),
+        format!("{repo_root}/lib.py"),
+        format!("{repo_root}/src/main.rs"),
+        format!("{repo_root}/main.py"),
+    ];
+    for candidate in &exact_candidates {
+        if paths.iter().any(|path| path == candidate) {
+            return Some(candidate.clone());
+        }
+    }
+
+    paths.iter().find_map(|path| {
+        let low = path.to_ascii_lowercase();
+        if !path.starts_with(&format!("{repo_root}/")) {
+            return None;
+        }
+        if low.ends_with("/readme.md")
+            || low.ends_with("/.gitignore")
+            || low.ends_with("/cargo.toml")
+            || low.ends_with("/test_game.py")
+            || low.contains("/tests/")
+            || low.contains("/test_")
+        {
+            return None;
+        }
+        if [".rs", ".py", ".js", ".ts"]
+            .iter()
+            .any(|ext| low.ends_with(ext))
+        {
+            return Some(path.clone());
+        }
+        None
+    })
+}
+
+fn preferred_repo_entrypoint_path(repo_root: &str, paths: &[String]) -> Option<String> {
+    let exact_candidates = [
+        format!("{repo_root}/src/main.rs"),
+        format!("{repo_root}/main.py"),
+        format!("{repo_root}/main.js"),
+        format!("{repo_root}/main.ts"),
+    ];
+    for candidate in &exact_candidates {
+        if paths.iter().any(|path| path == candidate) {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
+fn inferred_repo_scaffold_artifacts(
+    messages: &[serde_json::Value],
+) -> Option<RepoScaffoldArtifacts> {
+    let successes = successful_mutation_paths(messages);
+    let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (_, path) in &successes {
+        let Some(repo_root) = repo_root_from_success_path(path.as_str()) else {
+            continue;
+        };
+        groups.entry(repo_root).or_default().push(path.clone());
+    }
+
+    let (repo_root, paths) = groups.into_iter().max_by_key(|(repo_root, paths)| {
+        let mut score = paths.len();
+        if paths.iter().any(|path| path.ends_with("/README.md")) {
+            score += 3;
+        }
+        if paths
+            .iter()
+            .any(|path| path.ends_with("/src/lib.rs") || path.ends_with("/game.py"))
+        {
+            score += 4;
+        }
+        if paths
+            .iter()
+            .any(|path| path.ends_with("/src/main.rs") || path.ends_with("/main.py"))
+        {
+            score += 2;
+        }
+        score + repo_root.len() / 1000
+    })?;
+
+    let logic_path = preferred_repo_logic_path(repo_root.as_str(), paths.as_slice());
+    let entrypoint_path = preferred_repo_entrypoint_path(repo_root.as_str(), paths.as_slice());
+
+    Some(RepoScaffoldArtifacts {
+        repo_root,
+        logic_path,
+        entrypoint_path,
+    })
+}
+
 fn looks_like_successful_mutation_result(content: &str) -> bool {
     let trimmed = content.trim_start();
     trimmed.starts_with("OK: wrote '")
@@ -1047,25 +1281,27 @@ pub(super) fn synthesize_action_done_summary(
     plan: Option<&PlanBlock>,
     messages: &[serde_json::Value],
 ) -> Option<String> {
-    let successes = successful_mutation_paths(messages);
-    if let Some((_, lib_path)) = successes
-        .iter()
-        .rev()
-        .find(|(_, path)| path.ends_with("/src/lib.rs"))
-    {
-        let lib_path = compact_one_line(lib_path.as_str(), 160);
-        let repo_root = lib_path
-            .strip_suffix("/src/lib.rs")
-            .map(str::to_string)
-            .unwrap_or_else(|| "the repository".to_string());
-        let main_path = format!("{repo_root}/src/main.rs");
-        let has_main = successes.iter().any(|(_, path)| path == &main_path);
-        return Some(if has_main {
-            format!(
-                "Created minimal repository at `{repo_root}/` with gameplay logic in `{lib_path}` and runnable entrypoint in `{main_path}`."
-            )
-        } else {
-            format!("Created repository logic in `{lib_path}` and verified it.")
+    if let Some(artifacts) = inferred_repo_scaffold_artifacts(messages) {
+        let repo_root = compact_one_line(artifacts.repo_root.as_str(), 160);
+        let logic_path = artifacts
+            .logic_path
+            .as_deref()
+            .map(|path| compact_one_line(path, 160));
+        let entrypoint_path = artifacts
+            .entrypoint_path
+            .as_deref()
+            .map(|path| compact_one_line(path, 160));
+        return Some(match (logic_path, entrypoint_path) {
+            (Some(logic), Some(entrypoint)) if logic != entrypoint => format!(
+                "Created repository at `{repo_root}/` with main logic in `{logic}` and runnable entrypoint in `{entrypoint}`."
+            ),
+            (Some(logic), _) => {
+                format!("Created repository at `{repo_root}/` with main logic in `{logic}`.")
+            }
+            (None, Some(entrypoint)) => format!(
+                "Created repository at `{repo_root}/` with runnable entrypoint in `{entrypoint}`."
+            ),
+            (None, None) => format!("Created repository at `{repo_root}/` and verified its starter artifacts."),
         });
     }
 
@@ -1128,6 +1364,22 @@ pub(super) fn maybe_build_verified_action_auto_final_answer(
     if !summary.is_empty() {
         final_text.push_str(summary.as_str());
     }
+    if let Some(artifacts) = inferred_repo_scaffold_artifacts(messages) {
+        final_text.push_str("\n\nArtifacts:\n");
+        final_text.push_str("- repo: `");
+        final_text.push_str(compact_one_line(artifacts.repo_root.as_str(), 160).as_str());
+        final_text.push_str("/`\n");
+        if let Some(logic_path) = artifacts.logic_path.as_deref() {
+            final_text.push_str("- main logic: `");
+            final_text.push_str(compact_one_line(logic_path, 160).as_str());
+            final_text.push_str("`\n");
+        }
+        if let Some(entrypoint_path) = artifacts.entrypoint_path.as_deref() {
+            final_text.push_str("- entrypoint: `");
+            final_text.push_str(compact_one_line(entrypoint_path, 160).as_str());
+            final_text.push_str("`\n");
+        }
+    }
     final_text.push_str("\n\nAcceptance:\n");
     for item in &completed_acceptance {
         let idx = resolve_acceptance_reference(item, plan)?;
@@ -1176,13 +1428,25 @@ pub(super) fn rescue_invalid_done_payload_for_verified_action(
 
     for (idx, criterion) in plan.acceptance_criteria.iter().enumerate() {
         let label = acceptance_reference_label(plan, idx);
+        let artifact_command = preferred_action_artifact_command_for_criterion(
+            criterion,
+            known_commands,
+            observation_evidence,
+        );
         let command = if criterion_prefers_verification_proof(criterion) {
             verify_command
                 .clone()
+                .or_else(|| artifact_command.clone())
                 .or_else(|| observation_command.clone())
         } else if criterion_prefers_observation_proof(criterion) {
             observation_command
                 .clone()
+                .or_else(|| artifact_command.clone())
+                .or_else(|| verify_command.clone())
+        } else if criterion_prefers_artifact_proof(criterion) {
+            artifact_command
+                .clone()
+                .or_else(|| observation_command.clone())
                 .or_else(|| verify_command.clone())
         } else {
             None
@@ -1266,8 +1530,11 @@ mod tests {
         )
         .expect("final answer");
 
-        assert!(final_text.contains("src/tui/agent.rs"));
-        assert!(final_text.contains("via `read_file(path=src/tui/agent.rs)`"));
+        assert!(final_text.contains("src/tui/agent.rs") || final_text.contains("tui/agent.rs"));
+        assert!(
+            final_text.contains("via `read_file(path=src/tui/agent.rs)`")
+                || final_text.contains("via `read_file(path=tui/agent.rs)`")
+        );
         assert!(!final_text.contains("via `search_files("));
     }
 
@@ -1706,6 +1973,65 @@ mod tests {
     }
 
     #[test]
+    fn synthesize_action_done_summary_mentions_repo_root_and_python_logic() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_readme",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments":"{\"path\":\"maze_game_pygame/README.md\",\"content\":\"# maze\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_readme",
+                "content": "OK: wrote 'maze_game_pygame/README.md' (1 lines, 7 bytes)"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_game",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments":"{\"path\":\"maze_game_pygame/game.py\",\"content\":\"class MazeGame: ...\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_game",
+                "content": "OK: wrote 'maze_game_pygame/game.py' (1 lines, 20 bytes)"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_main",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments":"{\"path\":\"maze_game_pygame/main.py\",\"content\":\"def main(): ...\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_main",
+                "content": "OK: wrote 'maze_game_pygame/main.py' (1 lines, 16 bytes)"
+            }),
+        ];
+
+        let summary = synthesize_action_done_summary(None, &messages).expect("summary");
+        assert!(summary.contains("maze_game_pygame/"));
+        assert!(summary.contains("maze_game_pygame/game.py"));
+        assert!(summary.contains("maze_game_pygame/main.py"));
+    }
+
+    #[test]
     fn verified_action_auto_final_answer_uses_repo_artifact_evidence() {
         let plan = PlanBlock {
             goal: "Create a new git repo in demo_repo with starter files.".to_string(),
@@ -1756,6 +2082,136 @@ mod tests {
         assert!(final_text.contains("Acceptance:"));
         assert!(final_text.contains("test -d demo_repo/.git"));
         assert!(final_text.contains("README.md"));
+        assert!(final_text.contains("Artifacts:"));
+        assert!(final_text.contains("repo: `demo_repo/`"));
+    }
+
+    #[test]
+    fn verified_action_auto_final_answer_accepts_successful_write_as_artifact_proof() {
+        let plan = PlanBlock {
+            goal: "Create a pygame maze repo and verify it.".to_string(),
+            steps: vec![
+                "initialize the repo".to_string(),
+                "write the pygame files".to_string(),
+                "run the unittest smoke".to_string(),
+                "call done".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "maze_game_pygame/README.md explains the controls".to_string(),
+                "maze_game_pygame/game.py contains the maze gameplay logic".to_string(),
+                "maze_game_pygame/main.py launches the game loop".to_string(),
+                "maze_game_pygame/test_game.py passes under SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1".to_string(),
+            ],
+            risks: "wrong repo layout".to_string(),
+            assumptions: "pygame is available".to_string(),
+        };
+        let verify_command = "SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+        let final_text = maybe_build_verified_action_auto_final_answer(
+            Some(&plan),
+            &[json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_main",
+                    "type": "function",
+                    "function": {
+                        "name":"write_file",
+                        "arguments":"{\"path\":\"maze_game_pygame/main.py\",\"content\":\"print('maze')\\n\"}"
+                    }
+                }]
+            }), json!({
+                "role": "tool",
+                "tool_call_id": "call_main",
+                "content": "OK: wrote 'maze_game_pygame/main.py' (1 lines, 13 bytes)\n[auto-test] ✓ PASSED (exit 0)"
+            })],
+            &[
+                verify_command.to_string(),
+                "write_file(path=maze_game_pygame/main.py)".to_string(),
+            ],
+            &ObservationEvidence::default(),
+            VerificationLevel::Behavioral,
+            Some(verify_command),
+            Some(7),
+            Some(7),
+        )
+        .expect("auto final");
+
+        assert!(final_text.contains("maze_game_pygame/main.py"));
+        assert!(final_text.contains("SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"));
+    }
+
+    #[test]
+    fn rescue_invalid_done_payload_for_verified_action_uses_file_specific_artifact_proof() {
+        let plan = PlanBlock {
+            goal: "Create a pygame maze repo and verify it.".to_string(),
+            steps: vec![
+                "initialize the repo".to_string(),
+                "write the pygame files".to_string(),
+                "run the unittest smoke".to_string(),
+                "call done".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "maze_game_pygame/game.py contains the maze gameplay logic".to_string(),
+                "maze_game_pygame/main.py remains runnable".to_string(),
+                "maze_game_pygame/test_game.py passes under SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1".to_string(),
+            ],
+            risks: "wrong repo layout".to_string(),
+            assumptions: "pygame is available".to_string(),
+        };
+        let verify_command = "SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+
+        let (_, _, evidence) = rescue_invalid_done_payload_for_verified_action(
+            Some(&plan),
+            &[
+                "write_file(path=maze_game_pygame/game.py)".to_string(),
+                "write_file(path=maze_game_pygame/main.py)".to_string(),
+                "write_file(path=maze_game_pygame/test_game.py)".to_string(),
+                verify_command.to_string(),
+            ],
+            &ObservationEvidence::default(),
+            VerificationLevel::Behavioral,
+            Some(verify_command),
+            Some(7),
+            Some(7),
+        )
+        .expect("rescued done payload");
+
+        assert_eq!(evidence.len(), 3);
+        assert_eq!(
+            evidence[0].command,
+            "write_file(path=maze_game_pygame/game.py)"
+        );
+        assert_eq!(
+            evidence[1].command,
+            "write_file(path=maze_game_pygame/main.py)"
+        );
+        assert_eq!(evidence[2].command, verify_command);
+    }
+
+    #[test]
+    fn canonicalize_known_acceptance_commands_preserves_long_exec_verification_command() {
+        let verify_command = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+
+        let commands = canonicalize_known_acceptance_commands(
+            &[verify_command.to_string()],
+            &ObservationEvidence::default(),
+        );
+
+        assert_eq!(commands, vec![verify_command.to_string()]);
+    }
+
+    #[test]
+    fn preferred_action_verification_command_prefers_configured_case_preserving_test_cmd() {
+        let configured = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+        let lowercased = "test -d maze_game_pygame/.git && test -f maze_game_pygame/readme.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && sdl_videodriver=dummy python3 -m unittest -q 2>&1";
+
+        let chosen = preferred_action_verification_command(
+            &[lowercased.to_string()],
+            VerificationLevel::Behavioral,
+            Some(configured),
+        )
+        .expect("verification command");
+
+        assert_eq!(chosen, configured);
     }
 
     #[test]

@@ -119,6 +119,7 @@ Current code:
 - `src/tui/agent.rs` (load/save wiring, telemetry, prompt injection)
 - `.obstral/governor_contract.overlay.json` (eval-gated promoted overlay rules)
 - `src/main.rs::run_eval` (promotion step from passing eval case to promoted overlay)
+- `src/runtime_eval.rs` (benchmark reports now include agent config plus approximate transcript token telemetry for dogfood/example docs)
 - `src/harness_promotion.rs` + `obstral promote-harness` (reviewable promotion candidate artifact for GUI/TUI or human approval)
 - `src/harness_gate.rs` + `.obstral/governor_contract.promotion_gate.json` (human-gated approve / hold / apply-to-contract state shared by TUI and GUI)
 - `src/server.rs` + `web/app.js` + `src/tui/promotion_gate.rs` (review surfaces that consume the same board artifact and gate file)

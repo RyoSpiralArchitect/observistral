@@ -134,8 +134,30 @@
         { "kind": "error_free" },
         { "kind": "tool_call_seen", "name": "exec" },
         { "kind": "tool_call_seen", "name": "write_file" },
-        { "kind": "assistant_contains", "value": "maze_game" },
-        { "kind": "assistant_contains", "value": "src/lib.rs" },
+        { "kind": "assistant_contains", "value": "maze_game/" },
+        { "kind": "assistant_contains", "value": "maze_game/src/lib.rs" },
+        { "kind": "assistant_contains", "value": "maze_game/src/main.rs" },
+        { "kind": "assistant_contains", "value": "cargo test 2>&1" },
+        { "kind": "trace_event_seen", "event": "task_harness" },
+        { "kind": "trace_event_seen", "event": "harness_evolution_loaded" }
+      ]
+    },
+    {
+      "id": "maze-game-pygame-repo",
+      "tool_root": "tests/fixtures/runtime-maze-game-pygame",
+      "copy_tool_root": true,
+      "max_iters": 18,
+      "tags": ["action", "repo", "scaffold", "python", "pygame", "maze"],
+      "prompt": "Create a new git repo in `maze_game_pygame/` for a tiny pygame maze game. Keep the project minimal: add a README.md with controls, put the gameplay logic in `maze_game_pygame/game.py`, keep `maze_game_pygame/main.py` runnable, and include at least one unit test that passes under `cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1`. Final answer must include the repo path and the main gameplay file path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "exec" },
+        { "kind": "tool_call_seen", "name": "write_file" },
+        { "kind": "assistant_contains", "value": "maze_game_pygame/" },
+        { "kind": "assistant_contains", "value": "maze_game_pygame/game.py" },
+        { "kind": "assistant_contains", "value": "maze_game_pygame/main.py" },
+        { "kind": "assistant_contains", "value": "SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1" },
         { "kind": "trace_event_seen", "event": "task_harness" },
         { "kind": "trace_event_seen", "event": "harness_evolution_loaded" }
       ]

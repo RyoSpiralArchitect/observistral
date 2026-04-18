@@ -2571,8 +2571,10 @@ fn wrap_exec_with_pwd(cmd: &str) -> String {
         .join("\n");
     }
 
-    // POSIX: keep behavior simple (do not `set -e`).
-    format!("{raw}\necho \"{PWD_MARKER}$(pwd)\"")
+    // POSIX: keep behavior simple while preserving the wrapped command's exit status.
+    format!(
+        "{{\n{raw}\n__obstral_status=$?\necho \"{PWD_MARKER}$(pwd)\"\nif [ \"$__obstral_status\" -ne 0 ]; then\n  sh -c \"exit $__obstral_status\"\nelse\n  true\nfi\n}}"
+    )
 }
 
 fn strip_pwd_marker(stdout_raw: &str) -> (String, Option<String>) {
@@ -3512,7 +3514,7 @@ impl WorkingMemory {
     }
 
     fn remember_successful_verification(&mut self, command: &str) {
-        remember_recent_unique(&mut self.successful_verifications, command, 4, 120);
+        remember_recent_unique(&mut self.successful_verifications, command, 4, 1024);
     }
 
     fn set_strategy(&mut self, strategy: &str) {
@@ -5198,18 +5200,181 @@ fn collect_successful_observation_commands(messages: &[serde_json::Value]) -> Ve
     commands
 }
 
+fn collect_successful_mutation_commands(messages: &[serde_json::Value]) -> Vec<String> {
+    let mut pending: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut commands = Vec::new();
+
+    for msg in messages {
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if role == "assistant" {
+            let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for tc in tool_calls {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if !matches!(name, "write_file" | "patch_file" | "apply_diff") {
+                    continue;
+                }
+                let arguments = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let Some(signature) = canonicalize_tool_call_command(name, arguments) else {
+                    continue;
+                };
+                pending.insert(id.to_string(), signature);
+            }
+            continue;
+        }
+
+        if role != "tool" {
+            continue;
+        }
+
+        let tool_call_id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if tool_call_id.is_empty() {
+            continue;
+        }
+        let Some(signature) = pending.remove(tool_call_id) else {
+            continue;
+        };
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if non_exec_tool_succeeded(content) {
+            remember_recent_unique(&mut commands, signature.as_str(), 12, 200);
+        }
+    }
+
+    commands
+}
+
+fn collect_successful_auto_test_verification_commands(
+    messages: &[serde_json::Value],
+    test_cmd: Option<&str>,
+) -> Vec<String> {
+    let Some(test_cmd) = test_cmd.map(str::trim).filter(|cmd| !cmd.is_empty()) else {
+        return Vec::new();
+    };
+    let mut pending_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut commands = Vec::new();
+
+    for msg in messages {
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if role == "assistant" {
+            let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for tc in tool_calls {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if matches!(name, "write_file" | "patch_file" | "apply_diff") {
+                    pending_ids.insert(id.to_string());
+                }
+            }
+            continue;
+        }
+
+        if role != "tool" {
+            continue;
+        }
+
+        let tool_call_id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if tool_call_id.is_empty() || !pending_ids.remove(tool_call_id) {
+            continue;
+        }
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.contains("PASSED (exit 0)") {
+            remember_recent_unique(&mut commands, test_cmd, 8, 1024);
+        }
+    }
+
+    commands
+}
+
 fn collect_known_acceptance_commands(
     messages: &[serde_json::Value],
     working_mem: &WorkingMemory,
+    test_cmd: Option<&str>,
 ) -> Vec<String> {
     let mut commands = Vec::new();
     for command in &working_mem.successful_verifications {
-        remember_recent_unique(&mut commands, command.as_str(), 16, 200);
+        remember_recent_unique(&mut commands, command.as_str(), 16, 1024);
+    }
+    for command in collect_successful_auto_test_verification_commands(messages, test_cmd) {
+        remember_recent_unique(&mut commands, command.as_str(), 16, 1024);
+    }
+    for command in collect_successful_mutation_commands(messages) {
+        remember_recent_unique(&mut commands, command.as_str(), 16, 1024);
     }
     for command in collect_successful_observation_commands(messages) {
-        remember_recent_unique(&mut commands, command.as_str(), 16, 200);
+        remember_recent_unique(&mut commands, command.as_str(), 16, 1024);
     }
     commands
+}
+
+fn maybe_build_verified_action_closeout_text(
+    plan: Option<&PlanBlock>,
+    messages: &[serde_json::Value],
+    working_mem: &WorkingMemory,
+    observation_evidence: &ObservationEvidence,
+    required_verification: VerificationLevel,
+    test_cmd: Option<&str>,
+    last_mutation_step: Option<usize>,
+    last_verify_ok_step: Option<usize>,
+) -> Option<String> {
+    if latest_assistant_message_is_done(messages) {
+        return None;
+    }
+
+    let known_acceptance_commands = canonicalize_known_acceptance_commands(
+        &collect_known_acceptance_commands(messages, working_mem, test_cmd),
+        observation_evidence,
+    );
+
+    maybe_build_verified_action_auto_final_answer(
+        plan,
+        messages,
+        &known_acceptance_commands,
+        observation_evidence,
+        required_verification,
+        test_cmd,
+        last_mutation_step,
+        last_verify_ok_step,
+    )
 }
 
 fn build_impact_prompt(
@@ -6604,7 +6769,7 @@ fn verification_level_from_signature(sig: &str) -> Option<VerificationLevel> {
 }
 
 fn configured_test_cmd_verification_level(test_cmd: Option<&str>) -> Option<VerificationLevel> {
-    let sig = command_sig(test_cmd.unwrap_or(""));
+    let sig = command_sig_full(test_cmd.unwrap_or(""));
     if sig.is_empty() {
         return None;
     }
@@ -6615,6 +6780,17 @@ fn configured_test_cmd_verification_level(test_cmd: Option<&str>) -> Option<Veri
         return None;
     }
     verification_level_from_signature(&sig).or(Some(VerificationLevel::Behavioral))
+}
+
+fn command_has_failure_suppression(sig: &str) -> bool {
+    let normalized = sig.trim();
+    !normalized.is_empty()
+        && (normalized.contains("|| true")
+            || normalized.contains("|| :")
+            || normalized.contains("|| exit 0")
+            || normalized.contains("; true")
+            || normalized.contains("; :")
+            || normalized.contains("; exit 0"))
 }
 
 fn verification_requirement_hint(level: VerificationLevel, test_cmd: Option<&str>) -> String {
@@ -6682,16 +6858,19 @@ fn should_emit_verification_requirement_prompt(
 }
 
 fn classify_verify_level(command: &str, test_cmd: Option<&str>) -> Option<VerificationLevel> {
-    let c = command_sig(command);
+    let c = command_sig_full(command);
     if c.is_empty() {
+        return None;
+    }
+    if command_has_failure_suppression(&c) {
         return None;
     }
     if let Some(level) = verification_level_from_signature(&c) {
         return Some(level);
     }
     if let Some(t) = test_cmd {
-        let t_sig = command_sig(t);
-        if !t_sig.is_empty() && c.contains(&t_sig) {
+        let t_sig = command_sig_full(t);
+        if !t_sig.is_empty() && c == t_sig {
             return configured_test_cmd_verification_level(Some(t));
         }
     }
@@ -6712,20 +6891,24 @@ fn classify_exec_kind(command: &str, test_cmd: Option<&str>) -> ExecKind {
     ExecKind::Action
 }
 
-fn normalize_for_signature(s: &str) -> String {
+fn normalize_for_signature_with_limit(s: &str, max_len: usize) -> String {
     // Keep this tiny: lowercased + digits collapsed removes most "At line:123" noise.
-    let mut out = String::with_capacity(s.len().min(160));
+    let mut out = String::with_capacity(s.len().min(max_len));
     for ch in s.chars() {
         if ch.is_ascii_digit() {
             out.push('#');
         } else {
             out.push(ch.to_ascii_lowercase());
         }
-        if out.len() >= 160 {
+        if out.len() >= max_len {
             break;
         }
     }
     out
+}
+
+fn normalize_for_signature(s: &str) -> String {
+    normalize_for_signature_with_limit(s, 160)
 }
 
 fn text_contains_any(haystack: &str, terms: &[String]) -> bool {
@@ -6781,6 +6964,14 @@ fn should_auto_run_goal_checks(command_approval_required: bool, max_iters: usize
 }
 
 fn command_sig(command: &str) -> String {
+    command_sig_with_limit(command, 160)
+}
+
+fn command_sig_full(command: &str) -> String {
+    command_sig_with_limit(command, 4096)
+}
+
+fn command_sig_with_limit(command: &str, max_len: usize) -> String {
     // Single line, trimmed, collapsed whitespace.
     let normalized = command.replace("\r\n", "\n");
     let one = normalized
@@ -6789,7 +6980,7 @@ fn command_sig(command: &str) -> String {
         .unwrap_or("")
         .trim();
     let collapsed = one.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalize_for_signature(&collapsed)
+    normalize_for_signature_with_limit(&collapsed, max_len)
 }
 
 fn tool_call_action_sig(tc: &ToolCallData) -> Option<String> {
@@ -8577,6 +8768,46 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
         )
         .await;
 
+        if let Some(final_text) = maybe_build_verified_action_closeout_text(
+            active_plan.as_ref(),
+            &messages,
+            &working_mem,
+            &observation_evidence,
+            required_verification,
+            test_cmd.as_deref(),
+            last_mutation_step,
+            last_verify_ok_step,
+        ) {
+            state = AgentState::Done;
+            messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+            autosave_best_effort(
+                &autosaver,
+                &tx,
+                tool_root_abs.as_deref(),
+                checkpoint.as_deref(),
+                cur_cwd.as_deref(),
+                &messages,
+            )
+            .await;
+            let _ = tx
+                .send(StreamToken::GovernorState(build_governor_state(
+                    state,
+                    &recovery,
+                    &mem,
+                    file_tool_consec_failures,
+                    last_mutation_step,
+                    last_verify_ok_step,
+                    last_reflection.as_ref(),
+                )))
+                .await;
+            let _ = tx
+                .send(StreamToken::Delta(format!(
+                    "\n[agent] auto-finalized verified action before another model turn.\n\n{final_text}\n"
+                )))
+                .await;
+            break;
+        }
+
         // C — Token budget guardian: warn once when context grows large.
         let approx_tokens = approx_tokens_messages(&messages);
         if !budget_warned
@@ -10227,7 +10458,7 @@ Execute only the new minimal action: {}",
             }
 
             let known_acceptance_commands = canonicalize_known_acceptance_commands(
-                &collect_known_acceptance_commands(&messages, &working_mem),
+                &collect_known_acceptance_commands(&messages, &working_mem, test_cmd.as_deref()),
                 &observation_evidence,
             );
             if should_prefer_done_after_verified_action(
@@ -12452,7 +12683,7 @@ Required now: {}",
             let next_steps = args["next_steps"].as_str().unwrap_or("").trim();
             let done_plan = validated_plan_for_turn.as_ref().or(active_plan.as_ref());
             let known_acceptance_commands = canonicalize_known_acceptance_commands(
-                &collect_known_acceptance_commands(&messages, &working_mem),
+                &collect_known_acceptance_commands(&messages, &working_mem, test_cmd.as_deref()),
                 &observation_evidence,
             );
             let read_only_scores = if root_read_only {
@@ -14572,36 +14803,31 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
         }
     }
 
-    if !latest_assistant_message_is_done(&messages) {
-        if let Some(final_text) = maybe_build_verified_action_auto_final_answer(
-            active_plan.as_ref(),
+    if let Some(final_text) = maybe_build_verified_action_closeout_text(
+        active_plan.as_ref(),
+        &messages,
+        &working_mem,
+        &observation_evidence,
+        required_verification,
+        test_cmd.as_deref(),
+        last_mutation_step,
+        last_verify_ok_step,
+    ) {
+        messages.push(json!({"role": "assistant", "content": final_text.clone()}));
+        autosave_best_effort(
+            &autosaver,
+            &tx,
+            tool_root_abs.as_deref(),
+            checkpoint.as_deref(),
+            cur_cwd.as_deref(),
             &messages,
-            &canonicalize_known_acceptance_commands(
-                &collect_known_acceptance_commands(&messages, &working_mem),
-                &observation_evidence,
-            ),
-            &observation_evidence,
-            required_verification,
-            test_cmd.as_deref(),
-            last_mutation_step,
-            last_verify_ok_step,
-        ) {
-            messages.push(json!({"role": "assistant", "content": final_text.clone()}));
-            autosave_best_effort(
-                &autosaver,
-                &tx,
-                tool_root_abs.as_deref(),
-                checkpoint.as_deref(),
-                cur_cwd.as_deref(),
-                &messages,
-            )
+        )
+        .await;
+        let _ = tx
+            .send(StreamToken::Delta(format!(
+                "\n[agent] auto-finalized verified action task at session end.\n\n{final_text}\n"
+            )))
             .await;
-            let _ = tx
-                .send(StreamToken::Delta(format!(
-                    "\n[agent] auto-finalized verified action task at session end.\n\n{final_text}\n"
-                )))
-                .await;
-        }
     }
 
     if realize_cfg.enabled {
@@ -15780,6 +16006,97 @@ remaining_gap: still need to run cargo test\n\
 
         assert!(final_text.starts_with("[DONE]"));
         assert!(final_text.contains("src/tui/events.rs"));
+    }
+
+    #[test]
+    fn maybe_build_verified_action_closeout_text_finalizes_pygame_repo_after_verify() {
+        let plan = PlanBlock {
+            goal: "Create a small pygame maze game repo and verify it.".to_string(),
+            steps: vec![
+                "initialize the repo".to_string(),
+                "write the pygame gameplay files".to_string(),
+                "run the unittest smoke".to_string(),
+                "call done with verification evidence".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "maze_game_pygame/README.md explains the controls".to_string(),
+                "maze_game_pygame/game.py contains the maze gameplay logic".to_string(),
+                "maze_game_pygame/main.py launches the game loop".to_string(),
+                "maze_game_pygame/test_game.py passes under SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1".to_string(),
+            ],
+            risks: "wrong repo layout".to_string(),
+            assumptions: "pygame is available".to_string(),
+        };
+        let verify_command = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_game",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"maze_game_pygame/game.py\",\"content\":\"class MazeGame:\\n    pass\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_game",
+                "content": "OK: wrote 'maze_game_pygame/game.py' (2 lines, 25 bytes)"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_main",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"maze_game_pygame/main.py\",\"content\":\"from game import MazeGame\\n\\nif __name__ == \\\"__main__\\\":\\n    MazeGame().run()\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_main",
+                "content": "OK: wrote 'maze_game_pygame/main.py' (4 lines, 67 bytes)"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_verify",
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "arguments": format!("{{\"command\":{}}}", serde_json::to_string(verify_command).expect("json"))
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_verify",
+                "content": "OK (exit_code: 0)\nstdout:\nRan 3 tests in 0.002s\n\nOK"
+            }),
+        ];
+        let mut working_mem = WorkingMemory::default();
+        working_mem.remember_successful_verification(verify_command);
+
+        let final_text = maybe_build_verified_action_closeout_text(
+            Some(&plan),
+            &messages,
+            &working_mem,
+            &ObservationEvidence::default(),
+            VerificationLevel::Behavioral,
+            Some("SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"),
+            Some(7),
+            Some(7),
+        )
+        .expect("auto final answer");
+
+        assert!(final_text.starts_with("[DONE]"));
+        assert!(final_text.contains("maze_game_pygame/game.py"));
+        assert!(final_text.contains("maze_game_pygame/main.py"));
+        assert!(final_text.contains("SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"));
     }
 
     #[test]
@@ -17676,6 +17993,77 @@ verify: exit code is zero\n\
     }
 
     #[test]
+    fn classify_verify_level_rejects_failure_suppressed_commands() {
+        assert_eq!(classify_verify_level("cargo test || true", None), None);
+        assert_eq!(
+            classify_verify_level(
+                "cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1 || true",
+                Some("cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_verify_level_requires_full_configured_test_command_match() {
+        let configured = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+        let weak_probe = "test -d maze_game_pygame/.git && test -f maze_game_pygame/readme.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py || true";
+
+        assert_eq!(classify_verify_level(weak_probe, Some(configured)), None);
+        assert_eq!(
+            classify_verify_level(configured, Some(configured)),
+            Some(VerificationLevel::Behavioral)
+        );
+    }
+
+    #[test]
+    fn restore_done_gate_from_messages_ignores_weak_prefixed_test_probe() {
+        let configured = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+        let weak_probe = "test -d maze_game_pygame/.git && test -f maze_game_pygame/readme.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py || true";
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_readme",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"maze_game_pygame/README.md\",\"content\":\"# maze_game_pygame\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_readme",
+                "content": "OK: wrote 'maze_game_pygame/README.md' (1 lines, 19 bytes)\n[hash] before=0 after=1"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_probe",
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "arguments": format!("{{\"command\":{}}}", serde_json::to_string(weak_probe).expect("json"))
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_probe",
+                "content": "OK (exit_code: 0)\nstdout:\n"
+            }),
+        ];
+
+        let (_, last_mutation_step, last_build_verify_ok_step, last_behavioral_verify_ok_step, _) =
+            restore_done_gate_from_messages(&messages, Some(configured));
+
+        assert_eq!(last_mutation_step, Some(2));
+        assert_eq!(last_build_verify_ok_step, None);
+        assert_eq!(last_behavioral_verify_ok_step, None);
+    }
+
+    #[test]
     fn effective_verify_ok_step_requires_behavioral_when_requested() {
         assert_eq!(
             effective_verify_ok_step(VerificationLevel::Build, Some(3), Some(5)),
@@ -17916,6 +18304,76 @@ verify: exit code is zero\n\
 
         mem.sync_to_plan(&plan);
         assert_eq!(mem.completed_steps, vec!["verify build".to_string()]);
+    }
+
+    #[test]
+    fn remember_successful_verification_preserves_long_configured_test_command() {
+        let mut mem = WorkingMemory::default();
+        let command = "test -d maze_game/.git && test -f maze_game/README.md && test -f maze_game/src/lib.rs && test -f maze_game/src/main.rs && cd maze_game && cargo test 2>&1";
+
+        mem.remember_successful_verification(command);
+
+        assert_eq!(mem.successful_verifications.len(), 1);
+        assert!(mem.successful_verifications[0].contains("maze_game/src/main.rs"));
+        assert!(mem.successful_verifications[0].contains("cargo test 2>&1"));
+    }
+
+    #[test]
+    fn remember_successful_verification_preserves_pygame_unittest_tail() {
+        let mut mem = WorkingMemory::default();
+        let command = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+
+        mem.remember_successful_verification(command);
+
+        assert_eq!(mem.successful_verifications.len(), 1);
+        assert!(mem.successful_verifications[0].contains("maze_game_pygame/test_game.py"));
+        assert!(mem.successful_verifications[0]
+            .contains("SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"));
+    }
+
+    #[test]
+    fn collect_known_acceptance_commands_recovers_test_cmd_from_auto_test_pass() {
+        let test_cmd = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_test_game",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"maze_game_pygame/test_game.py\",\"content\":\"print('ok')\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_test_game",
+                "content": "OK: wrote 'maze_game_pygame/test_game.py' (1 lines, 12 bytes)\n[hash] before=0 after=1\n[auto-test] ✓ PASSED (exit 0)\nRan 3 tests in 0.10s\nOK"
+            }),
+        ];
+
+        let commands =
+            collect_known_acceptance_commands(&messages, &WorkingMemory::default(), Some(test_cmd));
+
+        assert!(commands.iter().any(|command| command == test_cmd));
+    }
+
+    #[test]
+    fn wrap_exec_with_pwd_preserves_nonzero_exit_code_on_posix() {
+        if cfg!(target_os = "windows") {
+            return;
+        }
+
+        let wrapped = wrap_exec_with_pwd("false");
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let result = rt
+            .block_on(exec::run_command(&wrapped, None))
+            .expect("run wrapped command");
+        let (_stdout, pwd_after) = strip_pwd_marker(&result.stdout);
+
+        assert_ne!(result.exit_code, 0);
+        assert!(pwd_after.is_some());
     }
 
     #[test]

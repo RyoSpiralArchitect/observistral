@@ -33,6 +33,42 @@ These screenshots come from the Playwright smoke flows that exercise the Web UI 
 
 ---
 
+## Dogfood Benchmarks
+
+OBSTRAL now keeps lightweight benchmark writeups for generated milestone repos without checking those repos into git.
+
+- [Benchmark Examples](docs/examples/README.md)
+- [Maze Game (Rust)](docs/examples/maze-game-rust.md)
+- [Maze Game (pygame)](docs/examples/maze-game-pygame.md)
+
+Each page records the eval prompt shape, provider/model, rerun command, runtime snapshot, and approximate transcript token usage from a green `runtime_eval` report.
+
+---
+
+## Current Benchmark Milestone
+
+The current milestone is simple but important: OBSTRAL can now regenerate two small repos end-to-end from `runtime_eval`, keep them out of git, and still document the result in a reproducible way.
+
+- `maze-game-rust-repo` proves the scaffold lane can create a fresh Rust repo, keep gameplay logic in `src/lib.rs`, keep `src/main.rs` runnable, and close with a real `cargo test`.
+- `maze-game-pygame-repo` proves the same closeout path works for a non-Rust repo, including a headless `pygame` verification command.
+- The benchmark reports now carry provider/model metadata plus approximate transcript token telemetry, which makes it easier to compare runs without pretending those numbers are billing-accurate.
+
+This matters because it turns "the agent made something cool once" into "the runtime can reproduce a milestone case and explain how it did it."
+
+---
+
+## Next Growth Opportunities
+
+The next stretch is less about making prettier demos and more about making the runtime trustworthy over longer work.
+
+- **Long-running durability**: session resume is much better now, but true multi-hour work still wants progress files, context compaction, and stronger drift-triggered replanning.
+- **Broader benchmark mix**: fresh repo scaffolds are a good start; the next useful cases are existing-repo bugfixes, small web apps, and medium refactors where over-observation is easier to trigger.
+- **Stronger verification pressure**: passing one test command is good, but adversarial evaluator loops, rollback/checkpoint restore, and quality-oriented checks would raise the floor a lot.
+- **Better telemetry**: transcript token estimates are useful for comparison, but provider-native usage accounting and benchmark trend history would make optimization much more concrete.
+- **Measured harness evolution**: the repo now has overlay, promotion candidate, and human-gated apply flow; the next step is learning which promoted rules actually improve future runs and which ones just add prompt weight.
+
+---
+
 ## Why OBSTRAL Exists
 
 Most LLM tools optimize for conversation.
