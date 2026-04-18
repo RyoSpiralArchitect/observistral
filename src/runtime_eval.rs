@@ -118,7 +118,27 @@ pub struct RuntimeEvalMetrics {
     pub realize_mean_latency_last: Option<f64>,
     pub realize_missing_last: Option<usize>,
     pub realize_early_leakage_last: Option<usize>,
+    pub transcript_input_tokens_est: usize,
+    pub transcript_output_tokens_est: usize,
+    pub transcript_total_tokens_est: usize,
+    pub last_assistant_tokens_est: Option<usize>,
     pub last_assistant: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeEvalAgentConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub chat_model: Option<String>,
+    pub code_model: Option<String>,
+    pub base_url: Option<String>,
+    pub mode: Option<String>,
+    pub persona: Option<String>,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    pub timeout_seconds: Option<u64>,
+    pub lang: Option<String>,
+    pub max_iters: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +156,7 @@ pub struct RuntimeEvalCaseReport {
     pub duration_ms: u128,
     pub prompt: String,
     pub tags: Vec<String>,
+    pub agent: RuntimeEvalAgentConfig,
     pub run_error: Option<String>,
     pub artifacts: RuntimeEvalArtifacts,
     pub metrics: RuntimeEvalMetrics,
@@ -151,6 +172,9 @@ pub struct RuntimeEvalSummary {
     pub avg_tool_calls: f64,
     pub avg_iterations: f64,
     pub avg_messages: f64,
+    pub avg_transcript_input_tokens_est: f64,
+    pub avg_transcript_output_tokens_est: f64,
+    pub avg_transcript_total_tokens_est: f64,
     pub avg_repo_map_fallbacks: f64,
     pub avg_provider_retries: f64,
     pub avg_provider_retry_delay_ms: f64,
@@ -250,6 +274,7 @@ pub fn evaluate_case(
     run_error: Option<String>,
 ) -> Result<RuntimeEvalCaseReport> {
     let trace_lines = load_trace_lines(&artifacts.trace_path)?;
+    let agent = extract_agent_config(&trace_lines);
     let metrics = collect_metrics(&trace_lines, &artifacts)?;
     let checks = evaluate_checks(case, root, &artifacts, &metrics, run_error.as_deref());
     let ok = checks.iter().all(|c| c.ok) && run_error.is_none();
@@ -260,6 +285,7 @@ pub fn evaluate_case(
         duration_ms,
         prompt: case.prompt.clone(),
         tags: case.tags.clone(),
+        agent,
         run_error,
         artifacts,
         metrics,
@@ -283,6 +309,18 @@ pub fn summarize_cases(cases: &[RuntimeEvalCaseReport]) -> RuntimeEvalSummary {
     let avg_messages = avg(cases
         .iter()
         .map(|c| c.metrics.messages_len as f64)
+        .collect());
+    let avg_transcript_input_tokens_est = avg(cases
+        .iter()
+        .map(|c| c.metrics.transcript_input_tokens_est as f64)
+        .collect());
+    let avg_transcript_output_tokens_est = avg(cases
+        .iter()
+        .map(|c| c.metrics.transcript_output_tokens_est as f64)
+        .collect());
+    let avg_transcript_total_tokens_est = avg(cases
+        .iter()
+        .map(|c| c.metrics.transcript_total_tokens_est as f64)
         .collect());
     let avg_repo_map_fallbacks = avg(cases
         .iter()
@@ -325,6 +363,9 @@ pub fn summarize_cases(cases: &[RuntimeEvalCaseReport]) -> RuntimeEvalSummary {
         avg_tool_calls,
         avg_iterations,
         avg_messages,
+        avg_transcript_input_tokens_est,
+        avg_transcript_output_tokens_est,
+        avg_transcript_total_tokens_est,
         avg_repo_map_fallbacks,
         avg_provider_retries,
         avg_provider_retry_delay_ms,
@@ -579,6 +620,12 @@ fn collect_metrics(
     if let Some(messages) = session_value.get("messages").and_then(|v| v.as_array()) {
         metrics.messages_len = messages.len();
         metrics.last_assistant = select_terminal_assistant_message(messages);
+        let token_estimates = estimate_transcript_tokens(messages);
+        metrics.transcript_input_tokens_est = token_estimates.input;
+        metrics.transcript_output_tokens_est = token_estimates.output;
+        metrics.transcript_total_tokens_est = token_estimates.total;
+        metrics.last_assistant_tokens_est =
+            metrics.last_assistant.as_deref().map(approx_tokens_text);
     }
 
     let graph_value = load_graph_value(&artifacts.graph_path).unwrap_or(Value::Null);
@@ -594,6 +641,100 @@ fn collect_metrics(
         .unwrap_or(0);
 
     Ok(metrics)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TranscriptTokenEstimate {
+    input: usize,
+    output: usize,
+    total: usize,
+}
+
+fn estimate_transcript_tokens(messages: &[Value]) -> TranscriptTokenEstimate {
+    let mut out = TranscriptTokenEstimate::default();
+    for msg in messages {
+        let count = approx_tokens_value(msg);
+        out.total += count;
+        match msg.get("role").and_then(|v| v.as_str()) {
+            Some("assistant") => out.output += count,
+            _ => out.input += count,
+        }
+    }
+    out
+}
+
+fn approx_tokens_value(value: &Value) -> usize {
+    serde_json::to_string(value)
+        .ok()
+        .map(|s| approx_tokens_text(&s))
+        .unwrap_or(0)
+}
+
+fn approx_tokens_text(s: &str) -> usize {
+    let chars = s.chars().count();
+    if chars == 0 {
+        return 0;
+    }
+    let non_ascii = s.chars().filter(|c| !c.is_ascii()).count();
+    let ascii = chars.saturating_sub(non_ascii);
+    let ascii_tokens = ascii.div_ceil(4);
+    ascii_tokens + non_ascii
+}
+
+fn extract_agent_config(trace_lines: &[TraceLine]) -> RuntimeEvalAgentConfig {
+    let mut config = RuntimeEvalAgentConfig::default();
+    for line in trace_lines {
+        if line.event != "agent_start" {
+            continue;
+        }
+        let cfg = line.data.get("cfg").unwrap_or(&Value::Null);
+        config.provider = cfg
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string());
+        config.model = cfg
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string());
+        config.chat_model = cfg
+            .get("chat_model")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string());
+        config.code_model = cfg
+            .get("code_model")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string());
+        config.base_url = cfg
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string());
+        config.mode = cfg
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string());
+        config.persona = cfg
+            .get("persona")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string());
+        config.temperature = cfg.get("temperature").and_then(|v| v.as_f64());
+        config.max_tokens = cfg
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        config.timeout_seconds = cfg.get("timeout_seconds").and_then(|v| v.as_u64());
+        config.lang = line
+            .data
+            .get("lang")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string());
+        config.max_iters = line
+            .data
+            .get("max_iters")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        break;
+    }
+    config
 }
 
 fn load_session_value(path: &Path) -> Result<Value> {
@@ -810,6 +951,7 @@ mod tests {
         std::fs::write(
             &trace_path,
             concat!(
+                "{\"event\":\"agent_start\",\"data\":{\"cfg\":{\"provider\":\"openai-compatible\",\"model\":\"gpt-5-mini\",\"chat_model\":\"gpt-5-mini\",\"code_model\":\"gpt-5-mini\",\"base_url\":\"https://api.openai.com/v1\",\"mode\":\"VIBE\",\"persona\":\"default\",\"temperature\":0.4,\"max_tokens\":1024,\"timeout_seconds\":120},\"lang\":\"en\",\"max_iters\":14}}\n",
                 "{\"event\":\"tool_call\",\"data\":{\"name\":\"search_files\"}}\n",
                 "{\"event\":\"tool_call\",\"data\":{\"name\":\"read_file\"}}\n",
                 "{\"event\":\"reflection_ledger_loaded\",\"data\":{\"entries\":2}}\n",
@@ -895,9 +1037,25 @@ mod tests {
         .unwrap();
 
         assert!(report.ok);
+        assert_eq!(report.agent.provider.as_deref(), Some("openai-compatible"));
+        assert_eq!(report.agent.model.as_deref(), Some("gpt-5-mini"));
+        assert_eq!(
+            report.agent.base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(report.agent.lang.as_deref(), Some("en"));
+        assert_eq!(report.agent.max_iters, Some(14));
         assert_eq!(report.metrics.tool_call_count, 2);
         assert_eq!(report.metrics.graph_nodes, 2);
         assert_eq!(report.metrics.messages_len, 2);
+        assert!(report.metrics.transcript_input_tokens_est > 0);
+        assert!(report.metrics.transcript_output_tokens_est > 0);
+        assert_eq!(
+            report.metrics.transcript_total_tokens_est,
+            report.metrics.transcript_input_tokens_est
+                + report.metrics.transcript_output_tokens_est
+        );
+        assert!(report.metrics.last_assistant_tokens_est.unwrap_or(0) > 0);
         assert_eq!(report.metrics.repo_map_fallback_count, 0);
         assert_eq!(report.metrics.provider_retry_count, 1);
         assert_eq!(report.metrics.provider_retry_total_delay_ms, 5000);
@@ -922,6 +1080,71 @@ mod tests {
             .last_assistant
             .unwrap_or_default()
             .contains("src/tui/events.rs"));
+    }
+
+    #[test]
+    fn summarize_cases_includes_transcript_token_averages() {
+        let summary = summarize_cases(&[
+            RuntimeEvalCaseReport {
+                id: "a".to_string(),
+                ok: true,
+                root: ".".to_string(),
+                duration_ms: 10,
+                prompt: "prompt".to_string(),
+                tags: vec![],
+                agent: RuntimeEvalAgentConfig::default(),
+                run_error: None,
+                artifacts: RuntimeEvalArtifacts {
+                    case_dir: PathBuf::from("."),
+                    trace_path: PathBuf::from("trace.jsonl"),
+                    session_path: PathBuf::from("session.json"),
+                    json_path: PathBuf::from("final.json"),
+                    graph_path: PathBuf::from("graph.json"),
+                },
+                metrics: RuntimeEvalMetrics {
+                    tool_call_count: 1,
+                    iteration_count: 2,
+                    messages_len: 3,
+                    transcript_input_tokens_est: 100,
+                    transcript_output_tokens_est: 40,
+                    transcript_total_tokens_est: 140,
+                    ..RuntimeEvalMetrics::default()
+                },
+                checks: vec![],
+            },
+            RuntimeEvalCaseReport {
+                id: "b".to_string(),
+                ok: false,
+                root: ".".to_string(),
+                duration_ms: 30,
+                prompt: "prompt".to_string(),
+                tags: vec![],
+                agent: RuntimeEvalAgentConfig::default(),
+                run_error: Some("boom".to_string()),
+                artifacts: RuntimeEvalArtifacts {
+                    case_dir: PathBuf::from("."),
+                    trace_path: PathBuf::from("trace.jsonl"),
+                    session_path: PathBuf::from("session.json"),
+                    json_path: PathBuf::from("final.json"),
+                    graph_path: PathBuf::from("graph.json"),
+                },
+                metrics: RuntimeEvalMetrics {
+                    tool_call_count: 3,
+                    iteration_count: 4,
+                    messages_len: 5,
+                    transcript_input_tokens_est: 200,
+                    transcript_output_tokens_est: 80,
+                    transcript_total_tokens_est: 280,
+                    ..RuntimeEvalMetrics::default()
+                },
+                checks: vec![],
+            },
+        ]);
+
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.avg_transcript_input_tokens_est, 150.0);
+        assert_eq!(summary.avg_transcript_output_tokens_est, 60.0);
+        assert_eq!(summary.avg_transcript_total_tokens_est, 210.0);
     }
 
     #[test]

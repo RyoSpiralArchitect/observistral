@@ -1530,9 +1530,7 @@ mod tests {
         )
         .expect("final answer");
 
-        assert!(
-            final_text.contains("src/tui/agent.rs") || final_text.contains("tui/agent.rs")
-        );
+        assert!(final_text.contains("src/tui/agent.rs") || final_text.contains("tui/agent.rs"));
         assert!(
             final_text.contains("via `read_file(path=src/tui/agent.rs)`")
                 || final_text.contains("via `read_file(path=tui/agent.rs)`")
