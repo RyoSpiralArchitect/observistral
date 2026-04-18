@@ -6704,7 +6704,7 @@ fn verification_level_from_signature(sig: &str) -> Option<VerificationLevel> {
 }
 
 fn configured_test_cmd_verification_level(test_cmd: Option<&str>) -> Option<VerificationLevel> {
-    let sig = command_sig(test_cmd.unwrap_or(""));
+    let sig = command_sig_full(test_cmd.unwrap_or(""));
     if sig.is_empty() {
         return None;
     }
@@ -6715,6 +6715,17 @@ fn configured_test_cmd_verification_level(test_cmd: Option<&str>) -> Option<Veri
         return None;
     }
     verification_level_from_signature(&sig).or(Some(VerificationLevel::Behavioral))
+}
+
+fn command_has_failure_suppression(sig: &str) -> bool {
+    let normalized = sig.trim();
+    !normalized.is_empty()
+        && (normalized.contains("|| true")
+            || normalized.contains("|| :")
+            || normalized.contains("|| exit 0")
+            || normalized.contains("; true")
+            || normalized.contains("; :")
+            || normalized.contains("; exit 0"))
 }
 
 fn verification_requirement_hint(level: VerificationLevel, test_cmd: Option<&str>) -> String {
@@ -6782,16 +6793,19 @@ fn should_emit_verification_requirement_prompt(
 }
 
 fn classify_verify_level(command: &str, test_cmd: Option<&str>) -> Option<VerificationLevel> {
-    let c = command_sig(command);
+    let c = command_sig_full(command);
     if c.is_empty() {
+        return None;
+    }
+    if command_has_failure_suppression(&c) {
         return None;
     }
     if let Some(level) = verification_level_from_signature(&c) {
         return Some(level);
     }
     if let Some(t) = test_cmd {
-        let t_sig = command_sig(t);
-        if !t_sig.is_empty() && c.contains(&t_sig) {
+        let t_sig = command_sig_full(t);
+        if !t_sig.is_empty() && c == t_sig {
             return configured_test_cmd_verification_level(Some(t));
         }
     }
@@ -6812,20 +6826,24 @@ fn classify_exec_kind(command: &str, test_cmd: Option<&str>) -> ExecKind {
     ExecKind::Action
 }
 
-fn normalize_for_signature(s: &str) -> String {
+fn normalize_for_signature_with_limit(s: &str, max_len: usize) -> String {
     // Keep this tiny: lowercased + digits collapsed removes most "At line:123" noise.
-    let mut out = String::with_capacity(s.len().min(160));
+    let mut out = String::with_capacity(s.len().min(max_len));
     for ch in s.chars() {
         if ch.is_ascii_digit() {
             out.push('#');
         } else {
             out.push(ch.to_ascii_lowercase());
         }
-        if out.len() >= 160 {
+        if out.len() >= max_len {
             break;
         }
     }
     out
+}
+
+fn normalize_for_signature(s: &str) -> String {
+    normalize_for_signature_with_limit(s, 160)
 }
 
 fn text_contains_any(haystack: &str, terms: &[String]) -> bool {
@@ -6881,6 +6899,14 @@ fn should_auto_run_goal_checks(command_approval_required: bool, max_iters: usize
 }
 
 fn command_sig(command: &str) -> String {
+    command_sig_with_limit(command, 160)
+}
+
+fn command_sig_full(command: &str) -> String {
+    command_sig_with_limit(command, 4096)
+}
+
+fn command_sig_with_limit(command: &str, max_len: usize) -> String {
     // Single line, trimmed, collapsed whitespace.
     let normalized = command.replace("\r\n", "\n");
     let one = normalized
@@ -6889,7 +6915,7 @@ fn command_sig(command: &str) -> String {
         .unwrap_or("")
         .trim();
     let collapsed = one.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalize_for_signature(&collapsed)
+    normalize_for_signature_with_limit(&collapsed, max_len)
 }
 
 fn tool_call_action_sig(tc: &ToolCallData) -> Option<String> {
@@ -17899,6 +17925,77 @@ verify: exit code is zero\n\
             Some(VerificationLevel::Behavioral)
         );
         assert_eq!(classify_verify_level("git status", None), None);
+    }
+
+    #[test]
+    fn classify_verify_level_rejects_failure_suppressed_commands() {
+        assert_eq!(classify_verify_level("cargo test || true", None), None);
+        assert_eq!(
+            classify_verify_level(
+                "cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1 || true",
+                Some("cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_verify_level_requires_full_configured_test_command_match() {
+        let configured = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+        let weak_probe = "test -d maze_game_pygame/.git && test -f maze_game_pygame/readme.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py || true";
+
+        assert_eq!(classify_verify_level(weak_probe, Some(configured)), None);
+        assert_eq!(
+            classify_verify_level(configured, Some(configured)),
+            Some(VerificationLevel::Behavioral)
+        );
+    }
+
+    #[test]
+    fn restore_done_gate_from_messages_ignores_weak_prefixed_test_probe() {
+        let configured = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+        let weak_probe = "test -d maze_game_pygame/.git && test -f maze_game_pygame/readme.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py || true";
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_readme",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"maze_game_pygame/README.md\",\"content\":\"# maze_game_pygame\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_readme",
+                "content": "OK: wrote 'maze_game_pygame/README.md' (1 lines, 19 bytes)\n[hash] before=0 after=1"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_probe",
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "arguments": format!("{{\"command\":{}}}", serde_json::to_string(weak_probe).expect("json"))
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_probe",
+                "content": "OK (exit_code: 0)\nstdout:\n"
+            }),
+        ];
+
+        let (_, last_mutation_step, last_build_verify_ok_step, last_behavioral_verify_ok_step, _) =
+            restore_done_gate_from_messages(&messages, Some(configured));
+
+        assert_eq!(last_mutation_step, Some(2));
+        assert_eq!(last_build_verify_ok_step, None);
+        assert_eq!(last_behavioral_verify_ok_step, None);
     }
 
     #[test]
