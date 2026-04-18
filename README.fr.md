@@ -33,6 +33,42 @@ Ces captures proviennent des smoke tests Playwright qui parcourent l'UI Web de b
 
 ---
 
+## Benchmarks Dogfood
+
+OBSTRAL conserve maintenant de petites fiches de benchmark pour les repos generes, sans ajouter ces repos eux-memes au git du projet.
+
+- [Benchmark Examples](docs/examples/README.md)
+- [Maze Game (Rust)](docs/examples/maze-game-rust.md)
+- [Maze Game (pygame)](docs/examples/maze-game-pygame.md)
+
+Chaque page note la forme du prompt d'eval, le provider/modele, la commande de rerun, un snapshot runtime, et une estimation des tokens issue d'un rapport `runtime_eval` vert.
+
+---
+
+## Milestone de Benchmark Actuel
+
+Le milestone actuel est simple mais important : OBSTRAL peut maintenant regenerer deux petits repos de bout en bout depuis `runtime_eval`, les garder hors du git du projet, et documenter le resultat de facon reproductible.
+
+- `maze-game-rust-repo` montre que la scaffold lane peut creer un repo Rust frais, garder la logique de jeu dans `src/lib.rs`, garder `src/main.rs` executable, puis conclure avec un vrai `cargo test`.
+- `maze-game-pygame-repo` montre que le meme chemin de closeout fonctionne aussi pour un repo non Rust, y compris avec une verification `pygame` headless.
+- Les rapports de benchmark portent maintenant le provider/modele ainsi qu'une telemetrie approximative des tokens du transcript, ce qui aide a comparer les runs sans pretendre fournir une facturation exacte.
+
+L'interet est la : on passe de « l'agent a produit un truc sympa une fois » a « le runtime peut reproduire un cas milestone et expliquer comment ».
+
+---
+
+## Prochaines Marges de Progression
+
+La suite utile consiste moins a produire de plus jolies demos qu'a rendre le runtime fiable sur des travaux plus longs.
+
+- **Robustesse long-running** : la reprise de session est deja bien meilleure, mais le vrai travail sur plusieurs heures veut encore des progress files, de la compaction de contexte, et des replans plus agressifs en cas de drift.
+- **Benchmarks plus varies** : les scaffolds de repo frais sont un bon debut ; les prochains cas utiles sont des bugfixes dans des repos existants, de petites applis web, et des refactors moyens ou la sur-observation apparait plus facilement.
+- **Verification plus dure** : un test qui passe, c'est bien ; des boucles evaluateur adversarial, du rollback/checkpoint restore, et des checks orientes qualite releveraient nettement le niveau minimal.
+- **Telemetrie plus riche** : les estimations de tokens du transcript sont utiles pour comparer, mais une mesure provider-native et un historique d'evolution des benchmarks rendraient l'optimisation bien plus concrete.
+- **Evolution du harness mesuree** : overlay, candidate de promotion, et apply avec gate humain existent deja ; l'etape suivante est de mesurer quelles regles promues ameliorent vraiment les runs futurs et lesquelles ne font qu'alourdir le prompt.
+
+---
+
 ## Pourquoi OBSTRAL existe
 
 La plupart des outils LLM optimisent la conversation.
