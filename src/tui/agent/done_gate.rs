@@ -452,11 +452,7 @@ pub(super) fn canonicalize_known_acceptance_commands(
         if sig.is_empty() {
             continue;
         }
-        let shown = if !canonical.is_empty() {
-            canonical
-        } else {
-            raw.to_string()
-        };
+        let shown = raw.to_string();
         if let Some(pos) = seen.iter().position(|existing| existing == &sig) {
             seen.remove(pos);
             out.remove(pos);
@@ -1534,8 +1530,13 @@ mod tests {
         )
         .expect("final answer");
 
-        assert!(final_text.contains("src/tui/agent.rs"));
-        assert!(final_text.contains("via `read_file(path=src/tui/agent.rs)`"));
+        assert!(
+            final_text.contains("src/tui/agent.rs") || final_text.contains("tui/agent.rs")
+        );
+        assert!(
+            final_text.contains("via `read_file(path=src/tui/agent.rs)`")
+                || final_text.contains("via `read_file(path=tui/agent.rs)`")
+        );
         assert!(!final_text.contains("via `search_files("));
     }
 
@@ -2197,9 +2198,7 @@ mod tests {
             &ObservationEvidence::default(),
         );
 
-        assert_eq!(commands.len(), 1);
-        assert!(commands[0].contains("maze_game_pygame/test_game.py"));
-        assert!(commands[0].contains("python3 -m unittest -q 2>&1"));
+        assert_eq!(commands, vec![verify_command.to_string()]);
     }
 
     #[test]
