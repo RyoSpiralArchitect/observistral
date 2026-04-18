@@ -789,6 +789,7 @@ pub struct SessionAutoSaver {
     path: PathBuf,
     created_at_ms: u128,
     observation_cache: Mutex<Option<ObservationCache>>,
+    progress_context: Mutex<Option<crate::progress_state::ProgressSaveContext>>,
     last_saved: Mutex<SaveKey>,
     warned: AtomicBool,
 }
@@ -800,6 +801,7 @@ impl SessionAutoSaver {
             path,
             created_at_ms,
             observation_cache: Mutex::new(existing.and_then(|s| s.observation_cache.clone())),
+            progress_context: Mutex::new(None),
             last_saved: Mutex::new(SaveKey::default()),
             warned: AtomicBool::new(false),
         }
@@ -811,6 +813,17 @@ impl SessionAutoSaver {
             .lock()
             .expect("SessionAutoSaver observation_cache poisoned");
         *slot = cache;
+    }
+
+    pub fn set_progress_context(
+        &self,
+        context: Option<crate::progress_state::ProgressSaveContext>,
+    ) {
+        let mut slot = self
+            .progress_context
+            .lock()
+            .expect("SessionAutoSaver progress_context poisoned");
+        *slot = context;
     }
 
     pub fn save_or_error(
@@ -857,6 +870,11 @@ impl SessionAutoSaver {
             .lock()
             .expect("SessionAutoSaver observation_cache poisoned")
             .clone();
+        let progress_context = self
+            .progress_context
+            .lock()
+            .expect("SessionAutoSaver progress_context poisoned")
+            .clone();
         let mut observation_hasher = std::collections::hash_map::DefaultHasher::new();
         observation_cache.hash(&mut observation_hasher);
         let key = SaveKey {
@@ -880,6 +898,7 @@ impl SessionAutoSaver {
             }
         }
 
+        let session_bridge = session_bridge_from_messages(messages);
         let snap = AgentSessionSnapshot {
             version: AgentSession::VERSION,
             created_at_ms: self.created_at_ms,
@@ -890,11 +909,21 @@ impl SessionAutoSaver {
             last_reflection: last_reflection_summary_from_messages(messages),
             recent_reflections: recent_reflection_summaries_from_messages(messages, 3),
             observation_cache: observation_cache.as_ref(),
-            session_bridge: session_bridge_from_messages(messages),
+            session_bridge: session_bridge.clone(),
             messages,
         };
         let json = serde_json::to_string_pretty(&snap).context("failed to serialize session")?;
         save_text_atomic(&self.path, &json)?;
+
+        if let (Some(root), Some(context)) = (tool_root, progress_context.as_ref()) {
+            let progress = crate::progress_state::RepoProgressState::derive_with_bridge(
+                context,
+                messages,
+                session_bridge.as_ref(),
+            );
+            let progress_path = crate::progress_state::path_for_root(root);
+            progress.save_atomic(&progress_path)?;
+        }
 
         let mut last = self
             .last_saved
@@ -1026,6 +1055,55 @@ mod tests {
             Some(1)
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn autosaver_writes_repo_progress_when_context_is_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_path = dir.path().join("session.json");
+        let tool_root = dir.path().join("tool_root");
+        std::fs::create_dir_all(&tool_root).expect("tool_root");
+        let existing = AgentSession::new(
+            Some(tool_root.to_string_lossy().to_string()),
+            None,
+            None,
+            None,
+            vec![
+                json!({"role":"user","content":"Fix the failing test with the smallest code change."}),
+                json!({"role":"assistant","content":"<plan>\ngoal: fix src/lib.rs\nsteps: 1) patch 2) verify\nacceptance: 1) cargo test passes\nrisks: stale read\nassumptions: src/lib.rs is wrong\n</plan>"}),
+                json!({
+                    "role":"assistant",
+                    "tool_calls": [{
+                        "id":"call_patch",
+                        "type":"function",
+                        "function":{"name":"patch_file","arguments":"{\"path\":\"src/lib.rs\",\"search\":\"bug\",\"replace\":\"fix\"}"}
+                    }]
+                }),
+                json!({"role":"tool","tool_call_id":"call_patch","content":"OK: patched 'src/lib.rs'"}),
+            ],
+        );
+        let saver = SessionAutoSaver::new(session_path.clone(), Some(&existing));
+        saver.set_progress_context(Some(crate::progress_state::ProgressSaveContext::new(
+            "Fix the failing test with the smallest code change.",
+            "fix_existing_files",
+            "modify_existing",
+        )));
+        saver
+            .save_or_error(
+                Some(tool_root.to_string_lossy().as_ref()),
+                None,
+                None,
+                &existing.messages,
+            )
+            .expect("save");
+
+        let progress_path =
+            crate::progress_state::path_for_root(tool_root.to_string_lossy().as_ref());
+        let progress =
+            crate::progress_state::RepoProgressState::load(&progress_path).expect("progress");
+        assert_eq!(progress.lane, "fix_existing_files");
+        assert_eq!(progress.completed_artifacts.len(), 1);
+        assert_eq!(progress.completed_artifacts[0].path, "src/lib.rs");
     }
 
     #[test]

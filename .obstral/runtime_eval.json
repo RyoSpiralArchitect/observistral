@@ -103,7 +103,10 @@
         { "kind": "tool_call_seen", "name": "read_file" },
         { "kind": "tool_call_seen", "name": "patch_file" },
         { "kind": "trace_event_seen", "event": "task_harness" },
-        { "kind": "trace_event_seen", "event": "harness_evolution_loaded" }
+        { "kind": "trace_event_seen", "event": "harness_evolution_loaded" },
+        { "kind": "trace_event_seen", "event": "progress_state_loaded" },
+        { "kind": "trace_event_seen", "event": "progress_bridge_prompted" },
+        { "kind": "tool_root_file_exists", "path": ".obstral/progress.json" }
       ]
     },
     {
@@ -118,8 +121,10 @@
         { "kind": "completed" },
         { "kind": "error_free" },
         { "kind": "trace_event_seen", "event": "session_bridge_prompted" },
+        { "kind": "trace_event_seen", "event": "progress_bridge_prompted" },
         { "kind": "tool_call_seen", "name": "patch_file" },
-        { "kind": "assistant_contains", "value": "src/lib.rs" }
+        { "kind": "assistant_contains", "value": "src/lib.rs" },
+        { "kind": "tool_root_file_exists", "path": ".obstral/progress.json" }
       ]
     },
     {

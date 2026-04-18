@@ -175,6 +175,7 @@ impl ProviderPreset {
                 "codestral-latest",
                 "devstral-medium-latest",
                 "mistral-small-latest",
+                "mistral-large-latest",
                 "other",
             ],
             ProviderPreset::HfLocal => &["local", "other"],
@@ -668,5 +669,12 @@ mod tests {
             "https://generativelanguage.googleapis.com/v1beta/openai",
             "gemini-2.5-flash",
         ));
+    }
+
+    #[test]
+    fn mistral_preset_lists_large_latest_model() {
+        assert!(ProviderPreset::Mistral
+            .representative_models()
+            .contains(&"mistral-large-latest"));
     }
 }

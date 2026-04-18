@@ -47,6 +47,7 @@ mod evaluator_loop;
 mod harness_evolution;
 mod memory;
 mod meta_harness;
+mod progress_bridge;
 mod provider_compat;
 mod read_only;
 mod repo_scaffold;
@@ -77,6 +78,7 @@ use self::memory::{
     ObservationEvidence, ObservationReadEvidence, ObservationSearchEvidence,
 };
 use self::meta_harness::MetaHarness;
+use self::progress_bridge::ProgressBridgeView;
 #[cfg(test)]
 use self::provider_compat::compat_synthetic_think;
 use self::provider_compat::{
@@ -148,6 +150,15 @@ fn sync_observation_cache_autosave(
 ) {
     if let Some(saver) = autosaver {
         saver.set_observation_cache(Some(evidence.to_session_cache()));
+    }
+}
+
+fn sync_progress_context_autosave(
+    autosaver: &Option<Arc<crate::agent_session::SessionAutoSaver>>,
+    context: crate::progress_state::ProgressSaveContext,
+) {
+    if let Some(saver) = autosaver {
+        saver.set_progress_context(Some(context));
     }
 }
 
@@ -4666,6 +4677,7 @@ struct StablePromptCache {
     evaluator_loop_hash: Option<u64>,
     harness_evolution_promoted_hash: Option<u64>,
     harness_evolution_hash: Option<u64>,
+    progress_bridge_hash: Option<u64>,
     session_bridge_hash: Option<u64>,
     task_contract_hash: Option<u64>,
     working_memory_hash: Option<u64>,
@@ -8430,6 +8442,11 @@ Fix: use --provider openai-compatible (or --provider mistral).",
     let root_user_text_low = root_user_text.to_ascii_lowercase();
     let root_read_only = is_root_read_only_observation_task(&root_user_text);
     let task_harness = TaskHarness::infer(&root_user_text, root_read_only);
+    let progress_context = crate::progress_state::ProgressSaveContext::new(
+        &root_user_text,
+        task_harness.lane_label(),
+        task_harness.artifact_mode_label(),
+    );
     let verification_contract = governor_contract::verification();
     let wants_repo_goal =
         text_contains_any(&root_user_text_low, &verification_contract.goal_repo_terms);
@@ -8489,6 +8506,7 @@ Fix: use --provider openai-compatible (or --provider mistral).",
     let mut observation_evidence = collect_observation_evidence(&messages);
     observation_evidence.merge_session_cache(start.observation_cache.as_ref());
     sync_observation_cache_autosave(&autosaver, &observation_evidence);
+    sync_progress_context_autosave(&autosaver, progress_context.clone());
     let session_bridge = SessionBridgeView::resolve(start.session_bridge.as_ref(), &messages);
     let mut prompt_cache = StablePromptCache::default();
     let mut prompted_harness_overlay_ids = std::collections::BTreeSet::new();
@@ -8590,6 +8608,36 @@ Execute only the new minimal action: {}",
         json!({
             "entries": reflection_ledger.entries.len(),
             "path": reflection_ledger_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        }),
+    )
+    .await;
+    let progress_state_path = tool_root_abs
+        .as_deref()
+        .map(crate::progress_state::path_for_root);
+    let progress_state = if let Some(path) = progress_state_path.as_ref() {
+        match crate::progress_state::RepoProgressState::load(path) {
+            Ok(progress) => Some(progress),
+            Err(e) if !path.exists() => None,
+            Err(e) => {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[progress_state] WARN: {e:#}\n"
+                    )))
+                    .await;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    emit_telemetry_event(
+        &tx,
+        "progress_state_loaded",
+        json!({
+            "path": progress_state_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            "has_state": progress_state.is_some(),
+            "completed_artifacts": progress_state.as_ref().map(|state| state.completed_artifacts.len()).unwrap_or(0),
+            "verified_commands": progress_state.as_ref().map(|state| state.verified_commands.len()).unwrap_or(0),
         }),
     )
     .await;
@@ -9200,6 +9248,25 @@ This is the LAST model call for this run.\n\
                 }),
             )
             .await;
+        }
+
+        let progress_bridge =
+            ProgressBridgeView::resolve(progress_state.as_ref(), &progress_context, &messages);
+        if let Some(telemetry) = progress_bridge.telemetry_payload() {
+            emit_telemetry_event(&tx, "progress_bridge_prompted", telemetry).await;
+        }
+        if let Some(progress_bridge_prompt) = progress_bridge.prompt() {
+            let compact_prompt = progress_bridge
+                .compact_prompt()
+                .unwrap_or_else(|| progress_bridge_prompt.clone());
+            msgs_for_call.push(json!({
+                "role": "system",
+                "content": render_cached_prompt(
+                    &mut prompt_cache.progress_bridge_hash,
+                    progress_bridge_prompt,
+                    compact_prompt,
+                ),
+            }));
         }
 
         if let Some(telemetry) = session_bridge.telemetry_payload() {
