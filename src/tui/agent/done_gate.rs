@@ -439,25 +439,23 @@ pub(super) fn canonicalize_known_acceptance_commands(
     let mut seen = Vec::new();
 
     for command in known_commands {
-        let display = compact_one_line(command.as_str(), 200);
-        if display == "-" {
+        let raw = command.trim();
+        if raw.is_empty() {
             continue;
         }
         let canonical = canonicalize_evidence_command_with_resolution(command.as_str(), evidence);
         let sig = if canonical.is_empty() {
-            normalize_memory_entry(display.as_str())
+            normalize_memory_entry(raw)
         } else {
             normalize_memory_entry(canonical.as_str())
         };
         if sig.is_empty() {
             continue;
         }
-        let shown = if !canonical.is_empty()
-            && parse_named_command_signature(canonical.as_str()).is_some()
-        {
+        let shown = if !canonical.is_empty() {
             canonical
         } else {
-            display
+            raw.to_string()
         };
         if let Some(pos) = seen.iter().position(|existing| existing == &sig) {
             seen.remove(pos);
@@ -2165,6 +2163,20 @@ mod tests {
             "write_file(path=maze_game_pygame/main.py)"
         );
         assert_eq!(evidence[2].command, verify_command);
+    }
+
+    #[test]
+    fn canonicalize_known_acceptance_commands_preserves_long_exec_verification_command() {
+        let verify_command = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+
+        let commands = canonicalize_known_acceptance_commands(
+            &[verify_command.to_string()],
+            &ObservationEvidence::default(),
+        );
+
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].contains("maze_game_pygame/test_game.py"));
+        assert!(commands[0].contains("python3 -m unittest -q 2>&1"));
     }
 
     #[test]
