@@ -900,6 +900,29 @@ fn preferred_action_verification_command(
     required_verification: VerificationLevel,
     test_cmd: Option<&str>,
 ) -> Option<String> {
+    if let Some(configured) = test_cmd
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .filter(|command| {
+            configured_test_cmd_verification_level(Some(command))
+                .map(|level| level.satisfies(required_verification))
+                .unwrap_or(false)
+        })
+    {
+        let configured_sig = command_sig_full(configured);
+        if !configured_sig.is_empty()
+            && known_commands.iter().any(|candidate| {
+                let candidate_sig = command_sig_full(candidate.as_str());
+                !candidate_sig.is_empty()
+                    && (candidate_sig == configured_sig
+                        || candidate_sig.contains(&configured_sig)
+                        || configured_sig.contains(&candidate_sig))
+            })
+        {
+            return Some(configured.to_string());
+        }
+    }
+
     known_commands.iter().rev().find_map(|command| {
         classify_verify_level(command.as_str(), test_cmd)
             .filter(|level| level.satisfies(required_verification))
@@ -2177,6 +2200,21 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert!(commands[0].contains("maze_game_pygame/test_game.py"));
         assert!(commands[0].contains("python3 -m unittest -q 2>&1"));
+    }
+
+    #[test]
+    fn preferred_action_verification_command_prefers_configured_case_preserving_test_cmd() {
+        let configured = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+        let lowercased = "test -d maze_game_pygame/.git && test -f maze_game_pygame/readme.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && sdl_videodriver=dummy python3 -m unittest -q 2>&1";
+
+        let chosen = preferred_action_verification_command(
+            &[lowercased.to_string()],
+            VerificationLevel::Behavioral,
+            Some(configured),
+        )
+        .expect("verification command");
+
+        assert_eq!(chosen, configured);
     }
 
     #[test]
