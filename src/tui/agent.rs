@@ -2571,8 +2571,10 @@ fn wrap_exec_with_pwd(cmd: &str) -> String {
         .join("\n");
     }
 
-    // POSIX: keep behavior simple (do not `set -e`).
-    format!("{raw}\necho \"{PWD_MARKER}$(pwd)\"")
+    // POSIX: keep behavior simple while preserving the wrapped command's exit status.
+    format!(
+        "{{\n{raw}\n__obstral_status=$?\necho \"{PWD_MARKER}$(pwd)\"\nif [ \"$__obstral_status\" -ne 0 ]; then\n  sh -c \"exit $__obstral_status\"\nelse\n  true\nfi\n}}"
+    )
 }
 
 fn strip_pwd_marker(stdout_raw: &str) -> (String, Option<String>) {
@@ -18251,6 +18253,23 @@ verify: exit code is zero\n\
         assert_eq!(mem.successful_verifications.len(), 1);
         assert!(mem.successful_verifications[0].contains("maze_game/src/main.rs"));
         assert!(mem.successful_verifications[0].contains("cargo test 2>&1"));
+    }
+
+    #[test]
+    fn wrap_exec_with_pwd_preserves_nonzero_exit_code_on_posix() {
+        if cfg!(target_os = "windows") {
+            return;
+        }
+
+        let wrapped = wrap_exec_with_pwd("false");
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let result = rt
+            .block_on(exec::run_command(&wrapped, None))
+            .expect("run wrapped command");
+        let (_stdout, pwd_after) = strip_pwd_marker(&result.stdout);
+
+        assert_ne!(result.exit_code, 0);
+        assert!(pwd_after.is_some());
     }
 
     #[test]
