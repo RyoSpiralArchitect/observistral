@@ -3512,7 +3512,7 @@ impl WorkingMemory {
     }
 
     fn remember_successful_verification(&mut self, command: &str) {
-        remember_recent_unique(&mut self.successful_verifications, command, 4, 120);
+        remember_recent_unique(&mut self.successful_verifications, command, 4, 320);
     }
 
     fn set_strategy(&mut self, strategy: &str) {
@@ -18142,6 +18142,18 @@ verify: exit code is zero\n\
 
         mem.sync_to_plan(&plan);
         assert_eq!(mem.completed_steps, vec!["verify build".to_string()]);
+    }
+
+    #[test]
+    fn remember_successful_verification_preserves_long_configured_test_command() {
+        let mut mem = WorkingMemory::default();
+        let command = "test -d maze_game/.git && test -f maze_game/README.md && test -f maze_game/src/lib.rs && test -f maze_game/src/main.rs && cd maze_game && cargo test 2>&1";
+
+        mem.remember_successful_verification(command);
+
+        assert_eq!(mem.successful_verifications.len(), 1);
+        assert!(mem.successful_verifications[0].contains("maze_game/src/main.rs"));
+        assert!(mem.successful_verifications[0].contains("cargo test 2>&1"));
     }
 
     #[test]
