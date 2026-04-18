@@ -8,5 +8,6 @@ These pages document repeatable OBSTRAL benchmark runs without checking the gene
 
 Current examples:
 
+- [Existing Repo Bugfix (Rust)](existing-repo-bugfix-rust.md)
 - [Maze Game (Rust)](maze-game-rust.md)
 - [Maze Game (pygame)](maze-game-pygame.md)

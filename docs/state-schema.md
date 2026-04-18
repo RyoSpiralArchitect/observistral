@@ -13,6 +13,7 @@ store state without first choosing the correct owner.
 | Provider/runtime config | `src/config.rs` | process / launch | CLI args + env | `PartialConfig`, `RunConfig` |
 | Project-local TUI prefs | `src/tui/prefs.rs` | cross-session | `.obstral/tui_prefs.json` | `TuiPrefs`, `PanePrefs`, `coder_realize_preset`, pane model/provider/mode |
 | Session persistence | `src/agent_session.rs` | resumable run | `session.json` | `AgentSession`, `ObservationCache`, recent reflections, `SessionBridge` |
+| Project-local repo progress snapshot | `src/progress_state.rs` | cross-session | `.obstral/progress.json` | current objective, completed artifacts, verified commands, repo-level progress bridge memory |
 | Project-local reflection ledger | `src/reflection_ledger.rs` | cross-session | `.obstral/reflection_ledger.json` | recurring wrong assumptions, next minimal actions, reflection counts |
 | Project-local harness evolution queue | `src/tui/agent/harness_evolution.rs` | cross-session | `.obstral/policy_patch_queue.json` | trace-derived runtime overlay proposals, seen/applied counts, promotion readiness |
 | Project-local promoted governor overlay | `src/tui/agent/harness_evolution.rs` | cross-session | `.obstral/governor_contract.overlay.json` | eval-gated promoted harness policies, green case IDs, stable overlay defaults |
@@ -104,6 +105,36 @@ This is the right home for typed operational memory such as:
 - recent successful commands used for `done` citation
 - accepted strategies that were already matched to successful follow-up actions
 - repeated dead-end commands that should not be retried first after resume
+
+### 3b. Project-local repo progress snapshot
+
+Code:
+
+- `src/progress_state.rs`
+
+File:
+
+- `.obstral/progress.json`
+
+Owns:
+
+- repo-level current objective for the active task lane
+- completed artifact paths that were actually created or patched
+- verified commands that already succeeded for this repo
+- lightweight repo-progress bridge memory that can be reused across future runs
+
+Examples:
+
+- `task_summary: "Fix the failing test with the smallest code change"`
+- `current_objective: "fix src/lib.rs"`
+- `completed_artifacts: ["src/lib.rs"]`
+- `verified_commands: ["cargo test 2>&1"]`
+
+Important rule:
+
+- this layer is repo-local operational memory, not a replacement for the live transcript
+- it should help the runtime resume work without restarting discovery
+- if current tool output contradicts it, current evidence wins immediately
 
 ### 4. Project-local reflection ledger
 

@@ -14,6 +14,7 @@ mod observer;
 mod pending_commands;
 mod pending_edits;
 mod personas;
+mod progress_state;
 mod project;
 mod providers;
 mod reflection_ledger;

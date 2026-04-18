@@ -66,6 +66,7 @@ Responsibilities:
 Current code:
 - `src/agent_session.rs` (`AgentSession`, `SessionAutoSaver`)
 - `src/project.rs` (project scan: stack/git/test_cmd)
+- `src/progress_state.rs` (`.obstral/progress.json`, repo-level objective / artifact / verification snapshot used by the progress bridge)
 
 ### 3) Task Graph
 

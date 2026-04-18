@@ -571,6 +571,13 @@ fn synthetic_action_plan(
     }
 }
 
+fn supports_action_task_rescues(provider: &ProviderKind) -> bool {
+    matches!(
+        provider,
+        ProviderKind::OpenAiCompatible | ProviderKind::Mistral
+    )
+}
+
 fn extract_loose_json_string_field(raw: &str, field: &str) -> Option<(String, bool)> {
     let needle = format!("\"{field}\"");
     let start = raw.find(needle.as_str())?;
@@ -819,7 +826,7 @@ pub(super) fn rescue_missing_plan_for_tool_turn(
     if root_read_only || !goal_wants_actions {
         return None;
     }
-    if !matches!(provider, ProviderKind::OpenAiCompatible) {
+    if !supports_action_task_rescues(&provider) {
         return None;
     }
     let artifact_creation_turn = matches!(
@@ -834,6 +841,10 @@ pub(super) fn rescue_missing_plan_for_tool_turn(
     let prior_diagnostic_blocks = consecutive_missing_plan_blocks_for_diagnostic_tools(messages);
     if artifact_creation_turn {
         if prior_blocks.saturating_add(1) < 2 {
+            return None;
+        }
+    } else if matches!(provider, ProviderKind::Mistral) {
+        if prior_blocks.saturating_add(1) < 2 && prior_diagnostic_blocks.saturating_add(1) < 2 {
             return None;
         }
     } else if prior_blocks.saturating_add(1) < 2 && prior_diagnostic_blocks.saturating_add(1) < 3 {
@@ -924,7 +935,7 @@ pub(super) fn rescue_missing_think_for_tool_turn(
     if root_read_only || !goal_wants_actions {
         return None;
     }
-    if !matches!(provider, ProviderKind::OpenAiCompatible) {
+    if !supports_action_task_rescues(&provider) {
         return None;
     }
     if matches!(
@@ -935,6 +946,9 @@ pub(super) fn rescue_missing_think_for_tool_turn(
     }
     if !is_diagnostic_tool_name(tc.name.as_str()) {
         return None;
+    }
+    if matches!(provider, ProviderKind::Mistral) {
+        return Some(compat_synthetic_think(tc, plan));
     }
     if force {
         return Some(compat_synthetic_think(tc, plan));
@@ -961,7 +975,7 @@ pub(super) fn rescue_missing_reflection_for_tool_turn(
     if root_read_only || !goal_wants_actions {
         return None;
     }
-    if !matches!(provider, ProviderKind::OpenAiCompatible) {
+    if !supports_action_task_rescues(&provider) {
         return None;
     }
 
@@ -1104,7 +1118,7 @@ pub(super) fn rescue_missing_impact_for_tool_turn(
     if root_read_only || !goal_wants_actions {
         return None;
     }
-    if !matches!(provider, ProviderKind::OpenAiCompatible) {
+    if !supports_action_task_rescues(&provider) {
         return None;
     }
     if !reason.to_ascii_lowercase().contains("successful mutation") {
@@ -1129,7 +1143,7 @@ pub(super) fn rescue_missing_evidence_for_tool_turn(
     if root_read_only || !goal_wants_actions {
         return None;
     }
-    if !matches!(provider, ProviderKind::OpenAiCompatible) {
+    if !supports_action_task_rescues(&provider) {
         return None;
     }
     if !mutation_tool_requires_evidence(tc) {
@@ -1305,4 +1319,169 @@ pub(super) fn select_think_for_tool_turn<'a>(
         .map(|(selected, synth)| std::ptr::eq(selected, synth))
         .unwrap_or(false);
     (fallback, used_synth)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rescue_missing_plan_for_tool_turn_after_repeated_blocks_for_mistral_actions() {
+        let tc = ToolCallData {
+            id: "call_2".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path":"Cargo.toml"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json!({"path":"Cargo.toml"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nread_file\narguments:\n{\"path\":\"Cargo.toml\"}"
+            }),
+        ];
+
+        let rescued = rescue_missing_plan_for_tool_turn(
+            &messages,
+            &tc,
+            "Fix the failing test with the smallest code change. Run tests before you finish.",
+            TaskHarness::infer(
+                "Fix the failing test with the smallest code change. Run tests before you finish.",
+                false,
+            ),
+            false,
+            true,
+            ProviderKind::Mistral,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+        )
+        .expect("synthetic action plan");
+
+        assert!(rescued.goal.contains("Fix the failing test"));
+        assert!(rescued
+            .steps
+            .iter()
+            .any(|step| step.contains("read_file(path=Cargo.toml)")));
+        assert!(rescued
+            .steps
+            .iter()
+            .any(|step| step.contains("cargo test 2>&1")));
+    }
+
+    #[test]
+    fn rescue_missing_plan_for_tool_turn_after_single_mixed_diagnostic_block_for_mistral() {
+        let tc = ToolCallData {
+            id: "call_2".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path":"Cargo.toml"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json!({"path":"src/lib.rs"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Plan Gate] Missing valid <plan>.\n\ntool:\nread_file\narguments:\n{\"path\":\"src/lib.rs\"}"
+            }),
+        ];
+
+        let rescued = rescue_missing_plan_for_tool_turn(
+            &messages,
+            &tc,
+            "Fix the failing test with the smallest code change. Run tests before you finish.",
+            TaskHarness::infer(
+                "Fix the failing test with the smallest code change. Run tests before you finish.",
+                false,
+            ),
+            false,
+            true,
+            ProviderKind::Mistral,
+            VerificationLevel::Behavioral,
+            Some("cargo test 2>&1"),
+        )
+        .expect("synthetic action plan after mixed diagnostic miss");
+
+        assert!(rescued
+            .steps
+            .iter()
+            .any(|step| step.contains("read_file(path=Cargo.toml)")));
+    }
+
+    #[test]
+    fn rescue_missing_think_for_tool_turn_after_repeated_blocks_for_mistral_actions() {
+        let tc = ToolCallData {
+            id: "call_2".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path":"Cargo.toml"}).to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json!({"path":"Cargo.toml"}).to_string()
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "GOVERNOR BLOCKED\n\n[Think Gate] Missing <think>.\n\ntool:\nread_file\narguments:\n{\"path\":\"Cargo.toml\"}"
+            }),
+        ];
+        let plan = PlanBlock {
+            goal: "Fix the failing test with the smallest code change.".to_string(),
+            steps: vec![
+                "read_file(path=Cargo.toml) or src/lib.rs to confirm the failing logic".to_string(),
+                "patch the smallest confirmed bug".to_string(),
+                "run cargo test 2>&1".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented and confirmed by a passing behavioral verification command".to_string(),
+            ],
+            risks: "wrong target or speculative fix".to_string(),
+            assumptions: "the failing test still reflects the requested bug".to_string(),
+        };
+
+        let rescued = rescue_missing_think_for_tool_turn(
+            &messages,
+            &tc,
+            &plan,
+            false,
+            true,
+            ProviderKind::Mistral,
+            false,
+        )
+        .expect("synthetic think");
+
+        validate_think(&rescued, &plan, &tc).expect("valid synthetic think");
+        assert_eq!(rescued.tool, "read_file");
+        assert!(rescued.next.contains("read Cargo.toml"));
+    }
 }
