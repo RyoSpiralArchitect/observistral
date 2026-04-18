@@ -2,7 +2,10 @@ use super::repo_scaffold::{
     default_repo_gitignore, repo_root_from_test_cmd, required_repo_files_from_test_cmd,
     resolve_repo_file_path, resolve_repo_scaffold_path, scaffold_repo_file_content,
 };
-use super::{canonicalize_tool_call_command, compact_one_line, RecoveryStage};
+use super::{
+    canonicalize_tool_call_command, classify_verify_level, compact_one_line,
+    non_exec_tool_succeeded, parse_exec_command_from_args, RecoveryStage,
+};
 use crate::streaming::ToolCallData;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -297,14 +300,23 @@ pub(super) fn build_progress_gate_block(
     messages: &[Value],
     recovery_stage: Option<RecoveryStage>,
     test_cmd: Option<&str>,
+    last_mutation_step: Option<usize>,
 ) -> Option<String> {
     if recovery_stage != Some(RecoveryStage::Fix) {
         return None;
     }
-    if !is_observation_tool(tc.name.as_str()) {
+    if harness.artifact_mode == ArtifactMode::ObserveOnly {
         return None;
     }
-    if harness.artifact_mode == ArtifactMode::ObserveOnly {
+
+    let history = observation_history(messages);
+    let verify_without_mutation = harness.artifact_mode == ArtifactMode::ExistingFiles
+        && last_mutation_step.is_none()
+        && tc.name == "exec"
+        && parse_exec_command_from_args(tc.arguments.as_str())
+            .and_then(|command| classify_verify_level(command.as_str(), test_cmd))
+            .is_some();
+    if !verify_without_mutation && !is_observation_tool(tc.name.as_str()) {
         return None;
     }
 
@@ -316,30 +328,85 @@ pub(super) fn build_progress_gate_block(
                 compact_one_line(tc.arguments.as_str(), 120)
             )
         });
-    let history = observation_history(messages);
-    let same_successes = history.by_command.get(&attempted).copied().unwrap_or(0);
-    if same_successes == 0 && history.total_successes < 2 {
+    if !verify_without_mutation {
+        let same_successes = history.by_command.get(&attempted).copied().unwrap_or(0);
+        let allow_first_target_read = matches!(
+            infer_fix_existing_focus(messages),
+            Some(FixExistingFocus::ReadImplementation(ref path))
+                if tc.name == "read_file"
+                    && same_successes == 0
+                    && serde_json::from_str::<Value>(tc.arguments.as_str())
+                        .ok()
+                        .and_then(|value| value.get("path").and_then(|v| v.as_str()).map(str::to_string))
+                        .as_deref()
+                        == Some(path.as_str())
+        );
+        if allow_first_target_read {
+            return None;
+        }
+        if same_successes == 0 && history.total_successes < 2 {
+            return None;
+        }
+    } else if history.total_successes < 2 {
         return None;
     }
 
+    let fix_focus = infer_fix_existing_focus(messages);
+    if let Some(FixExistingFocus::ReadImplementation(path)) = fix_focus.as_ref() {
+        return Some(format!(
+            "[Progress Gate]\n\
+Task lane: {}\n\
+Recovery stage is already `fix`.\n\
+Attempted next action: {}\n\
+Successful observation commands so far: {}\n\
+This is stalled progress, not forward motion.\n\
+Required now: read `{}` now to inspect the implementation before patching.\n\
+Do NOT rerun verification or widen search until `{}` is read.\n\
+Do NOT call the same observation tool on the same target again until the target changes or a mutation lands.",
+            harness.lane_label(),
+            compact_one_line(&attempted, 180),
+            history.total_successes,
+            compact_one_line(path, 140),
+            compact_one_line(path, 140),
+        ));
+    }
+
     let next_action = match harness.artifact_mode {
-        ArtifactMode::ExistingFiles => {
-            "apply the smallest edit now with `patch_file` or `apply_diff`"
-        }
+        ArtifactMode::ExistingFiles => match fix_focus.as_ref() {
+            Some(FixExistingFocus::PatchImplementation(path)) => format!(
+                "apply the smallest edit now with `patch_file` or `apply_diff` on `{}`",
+                compact_one_line(path, 140)
+            ),
+            _ => "apply the smallest edit now with `patch_file` or `apply_diff`".to_string(),
+        },
         ArtifactMode::NewFiles => {
-            "create the requested file now with `write_file` or a minimal `exec`"
+            "create the requested file now with `write_file` or a minimal `exec`".to_string()
         }
         ArtifactMode::NewRepo => {
-            "create the requested repo/project artifact now with `write_file` or `exec`"
+            "create the requested repo/project artifact now with `write_file` or `exec`".to_string()
         }
         ArtifactMode::ObserveOnly => unreachable!(),
     };
-    let verify_hint = test_cmd
-        .filter(|cmd| !cmd.trim().is_empty())
-        .map(|cmd| format!("If the artifact is already present, run the configured verification command now: `{}`.\n", compact_one_line(cmd, 140)))
-        .unwrap_or_else(|| {
-            "If you believe the artifact is already present, run a real command that proves it before `done`.\n".to_string()
-        });
+    let verify_hint = if verify_without_mutation {
+        test_cmd
+            .filter(|cmd| !cmd.trim().is_empty())
+            .map(|cmd| {
+                format!(
+                    "Do NOT run `{}` again before a mutation lands. Read the strongest target or patch now.\n",
+                    compact_one_line(cmd, 140)
+                )
+            })
+            .unwrap_or_else(|| {
+                "Do NOT rerun verification before a mutation lands. Read the strongest target or patch now.\n".to_string()
+            })
+    } else {
+        test_cmd
+            .filter(|cmd| !cmd.trim().is_empty())
+            .map(|cmd| format!("If the artifact is already present, run the configured verification command now: `{}`.\n", compact_one_line(cmd, 140)))
+            .unwrap_or_else(|| {
+                "If you believe the artifact is already present, run a real command that proves it before `done`.\n".to_string()
+            })
+    };
 
     Some(format!(
         "[Progress Gate]\n\
@@ -347,7 +414,7 @@ Task lane: {}\n\
 Recovery stage is already `fix`.\n\
 Attempted next action: {}\n\
 Successful observation commands so far: {}\n\
-This is stalled inspection, not progress.\n\
+This is stalled progress, not forward motion.\n\
 Required now: {}.\n\
 {}\
 Do NOT call the same observation tool on the same target again until the target changes or a mutation lands.",
@@ -375,6 +442,71 @@ pub(super) fn coerce_artifact_creation_tool_call(
     }
 
     let rewritten = recent_blocked_artifact_action(messages, harness)?;
+    let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| {
+            format!(
+                "{}({})",
+                tc.name,
+                compact_one_line(tc.arguments.as_str(), 120)
+            )
+        });
+    let coerced =
+        canonicalize_tool_call_command(rewritten.name.as_str(), rewritten.arguments.as_str())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}({})",
+                    rewritten.name,
+                    compact_one_line(rewritten.arguments.as_str(), 120)
+                )
+            });
+    if original == coerced {
+        None
+    } else {
+        Some((rewritten, original, coerced))
+    }
+}
+
+pub(super) fn coerce_fix_existing_tool_call(
+    harness: TaskHarness,
+    messages: &[Value],
+    tc: &ToolCallData,
+    test_cmd: Option<&str>,
+) -> Option<(ToolCallData, String, String)> {
+    if harness.lane != TaskLane::FixExisting || harness.artifact_mode != ArtifactMode::ExistingFiles
+    {
+        return None;
+    }
+
+    let FixExistingFocus::ReadImplementation(path) = infer_fix_existing_focus(messages)? else {
+        return None;
+    };
+    let wants_verify_exec = tc.name == "exec"
+        && parse_exec_command_from_args(tc.arguments.as_str())
+            .and_then(|command| classify_verify_level(command.as_str(), test_cmd))
+            .is_some();
+    if !wants_verify_exec && !is_observation_tool(tc.name.as_str()) {
+        return None;
+    }
+    if tc.name == "read_file"
+        && serde_json::from_str::<Value>(tc.arguments.as_str())
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some(path.as_str())
+    {
+        return None;
+    }
+
+    let rewritten = ToolCallData {
+        id: tc.id.clone(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({ "path": path }).to_string(),
+    };
     let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
         .unwrap_or_else(|| {
             format!(
@@ -520,15 +652,24 @@ pub(super) fn build_fix_stage_progress_hint(
         .last_successful_command
         .as_deref()
         .unwrap_or("recent observation");
+    let fix_focus = infer_fix_existing_focus(messages);
     let action = match harness.artifact_mode {
-        ArtifactMode::ExistingFiles => {
-            "apply the smallest edit now with `patch_file` or `apply_diff`"
-        }
+        ArtifactMode::ExistingFiles => match fix_focus.as_ref() {
+            Some(FixExistingFocus::ReadImplementation(path)) => format!(
+                "read `{}` now to inspect the implementation before patching",
+                compact_one_line(path, 140)
+            ),
+            Some(FixExistingFocus::PatchImplementation(path)) => format!(
+                "apply the smallest edit now with `patch_file` or `apply_diff` on `{}`",
+                compact_one_line(path, 140)
+            ),
+            None => "apply the smallest edit now with `patch_file` or `apply_diff`".to_string(),
+        },
         ArtifactMode::NewFiles => {
-            "create the requested file now with `write_file` or a minimal `exec`"
+            "create the requested file now with `write_file` or a minimal `exec`".to_string()
         }
         ArtifactMode::NewRepo => {
-            "create the requested repo/project artifact now with `write_file` or `exec`"
+            "create the requested repo/project artifact now with `write_file` or `exec`".to_string()
         }
         ArtifactMode::ObserveOnly => unreachable!(),
     };
@@ -550,6 +691,130 @@ Do NOT continue with more read/search/list calls unless the target is still genu
         action,
         verify_hint
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FixExistingFocus {
+    ReadImplementation(String),
+    PatchImplementation(String),
+}
+
+fn infer_fix_existing_focus(messages: &[Value]) -> Option<FixExistingFocus> {
+    let reads = successful_read_contents(messages);
+    let target = ["src/lib.rs", "src/main.rs", "lib.rs", "main.rs"]
+        .iter()
+        .find_map(|entry| {
+            let body = reads.get(*entry)?;
+            rust_module_file_candidates(entry, body)
+                .into_iter()
+                .find(|candidate| !candidate.trim().is_empty())
+        })?;
+
+    if reads.contains_key(target.as_str()) {
+        Some(FixExistingFocus::PatchImplementation(target))
+    } else {
+        Some(FixExistingFocus::ReadImplementation(target))
+    }
+}
+
+fn successful_read_contents(messages: &[Value]) -> BTreeMap<String, String> {
+    let mut pending: BTreeMap<String, String> = BTreeMap::new();
+    let mut out = BTreeMap::new();
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        match role {
+            "assistant" => {
+                let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for tc in tool_calls {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let name = tc
+                        .get("function")
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if id.is_empty() || name != "read_file" {
+                        continue;
+                    }
+                    let path = tc
+                        .get("function")
+                        .and_then(|v| v.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .and_then(|value| {
+                            value
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    if !path.trim().is_empty() {
+                        pending.insert(id.to_string(), path);
+                    }
+                }
+            }
+            "tool" => {
+                let tool_call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let Some(path) = pending.remove(tool_call_id) else {
+                    continue;
+                };
+                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if !non_exec_tool_succeeded(content) {
+                    continue;
+                }
+                let body = content
+                    .split_once('\n')
+                    .map(|(_, rest)| rest.to_string())
+                    .unwrap_or_default();
+                out.insert(path, body);
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn rust_module_file_candidates(seed_path: &str, body: &str) -> Vec<String> {
+    let dir = seed_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let rest = trimmed
+            .strip_prefix("mod ")
+            .or_else(|| trimmed.strip_prefix("pub mod "));
+        let Some(rest) = rest else {
+            continue;
+        };
+        let Some(module) = rest.strip_suffix(';') else {
+            continue;
+        };
+        let module = module.trim();
+        if module.is_empty()
+            || module.contains("::")
+            || !module
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            continue;
+        }
+        let candidate = if dir.is_empty() {
+            format!("{module}.rs")
+        } else {
+            format!("{dir}/{module}.rs")
+        };
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Default)]
@@ -1042,6 +1307,7 @@ mod tests {
             &messages,
             Some(RecoveryStage::Fix),
             Some("cargo test 2>&1"),
+            None,
         )
         .expect("progress gate block");
 
@@ -1095,6 +1361,7 @@ mod tests {
             &messages,
             Some(RecoveryStage::Fix),
             Some("test -f notes/todo.txt && grep -Fx \"ship it\" notes/todo.txt"),
+            None,
         )
         .expect("progress gate block");
 
@@ -1133,6 +1400,166 @@ mod tests {
 
         assert!(hint.contains("create the requested file now"));
         assert!(hint.contains("notes/todo.txt"));
+    }
+
+    #[test]
+    fn progress_gate_blocks_verify_exec_before_first_mutation_in_fix_lane() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_cargo",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_cargo",
+                "content": "[Cargo.toml] (8 lines, 120 bytes)\n[package]"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_lib",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_lib",
+                "content": "[src/lib.rs] (22 lines, 561 bytes)\nmod maze;"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_verify".to_string(),
+            name: "exec".to_string(),
+            arguments: json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+
+        let block = build_progress_gate_block(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &tc,
+            &messages,
+            Some(RecoveryStage::Fix),
+            Some("cargo test 2>&1"),
+            None,
+        )
+        .expect("progress gate verify block");
+
+        assert!(
+            block.contains("read `src/maze.rs` now to inspect the implementation before patching.")
+        );
+        assert!(block
+            .contains("Do NOT rerun verification or widen search until `src/maze.rs` is read."));
+    }
+
+    #[test]
+    fn progress_gate_allows_first_target_read_in_fix_lane() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_cargo",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_cargo",
+                "content": "[Cargo.toml] (8 lines, 120 bytes)\n[package]"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_lib",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_lib",
+                "content": "[src/lib.rs] (22 lines, 561 bytes)\nmod maze;"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_read_maze".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path":"src/maze.rs"}).to_string(),
+        };
+
+        let block = build_progress_gate_block(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &tc,
+            &messages,
+            Some(RecoveryStage::Fix),
+            Some("cargo test 2>&1"),
+            None,
+        );
+
+        assert!(block.is_none());
+    }
+
+    #[test]
+    fn coerce_fix_existing_tool_call_rewrites_verify_to_impl_read() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_cargo",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_cargo",
+                "content": "[Cargo.toml] (8 lines, 120 bytes)\n[package]"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_lib",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_lib",
+                "content": "[src/lib.rs] (22 lines, 561 bytes)\nmod maze;\n\npub use maze::{Direction, Maze, Point};"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_verify".to_string(),
+            name: "exec".to_string(),
+            arguments: json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_fix_existing_tool_call(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            Some("cargo test 2>&1"),
+        )
+        .expect("fix-existing coercion");
+
+        assert_eq!(original, "cargo test 2>&1");
+        assert_eq!(rewritten.name, "read_file");
+        assert!(rewritten.arguments.contains("src/maze.rs"));
+        assert_eq!(coerced, "read_file(path=src/maze.rs)");
     }
 
     #[test]

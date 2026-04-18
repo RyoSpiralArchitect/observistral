@@ -50,6 +50,8 @@ pub(super) struct PolicyPatch {
     pub blocked_scope: EvaluatorBlockScope,
     pub blocked_command_display: Option<String>,
     pub blocked_command_signature: Option<String>,
+    pub block_verify_exec_before_mutation: bool,
+    pub behavioral_test_cmd: Option<String>,
     pub exit_hint: String,
     pub support_note: Option<String>,
     pub pattern: FailurePattern,
@@ -68,12 +70,13 @@ impl EvaluatorLoop {
         reflection_ledger: &crate::reflection_ledger::ReflectionLedger,
         last_reflection: Option<&ReflectionBlock>,
         test_cmd: Option<&str>,
+        last_mutation_step: Option<usize>,
     ) -> Self {
         let Some(policy) = meta_harness.policy().cloned() else {
             return Self::default();
         };
 
-        let patch = build_policy_patch(&policy, test_cmd);
+        let patch = build_policy_patch(&policy, test_cmd, last_mutation_step);
         let support_note = related_reflection_memory(
             reflection_ledger,
             last_reflection,
@@ -107,6 +110,7 @@ impl EvaluatorLoop {
             "blocked_tools": patch.blocked_tools,
             "blocked_scope": patch.blocked_scope.label(),
             "blocked_command": patch.blocked_command_display,
+            "block_verify_exec_before_mutation": patch.block_verify_exec_before_mutation,
             "support_note": patch.support_note,
         }))
     }
@@ -140,6 +144,9 @@ impl EvaluatorLoop {
             "- blocked_scope: {}\n",
             patch.blocked_scope.label()
         ));
+        if patch.block_verify_exec_before_mutation {
+            out.push_str("- verify_exec_before_mutation: blocked\n");
+        }
         if let Some(command) = patch.blocked_command_display.as_deref() {
             out.push_str(&format!(
                 "- blocked_repeat: {}\n",
@@ -171,6 +178,9 @@ Prefer the listed tools now instead of widening observation.",
             format!("- blocked: {}", patch.blocked_tools.join(", ")),
             format!("- scope: {}", patch.blocked_scope.label()),
         ];
+        if patch.block_verify_exec_before_mutation {
+            lines.push("- verify_exec_before_mutation: blocked".to_string());
+        }
         if let Some(command) = patch.blocked_command_display.as_deref() {
             lines.push(format!(
                 "- blocked_repeat: {}",
@@ -192,10 +202,18 @@ Prefer the listed tools now instead of widening observation.",
 
     pub(super) fn build_violation_block(&self, tc: &ToolCallData) -> Option<String> {
         let patch = self.patch.as_ref()?;
-        if !patch
-            .blocked_tools
-            .iter()
-            .any(|tool| *tool == tc.name.as_str())
+        let blocks_verify_exec = patch.block_verify_exec_before_mutation
+            && tc.name == "exec"
+            && parse_exec_command_from_args(tc.arguments.as_str())
+                .and_then(|command| {
+                    classify_verify_level(command.as_str(), patch.behavioral_test_cmd.as_deref())
+                })
+                .is_some();
+        if !blocks_verify_exec
+            && !patch
+                .blocked_tools
+                .iter()
+                .any(|tool| *tool == tc.name.as_str())
         {
             return None;
         }
@@ -204,14 +222,16 @@ Prefer the listed tools now instead of widening observation.",
             canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str()).unwrap_or_else(
                 || blocked_tool_call_signature(tc.name.as_str(), tc.arguments.as_str()),
             );
-        match patch.blocked_scope {
-            EvaluatorBlockScope::ExactRepeatOnly => {
-                let blocked_signature = patch.blocked_command_signature.as_deref()?;
-                if normalize_for_signature(tool_signature.as_str()) != blocked_signature {
-                    return None;
+        if !blocks_verify_exec {
+            match patch.blocked_scope {
+                EvaluatorBlockScope::ExactRepeatOnly => {
+                    let blocked_signature = patch.blocked_command_signature.as_deref()?;
+                    if normalize_for_signature(tool_signature.as_str()) != blocked_signature {
+                        return None;
+                    }
                 }
+                EvaluatorBlockScope::AnyBlockedTool => {}
             }
-            EvaluatorBlockScope::AnyBlockedTool => {}
         }
 
         let repeated = patch
@@ -345,11 +365,15 @@ fn try_now_finding(patch: &PolicyPatch) -> EvaluatorFinding {
     }
 }
 
-fn build_policy_patch(policy: &PolicyDelta, test_cmd: Option<&str>) -> PolicyPatch {
+fn build_policy_patch(
+    policy: &PolicyDelta,
+    test_cmd: Option<&str>,
+    last_mutation_step: Option<usize>,
+) -> PolicyPatch {
     match policy.action {
         PolicyAction::MutateExistingNow => PolicyPatch {
             id: "force_mutation_after_observation_loop",
-            preferred_tools: vec!["patch_file", "apply_diff", "exec"],
+            preferred_tools: vec!["patch_file", "apply_diff"],
             blocked_tools: observation_tool_names(),
             blocked_scope: EvaluatorBlockScope::ExactRepeatOnly,
             blocked_command_display: policy.attempted_command.clone(),
@@ -357,6 +381,8 @@ fn build_policy_patch(policy: &PolicyDelta, test_cmd: Option<&str>) -> PolicyPat
                 .attempted_command
                 .as_deref()
                 .map(normalize_for_signature),
+            block_verify_exec_before_mutation: last_mutation_step.is_none(),
+            behavioral_test_cmd: test_cmd.map(str::to_string),
             exit_hint: test_cmd
                 .map(|command| {
                     format!(
@@ -381,6 +407,8 @@ fn build_policy_patch(policy: &PolicyDelta, test_cmd: Option<&str>) -> PolicyPat
                 .attempted_command
                 .as_deref()
                 .map(normalize_for_signature),
+            block_verify_exec_before_mutation: false,
+            behavioral_test_cmd: None,
             exit_hint: "Create the requested artifact on disk now, then verify it before `done`."
                 .to_string(),
             support_note: None,
@@ -393,6 +421,8 @@ fn build_policy_patch(policy: &PolicyDelta, test_cmd: Option<&str>) -> PolicyPat
             blocked_scope: EvaluatorBlockScope::AnyBlockedTool,
             blocked_command_display: None,
             blocked_command_signature: None,
+            block_verify_exec_before_mutation: false,
+            behavioral_test_cmd: None,
             exit_hint: policy
                 .next_target
                 .as_deref()
@@ -497,6 +527,7 @@ mod tests {
             &reflection_ledger,
             None,
             Some("cargo test 2>&1"),
+            None,
         );
 
         let prompt = evaluator.prompt().expect("prompt");
@@ -528,6 +559,7 @@ mod tests {
             &reflection_ledger,
             None,
             Some("cargo test 2>&1"),
+            None,
         );
         let repeated = ToolCallData {
             id: "call_repeat".to_string(),
@@ -567,6 +599,7 @@ mod tests {
             Some(
                 "test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore",
             ),
+            None,
         );
         let tc = ToolCallData {
             id: "call_list".to_string(),
@@ -597,9 +630,60 @@ mod tests {
                 next_minimal_action: "use patch_file on src/lib.rs".to_string(),
             }),
             Some("cargo test 2>&1"),
+            None,
         );
 
         let prompt = evaluator.prompt().expect("prompt");
         assert!(prompt.contains("Recent reflection already shifted strategy"));
+    }
+
+    #[test]
+    fn evaluator_loop_blocks_verify_exec_before_first_mutation() {
+        let reflection_ledger = crate::reflection_ledger::ReflectionLedger::default();
+        let evaluator = EvaluatorLoop::analyze(
+            TaskHarness {
+                lane: super::task_harness::TaskLane::FixExisting,
+                artifact_mode: super::task_harness::ArtifactMode::ExistingFiles,
+            },
+            &base_fix_meta_harness(),
+            &reflection_ledger,
+            None,
+            Some("cargo test 2>&1"),
+            None,
+        );
+        let tc = ToolCallData {
+            id: "call_verify".to_string(),
+            name: "exec".to_string(),
+            arguments: serde_json::json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+
+        let block = evaluator
+            .build_violation_block(&tc)
+            .expect("verify exec block");
+        assert!(block.contains("patch_file, apply_diff"));
+        assert!(block.contains("cargo test 2>&1"));
+    }
+
+    #[test]
+    fn evaluator_loop_allows_verify_exec_after_mutation_exists() {
+        let reflection_ledger = crate::reflection_ledger::ReflectionLedger::default();
+        let evaluator = EvaluatorLoop::analyze(
+            TaskHarness {
+                lane: super::task_harness::TaskLane::FixExisting,
+                artifact_mode: super::task_harness::ArtifactMode::ExistingFiles,
+            },
+            &base_fix_meta_harness(),
+            &reflection_ledger,
+            None,
+            Some("cargo test 2>&1"),
+            Some(5),
+        );
+        let tc = ToolCallData {
+            id: "call_verify".to_string(),
+            name: "exec".to_string(),
+            arguments: serde_json::json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+
+        assert!(evaluator.build_violation_block(&tc).is_none());
     }
 }

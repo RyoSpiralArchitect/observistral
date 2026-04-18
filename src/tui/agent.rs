@@ -104,7 +104,8 @@ use self::session_bridge::SessionBridgeView;
 use self::task_harness::{
     allows_artifact_creation_during_diagnose, allows_artifact_creation_during_verify,
     build_fix_stage_progress_hint, build_progress_gate_block, coerce_artifact_creation_tool_call,
-    coerce_repo_goal_completion_tool_call, repair_repo_scaffold_write_tool_call, TaskHarness,
+    coerce_fix_existing_tool_call, coerce_repo_goal_completion_tool_call,
+    repair_repo_scaffold_write_tool_call, TaskHarness,
 };
 
 #[derive(Debug, Clone)]
@@ -9072,6 +9073,7 @@ This is the LAST model call for this run.\n\
             &reflection_ledger,
             last_reflection.as_ref(),
             test_cmd.as_deref(),
+            last_mutation_step,
         );
         if let Some(telemetry) = evaluator_loop.telemetry_payload(task_harness) {
             emit_telemetry_event(&tx, "evaluator_loop", telemetry).await;
@@ -9848,6 +9850,32 @@ Execute only the new minimal action: {}",
                         "to": coerced,
                         "tool": rewritten.name,
                         "reason": "best_followup_read",
+                    }),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) =
+                coerce_fix_existing_tool_call(task_harness, &messages, tc, test_cmd.as_deref())
+            {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[task_harness] focused fix-existing action: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "task_harness_tool_coercion",
+                    json!({
+                        "lane": task_harness.lane_label(),
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                        "reason": "focus_fix_existing",
                     }),
                 )
                 .await;
@@ -10817,6 +10845,7 @@ Execute only the new minimal action: {}",
                 &messages,
                 recovery.stage,
                 test_cmd.as_deref(),
+                last_mutation_step,
             ) {
                 state = AgentState::Recovery;
                 let _ = tx

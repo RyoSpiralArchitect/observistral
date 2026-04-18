@@ -128,6 +128,26 @@
       ]
     },
     {
+      "id": "fix-rust-maze-wall-bug",
+      "tool_root": "tests/fixtures/runtime-fix-rust-medium",
+      "copy_tool_root": true,
+      "max_iters": 14,
+      "tags": ["action", "fix", "rust", "tests", "medium"],
+      "prompt": "Fix the failing maze movement test with the smallest safe code change. Run tests before you finish. Final answer must include the changed file path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "tool_call_seen", "name": "patch_file" },
+        { "kind": "trace_event_seen", "event": "task_harness" },
+        { "kind": "trace_event_seen", "event": "harness_evolution_loaded" },
+        { "kind": "trace_event_seen", "event": "progress_state_loaded" },
+        { "kind": "assistant_contains", "value": "src/maze.rs" },
+        { "kind": "assistant_contains", "value": "cargo test 2>&1" },
+        { "kind": "tool_root_file_exists", "path": ".obstral/progress.json" }
+      ]
+    },
+    {
       "id": "maze-game-rust-repo",
       "tool_root": "tests/fixtures/runtime-maze-game",
       "copy_tool_root": true,
