@@ -3514,7 +3514,7 @@ impl WorkingMemory {
     }
 
     fn remember_successful_verification(&mut self, command: &str) {
-        remember_recent_unique(&mut self.successful_verifications, command, 4, 320);
+        remember_recent_unique(&mut self.successful_verifications, command, 4, 1024);
     }
 
     fn set_strategy(&mut self, strategy: &str) {
@@ -18253,6 +18253,19 @@ verify: exit code is zero\n\
         assert_eq!(mem.successful_verifications.len(), 1);
         assert!(mem.successful_verifications[0].contains("maze_game/src/main.rs"));
         assert!(mem.successful_verifications[0].contains("cargo test 2>&1"));
+    }
+
+    #[test]
+    fn remember_successful_verification_preserves_pygame_unittest_tail() {
+        let mut mem = WorkingMemory::default();
+        let command = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+
+        mem.remember_successful_verification(command);
+
+        assert_eq!(mem.successful_verifications.len(), 1);
+        assert!(mem.successful_verifications[0].contains("maze_game_pygame/test_game.py"));
+        assert!(mem.successful_verifications[0]
+            .contains("SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"));
     }
 
     #[test]
