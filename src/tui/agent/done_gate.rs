@@ -249,7 +249,7 @@ pub(super) fn build_read_only_completion_hint(
     }
 
     let known_commands = canonicalize_known_acceptance_commands(
-        &collect_known_acceptance_commands(messages, working_mem),
+        &collect_known_acceptance_commands(messages, working_mem, None),
         evidence,
     );
     let cite_commands: Vec<String> = completed_scores
@@ -337,7 +337,7 @@ pub(super) fn build_read_only_iteration_cap_final_answer(
     }
 
     let known_commands = canonicalize_known_acceptance_commands(
-        &collect_known_acceptance_commands(messages, working_mem),
+        &collect_known_acceptance_commands(messages, working_mem, None),
         evidence,
     );
     let mut completed_rows: Vec<(usize, String)> = scores

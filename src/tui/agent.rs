@@ -5266,19 +5266,82 @@ fn collect_successful_mutation_commands(messages: &[serde_json::Value]) -> Vec<S
     commands
 }
 
+fn collect_successful_auto_test_verification_commands(
+    messages: &[serde_json::Value],
+    test_cmd: Option<&str>,
+) -> Vec<String> {
+    let Some(test_cmd) = test_cmd.map(str::trim).filter(|cmd| !cmd.is_empty()) else {
+        return Vec::new();
+    };
+    let mut pending_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut commands = Vec::new();
+
+    for msg in messages {
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if role == "assistant" {
+            let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for tc in tool_calls {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if matches!(name, "write_file" | "patch_file" | "apply_diff") {
+                    pending_ids.insert(id.to_string());
+                }
+            }
+            continue;
+        }
+
+        if role != "tool" {
+            continue;
+        }
+
+        let tool_call_id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if tool_call_id.is_empty() || !pending_ids.remove(tool_call_id) {
+            continue;
+        }
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.contains("PASSED (exit 0)") {
+            remember_recent_unique(&mut commands, test_cmd, 8, 1024);
+        }
+    }
+
+    commands
+}
+
 fn collect_known_acceptance_commands(
     messages: &[serde_json::Value],
     working_mem: &WorkingMemory,
+    test_cmd: Option<&str>,
 ) -> Vec<String> {
     let mut commands = Vec::new();
     for command in &working_mem.successful_verifications {
-        remember_recent_unique(&mut commands, command.as_str(), 16, 200);
+        remember_recent_unique(&mut commands, command.as_str(), 16, 1024);
+    }
+    for command in collect_successful_auto_test_verification_commands(messages, test_cmd) {
+        remember_recent_unique(&mut commands, command.as_str(), 16, 1024);
     }
     for command in collect_successful_mutation_commands(messages) {
-        remember_recent_unique(&mut commands, command.as_str(), 16, 200);
+        remember_recent_unique(&mut commands, command.as_str(), 16, 1024);
     }
     for command in collect_successful_observation_commands(messages) {
-        remember_recent_unique(&mut commands, command.as_str(), 16, 200);
+        remember_recent_unique(&mut commands, command.as_str(), 16, 1024);
     }
     commands
 }
@@ -5298,7 +5361,7 @@ fn maybe_build_verified_action_closeout_text(
     }
 
     let known_acceptance_commands = canonicalize_known_acceptance_commands(
-        &collect_known_acceptance_commands(messages, working_mem),
+        &collect_known_acceptance_commands(messages, working_mem, test_cmd),
         observation_evidence,
     );
 
@@ -10395,7 +10458,7 @@ Execute only the new minimal action: {}",
             }
 
             let known_acceptance_commands = canonicalize_known_acceptance_commands(
-                &collect_known_acceptance_commands(&messages, &working_mem),
+                &collect_known_acceptance_commands(&messages, &working_mem, test_cmd.as_deref()),
                 &observation_evidence,
             );
             if should_prefer_done_after_verified_action(
@@ -12620,7 +12683,7 @@ Required now: {}",
             let next_steps = args["next_steps"].as_str().unwrap_or("").trim();
             let done_plan = validated_plan_for_turn.as_ref().or(active_plan.as_ref());
             let known_acceptance_commands = canonicalize_known_acceptance_commands(
-                &collect_known_acceptance_commands(&messages, &working_mem),
+                &collect_known_acceptance_commands(&messages, &working_mem, test_cmd.as_deref()),
                 &observation_evidence,
             );
             let read_only_scores = if root_read_only {
@@ -18266,6 +18329,34 @@ verify: exit code is zero\n\
         assert!(mem.successful_verifications[0].contains("maze_game_pygame/test_game.py"));
         assert!(mem.successful_verifications[0]
             .contains("SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"));
+    }
+
+    #[test]
+    fn collect_known_acceptance_commands_recovers_test_cmd_from_auto_test_pass() {
+        let test_cmd = "test -d maze_game_pygame/.git && test -f maze_game_pygame/README.md && test -f maze_game_pygame/game.py && test -f maze_game_pygame/main.py && test -f maze_game_pygame/test_game.py && cd maze_game_pygame && SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1";
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_test_game",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"maze_game_pygame/test_game.py\",\"content\":\"print('ok')\\n\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_test_game",
+                "content": "OK: wrote 'maze_game_pygame/test_game.py' (1 lines, 12 bytes)\n[hash] before=0 after=1\n[auto-test] ✓ PASSED (exit 0)\nRan 3 tests in 0.10s\nOK"
+            }),
+        ];
+
+        let commands =
+            collect_known_acceptance_commands(&messages, &WorkingMemory::default(), Some(test_cmd));
+
+        assert!(commands.iter().any(|command| command == test_cmd));
     }
 
     #[test]
