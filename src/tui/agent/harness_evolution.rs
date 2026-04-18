@@ -779,6 +779,7 @@ mod tests {
             &ReflectionLedger::default(),
             None,
             Some("cargo test 2>&1"),
+            None,
         );
         ContractPatchProposal::from_signals(fix_task_harness(), &meta, &evaluator)
             .expect("fix proposal")
@@ -797,6 +798,7 @@ mod tests {
             init_repo_harness(),
             &meta,
             &ReflectionLedger::default(),
+            None,
             None,
             None,
         );
