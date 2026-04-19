@@ -1,3 +1,4 @@
+use super::failure_localization::infer_fix_existing_symbol;
 use super::repo_scaffold::{
     default_repo_gitignore, repo_root_from_test_cmd, required_repo_files_from_test_cmd,
     resolve_repo_file_path, resolve_repo_scaffold_path, scaffold_repo_file_content,
@@ -471,14 +472,17 @@ pub(super) fn coerce_fix_existing_tool_call(
     messages: &[Value],
     tc: &ToolCallData,
     test_cmd: Option<&str>,
+    tool_root: Option<&str>,
 ) -> Option<(ToolCallData, String, String)> {
     if harness.lane != TaskLane::FixExisting || harness.artifact_mode != ArtifactMode::ExistingFiles
     {
         return None;
     }
 
-    let FixExistingFocus::ReadImplementation(path) = infer_fix_existing_focus(messages)? else {
-        return None;
+    let path = match infer_fix_existing_focus(messages) {
+        Some(FixExistingFocus::ReadImplementation(path)) => path,
+        Some(FixExistingFocus::PatchImplementation(_)) => return None,
+        None => fallback_fix_existing_anchor(messages, tool_root)?,
     };
     let wants_verify_exec = tc.name == "exec"
         && parse_exec_command_from_args(tc.arguments.as_str())
@@ -693,6 +697,19 @@ Do NOT continue with more read/search/list calls unless the target is still genu
     ))
 }
 
+pub(super) fn fix_existing_target_hint(messages: &[Value]) -> Option<String> {
+    let path = match infer_fix_existing_focus(messages)? {
+        FixExistingFocus::ReadImplementation(path)
+        | FixExistingFocus::PatchImplementation(path) => path,
+    };
+    let reads = successful_read_contents(messages);
+    let function = infer_fix_existing_symbol(messages, &reads, path.as_str());
+    Some(match function {
+        Some(function) => format!("{path}::{function}"),
+        None => path,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FixExistingFocus {
     ReadImplementation(String),
@@ -715,6 +732,36 @@ fn infer_fix_existing_focus(messages: &[Value]) -> Option<FixExistingFocus> {
     } else {
         Some(FixExistingFocus::ReadImplementation(target))
     }
+}
+
+fn fallback_fix_existing_anchor(messages: &[Value], tool_root: Option<&str>) -> Option<String> {
+    let reads = successful_read_contents(messages);
+    if reads.contains_key("src/lib.rs") || reads.contains_key("src/main.rs") {
+        return None;
+    }
+
+    let history = observation_history(messages);
+    let saw_src_discovery = history.by_command.keys().any(|command| {
+        command.starts_with("search_files(") && command.contains("dir=src")
+            || command.starts_with("list_dir(") && command.contains("dir=src")
+    });
+    if !saw_src_discovery {
+        return None;
+    }
+
+    let root = tool_root?.trim();
+    if root.is_empty() {
+        return None;
+    }
+    let lib = std::path::Path::new(root).join("src/lib.rs");
+    if lib.exists() {
+        return Some("src/lib.rs".to_string());
+    }
+    let main = std::path::Path::new(root).join("src/main.rs");
+    if main.exists() {
+        return Some("src/main.rs".to_string());
+    }
+    None
 }
 
 fn successful_read_contents(messages: &[Value]) -> BTreeMap<String, String> {
@@ -1553,6 +1600,7 @@ mod tests {
             &messages,
             &tc,
             Some("cargo test 2>&1"),
+            None,
         )
         .expect("fix-existing coercion");
 
@@ -1560,6 +1608,100 @@ mod tests {
         assert_eq!(rewritten.name, "read_file");
         assert!(rewritten.arguments.contains("src/maze.rs"));
         assert_eq!(coerced, "read_file(path=src/maze.rs)");
+    }
+
+    #[test]
+    fn coerce_fix_existing_tool_call_uses_src_anchor_after_search() {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src")).expect("create src");
+        std::fs::write(tmp.path().join("src/lib.rs"), "mod robot;\n").expect("write lib");
+
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_list_src",
+                    "type": "function",
+                    "function": {"name":"list_dir","arguments":"{\"dir\":\"src\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_list_src",
+                "content": "[list_dir: 'src' ・ 2 item(s)]\nlib.rs\nrobot.rs"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search_tests",
+                    "type": "function",
+                    "function": {"name":"search_files","arguments":"{\"dir\":\"src\",\"pattern\":\"#[test]\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search_tests",
+                "content": "[search_files: '#[test]' — 2 match(es)] [pruned 3L]"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_repeat_search".to_string(),
+            name: "search_files".to_string(),
+            arguments: json!({"dir":"src","pattern":"#[test]"}).to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_fix_existing_tool_call(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            Some("cargo test 2>&1"),
+            tmp.path().to_str(),
+        )
+        .expect("fix-existing anchor coercion");
+
+        assert_eq!(original, "search_files(dir=src, pattern=#[test])");
+        assert_eq!(rewritten.name, "read_file");
+        assert_eq!(coerced, "read_file(path=src/lib.rs)");
+    }
+
+    #[test]
+    fn fix_existing_target_hint_includes_impl_function() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_main",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/main.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_main",
+                "content": "[src/main.rs] (22 lines, 400 bytes)\nmod robot;\n\nfn main() {\n    println!(\"{}\", Robot::demo().status());\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn turning_left_from_north_points_west() {\n        let mut robot = Robot::demo();\n        robot.turn_left();\n    }\n}"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_robot",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/robot.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_robot",
+                "content": "[src/robot.rs] (40 lines, 800 bytes)\npub fn turn_left(&mut self) {\n    self.heading = match self.heading {\n        Heading::North => Heading::East,\n        Heading::East => Heading::North,\n        Heading::South => Heading::East,\n        Heading::West => Heading::South,\n    };\n}"
+            }),
+        ];
+
+        assert_eq!(
+            fix_existing_target_hint(&messages).as_deref(),
+            Some("src/robot.rs::turn_left")
+        );
     }
 
     #[test]

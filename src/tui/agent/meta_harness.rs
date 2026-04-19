@@ -1,4 +1,4 @@
-use super::task_harness::{ArtifactMode, TaskHarness};
+use super::task_harness::{fix_existing_target_hint, ArtifactMode, TaskHarness};
 use super::*;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -279,7 +279,10 @@ fn detect_repeated_observation_loop(
         action,
         evidence_count: window.total_successes_since_mutation,
         attempted_command: window.last_command,
-        next_target: None,
+        next_target: match task_harness.artifact_mode {
+            ArtifactMode::ExistingFiles => fix_existing_target_hint(messages),
+            _ => None,
+        },
     })
 }
 

@@ -44,6 +44,7 @@ use std::path::Path;
 
 mod done_gate;
 mod evaluator_loop;
+mod failure_localization;
 mod harness_evolution;
 mod memory;
 mod meta_harness;
@@ -63,6 +64,7 @@ use self::done_gate::{
     synthesize_action_done_summary, validate_done_acceptance,
 };
 use self::evaluator_loop::EvaluatorLoop;
+use self::failure_localization::interesting_failure_line;
 pub(crate) use self::harness_evolution::{
     overlay_path_for_root as harness_evolution_overlay_path_for_root,
     path_for_root as harness_evolution_queue_path_for_root,
@@ -7197,46 +7199,7 @@ fn consecutive_missing_think_blocks_for_observation(messages: &[serde_json::Valu
 }
 
 fn pick_interesting_error_line(stdout: &str, stderr: &str) -> String {
-    let keywords = [
-        "error",
-        "fatal",
-        "exception",
-        "traceback",
-        "parsererror",
-        "unexpected token",
-        "not recognized",
-        "commandnotfoundexception",
-        "missing expression",
-        "unable to",
-        "could not",
-        "access is denied",
-        "permission denied",
-    ];
-
-    for src in [stderr, stdout] {
-        for ln in src.lines() {
-            let t = ln.trim();
-            if t.is_empty() {
-                continue;
-            }
-            let low = t.to_ascii_lowercase();
-            if keywords.iter().any(|k| low.contains(k)) {
-                return normalize_for_signature(t);
-            }
-        }
-    }
-
-    // Fall back to the first non-empty line.
-    for src in [stderr, stdout] {
-        for ln in src.lines() {
-            let t = ln.trim();
-            if !t.is_empty() {
-                return normalize_for_signature(t);
-            }
-        }
-    }
-
-    String::new()
+    interesting_failure_line(stdout, stderr)
 }
 
 fn error_signature(command: &str, stdout: &str, stderr: &str, exit_code: i32) -> String {
@@ -9858,9 +9821,13 @@ Execute only the new minimal action: {}",
         }
 
         if let Some(tc) = tool_call.as_ref() {
-            if let Some((rewritten, original, coerced)) =
-                coerce_fix_existing_tool_call(task_harness, &messages, tc, test_cmd.as_deref())
-            {
+            if let Some((rewritten, original, coerced)) = coerce_fix_existing_tool_call(
+                task_harness,
+                &messages,
+                tc,
+                test_cmd.as_deref(),
+                tool_root_abs.as_deref(),
+            ) {
                 let _ = tx
                     .send(StreamToken::Delta(format!(
                         "[task_harness] focused fix-existing action: {} -> {}\n",
