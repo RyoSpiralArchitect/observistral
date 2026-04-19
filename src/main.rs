@@ -37,7 +37,7 @@ use std::time::SystemTime;
 use tokio::sync::mpsc;
 
 use crate::chatbot::ChatBot;
-use crate::config::{PartialConfig, ProviderKind};
+use crate::config::{PartialConfig, ProviderPreset};
 use crate::server::ServeArgs;
 use crate::tui::TuiArgs;
 
@@ -112,6 +112,46 @@ enum ListWhat {
     Providers,
     Modes,
     Personas,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum CliProviderPreset {
+    #[value(name = "openai")]
+    OpenAi,
+    #[value(name = "gemini", alias = "google", alias = "google-gemini")]
+    Gemini,
+    #[value(
+        name = "anthropic-compat",
+        alias = "claude-compat",
+        alias = "anthropic_openai"
+    )]
+    AnthropicCompat,
+    #[value(
+        name = "openai-compatible",
+        alias = "openai-compat",
+        alias = "openai_compat"
+    )]
+    OpenAiCompatible,
+    #[value(name = "mistral")]
+    Mistral,
+    #[value(name = "anthropic", alias = "claude")]
+    Anthropic,
+    #[value(name = "hf", alias = "huggingface", alias = "hf-local")]
+    Hf,
+}
+
+impl From<CliProviderPreset> for ProviderPreset {
+    fn from(value: CliProviderPreset) -> Self {
+        match value {
+            CliProviderPreset::OpenAi => ProviderPreset::OpenAi,
+            CliProviderPreset::Gemini => ProviderPreset::Gemini,
+            CliProviderPreset::AnthropicCompat => ProviderPreset::AnthropicCompat,
+            CliProviderPreset::OpenAiCompatible => ProviderPreset::OpenAiCompatibleCustom,
+            CliProviderPreset::Mistral => ProviderPreset::Mistral,
+            CliProviderPreset::Anthropic => ProviderPreset::Anthropic,
+            CliProviderPreset::Hf => ProviderPreset::HfLocal,
+        }
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -440,7 +480,7 @@ struct CommonArgs {
     vibe: bool,
 
     #[arg(long, value_enum, global = true)]
-    provider: Option<ProviderKind>,
+    provider: Option<CliProviderPreset>,
 
     #[arg(long, global = true)]
     model: Option<String>,
@@ -499,9 +539,9 @@ struct CommonArgs {
 
 impl CommonArgs {
     fn to_partial_config(&self) -> PartialConfig {
-        PartialConfig {
+        let mut partial = PartialConfig {
             vibe: self.vibe,
-            provider: self.provider.clone(),
+            provider: None,
             model: self.model.clone(),
             chat_model: self.chat_model.clone(),
             code_model: self.code_model.clone(),
@@ -514,7 +554,11 @@ impl CommonArgs {
             timeout_seconds: Some(self.timeout_seconds),
             hf_device: self.device.clone(),
             hf_local_only: if self.hf_local_only { Some(true) } else { None },
+        };
+        if let Some(preset) = self.provider.clone() {
+            crate::config::apply_provider_preset(&mut partial, preset.into());
         }
+        partial
     }
 }
 
@@ -3497,7 +3541,8 @@ fn read_stdin_to_string() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_promote_path;
+    use super::{resolve_promote_path, CliProviderPreset, CommonArgs};
+    use crate::config::ProviderKind;
     use std::path::{Path, PathBuf};
 
     fn temp_dir() -> PathBuf {
@@ -3546,6 +3591,36 @@ mod tests {
         assert_eq!(
             resolved,
             Path::new(&root).join(".obstral/governor_contract.promotion.json")
+        );
+    }
+
+    #[test]
+    fn common_args_to_partial_config_applies_gemini_preset() {
+        let args = CommonArgs {
+            vibe: false,
+            provider: Some(CliProviderPreset::Gemini),
+            model: None,
+            chat_model: None,
+            code_model: None,
+            api_key: None,
+            base_url: None,
+            mode: None,
+            persona: None,
+            temperature: 0.4,
+            max_tokens: 1024,
+            timeout_seconds: 120,
+            diff_file: None,
+            log_file: None,
+            device: None,
+            hf_local_only: false,
+            stdin: false,
+        };
+
+        let partial = args.to_partial_config();
+        assert_eq!(partial.provider, Some(ProviderKind::OpenAiCompatible));
+        assert_eq!(
+            partial.base_url.as_deref(),
+            Some("https://generativelanguage.googleapis.com/v1beta/openai")
         );
     }
 }

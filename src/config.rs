@@ -51,7 +51,7 @@ impl std::str::FromStr for ProviderKind {
 }
 
 pub fn supported_providers() -> Vec<&'static str> {
-    vec!["openai-compatible", "mistral", "anthropic", "hf"]
+    provider_preset_keys(false)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,6 +238,18 @@ pub fn parse_provider_preset(s: &str) -> Option<ProviderPreset> {
     }
 }
 
+pub fn apply_provider_preset(partial: &mut PartialConfig, preset: ProviderPreset) {
+    partial.provider = Some(preset.provider_kind());
+    let needs_default_base_url = partial
+        .base_url
+        .as_deref()
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true);
+    if needs_default_base_url {
+        partial.base_url = preset.default_base_url().map(str::to_string);
+    }
+}
+
 pub fn provider_preset_for_run(cfg: &RunConfig) -> ProviderPreset {
     detect_provider_preset(&cfg.provider, &cfg.base_url)
 }
@@ -334,7 +346,13 @@ pub struct RunConfig {
 impl PartialConfig {
     pub fn resolve(mut self) -> Result<RunConfig> {
         if self.provider.is_none() {
-            self.provider = env_trimmed("OBS_PROVIDER").and_then(|v| parse_provider(&v));
+            if let Some(v) = env_trimmed("OBS_PROVIDER") {
+                if let Some(preset) = parse_provider_preset(&v) {
+                    apply_provider_preset(&mut self, preset);
+                } else {
+                    self.provider = parse_provider(&v);
+                }
+            }
         }
         if self.model.is_none() {
             self.model = env_trimmed("OBS_MODEL");
@@ -642,6 +660,38 @@ mod tests {
                         "https://generativelanguage.googleapis.com/v1beta/openai",
                     );
                     assert_eq!(key.as_deref(), Some("gem-test"));
+                })
+            })
+        });
+    }
+
+    #[test]
+    fn apply_provider_preset_sets_gemini_base_url() {
+        let mut partial = PartialConfig::default();
+        apply_provider_preset(&mut partial, ProviderPreset::Gemini);
+        assert_eq!(partial.provider, Some(ProviderKind::OpenAiCompatible));
+        assert_eq!(
+            partial.base_url.as_deref(),
+            Some("https://generativelanguage.googleapis.com/v1beta/openai")
+        );
+    }
+
+    #[test]
+    fn resolve_honors_obs_provider_gemini_preset() {
+        with_env_var("OBS_PROVIDER", Some("gemini"), || {
+            with_env_var("OBS_BASE_URL", None, || {
+                with_env_var("GEMINI_API_KEY", Some("gem-test"), || {
+                    let cfg = PartialConfig::default()
+                        .resolve()
+                        .expect("resolve gemini preset");
+                    assert_eq!(cfg.provider, ProviderKind::OpenAiCompatible);
+                    assert_eq!(
+                        cfg.base_url,
+                        "https://generativelanguage.googleapis.com/v1beta/openai"
+                    );
+                    assert_eq!(cfg.model, "gemini-2.5-flash");
+                    assert_eq!(cfg.chat_model, "gemini-2.5-flash");
+                    assert_eq!(cfg.code_model, "gemini-2.5-flash");
                 })
             })
         });

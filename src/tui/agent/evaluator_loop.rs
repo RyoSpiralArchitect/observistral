@@ -383,17 +383,25 @@ fn build_policy_patch(
                 .map(normalize_for_signature),
             block_verify_exec_before_mutation: last_mutation_step.is_none(),
             behavioral_test_cmd: test_cmd.map(str::to_string),
-            exit_hint: test_cmd
-                .map(|command| {
-                    format!(
-                        "Apply the minimal change, then verify with `{}` before `done`.",
-                        compact_one_line(command, 120)
-                    )
-                })
-                .unwrap_or_else(|| {
+            exit_hint: match (policy.next_target.as_deref(), test_cmd) {
+                (Some(target), Some(command)) => format!(
+                    "Patch `{}` with the minimal change, then verify with `{}` before `done`.",
+                    compact_one_line(target, 140),
+                    compact_one_line(command, 120)
+                ),
+                (Some(target), None) => format!(
+                    "Patch `{}` with the minimal change, then run the narrowest verification before `done`.",
+                    compact_one_line(target, 140)
+                ),
+                (None, Some(command)) => format!(
+                    "Apply the minimal change, then verify with `{}` before `done`.",
+                    compact_one_line(command, 120)
+                ),
+                (None, None) => {
                     "Apply the minimal change, then run the narrowest verification before `done`."
                         .to_string()
-                }),
+                }
+            },
             support_note: None,
             pattern: policy.pattern,
         },
@@ -635,6 +643,31 @@ mod tests {
 
         let prompt = evaluator.prompt().expect("prompt");
         assert!(prompt.contains("Recent reflection already shifted strategy"));
+    }
+
+    #[test]
+    fn evaluator_loop_exit_hint_mentions_next_target() {
+        let reflection_ledger = crate::reflection_ledger::ReflectionLedger::default();
+        let evaluator = EvaluatorLoop::analyze(
+            TaskHarness {
+                lane: super::task_harness::TaskLane::FixExisting,
+                artifact_mode: super::task_harness::ArtifactMode::ExistingFiles,
+            },
+            &MetaHarness::for_test(PolicyDelta {
+                pattern: FailurePattern::RepeatedObservationLoop,
+                action: PolicyAction::MutateExistingNow,
+                evidence_count: 4,
+                attempted_command: Some("read_file(path=src/robot.rs)".to_string()),
+                next_target: Some("src/robot.rs::turn_left".to_string()),
+            }),
+            &reflection_ledger,
+            None,
+            Some("cargo test 2>&1"),
+            None,
+        );
+
+        let prompt = evaluator.prompt().expect("prompt");
+        assert!(prompt.contains("src/robot.rs::turn_left"));
     }
 
     #[test]
