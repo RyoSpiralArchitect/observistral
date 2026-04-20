@@ -199,6 +199,10 @@ impl TaskHarness {
         }
     }
 
+    pub(super) fn allows_repo_goal_check(self) -> bool {
+        self.artifact_mode == ArtifactMode::NewRepo
+    }
+
     fn progress_shape_hint(self) -> &'static str {
         match self.lane {
             TaskLane::ReadOnlyObserve => {
@@ -479,11 +483,21 @@ pub(super) fn coerce_fix_existing_tool_call(
         return None;
     }
 
-    let path = match infer_fix_existing_focus(messages) {
-        Some(FixExistingFocus::ReadImplementation(path)) => path,
-        Some(FixExistingFocus::PatchImplementation(_)) => return None,
-        None => fallback_fix_existing_anchor(messages, tool_root)?,
+    let mut path = match direct_impl_from_attempted_subdir_listing(tc, tool_root) {
+        Some(path) => path,
+        None => match infer_fix_existing_focus(messages) {
+            Some(FixExistingFocus::ReadImplementation(path)) => path,
+            Some(FixExistingFocus::PatchImplementation(_)) => return None,
+            None => concrete_impl_from_recent_subdir_listing(messages, tool_root)
+                .or_else(|| fallback_fix_existing_anchor(messages, tool_root))?,
+        },
     };
+    path = resolve_existing_rust_path(path.as_str(), tool_root);
+    if let Some(concrete_impl) = concrete_impl_from_recent_subdir_listing(messages, tool_root) {
+        if path == "src/lib.rs" || path.ends_with("/mod.rs") {
+            path = concrete_impl;
+        }
+    }
     let wants_verify_exec = tc.name == "exec"
         && parse_exec_command_from_args(tc.arguments.as_str())
             .and_then(|command| classify_verify_level(command.as_str(), test_cmd))
@@ -511,6 +525,124 @@ pub(super) fn coerce_fix_existing_tool_call(
         name: "read_file".to_string(),
         arguments: serde_json::json!({ "path": path }).to_string(),
     };
+    let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| {
+            format!(
+                "{}({})",
+                tc.name,
+                compact_one_line(tc.arguments.as_str(), 120)
+            )
+        });
+    let coerced =
+        canonicalize_tool_call_command(rewritten.name.as_str(), rewritten.arguments.as_str())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}({})",
+                    rewritten.name,
+                    compact_one_line(rewritten.arguments.as_str(), 120)
+                )
+            });
+    if original == coerced {
+        None
+    } else {
+        Some((rewritten, original, coerced))
+    }
+}
+
+pub(super) fn coerce_fix_existing_blocked_mutation_tool_call(
+    harness: TaskHarness,
+    messages: &[Value],
+    tc: &ToolCallData,
+    root_user_text: &str,
+) -> Option<(ToolCallData, String, String)> {
+    if harness.lane != TaskLane::FixExisting || harness.artifact_mode != ArtifactMode::ExistingFiles
+    {
+        return None;
+    }
+    if !is_observation_tool(tc.name.as_str()) {
+        return None;
+    }
+
+    let rewritten = recent_blocked_fix_existing_mutation_action(messages, root_user_text)?;
+    let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| {
+            format!(
+                "{}({})",
+                tc.name,
+                compact_one_line(tc.arguments.as_str(), 120)
+            )
+        });
+    let coerced =
+        canonicalize_tool_call_command(rewritten.name.as_str(), rewritten.arguments.as_str())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}({})",
+                    rewritten.name,
+                    compact_one_line(rewritten.arguments.as_str(), 120)
+                )
+            });
+    if original == coerced {
+        None
+    } else {
+        Some((rewritten, original, coerced))
+    }
+}
+
+pub(super) fn repair_fix_existing_mutation_tool_call(
+    harness: TaskHarness,
+    messages: &[Value],
+    tc: &ToolCallData,
+    root_user_text: &str,
+) -> Option<(ToolCallData, String, String)> {
+    if harness.lane != TaskLane::FixExisting || harness.artifact_mode != ArtifactMode::ExistingFiles
+    {
+        return None;
+    }
+    if !matches!(tc.name.as_str(), "patch_file" | "apply_diff") {
+        return None;
+    }
+
+    let reads = successful_read_contents(messages);
+    let rewritten = validate_or_repair_blocked_fix_existing_mutation(tc, &reads, root_user_text)?;
+    let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| {
+            format!(
+                "{}({})",
+                tc.name,
+                compact_one_line(tc.arguments.as_str(), 120)
+            )
+        });
+    let coerced =
+        canonicalize_tool_call_command(rewritten.name.as_str(), rewritten.arguments.as_str())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}({})",
+                    rewritten.name,
+                    compact_one_line(rewritten.arguments.as_str(), 120)
+                )
+            });
+    if original == coerced {
+        None
+    } else {
+        Some((rewritten, original, coerced))
+    }
+}
+
+pub(super) fn coerce_fix_existing_literal_mutation_tool_call(
+    harness: TaskHarness,
+    messages: &[Value],
+    tc: &ToolCallData,
+    root_user_text: &str,
+) -> Option<(ToolCallData, String, String)> {
+    if harness.lane != TaskLane::FixExisting || harness.artifact_mode != ArtifactMode::ExistingFiles
+    {
+        return None;
+    }
+    if !is_observation_tool(tc.name.as_str()) {
+        return None;
+    }
+
+    let rewritten = synthesize_fix_existing_literal_member_patch(messages, root_user_text)?;
     let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
         .unwrap_or_else(|| {
             format!(
@@ -718,20 +850,43 @@ enum FixExistingFocus {
 
 fn infer_fix_existing_focus(messages: &[Value]) -> Option<FixExistingFocus> {
     let reads = successful_read_contents(messages);
-    let target = ["src/lib.rs", "src/main.rs", "lib.rs", "main.rs"]
-        .iter()
-        .find_map(|entry| {
-            let body = reads.get(*entry)?;
-            rust_module_file_candidates(entry, body)
-                .into_iter()
-                .find(|candidate| !candidate.trim().is_empty())
-        })?;
+    let target = search_derived_fix_existing_path(messages)
+        .or_else(|| {
+            ["src/lib.rs", "src/main.rs", "lib.rs", "main.rs"]
+                .iter()
+                .find_map(|entry| {
+                    let body = reads.get(*entry)?;
+                    rust_module_file_candidates(entry, body)
+                        .into_iter()
+                        .find(|candidate| !candidate.trim().is_empty())
+                })
+        })
+        .or_else(|| latest_successful_source_read_path(messages, &reads))?;
 
     if reads.contains_key(target.as_str()) {
         Some(FixExistingFocus::PatchImplementation(target))
     } else {
         Some(FixExistingFocus::ReadImplementation(target))
     }
+}
+
+fn search_derived_fix_existing_path(messages: &[Value]) -> Option<String> {
+    for hit in successful_search_hits(messages).into_iter().rev() {
+        let Some(query) = normalize_rust_ident_fragment(hit.query.as_str()) else {
+            continue;
+        };
+        for candidate in rust_module_file_candidates(hit.path.as_str(), hit.snippet.as_str()) {
+            let stem = std::path::Path::new(candidate.as_str())
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .trim();
+            if !stem.is_empty() && stem == query {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn fallback_fix_existing_anchor(messages: &[Value], tool_root: Option<&str>) -> Option<String> {
@@ -762,6 +917,195 @@ fn fallback_fix_existing_anchor(messages: &[Value], tool_root: Option<&str>) -> 
         return Some("src/main.rs".to_string());
     }
     None
+}
+
+fn concrete_impl_from_recent_subdir_listing(
+    messages: &[Value],
+    tool_root: Option<&str>,
+) -> Option<String> {
+    let root = tool_root?.trim();
+    if root.is_empty() {
+        return None;
+    }
+    let listed_dir = latest_successful_list_dir_path(messages)?;
+    if !listed_dir.starts_with("src/") || listed_dir == "src" {
+        return None;
+    }
+    concrete_impl_under_dir(root, listed_dir.as_str())
+}
+
+fn direct_impl_from_attempted_subdir_listing(
+    tc: &ToolCallData,
+    tool_root: Option<&str>,
+) -> Option<String> {
+    if tc.name != "list_dir" {
+        return None;
+    }
+    let root = tool_root?.trim();
+    if root.is_empty() {
+        return None;
+    }
+    let dir = serde_json::from_str::<Value>(tc.arguments.as_str())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("dir")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })?;
+    if !dir.starts_with("src/") || dir == "src" {
+        return None;
+    }
+    concrete_impl_under_dir(root, dir.as_str())
+}
+
+fn concrete_impl_under_dir(root: &str, dir: &str) -> Option<String> {
+    let abs_dir = std::path::Path::new(root).join(dir);
+    let entries = std::fs::read_dir(abs_dir).ok()?;
+    let mut rust_files = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            name.ends_with(".rs").then_some(name)
+        })
+        .collect::<Vec<_>>();
+    rust_files.sort();
+    let concrete = rust_files
+        .into_iter()
+        .filter(|name| !matches!(name.as_str(), "mod.rs" | "lib.rs" | "main.rs"))
+        .collect::<Vec<_>>();
+    if concrete.len() != 1 {
+        return None;
+    }
+    Some(format!("{}/{}", dir, concrete[0]))
+}
+
+fn latest_successful_list_dir_path(messages: &[Value]) -> Option<String> {
+    let mut pending: BTreeMap<String, String> = BTreeMap::new();
+    let mut out = None;
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        match role {
+            "assistant" => {
+                let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for tc in tool_calls {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let name = tc
+                        .get("function")
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if id.is_empty() || name != "list_dir" {
+                        continue;
+                    }
+                    let dir = tc
+                        .get("function")
+                        .and_then(|v| v.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .and_then(|value| {
+                            value
+                                .get("dir")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    pending.insert(id.to_string(), dir);
+                }
+            }
+            "tool" => {
+                let tool_call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let Some(dir) = pending.remove(tool_call_id) else {
+                    continue;
+                };
+                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if non_exec_tool_succeeded(content) {
+                    out = Some(dir);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn latest_successful_source_read_path(
+    messages: &[Value],
+    reads: &BTreeMap<String, String>,
+) -> Option<String> {
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for tc in tool_calls.iter().rev() {
+            let name = tc
+                .get("function")
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if name != "read_file" {
+                continue;
+            }
+            let path = tc
+                .get("function")
+                .and_then(|v| v.get("arguments"))
+                .and_then(|v| v.as_str())
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|value| {
+                    value
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                });
+            let Some(path) = path else {
+                continue;
+            };
+            if reads.contains_key(path.as_str())
+                && path.starts_with("src/")
+                && path.ends_with(".rs")
+            {
+                return Some(path);
+            }
+        }
+    }
+    reads
+        .keys()
+        .rev()
+        .find(|path| path.starts_with("src/") && path.ends_with(".rs"))
+        .cloned()
+}
+
+fn resolve_existing_rust_path(path: &str, tool_root: Option<&str>) -> String {
+    let Some(root) = tool_root.map(str::trim).filter(|root| !root.is_empty()) else {
+        return path.to_string();
+    };
+    let abs = std::path::Path::new(root).join(path);
+    if abs.exists() {
+        return path.to_string();
+    }
+    if !path.ends_with(".rs") {
+        return path.to_string();
+    }
+    let stem = path.trim_end_matches(".rs");
+    let mod_path = format!("{stem}/mod.rs");
+    if std::path::Path::new(root).join(mod_path.as_str()).exists() {
+        mod_path
+    } else {
+        path.to_string()
+    }
 }
 
 fn successful_read_contents(messages: &[Value]) -> BTreeMap<String, String> {
@@ -827,6 +1171,107 @@ fn successful_read_contents(messages: &[Value]) -> BTreeMap<String, String> {
     }
 
     out
+}
+
+#[derive(Debug, Clone)]
+struct SuccessfulSearchHit {
+    query: String,
+    path: String,
+    snippet: String,
+}
+
+fn successful_search_hits(messages: &[Value]) -> Vec<SuccessfulSearchHit> {
+    let mut pending: BTreeMap<String, String> = BTreeMap::new();
+    let mut out = Vec::new();
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        match role {
+            "assistant" => {
+                let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for tc in tool_calls {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let name = tc
+                        .get("function")
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if id.is_empty() || name != "search_files" {
+                        continue;
+                    }
+                    let pattern = tc
+                        .get("function")
+                        .and_then(|v| v.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .and_then(|value| {
+                            value
+                                .get("pattern")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    if !pattern.trim().is_empty() {
+                        pending.insert(id.to_string(), pattern);
+                    }
+                }
+            }
+            "tool" => {
+                let tool_call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let Some(query) = pending.remove(tool_call_id) else {
+                    continue;
+                };
+                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if !content.trim_start().starts_with("[search_files:") {
+                    continue;
+                }
+                for line in content.lines().skip(1) {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('[') {
+                        continue;
+                    }
+                    let mut parts = trimmed.splitn(3, ':');
+                    let Some(path) = parts.next() else {
+                        continue;
+                    };
+                    let Some(_line_no) = parts.next() else {
+                        continue;
+                    };
+                    let Some(snippet) = parts.next() else {
+                        continue;
+                    };
+                    out.push(SuccessfulSearchHit {
+                        query: query.clone(),
+                        path: path.trim().to_string(),
+                        snippet: snippet.trim().to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn normalize_rust_ident_fragment(raw: &str) -> Option<String> {
+    let ident: String = raw
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    if ident.is_empty() {
+        None
+    } else {
+        Some(ident)
+    }
 }
 
 fn rust_module_file_candidates(seed_path: &str, body: &str) -> Vec<String> {
@@ -976,6 +1421,211 @@ fn recent_blocked_artifact_action(
     None
 }
 
+fn recent_blocked_fix_existing_mutation_action(
+    messages: &[Value],
+    root_user_text: &str,
+) -> Option<ToolCallData> {
+    let reads = successful_read_contents(messages);
+    let mut idx = messages.len();
+    while idx >= 2 {
+        let tool_msg = &messages[idx - 1];
+        let assistant_msg = &messages[idx - 2];
+        idx -= 2;
+
+        if tool_msg.get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+        let content = tool_msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if !looks_like_missing_gate_block(content) && !content.contains("[Evidence Gate]") {
+            break;
+        }
+        let Some(candidate) = first_tool_call_from_message(assistant_msg) else {
+            continue;
+        };
+        if !matches!(candidate.name.as_str(), "patch_file" | "apply_diff") {
+            continue;
+        }
+        if let Some(repaired) =
+            validate_or_repair_blocked_fix_existing_mutation(&candidate, &reads, root_user_text)
+        {
+            return Some(repaired);
+        }
+    }
+    None
+}
+
+fn synthesize_fix_existing_literal_member_patch(
+    messages: &[Value],
+    root_user_text: &str,
+) -> Option<ToolCallData> {
+    let reads = successful_read_contents(messages);
+    let target_path = match infer_fix_existing_focus(messages)? {
+        FixExistingFocus::PatchImplementation(path) => path,
+        FixExistingFocus::ReadImplementation(_) => return None,
+    };
+    if !target_path.starts_with("src/") {
+        return None;
+    }
+    let body = reads.get(target_path.as_str())?;
+    let missing_literal = path_literals_in_text(root_user_text)
+        .into_iter()
+        .find(|literal| literal.starts_with("src/") && literal != &target_path)?;
+    let (search, replace) = synthesize_list_member_insertion(body, missing_literal.as_str())?;
+    Some(ToolCallData {
+        id: "synthetic_fix_existing_patch".to_string(),
+        name: "patch_file".to_string(),
+        arguments: serde_json::json!({
+            "path": target_path,
+            "search": search,
+            "replace": replace,
+        })
+        .to_string(),
+    })
+}
+
+fn validate_or_repair_blocked_fix_existing_mutation(
+    tc: &ToolCallData,
+    reads: &BTreeMap<String, String>,
+    root_user_text: &str,
+) -> Option<ToolCallData> {
+    if tc.name == "apply_diff" {
+        let parsed = serde_json::from_str::<Value>(tc.arguments.as_str()).ok()?;
+        let path = parsed.get("path").and_then(|v| v.as_str())?.trim();
+        let diff = parsed.get("diff").and_then(|v| v.as_str())?.trim();
+        if path.is_empty() || diff.is_empty() || !reads.contains_key(path) {
+            return None;
+        }
+        return Some(tc.clone());
+    }
+
+    let parsed = serde_json::from_str::<Value>(tc.arguments.as_str()).ok();
+    let path = parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| extract_loose_json_string_field(tc.arguments.as_str(), "path"))?;
+    if !reads.contains_key(path.as_str()) {
+        return None;
+    }
+    let search = parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("search")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| extract_loose_json_string_field(tc.arguments.as_str(), "search"));
+    let replace = parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("replace")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| extract_loose_json_string_field(tc.arguments.as_str(), "replace"));
+
+    if let (Some(search), Some(replace)) = (search.as_ref(), replace.as_ref()) {
+        if !search.trim().is_empty() && !replace.trim().is_empty() {
+            return Some(tc.clone());
+        }
+    }
+
+    repair_blocked_patch_with_prompt_literal(
+        tc,
+        path.as_str(),
+        search.as_deref().unwrap_or(""),
+        reads.get(path.as_str())?,
+        root_user_text,
+    )
+}
+
+fn repair_blocked_patch_with_prompt_literal(
+    tc: &ToolCallData,
+    path: &str,
+    search_prefix: &str,
+    body: &str,
+    root_user_text: &str,
+) -> Option<ToolCallData> {
+    let missing_literal = path_literals_in_text(root_user_text)
+        .into_iter()
+        .find(|literal| literal.starts_with("src/") && literal != path)?;
+    if search_prefix.trim().is_empty() {
+        return None;
+    }
+    let start = body.find(search_prefix)?;
+    let tail = &body[start..];
+    let closing_rel = tail.find("\n];")?;
+    let segment = &tail[..closing_rel + 3];
+    let mut last_item_line = None;
+    let mut closing_line = None;
+    for line in segment.lines() {
+        let trimmed = line.trim();
+        if trimmed == "];" {
+            closing_line = Some(line.to_string());
+            break;
+        }
+        if trimmed.starts_with('"') && trimmed.ends_with(',') {
+            last_item_line = Some(line.to_string());
+        }
+    }
+    let last_item_line = last_item_line?;
+    let closing_line = closing_line?;
+    let indent: String = last_item_line
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .collect();
+    let search = format!("{last_item_line}\n{closing_line}");
+    let replace = format!("{last_item_line}\n{indent}\"{missing_literal}\",\n{closing_line}");
+    Some(ToolCallData {
+        id: tc.id.clone(),
+        name: "patch_file".to_string(),
+        arguments: serde_json::json!({
+            "path": path,
+            "search": search,
+            "replace": replace,
+        })
+        .to_string(),
+    })
+}
+
+fn synthesize_list_member_insertion(body: &str, missing_literal: &str) -> Option<(String, String)> {
+    let quoted_literal = format!("\"{missing_literal}\",");
+    if body.lines().any(|line| line.trim() == quoted_literal) {
+        return None;
+    }
+    let mut last_item_line = None;
+    let mut closing_line = None;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed == "];" {
+            closing_line = Some(line.to_string());
+            break;
+        }
+        if trimmed.starts_with('"') && trimmed.ends_with(',') {
+            last_item_line = Some(line.to_string());
+        }
+    }
+    let last_item_line = last_item_line?;
+    let closing_line = closing_line?;
+    let indent: String = last_item_line
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .collect();
+    let search = format!("{last_item_line}\n{closing_line}");
+    let replace = format!("{last_item_line}\n{indent}\"{missing_literal}\",\n{closing_line}");
+    Some((search, replace))
+}
+
 fn first_tool_call_from_message(msg: &Value) -> Option<ToolCallData> {
     let tool_calls = msg.get("tool_calls")?.as_array()?;
     let tc = tool_calls.first()?;
@@ -996,6 +1646,100 @@ fn first_tool_call_from_message(msg: &Value) -> Option<ToolCallData> {
 fn looks_like_missing_gate_block(content: &str) -> bool {
     content.contains("GOVERNOR BLOCKED")
         && (content.contains("Missing valid <plan>") || content.contains("Missing <think>"))
+}
+
+fn extract_loose_json_string_field(raw: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let start = raw.find(needle.as_str())?;
+    let after_key = &raw[start + needle.len()..];
+    let colon = after_key.find(':')?;
+    let mut tail = after_key[colon + 1..].trim_start();
+    if !tail.starts_with('"') {
+        return None;
+    }
+    tail = &tail[1..];
+
+    let mut out = String::new();
+    let mut chars = tail.chars();
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            out.push(match ch {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                other => other,
+            });
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(out),
+            other => out.push(other),
+        }
+    }
+
+    Some(out)
+}
+
+fn path_literals_in_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in text.split_whitespace() {
+        let trimmed = token
+            .trim_matches(|c: char| {
+                (c.is_ascii_punctuation() && !matches!(c, '.' | '/' | '\\' | '_' | '-'))
+                    || matches!(
+                        c,
+                        '「' | '」'
+                            | '『'
+                            | '』'
+                            | '（'
+                            | '）'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '`'
+                            | '"'
+                            | '\''
+                    )
+            })
+            .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'))
+            .trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '「' | '」'
+                        | '『'
+                        | '』'
+                        | '（'
+                        | '）'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '`'
+                        | '"'
+                        | '\''
+                )
+            });
+        let has_path_sep = trimmed.contains('/') || trimmed.contains('\\');
+        let has_extension = trimmed
+            .split('/')
+            .next_back()
+            .is_some_and(|segment| segment.contains('.'));
+        if (has_path_sep || has_extension) && !trimmed.is_empty() {
+            let literal = trimmed.replace('\\', "/");
+            if !out.contains(&literal) {
+                out.push(literal);
+            }
+        }
+    }
+    out
 }
 
 fn supports_artifact_action(harness: TaskHarness, name: &str) -> bool {
@@ -1557,6 +2301,20 @@ mod tests {
     }
 
     #[test]
+    fn fix_existing_tasks_do_not_request_repo_goal_check() {
+        assert!(!TaskHarness {
+            lane: TaskLane::FixExisting,
+            artifact_mode: ArtifactMode::ExistingFiles,
+        }
+        .allows_repo_goal_check());
+        assert!(TaskHarness {
+            lane: TaskLane::ScaffoldRepo,
+            artifact_mode: ArtifactMode::NewRepo,
+        }
+        .allows_repo_goal_check());
+    }
+
+    #[test]
     fn coerce_fix_existing_tool_call_rewrites_verify_to_impl_read() {
         let messages = vec![
             json!({
@@ -1665,6 +2423,441 @@ mod tests {
         assert_eq!(original, "search_files(dir=src, pattern=#[test])");
         assert_eq!(rewritten.name, "read_file");
         assert_eq!(coerced, "read_file(path=src/lib.rs)");
+    }
+
+    #[test]
+    fn coerce_fix_existing_tool_call_prefers_mod_rs_when_module_directory_exists() {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src/observer")).expect("create observer dir");
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub mod observer;\n").expect("write lib");
+        std::fs::write(
+            tmp.path().join("src/observer/mod.rs"),
+            "pub mod repo_rules;\n",
+        )
+        .expect("write observer mod");
+
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_lib",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_lib",
+                "content": "[src/lib.rs] (1 line, 18 bytes)\npub mod observer;"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_list_observer".to_string(),
+            name: "list_dir".to_string(),
+            arguments: json!({"dir":"src/observer"}).to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_fix_existing_tool_call(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            Some("cargo test 2>&1"),
+            tmp.path().to_str(),
+        )
+        .expect("fix-existing mod.rs coercion");
+
+        assert_eq!(original, "list_dir(dir=src/observer)");
+        assert_eq!(rewritten.name, "read_file");
+        assert_eq!(coerced, "read_file(path=src/observer/mod.rs)");
+    }
+
+    #[test]
+    fn coerce_fix_existing_tool_call_prefers_single_impl_file_after_subdir_listing() {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src/observer")).expect("create observer dir");
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub mod observer;\n").expect("write lib");
+        std::fs::write(
+            tmp.path().join("src/observer/mod.rs"),
+            "pub mod repo_rules;\n",
+        )
+        .expect("write observer mod");
+        std::fs::write(
+            tmp.path().join("src/observer/repo_rules.rs"),
+            "pub const REPLAY_SENSITIVE: &[&str] = &[];\n",
+        )
+        .expect("write repo_rules");
+
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_lib",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_lib",
+                "content": "[src/lib.rs] (1 line, 18 bytes)\npub mod observer;"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_list_observer",
+                    "type": "function",
+                    "function": {"name":"list_dir","arguments":"{\"dir\":\"src/observer\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_list_observer",
+                "content": "[list_dir: 'src/observer' ・ 2 item(s)]\nmod.rs\nrepo_rules.rs"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_list_observer_again".to_string(),
+            name: "list_dir".to_string(),
+            arguments: json!({"dir":"src/observer","include_hidden":true}).to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_fix_existing_tool_call(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            Some("cargo test 2>&1"),
+            tmp.path().to_str(),
+        )
+        .expect("fix-existing concrete impl coercion");
+
+        assert_eq!(original, "list_dir(dir=src/observer, include_hidden=true)");
+        assert_eq!(rewritten.name, "read_file");
+        assert_eq!(coerced, "read_file(path=src/observer/repo_rules.rs)");
+    }
+
+    #[test]
+    fn coerce_fix_existing_tool_call_prefers_single_impl_file_from_attempted_subdir_listing() {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src/observer")).expect("create observer dir");
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub mod observer;\n").expect("write lib");
+        std::fs::write(
+            tmp.path().join("src/observer/mod.rs"),
+            "pub mod repo_rules;\n",
+        )
+        .expect("write observer mod");
+        std::fs::write(
+            tmp.path().join("src/observer/repo_rules.rs"),
+            "pub const REPLAY_SENSITIVE: &[&str] = &[];\n",
+        )
+        .expect("write repo_rules");
+
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_list_src",
+                    "type": "function",
+                    "function": {"name":"list_dir","arguments":"{\"dir\":\"src\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_list_src",
+                "content": "[list_dir: 'src' ・ 2 item(s)]\nlib.rs\nobserver/"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_list_observer".to_string(),
+            name: "list_dir".to_string(),
+            arguments: json!({"dir":"src/observer","include_hidden":false}).to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_fix_existing_tool_call(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            Some("cargo test 2>&1"),
+            tmp.path().to_str(),
+        )
+        .expect("fix-existing direct impl coercion");
+
+        assert_eq!(original, "list_dir(dir=src/observer, include_hidden=false)");
+        assert_eq!(rewritten.name, "read_file");
+        assert_eq!(coerced, "read_file(path=src/observer/repo_rules.rs)");
+    }
+
+    #[test]
+    fn coerce_fix_existing_tool_call_prefers_module_candidate_from_search_hit() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_lib",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_lib",
+                "content": "[src/lib.rs] (1 line, 18 bytes)\npub mod observer;"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search_repo_rules",
+                    "type": "function",
+                    "function": {"name":"search_files","arguments":"{\"pattern\":\"repo_rules\",\"dir\":\"\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search_repo_rules",
+                "content": "[search_files: 'repo_rules' — 1 match(es)]\nsrc/observer/mod.rs:1: pub mod repo_rules;"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_repeat_search".to_string(),
+            name: "search_files".to_string(),
+            arguments: json!({"pattern":"repo_rules","dir":""}).to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_fix_existing_tool_call(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            Some("cargo test 2>&1"),
+            None,
+        )
+        .expect("fix-existing search-derived coercion");
+
+        assert_eq!(original, "search_files(pattern=repo_rules)");
+        assert_eq!(rewritten.name, "read_file");
+        assert_eq!(coerced, "read_file(path=src/observer/repo_rules.rs)");
+    }
+
+    #[test]
+    fn coerce_fix_existing_blocked_mutation_tool_call_restores_prompt_literal_patch() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_rules",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/observer/repo_rules.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_rules",
+                "content": "[src/observer/repo_rules.rs] (10 lines, 200 bytes)\nconst TUI_REPLAY_PATHS: &[&str] = &[\n    \"src/tui/events.rs\",\n    \"src/tui/app.rs\",\n    \"src/tui/prefs.rs\",\n    \"src/tui/ui.rs\",\n    \"src/tui/suggestion.rs\",\n];\n"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_patch_rules",
+                    "type": "function",
+                    "function": {
+                        "name":"patch_file",
+                        "arguments":"{\"path\":\"src/observer/repo_rules.rs\",\"search\":\"const TUI_REPLAY_PATHS: &["
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_patch_rules",
+                "content": "GOVERNOR BLOCKED\n\n[Evidence Gate]\nTarget path: <path>\n\ntool:\npatch_file\narguments:\n{\"path\":\"src/observer/repo_rules.rs\",\"search\":\"const TUI_REPLAY_PATHS: &["
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_search_again".to_string(),
+            name: "search_files".to_string(),
+            arguments: json!({"pattern":"review_panel.rs"}).to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_fix_existing_blocked_mutation_tool_call(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "Fix the existing observer rule module so `src/tui/review_panel.rs` is treated as replay-sensitive.",
+        )
+        .expect("blocked mutation coercion");
+
+        assert_eq!(original, "search_files(pattern=review_panel.rs)");
+        assert_eq!(rewritten.name, "patch_file");
+        assert!(rewritten
+            .arguments
+            .contains("\"path\":\"src/observer/repo_rules.rs\""));
+        assert!(rewritten.arguments.contains("src/tui/review_panel.rs"));
+        assert!(coerced.starts_with("patch_file("));
+    }
+
+    #[test]
+    fn repair_fix_existing_mutation_tool_call_repairs_truncated_patch_before_execution() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_rules",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/observer/repo_rules.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_rules",
+                "content": "[src/observer/repo_rules.rs] (10 lines, 200 bytes)\nconst TUI_REPLAY_PATHS: &[&str] = &[\n    \"src/tui/events.rs\",\n    \"src/tui/app.rs\",\n    \"src/tui/prefs.rs\",\n    \"src/tui/ui.rs\",\n    \"src/tui/suggestion.rs\",\n];\n"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_patch".to_string(),
+            name: "patch_file".to_string(),
+            arguments: "{\"path\":\"src/observer/repo_rules.rs\",\"search\":\"const TUI_REPLAY_PATHS: &[&str] = &[\\n    \\\"src/tui/events.rs\\\",\\n    \\\"src/tui/app.rs\\\",\\n    \\\"src/tui/prefs".to_string(),
+        };
+
+        let (rewritten, _original, coerced) = repair_fix_existing_mutation_tool_call(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "Fix the existing observer rule module so `src/tui/review_panel.rs` is treated as replay-sensitive.",
+        )
+        .expect("repair malformed patch");
+
+        assert_eq!(rewritten.name, "patch_file");
+        assert!(rewritten
+            .arguments
+            .contains("\"path\":\"src/observer/repo_rules.rs\""));
+        assert!(rewritten.arguments.contains("src/tui/review_panel.rs"));
+        assert!(coerced.starts_with("patch_file("));
+    }
+
+    #[test]
+    fn coerce_fix_existing_literal_mutation_tool_call_synthesizes_patch_after_impl_read() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_lib",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_lib",
+                "content": "[src/lib.rs] (1 line, 18 bytes)\npub mod observer;"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_search_repo_rules",
+                    "type": "function",
+                    "function": {"name":"search_files","arguments":"{\"pattern\":\"repo_rules\",\"dir\":\"\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_search_repo_rules",
+                "content": "[search_files: 'repo_rules' — 1 match(es)]\nsrc/observer/mod.rs:1: pub mod repo_rules;"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_rules",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/observer/repo_rules.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_rules",
+                "content": "[src/observer/repo_rules.rs] (10 lines, 200 bytes)\nconst TUI_REPLAY_PATHS: &[&str] = &[\n    \"src/tui/events.rs\",\n    \"src/tui/app.rs\",\n    \"src/tui/prefs.rs\",\n    \"src/tui/ui.rs\",\n    \"src/tui/suggestion.rs\",\n];\n"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_search_again".to_string(),
+            name: "search_files".to_string(),
+            arguments: json!({"pattern":"review_panel.rs"}).to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_fix_existing_literal_mutation_tool_call(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "Fix the existing observer rule module so `src/tui/review_panel.rs` is treated as replay-sensitive, using the smallest safe code change.",
+        )
+        .expect("literal mutation coercion");
+
+        assert_eq!(original, "search_files(pattern=review_panel.rs)");
+        assert_eq!(rewritten.name, "patch_file");
+        assert!(rewritten
+            .arguments
+            .contains("\"path\":\"src/observer/repo_rules.rs\""));
+        assert!(rewritten.arguments.contains("src/tui/review_panel.rs"));
+        assert!(coerced.starts_with("patch_file("));
+    }
+
+    #[test]
+    fn coerce_fix_existing_literal_mutation_tool_call_ignores_test_only_literal_match() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_rules",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/observer/repo_rules.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_rules",
+                "content": "[src/observer/repo_rules.rs] (27 lines, 629 bytes)\nconst TUI_REPLAY_PATHS: &[&str] = &[\n    \"src/tui/events.rs\",\n    \"src/tui/app.rs\",\n    \"src/tui/prefs.rs\",\n    \"src/tui/ui.rs\",\n    \"src/tui/suggestion.rs\",\n];\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn review_panel_is_replay_sensitive() {\n        assert!(requires_tui_replay(\"src/tui/review_panel.rs\"));\n    }\n}\n"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_search_again".to_string(),
+            name: "search_files".to_string(),
+            arguments: json!({"pattern":"review_panel.rs"}).to_string(),
+        };
+
+        let (rewritten, _original, coerced) = coerce_fix_existing_literal_mutation_tool_call(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "Fix the existing observer rule module so `src/tui/review_panel.rs` is treated as replay-sensitive.",
+        )
+        .expect("literal mutation despite test reference");
+
+        assert_eq!(rewritten.name, "patch_file");
+        assert!(rewritten
+            .arguments
+            .contains("\"path\":\"src/observer/repo_rules.rs\""));
+        assert!(rewritten.arguments.contains("src/tui/review_panel.rs"));
+        assert!(coerced.starts_with("patch_file("));
     }
 
     #[test]

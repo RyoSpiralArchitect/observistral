@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "paths": [
+    "src/tui/events.rs",
+    "src/tui/app.rs",
+    "src/tui/prefs.rs",
+    "src/tui/ui.rs",
+    "src/tui/suggestion.rs"
+  ]
+}

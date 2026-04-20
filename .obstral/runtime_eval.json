@@ -188,6 +188,24 @@
       ]
     },
     {
+      "id": "self-fix-observer-repo-rules-review-panel",
+      "tool_root": "tests/fixtures/runtime-self-fix-observer-rules",
+      "copy_tool_root": true,
+      "max_iters": 14,
+      "tags": ["action", "fix", "rust", "self", "observer", "medium"],
+      "prompt": "Fix the existing observer rule module so `src/tui/review_panel.rs` is treated as replay-sensitive, using the smallest safe code change. Because replay-sensitive observer rules are documented in this repo, update `docs/runtime-architecture.md` and `.obstral/tui_replay.json` to match. Run `cargo test -q observer::repo_rules::tests:: 2>&1 && bash scripts/tui-replay-smoke.sh` before you finish. Final answer must include the changed Rust file path, the docs file path, and the replay spec path.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "tool_call_seen", "name": "patch_file" },
+        { "kind": "assistant_contains", "value": "src/observer/repo_rules.rs" },
+        { "kind": "assistant_contains", "value": "docs/runtime-architecture.md" },
+        { "kind": "assistant_contains", "value": ".obstral/tui_replay.json" },
+        { "kind": "assistant_contains", "value": "cargo test -q observer::repo_rules::tests:: 2>&1 && bash scripts/tui-replay-smoke.sh" }
+      ]
+    },
+    {
       "id": "maze-game-rust-repo",
       "tool_root": "tests/fixtures/runtime-maze-game",
       "copy_tool_root": true,
