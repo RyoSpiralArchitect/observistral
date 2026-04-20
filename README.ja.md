@@ -53,6 +53,7 @@ OBSTRAL では、生成した milestone repo を git に含めずに、軽量な
 - `maze-game-rust-repo` は、scaffold lane が fresh な Rust repo を作り、ゲームロジックを `src/lib.rs` に置き、`src/main.rs` を runnable に保ち、最後に本物の `cargo test` で締められることを示します。
 - `maze-game-pygame-repo` は、同じ closeout path が非 Rust repo でも動き、headless な `pygame` の verification command まで運べることを示します。
 - `resume-session-bridge-fix` は、seed された session memory と repo-local な `.obstral/progress.json` を使って既存 Rust repo の bugfix を resume し、最小の safe patch へ戻せることを示します。
+- medium+ の self-dogfood stretch case である `self-fix-observer-repo-rules-review-panel` は、いま `src/observer/repo_rules.rs` へ安定して着地し、最小の Rust patch まで適用できています。残る live の本命は、required な `docs/runtime-architecture.md` と `.obstral/tui_replay.json` の follow-up を、missing-`<think>` の揺れがあっても最後の verification まで押し切ることです。
 - benchmark report には provider/model に加えて概算 transcript token telemetry も入るようになり、billing 精度を装わずに run 同士を比較しやすくなりました。
 
 これは「たまたま一度うまく作れた」から、「runtime が milestone case を再現し、そのやり方まで説明できる」への前進です。
@@ -65,6 +66,7 @@ OBSTRAL では、生成した milestone repo を git に含めずに、軽量な
 
 - **long-running の耐久性**: session resume はかなり良くなり、repo-local progress snapshot も入りましたが、数時間単位の仕事には context compaction、drift に応じた replan、checkpoint-aware な recovery がまだ欲しいです。
 - **benchmark の幅**: fresh repo scaffold と既存 repo bugfix は良い入口で、次は小さな web app、観測ループに入りやすい中規模 refactor、docs/config task が効きます。
+- **self-dogfood の closeout 品質**: low-touch self-fix case では正しい Rust file まで届き、repo-rule の follow-up も queue できるようになりましたが、`code -> docs -> replay -> verify` の連鎖を provider の missing-`<think>` 越しでも deterministic に運ぶ余地がまだあります。
 - **verification の圧力**: ひとつ test command が通るだけでも良いですが、adversarial evaluator loop、rollback/checkpoint restore、quality oriented な check を入れるとかなり強くなります。
 - **telemetry の深さ**: 今の transcript token estimate は比較には役立ちますが、provider-native な usage accounting や benchmark trend history があると最適化がもっと具体的になります。
 - **harness evolution の計測**: overlay、promotion candidate、人間ゲートつき apply flow は揃ってきたので、次は「どの promoted rule が未来の run を本当に良くしたか」を測る段です。

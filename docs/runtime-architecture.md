@@ -92,6 +92,18 @@ Current code:
 - Streaming adapter: `src/streaming.rs`
 - Web longrun loop: `web/app.js::runCoderAgentic`
 
+### 4b) Observer Critique Layer
+
+Responsibilities:
+- summarize transcript/tool risk after the coder loop
+- surface repo-rule follow-ups such as required docs or replay/eval proof
+- keep "next improvement" suggestions small enough to feed back into dogfood work
+
+Current code:
+- deterministic critique engine: `src/observer/engine.rs`
+- transcript/event analysis: `src/observer/detector.rs`, `src/observer/analyzer.rs`
+- repo-rule follow-up heuristics: `src/observer/repo_rules.rs`
+
 ### 5) Safety Governor
 
 Responsibilities:

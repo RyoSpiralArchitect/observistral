@@ -45,6 +45,7 @@ use std::path::Path;
 mod done_gate;
 mod evaluator_loop;
 mod failure_localization;
+mod followup_requirements;
 mod harness_evolution;
 mod memory;
 mod meta_harness;
@@ -65,6 +66,9 @@ use self::done_gate::{
 };
 use self::evaluator_loop::EvaluatorLoop;
 use self::failure_localization::interesting_failure_line;
+use self::followup_requirements::{
+    coerce_existing_followup_tool_call, matches_required_existing_followup,
+};
 pub(crate) use self::harness_evolution::{
     overlay_path_for_root as harness_evolution_overlay_path_for_root,
     path_for_root as harness_evolution_queue_path_for_root,
@@ -106,8 +110,9 @@ use self::session_bridge::SessionBridgeView;
 use self::task_harness::{
     allows_artifact_creation_during_diagnose, allows_artifact_creation_during_verify,
     build_fix_stage_progress_hint, build_progress_gate_block, coerce_artifact_creation_tool_call,
+    coerce_fix_existing_blocked_mutation_tool_call, coerce_fix_existing_literal_mutation_tool_call,
     coerce_fix_existing_tool_call, coerce_repo_goal_completion_tool_call,
-    repair_repo_scaffold_write_tool_call, TaskHarness,
+    repair_fix_existing_mutation_tool_call, repair_repo_scaffold_write_tool_call, TaskHarness,
 };
 
 #[derive(Debug, Clone)]
@@ -2805,6 +2810,7 @@ impl RecoveryGovernor {
         tc: &ToolCallData,
         test_cmd: Option<&str>,
         task_harness: TaskHarness,
+        allow_existing_followup_verify: bool,
     ) -> Option<String> {
         let Some(stage) = self.stage else {
             return None;
@@ -2835,7 +2841,9 @@ Required now: run diagnostics first (e.g. `pwd`, `ls`/`dir`, `git status`, `git 
             }
             RecoveryStage::Fix => None, // allow edits/commands to fix
             RecoveryStage::Verify => {
-                if allows_artifact_creation_during_verify(task_harness, tc) {
+                if allows_artifact_creation_during_verify(task_harness, tc)
+                    || allow_existing_followup_verify
+                {
                     return None;
                 }
                 if name == "exec" {
@@ -4941,10 +4949,69 @@ fn mutation_tool_requires_evidence(tc: &ToolCallData) -> bool {
     matches!(tc.name.as_str(), "patch_file" | "apply_diff")
 }
 
+fn extract_loose_json_string_field(raw: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let start = raw.find(needle.as_str())?;
+    let after_key = &raw[start + needle.len()..];
+    let colon = after_key.find(':')?;
+    let mut tail = after_key[colon + 1..].trim_start();
+    if !tail.starts_with('"') {
+        return None;
+    }
+    tail = &tail[1..];
+
+    let mut out = String::new();
+    let mut chars = tail.chars();
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            match ch {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000C}'),
+                'u' => {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        let Some(h) = chars.next() else {
+                            return Some(out);
+                        };
+                        hex.push(h);
+                    }
+                    if let Ok(value) = u16::from_str_radix(hex.as_str(), 16) {
+                        if let Some(decoded) = char::from_u32(value as u32) {
+                            out.push(decoded);
+                        }
+                    }
+                }
+                other => out.push(other),
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(out),
+            other => out.push(other),
+        }
+    }
+
+    Some(out)
+}
+
 fn mutation_target_path(tc: &ToolCallData) -> Option<String> {
-    let args = serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()?;
-    args.get("path")
-        .and_then(|v| v.as_str())
+    serde_json::from_str::<serde_json::Value>(&tc.arguments)
+        .ok()
+        .and_then(|args| {
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| extract_loose_json_string_field(tc.arguments.as_str(), "path"))
         .map(|path| compact_one_line(path.trim(), 180))
         .filter(|path| path != "-")
 }
@@ -8412,8 +8479,8 @@ Fix: use --provider openai-compatible (or --provider mistral).",
         task_harness.artifact_mode_label(),
     );
     let verification_contract = governor_contract::verification();
-    let wants_repo_goal =
-        text_contains_any(&root_user_text_low, &verification_contract.goal_repo_terms);
+    let wants_repo_goal = task_harness.allows_repo_goal_check()
+        && text_contains_any(&root_user_text_low, &verification_contract.goal_repo_terms);
     let wants_test_goal =
         text_contains_any(&root_user_text_low, &verification_contract.goal_test_terms);
     let wants_build_goal =
@@ -9817,6 +9884,126 @@ Execute only the new minimal action: {}",
                 )
                 .await;
                 tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) =
+                repair_fix_existing_mutation_tool_call(task_harness, &messages, tc, &root_user_text)
+            {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[task_harness] repaired malformed fix-existing mutation: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "task_harness_tool_coercion",
+                    json!({
+                        "lane": task_harness.lane_label(),
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                        "reason": "repair_fix_mutation",
+                    }),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) =
+                coerce_fix_existing_blocked_mutation_tool_call(
+                    task_harness,
+                    &messages,
+                    tc,
+                    &root_user_text,
+                )
+            {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[task_harness] restored blocked fix-existing mutation: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "task_harness_tool_coercion",
+                    json!({
+                        "lane": task_harness.lane_label(),
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                        "reason": "restore_blocked_fix_mutation",
+                    }),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) =
+                coerce_existing_followup_tool_call(&messages, tc, &root_user_text)
+            {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[task_harness] focused required follow-up edit: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "task_harness_tool_coercion",
+                    json!({
+                        "lane": task_harness.lane_label(),
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                        "reason": "required_followup_edit",
+                    }),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        let preserves_required_followup = tool_call
+            .as_ref()
+            .is_some_and(|tc| matches_required_existing_followup(&messages, tc, &root_user_text));
+
+        if !preserves_required_followup {
+            if let Some(tc) = tool_call.as_ref() {
+                if let Some((rewritten, original, coerced)) =
+                    coerce_fix_existing_literal_mutation_tool_call(
+                        task_harness,
+                        &messages,
+                        tc,
+                        &root_user_text,
+                    )
+                {
+                    let _ = tx
+                        .send(StreamToken::Delta(format!(
+                            "[task_harness] synthesized fix-existing mutation from gathered evidence: {} -> {}\n",
+                            original, coerced
+                        )))
+                        .await;
+                    emit_telemetry_event(
+                        &tx,
+                        "task_harness_tool_coercion",
+                        json!({
+                            "lane": task_harness.lane_label(),
+                            "from": original,
+                            "to": coerced,
+                            "tool": rewritten.name,
+                            "reason": "synthesize_literal_fix_mutation",
+                        }),
+                    )
+                    .await;
+                    tool_call = Some(rewritten);
+                }
             }
         }
 
@@ -12983,7 +13170,14 @@ Required now: {}",
         // ── apply_diff tool ───────────────────────────────────────────────
         // Recovery gate: while recovering from failures, enforce a strict
         // Diagnose -> Fix -> Verify workflow to prevent phase drift.
-        if let Some(block) = recovery.maybe_block_tool(&tc, test_cmd.as_deref(), task_harness) {
+        let allow_existing_followup_verify =
+            matches_required_existing_followup(&messages, &tc, &root_user_text);
+        if let Some(block) = recovery.maybe_block_tool(
+            &tc,
+            test_cmd.as_deref(),
+            task_harness,
+            allow_existing_followup_verify,
+        ) {
             state = AgentState::Recovery;
             let _ = tx
                 .send(StreamToken::Delta(format!(
@@ -17515,6 +17709,40 @@ verify: exit code is zero\n\
     }
 
     #[test]
+    fn rescue_missing_evidence_for_tool_turn_accepts_truncated_patch_path() {
+        let tc = ToolCallData {
+            id: "call_patch".to_string(),
+            name: "patch_file".to_string(),
+            arguments:
+                "{\"path\":\"src/observer/repo_rules.rs\",\"search\":\"const TUI_REPLAY_PATHS: &["
+                    .to_string(),
+        };
+        let observations = ObservationEvidence {
+            reads: vec![ObservationReadEvidence {
+                command: "read_file(path=src/observer/repo_rules.rs)".to_string(),
+                path: "src/observer/repo_rules.rs".to_string(),
+            }],
+            searches: Vec::new(),
+            resolutions: Vec::new(),
+        };
+
+        let evidence = rescue_missing_evidence_for_tool_turn(
+            &tc,
+            false,
+            true,
+            ProviderKind::OpenAiCompatible,
+            &observations,
+        )
+        .expect("synthetic evidence for truncated patch");
+
+        validate_evidence_block(&evidence, &tc, &observations).expect("valid synthetic evidence");
+        assert_eq!(
+            evidence.target_files,
+            vec!["src/observer/repo_rules.rs".to_string()]
+        );
+    }
+
+    #[test]
     fn repair_truncated_patch_tool_call_from_recent_mismatch_recovers_smoke_fix() {
         let tc = ToolCallData {
             id: "call_patch".to_string(),
@@ -18184,6 +18412,7 @@ verify: exit code is zero\n\
                     "Create `notes/todo.txt` containing exactly `ship it`.",
                     false,
                 ),
+                false,
             )
             .is_none());
     }

@@ -303,3 +303,44 @@ pub fn format_critique_as_observer_blocks(c: &Critique) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observer_transcript_surfaces_repo_rule_followups_for_tui_state_change() {
+        let transcript = r#"
+✎ patch_file: src/tui/prefs.rs
+```bash
+$ cargo test -q tui::events::tests::
+exit: 0
+```
+"#;
+
+        let critique = run_observer_from_transcript(transcript, None);
+        let formatted = format_critique_as_observer_blocks(&critique);
+
+        assert!(formatted.contains("Update state ownership docs"));
+        assert!(formatted.contains("docs/state-schema.md"));
+        assert!(formatted.contains("Refresh TUI replay proof"));
+        assert!(formatted.contains(".obstral/tui_replay.json"));
+    }
+
+    #[test]
+    fn observer_transcript_surfaces_runtime_eval_followup_for_coder_loop_change() {
+        let transcript = r#"
+✎ patch_file: src/tui/agent/task_harness.rs
+```bash
+$ cargo test -q tui::agent::tests::
+exit: 0
+```
+"#;
+
+        let critique = run_observer_from_transcript(transcript, None);
+        let formatted = format_critique_as_observer_blocks(&critique);
+
+        assert!(formatted.contains("Refresh runtime eval proof"));
+        assert!(formatted.contains(".obstral/runtime_eval.json"));
+    }
+}

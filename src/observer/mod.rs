@@ -2,6 +2,7 @@ pub mod analyzer;
 pub mod detector;
 pub mod engine;
 pub mod memory;
+pub mod repo_rules;
 pub mod scorer;
 
 use serde::{Deserialize, Serialize};

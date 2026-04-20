@@ -53,6 +53,7 @@ Le milestone actuel est simple mais important : OBSTRAL peut maintenant couvrir 
 - `maze-game-rust-repo` montre que la scaffold lane peut creer un repo Rust frais, garder la logique de jeu dans `src/lib.rs`, garder `src/main.rs` executable, puis conclure avec un vrai `cargo test`.
 - `maze-game-pygame-repo` montre que le meme chemin de closeout fonctionne aussi pour un repo non Rust, y compris avec une verification `pygame` headless.
 - `resume-session-bridge-fix` montre que le runtime peut reprendre un bugfix Rust dans un repo existant en combinant une memoire de session seedee et une memoire repo-locale `.obstral/progress.json`, puis pousser l'agent vers le plus petit patch sur.
+- Le stretch case medium+ de self-dogfood `self-fix-observer-repo-rules-review-panel` atteint maintenant `src/observer/repo_rules.rs` de facon fiable et applique le plus petit patch Rust attendu ; le goulot d'etranglement live restant est de pousser les follow-ups requis sur `docs/runtime-architecture.md` et `.obstral/tui_replay.json` jusqu'a la verification finale malgre les oublis de bloc `<think>`.
 - Les rapports de benchmark portent maintenant le provider/modele ainsi qu'une telemetrie approximative des tokens du transcript, ce qui aide a comparer les runs sans pretendre fournir une facturation exacte.
 
 L'interet est la : on passe de « l'agent a produit un truc sympa une fois » a « le runtime peut reproduire un cas milestone et expliquer comment ».
@@ -65,6 +66,7 @@ La suite utile consiste moins a produire de plus jolies demos qu'a rendre le run
 
 - **Robustesse long-running** : la reprise de session est deja bien meilleure, et les snapshots repo-locaux de progression sont en place, mais le vrai travail sur plusieurs heures veut encore une compaction de contexte plus forte, des replans plus agressifs en cas de drift, et une recovery mieux branchee sur les checkpoints.
 - **Benchmarks plus varies** : les scaffolds de repo frais plus un bugfix sur repo existant sont un bon debut ; les prochains cas utiles sont de petites applis web, des refactors moyens, et des taches docs/config ou le bon niveau de verification est plus subtil.
+- **Qualite de closeout en self-dogfood** : les cas self-fix low-touch atteignent maintenant le bon fichier Rust et savent mettre en file les follow-ups de repo rules, mais le runtime doit encore porter plus deterministement la chaine `code -> docs -> replay -> verify` quand le provider oublie `<think>`.
 - **Verification plus dure** : un test qui passe, c'est bien ; des boucles evaluateur adversarial, du rollback/checkpoint restore, et des checks orientes qualite releveraient nettement le niveau minimal.
 - **Telemetrie plus riche** : les estimations de tokens du transcript sont utiles pour comparer, mais une mesure provider-native et un historique d'evolution des benchmarks rendraient l'optimisation bien plus concrete.
 - **Evolution du harness mesuree** : overlay, candidate de promotion, et apply avec gate humain existent deja ; l'etape suivante est de mesurer quelles regles promues ameliorent vraiment les runs futurs et lesquelles ne font qu'alourdir le prompt.

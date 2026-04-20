@@ -1,4 +1,5 @@
 use crate::observer::detector::{Event, FileScanTool};
+use crate::observer::repo_rules;
 use crate::observer::{Cost, DevPhase, Proposal, ProposalStatus, Risk, RiskAxis, Severity};
 use std::collections::{BTreeSet, HashSet};
 
@@ -447,6 +448,10 @@ pub fn analyze(events: &[Event]) -> Vec<Risk> {
         }
     }
 
+    for risk in repo_rules::detect(events) {
+        push(risk);
+    }
+
     out
 }
 
@@ -655,6 +660,72 @@ pub fn generate_proposals(risks: &[Risk]) -> Vec<Proposal> {
                     .unwrap_or_else(|| "duration_ms".to_string())
                     .chars()
                     .take(40)
+                    .collect(),
+                axis: Some(r.axis),
+            });
+            continue;
+        }
+
+        if repo_rules::is_missing_state_schema_doc(r.description.as_str()) {
+            push(Proposal {
+                title: "Update state ownership docs".to_string(),
+                to_coder: "This change touched a state-owner file. Update `docs/state-schema.md` in the same change so the owner and persistence boundary stay explicit.".to_string(),
+                severity: r.severity,
+                score: 0,
+                phase: DevPhase::Core,
+                impact: "State changes drift quickly when the code and ownership docs diverge, which makes self-dogfooding harder to trust.".to_string(),
+                cost: Cost::Low,
+                status: ProposalStatus::New,
+                quote: r
+                    .evidence
+                    .clone()
+                    .unwrap_or_else(|| "docs/state-schema.md".to_string())
+                    .chars()
+                    .take(60)
+                    .collect(),
+                axis: Some(r.axis),
+            });
+            continue;
+        }
+
+        if repo_rules::is_missing_tui_replay_proof(r.description.as_str()) {
+            push(Proposal {
+                title: "Refresh TUI replay proof".to_string(),
+                to_coder: "This change touched TUI-visible or TUI-control-flow code. Run `cargo run -- ... tui-replay --spec .obstral/tui_replay.json` and keep the proof green before calling the work done.".to_string(),
+                severity: r.severity,
+                score: 0,
+                phase: DevPhase::Core,
+                impact: "Without replay proof, TUI regressions can slip through even when targeted unit tests are green.".to_string(),
+                cost: Cost::Low,
+                status: ProposalStatus::New,
+                quote: r
+                    .evidence
+                    .clone()
+                    .unwrap_or_else(|| "tui-replay".to_string())
+                    .chars()
+                    .take(60)
+                    .collect(),
+                axis: Some(r.axis),
+            });
+            continue;
+        }
+
+        if repo_rules::is_missing_runtime_eval_proof(r.description.as_str()) {
+            push(Proposal {
+                title: "Refresh runtime eval proof".to_string(),
+                to_coder: "This change touched coder-loop/runtime code. Run `cargo run -- ... eval --spec .obstral/runtime_eval.json` for the affected case before closeout so the harness proof stays current.".to_string(),
+                severity: r.severity,
+                score: 0,
+                phase: DevPhase::Core,
+                impact: "Coder-loop changes without runtime-eval proof make self-dogfooding fragile because regressions show up only in live runs later.".to_string(),
+                cost: Cost::Low,
+                status: ProposalStatus::New,
+                quote: r
+                    .evidence
+                    .clone()
+                    .unwrap_or_else(|| "runtime_eval.json".to_string())
+                    .chars()
+                    .take(60)
                     .collect(),
                 axis: Some(r.axis),
             });
