@@ -1142,6 +1142,70 @@ fn latest_successful_mutation_path(messages: &[serde_json::Value]) -> Option<(St
     successful_mutation_paths(messages).into_iter().last()
 }
 
+fn unique_successful_mutation_paths(messages: &[serde_json::Value]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (_, path) in successful_mutation_paths(messages) {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn inferred_followup_summary_paths(messages: &[serde_json::Value]) -> Vec<String> {
+    let paths = unique_successful_mutation_paths(messages);
+    let mut chosen = Vec::new();
+
+    if let Some(code_path) = paths
+        .iter()
+        .rev()
+        .find(|path| path.starts_with("src/") && path.ends_with(".rs"))
+        .cloned()
+    {
+        chosen.push(code_path);
+    }
+    if let Some(docs_path) = paths
+        .iter()
+        .rev()
+        .find(|path| path.starts_with("docs/") && path.ends_with(".md"))
+        .cloned()
+    {
+        if !chosen.contains(&docs_path) {
+            chosen.push(docs_path);
+        }
+    }
+    if let Some(replay_path) = paths
+        .iter()
+        .rev()
+        .find(|path| path.ends_with("tui_replay.json"))
+        .cloned()
+    {
+        if !chosen.contains(&replay_path) {
+            chosen.push(replay_path);
+        }
+    }
+
+    chosen
+}
+
+fn format_path_list(paths: &[String]) -> String {
+    let quoted = paths
+        .iter()
+        .map(|path| format!("`{}`", compact_one_line(path.as_str(), 160)))
+        .collect::<Vec<_>>();
+    match quoted.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let mut out = quoted[..quoted.len() - 1].join(", ");
+            out.push_str(", and ");
+            out.push_str(&quoted[quoted.len() - 1]);
+            out
+        }
+    }
+}
+
 fn repo_root_from_success_path(path: &str) -> Option<String> {
     let trimmed = path.trim().trim_end_matches('/');
     for suffix in [
@@ -1303,6 +1367,14 @@ pub(super) fn synthesize_action_done_summary(
             ),
             (None, None) => format!("Created repository at `{repo_root}/` and verified its starter artifacts."),
         });
+    }
+
+    let followup_paths = inferred_followup_summary_paths(messages);
+    if followup_paths.len() >= 2 {
+        return Some(format!(
+            "Updated {} and verified the requested change.",
+            format_path_list(&followup_paths)
+        ));
     }
 
     if let Some((tool, path)) = latest_successful_mutation_path(messages) {
@@ -1910,6 +1982,65 @@ mod tests {
         let summary = synthesize_action_done_summary(None, &messages).expect("summary");
         assert!(summary.contains("notes/todo.txt"));
         assert!(summary.contains("Created"));
+    }
+
+    #[test]
+    fn synthesize_action_done_summary_mentions_code_docs_and_replay_followups() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_rules",
+                    "type": "function",
+                    "function": {
+                        "name":"patch_file",
+                        "arguments":"{\"path\":\"src/observer/repo_rules.rs\",\"search\":\"old\",\"replace\":\"new\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_rules",
+                "content": "OK: patched 'src/observer/repo_rules.rs' (+1 lines, 10 total)"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_docs",
+                    "type": "function",
+                    "function": {
+                        "name":"patch_file",
+                        "arguments":"{\"path\":\"docs/runtime-architecture.md\",\"search\":\"old\",\"replace\":\"new\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_docs",
+                "content": "OK: patched 'docs/runtime-architecture.md' (+1 lines, 12 total)"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_replay",
+                    "type": "function",
+                    "function": {
+                        "name":"patch_file",
+                        "arguments":"{\"path\":\".obstral/tui_replay.json\",\"search\":\"old\",\"replace\":\"new\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_replay",
+                "content": "OK: patched '.obstral/tui_replay.json' (+1 lines, 10 total)"
+            }),
+        ];
+
+        let summary = synthesize_action_done_summary(None, &messages).expect("summary");
+        assert!(summary.contains("src/observer/repo_rules.rs"));
+        assert!(summary.contains("docs/runtime-architecture.md"));
+        assert!(summary.contains(".obstral/tui_replay.json"));
     }
 
     #[test]
