@@ -483,13 +483,16 @@ pub(super) fn coerce_fix_existing_tool_call(
         return None;
     }
 
-    let mut path = match direct_impl_from_attempted_subdir_listing(tc, tool_root) {
+    let mut path = match explicit_existing_rust_path_from_tool_call(tc, tool_root) {
         Some(path) => path,
-        None => match infer_fix_existing_focus(messages) {
-            Some(FixExistingFocus::ReadImplementation(path)) => path,
-            Some(FixExistingFocus::PatchImplementation(_)) => return None,
-            None => concrete_impl_from_recent_subdir_listing(messages, tool_root)
-                .or_else(|| fallback_fix_existing_anchor(messages, tool_root))?,
+        None => match direct_impl_from_attempted_subdir_listing(tc, tool_root) {
+            Some(path) => path,
+            None => match infer_fix_existing_focus(messages) {
+                Some(FixExistingFocus::ReadImplementation(path)) => path,
+                Some(FixExistingFocus::PatchImplementation(_)) => return None,
+                None => concrete_impl_from_recent_subdir_listing(messages, tool_root)
+                    .or_else(|| fallback_fix_existing_anchor(messages, tool_root))?,
+            },
         },
     };
     path = resolve_existing_rust_path(path.as_str(), tool_root);
@@ -957,6 +960,35 @@ fn direct_impl_from_attempted_subdir_listing(
         return None;
     }
     concrete_impl_under_dir(root, dir.as_str())
+}
+
+fn explicit_existing_rust_path_from_tool_call(
+    tc: &ToolCallData,
+    tool_root: Option<&str>,
+) -> Option<String> {
+    if !matches!(tc.name.as_str(), "read_file" | "patch_file" | "apply_diff") {
+        return None;
+    }
+    let path = serde_json::from_str::<Value>(tc.arguments.as_str())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })?;
+    if !path.starts_with("src/") || !path.ends_with(".rs") {
+        return None;
+    }
+    let resolved = resolve_existing_rust_path(path.as_str(), tool_root);
+    let root = tool_root?.trim();
+    if root.is_empty() {
+        return Some(resolved);
+    }
+    std::path::Path::new(root)
+        .join(resolved.as_str())
+        .exists()
+        .then_some(resolved)
 }
 
 fn concrete_impl_under_dir(root: &str, dir: &str) -> Option<String> {
@@ -2539,6 +2571,53 @@ mod tests {
         assert_eq!(original, "list_dir(dir=src/observer, include_hidden=true)");
         assert_eq!(rewritten.name, "read_file");
         assert_eq!(coerced, "read_file(path=src/observer/repo_rules.rs)");
+    }
+
+    #[test]
+    fn coerce_fix_existing_tool_call_keeps_explicit_impl_read_path() {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src/observer")).expect("create observer dir");
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub mod observer;\n").expect("write lib");
+        std::fs::write(
+            tmp.path().join("src/observer/mod.rs"),
+            "pub mod repo_rules;\n",
+        )
+        .expect("write observer mod");
+        std::fs::write(
+            tmp.path().join("src/observer/repo_rules.rs"),
+            "pub const REPLAY_SENSITIVE: &[&str] = &[];\n",
+        )
+        .expect("write repo_rules");
+
+        let messages = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_list_src",
+                "type": "function",
+                "function": {"name":"list_dir","arguments":"{\"dir\":\"src\"}"}
+            }]
+        })];
+        let tc = ToolCallData {
+            id: "call_read_repo_rules".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path":"src/observer/repo_rules.rs"}).to_string(),
+        };
+
+        let rewritten = coerce_fix_existing_tool_call(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            Some("cargo test 2>&1"),
+            tmp.path().to_str(),
+        );
+
+        assert!(
+            rewritten.is_none(),
+            "explicit impl read should not be rerouted"
+        );
     }
 
     #[test]

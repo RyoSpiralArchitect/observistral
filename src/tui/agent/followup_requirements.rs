@@ -94,38 +94,53 @@ fn next_followup_requirement(
     let docs_path = docs_followup_path(root_user_text);
     let tui_replay_path = tui_replay_followup_path(root_user_text);
     let mut pending = Vec::new();
+    let prompt_missing_literal = target_src_literal(root_user_text);
+
+    if has_successful_primary_source_mutation(mutations) {
+        if let (Some(file_path), Some(missing_literal)) =
+            (docs_path.as_ref(), prompt_missing_literal.as_ref())
+        {
+            push_unique_requirement(
+                &mut pending,
+                FollowupRequirement {
+                    file_path: file_path.clone(),
+                    missing_literal: missing_literal.clone(),
+                    kind: FollowupKind::Docs,
+                },
+            );
+        }
+        if let (Some(file_path), Some(missing_literal)) =
+            (tui_replay_path.as_ref(), prompt_missing_literal.as_ref())
+        {
+            push_unique_requirement(
+                &mut pending,
+                FollowupRequirement {
+                    file_path: file_path.clone(),
+                    missing_literal: missing_literal.clone(),
+                    kind: FollowupKind::TuiReplay,
+                },
+            );
+        }
+    }
 
     for pending_requirement in
         missing_followup_requirements(messages, docs_path.clone(), tui_replay_path.clone())
     {
-        pending.push(pending_requirement);
+        push_unique_requirement(&mut pending, pending_requirement);
     }
 
-    if let Some(missing_literal) = target_src_literal(root_user_text) {
-        if let Some(file_path) = docs_path.as_ref() {
-            if reads.contains_key(file_path.as_str()) {
-                pending.push(FollowupRequirement {
-                    file_path: file_path.clone(),
-                    missing_literal: missing_literal.clone(),
-                    kind: FollowupKind::Docs,
-                });
-            }
-        }
-        if let Some(file_path) = tui_replay_path.as_ref() {
-            if reads.contains_key(file_path.as_str()) {
-                pending.push(FollowupRequirement {
-                    file_path: file_path.clone(),
-                    missing_literal,
-                    kind: FollowupKind::TuiReplay,
-                });
-            }
-        }
-    }
-
-    pending.reverse();
     pending
         .into_iter()
         .find(|requirement| !followup_requirement_is_satisfied(requirement, reads, mutations))
+}
+
+fn push_unique_requirement(
+    pending: &mut Vec<FollowupRequirement>,
+    requirement: FollowupRequirement,
+) {
+    if !pending.contains(&requirement) {
+        pending.push(requirement);
+    }
 }
 
 fn synthesize_followup_patch(
@@ -275,6 +290,12 @@ fn followup_requirement_is_satisfied(
         || mutations
             .get(requirement.file_path.as_str())
             .is_some_and(|body| body.contains(requirement.missing_literal.as_str()))
+}
+
+fn has_successful_primary_source_mutation(mutations: &BTreeMap<String, String>) -> bool {
+    mutations
+        .keys()
+        .any(|path| path.starts_with("src/") && path.ends_with(".rs"))
 }
 
 fn successful_read_contents(messages: &[Value]) -> BTreeMap<String, String> {
@@ -541,6 +562,19 @@ mod tests {
             json!({
                 "role":"assistant",
                 "tool_calls":[{
+                    "id":"call_patch_rules",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\"src/observer/repo_rules.rs\",\"search\":\"old\",\"replace\":\"new\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_rules",
+                "content":"OK: patched 'src/observer/repo_rules.rs' (+1 lines, 3 total)"
+            }),
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
                     "id":"call_read_docs",
                     "type":"function",
                     "function":{"name":"read_file","arguments":"{\"path\":\"docs/runtime-architecture.md\"}"}
@@ -621,6 +655,19 @@ mod tests {
             json!({
                 "role":"assistant",
                 "tool_calls":[{
+                    "id":"call_patch_rules",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\"src/observer/repo_rules.rs\",\"search\":\"old\",\"replace\":\"new\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_rules",
+                "content":"OK: patched 'src/observer/repo_rules.rs' (+1 lines, 3 total)"
+            }),
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
                     "id":"call_read_docs",
                     "type":"function",
                     "function":{"name":"read_file","arguments":"{\"path\":\"docs/runtime-architecture.md\"}"}
@@ -680,8 +727,81 @@ mod tests {
     }
 
     #[test]
+    fn advances_from_docs_patch_to_replay_read_before_verify() {
+        let messages = vec![
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_patch_rules",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\"src/observer/repo_rules.rs\",\"search\":\"old\",\"replace\":\"new\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_rules",
+                "content":"OK: patched 'src/observer/repo_rules.rs' (+1 lines, 3 total)"
+            }),
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_read_docs",
+                    "type":"function",
+                    "function":{"name":"read_file","arguments":"{\"path\":\"docs/runtime-architecture.md\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_read_docs",
+                "content":"[docs/runtime-architecture.md] (8 lines, 120 bytes)\n# Runtime architecture\n\n- `src/tui/events.rs`\n- `src/tui/app.rs`\n"
+            }),
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_patch_docs",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\"docs/runtime-architecture.md\",\"search\":\"- `src/tui/app.rs`\\n\",\"replace\":\"- `src/tui/app.rs`\\n- `src/tui/review_panel.rs`\\n\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_docs",
+                "content":"OK: patched 'docs/runtime-architecture.md' (+1 lines, 4 total)"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_exec".to_string(),
+            name: "exec".to_string(),
+            arguments: json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+
+        let (rewritten, _original, coerced) = coerce_existing_followup_tool_call(
+            &messages,
+            &tc,
+            "Update docs/runtime-architecture.md and .obstral/tui_replay.json to include `src/tui/review_panel.rs`.",
+        )
+        .expect("replay read followup after docs patch");
+
+        assert_eq!(rewritten.name, "read_file");
+        assert_eq!(coerced, "read_file(path=.obstral/tui_replay.json)");
+    }
+
+    #[test]
     fn allows_pending_replay_followup_patch_during_verify() {
         let messages = vec![
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_patch_rules",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\"src/observer/repo_rules.rs\",\"search\":\"old\",\"replace\":\"new\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_rules",
+                "content":"OK: patched 'src/observer/repo_rules.rs' (+1 lines, 3 total)"
+            }),
             json!({
                 "role":"assistant",
                 "tool_calls":[{
