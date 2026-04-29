@@ -54,6 +54,8 @@ OBSTRAL では、生成した milestone repo を git に含めずに、軽量な
 - `maze-game-pygame-repo` は、同じ closeout path が非 Rust repo でも動き、headless な `pygame` の verification command まで運べることを示します。
 - `resume-session-bridge-fix` は、seed された session memory と repo-local な `.obstral/progress.json` を使って既存 Rust repo の bugfix を resume し、最小の safe patch へ戻せることを示します。
 - medium+ の self-dogfood stretch case である `self-fix-observer-repo-rules-review-panel` は、いま end-to-end で green です。runtime は `src/observer/repo_rules.rs` を patch し、required な `docs/runtime-architecture.md` と `.obstral/tui_replay.json` の follow-up も運び、そのまま正確な verification command を final handoff に載せて閉じられます。
+- PR-ready self-dogfood case の `self-fix-pr-ready-runtime-followup` も end-to-end で green です。runtime は `src/tui/agent/followup_requirements.rs` を patch し、required な `docs/state-schema.md` と `.obstral/runtime_eval.json` の follow-up を運び、verified artifact path が final handoff から落ちそうな時は補完します。最新 green run は `.tmp/runtime_eval_1777229175/report.json` で、`tools=7`、`messages=22`、概算 transcript token は `3.85k` です。merge readiness は `.tmp/runtime_eval_1777229175/merge_gate.json` に出ます。
+- runtime eval closeout は `report.json` の隣に generated な `merge_gate.json` を書くようになり、`obstral merge-gate`、TUI の Merge tab、Web GUI の merge-gate panel から readiness を読み、passing case を approve し、各 case を hold し、destructive rollback を実行せずに rollback preview をコピーできます。
 - benchmark report には provider/model に加えて概算 transcript token telemetry も入るようになり、billing 精度を装わずに run 同士を比較しやすくなりました。
 
 これは「たまたま一度うまく作れた」から、「runtime が milestone case を再現し、そのやり方まで説明できる」への前進です。
@@ -66,7 +68,7 @@ OBSTRAL では、生成した milestone repo を git に含めずに、軽量な
 
 - **long-running の耐久性**: session resume はかなり良くなり、repo-local progress snapshot も入りましたが、数時間単位の仕事には context compaction、drift に応じた replan、checkpoint-aware な recovery がまだ欲しいです。
 - **benchmark の幅**: fresh repo scaffold と既存 repo bugfix は良い入口で、次は小さな web app、観測ループに入りやすい中規模 refactor、docs/config task が効きます。
-- **より高い touch の self-dogfood benchmark**: low-touch な observer self-fix path は通ったので、次は本当に `PR-ready` な change set を要求する benchmark が良いです。つまり code fix、docs owner update、replay/eval proof、そしてそれらをまとめて引用する final handoff まで含むケースです。
+- **merge-ready な self-dogfood loop**: PR-ready fixture work には branch/checkpoint safety、generated merge gate、CLI reader、TUI/GUI 共有の human review state が入りました。次に効くのは、approved gate state を replay/eval で昇格判定して PR-ready merge workflow へつなぐ段です。
 - **verification の圧力**: ひとつ test command が通るだけでも良いですが、adversarial evaluator loop、rollback/checkpoint restore、quality oriented な check を入れるとかなり強くなります。
 - **telemetry の深さ**: 今の transcript token estimate は比較には役立ちますが、provider-native な usage accounting や benchmark trend history があると最適化がもっと具体的になります。
 - **harness evolution の計測**: overlay、promotion candidate、人間ゲートつき apply flow は揃ってきたので、次は「どの promoted rule が未来の run を本当に良くしたか」を測る段です。
@@ -411,7 +413,8 @@ bash ./scripts/run-tui.sh
 
 TUI のデフォルト:
 - UI言語は英語で起動（`/lang ja|en|fr` で実行中に切り替え）。
-- 右ペインは `Chat` で開く。`Ctrl+R` または `/tab observer|chat|tasks` で切り替え。
+- 右ペインは `Chat` で開く。`Ctrl+R` または `/tab observer|chat|tasks|promotions|merge` で切り替え。
+- `Merge` tab は最新の runtime eval `merge_gate.json` を読む。`A` で passing case を approve、`H` で hold、`R` で refresh、`Ctrl+Y` で rollback preview を実行せずにコピーできる。
 - `/keys` で、各ペインが必要とする API キーの env var / CLI flag を確認できる。
 - composer で `/` を打つと、軽い slash command picker が出る。
 - exact `/provider` と `/model` では、`↑/↓` と `Enter` で選ぶ picker が開く。`/provider` は `openai` / `gemini` / `anthropic-compat` / `mistral` / `anthropic` / `hf` の vendor preset を出し、`/model` は選択中 preset に応じた代表モデルと `other` を出す。
@@ -450,6 +453,12 @@ obstral review -C .
 
 # チェックポイント以降の差分をレビュー（`obstral agent`が出すhashを指定）
 obstral review -C . --base <checkpoint_hash>
+
+# 最新 runtime eval merge gate の readiness を確認
+obstral merge-gate -C .
+obstral merge-gate -C . --json
+obstral merge-gate -C . --ci
+# 同じ gate は TUI `/tab merge`、または Web GUI Settings -> Merge gate からも review できる
 ```
 
 **Python Lite（WDAC / Rustバイナリ不可）**

@@ -122,6 +122,7 @@ fn right_tab_label(tab: RightTab) -> &'static str {
         RightTab::Chat => "chat",
         RightTab::Tasks => "tasks",
         RightTab::Promotions => "promotions",
+        RightTab::MergeGate => "merge-gate",
     }
 }
 
@@ -131,6 +132,7 @@ fn parse_right_tab(raw: &str) -> Option<RightTab> {
         "chat" => Some(RightTab::Chat),
         "tasks" | "task" => Some(RightTab::Tasks),
         "promotions" | "promotion" | "promote" => Some(RightTab::Promotions),
+        "merge-gate" | "merge_gate" | "merge" | "gate" => Some(RightTab::MergeGate),
         _ => None,
     }
 }

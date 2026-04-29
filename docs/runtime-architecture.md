@@ -62,11 +62,13 @@ Responsibilities:
 - atomic save + crash resume
 - track tool_root / checkpoint / cwd
 - (optionally) trace output
+- refuse git checkpoint commits when an eval sandbox is only a subdirectory of the real repo
 
 Current code:
 - `src/agent_session.rs` (`AgentSession`, `SessionAutoSaver`)
 - `src/project.rs` (project scan: stack/git/test_cmd)
 - `src/progress_state.rs` (`.obstral/progress.json`, repo-level objective / artifact / verification snapshot used by the progress bridge)
+- `src/tui/agent.rs::git_create_checkpoint` (checkpoint creation is limited to tool roots that are themselves the git top-level)
 
 ### 3) Task Graph
 
@@ -85,10 +87,15 @@ Responsibilities:
 - iterative model calls
 - append messages (OpenAI tool-call format)
 - execute tools and feed results back
+- carry required docs/replay/runtime-eval follow-up edits before verification
+- enrich verified final handoffs with requested artifact paths the model omitted
+- prefer the fixture/project configured verification command during automatic goal checks
 - stop conditions + goal checks
 
 Current code:
 - TUI/CLI agentic loop: `src/tui/agent.rs::run_agentic_json`
+- Required follow-up edit coercion: `src/tui/agent/followup_requirements.rs`
+- Final handoff artifact repair: `src/tui/agent/final_handoff.rs`
 - Streaming adapter: `src/streaming.rs`
 - Web longrun loop: `web/app.js::runCoderAgentic`
 
@@ -125,6 +132,7 @@ Responsibilities:
 - persist trace-derived runtime policy overlays outside the ephemeral loop
 - feed deterministic `MetaHarness` / `EvaluatorLoop` findings back into later turns
 - keep "overlay first, source-contract later" promotion boundaries explicit
+- connect green eval runs to merge-ready evidence and failed runs to rollback evidence
 
 Current code:
 - `src/tui/agent/harness_evolution.rs` (`ContractPatchProposal`, `HarnessEvolutionQueue`, runtime overlay prompt)
@@ -132,10 +140,13 @@ Current code:
 - `src/tui/agent.rs` (load/save wiring, telemetry, prompt injection)
 - `.obstral/governor_contract.overlay.json` (eval-gated promoted overlay rules)
 - `src/main.rs::run_eval` (promotion step from passing eval case to promoted overlay)
+- `src/eval_merge_gate.rs` + `.tmp/runtime_eval_*/merge_gate.json` (generated merge readiness / rollback / promoted-overlay evidence)
+- `src/main.rs::run_merge_gate` / `obstral merge-gate` (CLI reader for merge readiness, CI status, and rollback previews)
+- `src/merge_gate.rs` + `.obstral/runtime_eval.merge_gate_review.json` (human approve / hold review state layered over the latest generated merge gate)
 - `src/runtime_eval.rs` (benchmark reports now include agent config plus approximate transcript token telemetry for dogfood/example docs)
 - `src/harness_promotion.rs` + `obstral promote-harness` (reviewable promotion candidate artifact for GUI/TUI or human approval)
 - `src/harness_gate.rs` + `.obstral/governor_contract.promotion_gate.json` (human-gated approve / hold / apply-to-contract state shared by TUI and GUI)
-- `src/server.rs` + `web/app.js` + `src/tui/promotion_gate.rs` (review surfaces that consume the same board artifact and gate file)
+- `src/server.rs` + `web/app.js` + `src/tui/promotion_gate.rs` + `src/tui/merge_gate.rs` (review surfaces that consume the same board artifacts and gate files)
 
 ### 6) Tool Router
 

@@ -19,6 +19,8 @@ store state without first choosing the correct owner.
 | Project-local promoted governor overlay | `src/tui/agent/harness_evolution.rs` | cross-session | `.obstral/governor_contract.overlay.json` | eval-gated promoted harness policies, green case IDs, stable overlay defaults |
 | Project-local contract promotion candidate | `src/harness_promotion.rs` | generated artifact | `.obstral/governor_contract.promotion.json` | UI-ready candidate list, patch previews, promotion decisions for `shared/governor_contract.json` |
 | Project-local contract promotion review gate | `src/harness_gate.rs` | cross-session | `.obstral/governor_contract.promotion_gate.json` | human review decisions like approved/held/applied, GUI/TUI gate state for source-contract updates |
+| Runtime eval merge gate | `src/eval_merge_gate.rs` | generated artifact | `.tmp/runtime_eval_*/merge_gate.json` | merge readiness, rollback availability, promoted overlay paths, checkpoint status |
+| Project-local merge gate review state | `src/merge_gate.rs` | cross-session | `.obstral/runtime_eval.merge_gate_review.json` | human approve/hold decisions for latest runtime eval merge-gate cases, shared by TUI and GUI |
 | In-memory orchestration state | `src/tui/app.rs` + `src/tui/agent/task_harness.rs` + `src/tui/agent/meta_harness.rs` + `src/tui/agent/evaluator_loop.rs` | live TUI session / live coder loop | memory only | `App`, `pending_auto_fix`, `TaskHarness`, `TaskLane`, `ArtifactMode`, `MetaHarness`, `FailurePattern`, `PolicyDelta`, `EvaluatorLoop`, `EvaluatorFinding`, `PolicyPatch` |
 | Intent state | `src/tui/intent.rs` | live session, optionally persisted later | memory only today | `IntentAnchor`, `IntentUpdateKind`, normalized constraints/success criteria |
 | Replay/eval fixtures | `.obstral/*.json` + `src/runtime_eval.rs` + `src/tui_replay.rs` | versioned test input/output | repo files + `.tmp/` artifacts | runtime eval spec, TUI replay spec, reports |
@@ -288,6 +290,53 @@ Important rule:
 - this file may authorize source-contract updates, but it does not replace the candidate artifact itself
 - runtime overlays and promotion candidates should remain derivable even if this review gate is reset
 
+### 5f. Runtime eval merge gate
+
+Code:
+
+- `src/eval_merge_gate.rs`
+
+File:
+
+- `.tmp/runtime_eval_*/merge_gate.json`
+
+Owns:
+
+- whether an eval run is merge-ready from the runtime report summary
+- per-case rollback status and the checkpoint hash that would make rollback possible
+- promoted overlay artifact paths produced by passing eval cases
+- a compact machine-readable bridge from "eval passed" to "safe to promote/merge"
+
+Important rules:
+
+- this file is generated evidence, not persistent repo state
+- rollback commands are advisory and human-gated; the eval runner must not run destructive restore commands by itself
+- copied eval tool roots under `.tmp/` must not create checkpoint commits in the parent repo
+
+### 5g. Project-local merge gate review state
+
+Code:
+
+- `src/merge_gate.rs`
+- `src/tui/merge_gate.rs`
+- `src/server.rs` + `web/app.js`
+
+File:
+
+- `.obstral/runtime_eval.merge_gate_review.json`
+
+Owns:
+
+- human approve/hold decisions for cases in the latest runtime eval merge gate
+- GUI/TUI board state derived from `.tmp/runtime_eval_*/merge_gate.json`
+- rollback preview visibility without executing destructive rollback commands
+
+Important rules:
+
+- approvals are scoped to both case id and gate path so stale eval runs do not carry approval forward accidentally
+- failed cases can be held, but only passing cases can be approved
+- rollback commands stay preview/copy-only in GUI/TUI until a separate destructive rollback flow is explicitly introduced
+
 ### 6. Intent state
 
 Code:
@@ -324,6 +373,7 @@ Files:
 - `.obstral/runtime_eval.json`
 - `.obstral/tui_replay.json`
 - `.tmp/runtime_eval_*`
+- `.tmp/runtime_eval_*/merge_gate.json`
 - `.tmp/tui_replay_*`
 
 Owns:
@@ -331,6 +381,7 @@ Owns:
 - repeatable behavior probes
 - diagnostics and artifact capture
 - per-case copied worktrees for mutation-oriented eval runs
+- merge-gate reports that connect pass/fail outcomes to rollback and promotion evidence
 - quality gates for changes to agent behavior
 
 This layer should never become a substitute for runtime state. It is the place
@@ -338,6 +389,10 @@ to measure behavior, not to drive live orchestration.
 
 Runtime eval cases may seed `session.json` when a regression only appears after
 resume. Keep those seed sessions small, typed, and reviewable.
+
+Runtime eval merge gates are written next to `report.json`. They should be used
+as closeout evidence for self-dogfood changes, but they should remain disposable
+and reproducible from a fresh eval run.
 
 ## Rules for adding new state
 

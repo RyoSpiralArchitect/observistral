@@ -11,8 +11,10 @@ use crate::config::{
     RunConfig,
 };
 use crate::harness_gate::HarnessPromotionBoardStatus;
+use crate::merge_gate::MergeGateBoardStatus;
 
 use super::app::{App, Focus, Message, RightTab, Role, TaskPhase, TaskTarget};
+use super::merge_gate;
 use super::promotion_gate;
 
 // ── Brand palette (mirrors web UI) ────────────────────────────────────────────
@@ -24,6 +26,7 @@ const WARN: Color = Color::Rgb(251, 191, 36); // amber-400
 const DANGER: Color = Color::Rgb(248, 113, 113); // red-400
 const SUCCESS: Color = Color::Rgb(74, 222, 128); // green-400
 const PROMO: Color = Color::Rgb(129, 140, 248); // indigo-400
+const MERGE: Color = Color::Rgb(56, 189, 248); // sky-400
 const MUTED: Color = Color::Rgb(100, 116, 139); // slate-500
 const TEXT_BODY: Color = Color::Rgb(226, 232, 240); // slate-200
 const BG_DARK: Color = Color::Rgb(15, 23, 42); // slate-950
@@ -109,7 +112,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     String::new()
                 },
-                "TABS:[OBS] CHAT TASKS PROMO".to_string(),
+                "TABS:[OBS] CHAT TASKS REVIEW MERGE".to_string(),
                 OBS_MAG,
             ),
             RightTab::Chat => (
@@ -122,7 +125,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     String::new()
                 },
-                "TABS: OBS [CHAT] TASKS PROMO".to_string(),
+                "TABS: OBS [CHAT] TASKS REVIEW MERGE".to_string(),
                 ACCENT,
             ),
             RightTab::Tasks => (
@@ -135,7 +138,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     String::new()
                 },
-                "TABS: OBS CHAT [TASKS] PROMO".to_string(),
+                "TABS: OBS CHAT [TASKS] REVIEW MERGE".to_string(),
                 WARN,
             ),
             RightTab::Promotions => (
@@ -148,8 +151,22 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
                 "---",
                 "human-gate".to_string(),
                 String::new(),
-                "TABS: OBS CHAT TASKS [REVIEW]".to_string(),
+                "TABS: OBS CHAT TASKS [REVIEW] MERGE".to_string(),
                 PROMO,
+            ),
+            RightTab::MergeGate => (
+                "MERGE",
+                format!(
+                    "{} queued",
+                    app.merge_gate.summary.needs_review
+                        + app.merge_gate.summary.rollback_available
+                        + app.merge_gate.summary.blocked
+                ),
+                "---",
+                "human-gate".to_string(),
+                String::new(),
+                "TABS: OBS CHAT TASKS REVIEW [MERGE]".to_string(),
+                MERGE,
             ),
         };
     let key_badge = if active_key_missing(app) {
@@ -272,7 +289,7 @@ fn active_key_missing(app: &App) -> bool {
         Focus::Right => match app.right_tab {
             RightTab::Observer => &app.observer_cfg,
             RightTab::Chat => &app.chat_cfg,
-            RightTab::Tasks | RightTab::Promotions => return false,
+            RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => return false,
         },
     };
     provider_requires_key(&cfg.provider) && cfg.api_key.is_none()
@@ -327,6 +344,9 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App) {
         RightTab::Promotions => {
             render_promotions_pane(frame, right[1], app, right_focused);
         }
+        RightTab::MergeGate => {
+            render_merge_gate_pane(frame, right[1], app, right_focused);
+        }
     }
 }
 
@@ -361,6 +381,24 @@ fn render_right_tab_bar(frame: &mut Frame, area: Rect, app: &App, focused: bool)
                 "[Review]".to_string()
             },
             style_for(RightTab::Promotions, PROMO),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            if app.merge_gate.summary.needs_review
+                + app.merge_gate.summary.rollback_available
+                + app.merge_gate.summary.blocked
+                > 0
+            {
+                format!(
+                    "[Merge {}]",
+                    app.merge_gate.summary.needs_review
+                        + app.merge_gate.summary.rollback_available
+                        + app.merge_gate.summary.blocked
+                )
+            } else {
+                "[Merge]".to_string()
+            },
+            style_for(RightTab::MergeGate, MERGE),
         ),
         Span::styled("   Ctrl+R or /tab", Style::default().fg(MUTED)),
     ]);
@@ -735,6 +773,22 @@ fn promotion_status_style(status: HarnessPromotionBoardStatus, selected: bool) -
     }
 }
 
+fn merge_gate_status_style(status: MergeGateBoardStatus, selected: bool) -> Style {
+    let color = match status {
+        MergeGateBoardStatus::NeedsReview => WARN,
+        MergeGateBoardStatus::Approved => SUCCESS,
+        MergeGateBoardStatus::Held => DANGER,
+        MergeGateBoardStatus::RollbackAvailable => MERGE,
+        MergeGateBoardStatus::Blocked => MUTED,
+    };
+    let style = Style::default().fg(color);
+    if selected {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
 fn render_promotions_pane(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
     let border_style = if focused {
         Style::default().fg(PROMO)
@@ -814,6 +868,92 @@ fn render_promotions_pane(frame: &mut Frame, area: Rect, app: &App, focused: boo
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+fn render_merge_gate_pane(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
+    let border_style = if focused {
+        Style::default().fg(MERGE)
+    } else {
+        Style::default().fg(UNFOCUSED)
+    };
+    let summary = &app.merge_gate.summary;
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "MERGE GATE",
+            Style::default().fg(MERGE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  review:{} approved:{} rollback:{} blocked:{}",
+                summary.needs_review, summary.approved, summary.rollback_available, summary.blocked
+            ),
+            Style::default().fg(MUTED),
+        ),
+        Span::raw(" "),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style);
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if app.merge_gate.entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                app.merge_gate
+                    .status_message
+                    .clone()
+                    .unwrap_or_else(|| "no merge gate artifact yet".to_string())
+            ),
+            Style::default().fg(MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Run `obstral eval --spec .obstral/runtime_eval.json` to generate merge_gate.json.",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        let total = app.merge_gate.entries.len();
+        let cur = app.merge_gate_cursor.min(total.saturating_sub(1));
+        let (start, end) = merge_gate::visible_window(&app.merge_gate, cur, inner.height as usize);
+
+        for i in start..end {
+            let entry = &app.merge_gate.entries[i];
+            let selected = i == cur;
+            let prefix = if selected { ">" } else { " " };
+            let mut root = entry.root.clone();
+            if root.chars().count() > 36 {
+                root = "…".to_string()
+                    + &root
+                        .chars()
+                        .rev()
+                        .take(35)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect::<String>();
+            }
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {prefix}[{}] {:<7} {}",
+                    entry.review_badge, entry.case_status, entry.id
+                ),
+                merge_gate_status_style(entry.review_status, selected),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("   {}  {}", root, merge_gate::primary_action_hint(entry)),
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 fn key_row(key: &'static str, desc: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {key:<18}"), Style::default().fg(ACCENT)),
@@ -827,13 +967,13 @@ fn render_welcome(frame: &mut Frame, area: Rect, app: &App, view: PaneView) {
             CODER_BLUE,
             " ◈ CODER",
             "Describe the coding task, then press Enter.",
-            "Chat lives on the right pane by default. Use Ctrl+R or /tab observer|chat|tasks|promotions.",
+            "Chat lives on the right pane by default. Use Ctrl+R or /tab observer|chat|tasks|promotions|merge.",
             &app.coder_cfg,
             "Coder defaults to a coding-first mode in the TUI.",
             [
                 "1) Run /keys if your provider needs an API key",
                 "2) Type the task here and press Enter",
-                "3) Use Ctrl+R for Chat / Observer / Tasks / Review",
+                "3) Use Ctrl+R for Chat / Observer / Tasks / Review / Merge",
             ],
         ),
         PaneView::Observer => (
@@ -859,7 +999,7 @@ fn render_welcome(frame: &mut Frame, area: Rect, app: &App, view: PaneView) {
             [
                 "1) Use Chat for brainstorming or clarification",
                 "2) Move to Coder when you want execution",
-                "3) Use /tab observer|tasks|promotions to inspect the runtime",
+                "3) Use /tab observer|tasks|promotions|merge to inspect the runtime",
             ],
         ),
     };
@@ -1691,6 +1831,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
             RightTab::Chat => ("CHAT", ACCENT, app.chat.streaming, false),
             RightTab::Tasks => ("TASKS", WARN, false, true),
             RightTab::Promotions => ("REVIEW", PROMO, false, true),
+            RightTab::MergeGate => ("MERGE", MERGE, false, true),
         },
     };
 
@@ -1707,6 +1848,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         match app.right_tab {
             RightTab::Tasks => "Enter=dispatch  Space=done  Ctrl+R=tab",
             RightTab::Promotions => "Enter=primary  A=approve  H=hold  P=apply  R=refresh",
+            RightTab::MergeGate => "Enter=approve  A=approve  H=hold  R=refresh  Ctrl+Y=copy",
             RightTab::Observer | RightTab::Chat => "Ctrl+R=tab",
         }
     } else if active_picker.is_some() {
@@ -1840,6 +1982,73 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                     )));
                 }
             }
+            RightTab::MergeGate => {
+                if app.merge_gate.entries.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  {}",
+                            app.merge_gate
+                                .status_message
+                                .clone()
+                                .unwrap_or_else(|| "no merge gate artifact yet".to_string())
+                        ),
+                        Style::default().fg(MUTED),
+                    )));
+                } else {
+                    let idx = app
+                        .merge_gate_cursor
+                        .min(app.merge_gate.entries.len().saturating_sub(1));
+                    let entry = &app.merge_gate.entries[idx];
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", entry.id),
+                        Style::default().fg(TEXT_BODY).add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  case:{}  review:{}  root:{}",
+                            entry.case_status, entry.review_badge, entry.root
+                        ),
+                        Style::default().fg(MUTED),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        format!("  primary:{}", merge_gate::primary_action_hint(entry)),
+                        Style::default().fg(MUTED),
+                    )));
+                    if let Some(status) = app.merge_gate_status.as_deref() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  note: {status}"),
+                            Style::default().fg(ACCENT),
+                        )));
+                    }
+                    if let Some(path) = entry.promoted_overlay_path.as_deref() {
+                        lines.push(Line::default());
+                        lines.push(Line::from(Span::styled(
+                            format!("  overlay: {path}"),
+                            Style::default().fg(MUTED),
+                        )));
+                    }
+                    if let Some(command) = entry.rollback_command.as_deref() {
+                        lines.push(Line::default());
+                        lines.push(Line::from(Span::styled(
+                            "  rollback preview (not executed):",
+                            Style::default().fg(WARN),
+                        )));
+                        lines.push(Line::from(Span::styled(
+                            format!("  {command}"),
+                            Style::default().fg(TEXT_BODY),
+                        )));
+                    }
+                    lines.push(Line::default());
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  keys: enter=approve  a=approve ({})  h=hold ({})  r=refresh  ctrl+y=copy preview",
+                            if entry.can_approve { "ready" } else { "locked" },
+                            if entry.can_hold { "ready" } else { "locked" }
+                        ),
+                        Style::default().fg(MUTED),
+                    )));
+                }
+            }
             RightTab::Observer | RightTab::Chat => {}
         }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -1889,7 +2098,7 @@ fn current_input_text(app: &App) -> String {
         Focus::Right => match app.right_tab {
             RightTab::Observer => app.observer.textarea.lines().join("\n"),
             RightTab::Chat => app.chat.textarea.lines().join("\n"),
-            RightTab::Tasks | RightTab::Promotions => String::new(),
+            RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => String::new(),
         },
     }
 }
@@ -2005,7 +2214,7 @@ fn render_active_textarea(frame: &mut Frame, area: Rect, app: &App) {
         Focus::Right => match app.right_tab {
             RightTab::Observer => frame.render_widget(&app.observer.textarea, area),
             RightTab::Chat => frame.render_widget(&app.chat.textarea, area),
-            RightTab::Tasks | RightTab::Promotions => {}
+            RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => {}
         },
     }
 }
@@ -2016,7 +2225,7 @@ fn active_pane(app: &App) -> &super::app::Pane {
         Focus::Right => match app.right_tab {
             RightTab::Observer => &app.observer,
             RightTab::Chat => &app.chat,
-            RightTab::Tasks | RightTab::Promotions => &app.observer,
+            RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => &app.observer,
         },
     }
 }
@@ -2027,7 +2236,7 @@ fn active_run_config(app: &App) -> &crate::config::RunConfig {
         Focus::Right => match app.right_tab {
             RightTab::Observer => &app.observer_cfg,
             RightTab::Chat => &app.chat_cfg,
-            RightTab::Tasks | RightTab::Promotions => &app.observer_cfg,
+            RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => &app.observer_cfg,
         },
     }
 }
@@ -2038,7 +2247,7 @@ fn input_placeholder(app: &App) -> &'static str {
         Focus::Right => match app.right_tab {
             RightTab::Observer => "Ask for critique, diagnosis, or /meta-diagnose…",
             RightTab::Chat => "Ask a question or brainstorm…",
-            RightTab::Tasks | RightTab::Promotions => "",
+            RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => "",
         },
     }
 }
@@ -2051,6 +2260,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             RightTab::Chat => "Chat",
             RightTab::Tasks => "Tasks",
             RightTab::Promotions => "Promotions",
+            RightTab::MergeGate => "Merge Gate",
         },
     };
     let line = Line::from(vec![

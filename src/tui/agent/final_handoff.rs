@@ -1,0 +1,242 @@
+use serde_json::Value;
+use std::collections::BTreeSet;
+
+pub(super) fn enrich_text_final_handoff(
+    content: &str,
+    root_user_text: &str,
+    messages: &[Value],
+    test_cmd: Option<&str>,
+) -> Option<String> {
+    if !content.trim_start().starts_with("[DONE]") {
+        return None;
+    }
+    if !root_user_text
+        .to_ascii_lowercase()
+        .contains("final answer must include")
+    {
+        return None;
+    }
+
+    let mutated = successful_mutation_paths(messages);
+    let mut missing_paths = path_literals_in_text(root_user_text)
+        .into_iter()
+        .filter(|path| mutated.contains(path))
+        .filter(|path| !content.contains(path))
+        .collect::<Vec<_>>();
+    missing_paths.sort();
+    missing_paths.dedup();
+
+    let mut enriched = content.to_string();
+    if !missing_paths.is_empty() {
+        enriched.push_str("\n\nArtifacts:\n");
+        for path in missing_paths {
+            enriched.push_str("- `");
+            enriched.push_str(path.as_str());
+            enriched.push_str("`\n");
+        }
+    }
+
+    if let Some(cmd) = test_cmd
+        .map(str::trim)
+        .filter(|cmd| !cmd.is_empty())
+        .filter(|_cmd| {
+            root_user_text
+                .to_ascii_lowercase()
+                .contains("verification command")
+        })
+        .filter(|cmd| !content.contains(cmd))
+        .filter(|_cmd| successful_auto_test_seen(messages))
+    {
+        enriched.push_str("\nVerification:\n- `");
+        enriched.push_str(cmd);
+        enriched.push_str("`\n");
+    }
+
+    (enriched != content).then_some(enriched)
+}
+
+fn successful_mutation_paths(messages: &[Value]) -> BTreeSet<String> {
+    let mut pending = std::collections::BTreeMap::new();
+    let mut out = BTreeSet::new();
+
+    for msg in messages {
+        match msg.get("role").and_then(|v| v.as_str()).unwrap_or("") {
+            "assistant" => {
+                let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for tc in tool_calls {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let name = tc
+                        .get("function")
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if id.is_empty() || !matches!(name, "patch_file" | "write_file") {
+                        continue;
+                    }
+                    let Some(path) = tc
+                        .get("function")
+                        .and_then(|v| v.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .and_then(|value| {
+                            value
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                    else {
+                        continue;
+                    };
+                    pending.insert(id.to_string(), path);
+                }
+            }
+            "tool" => {
+                let tool_call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let Some(path) = pending.remove(tool_call_id) else {
+                    continue;
+                };
+                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if content.starts_with("OK:") {
+                    out.insert(path);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn successful_auto_test_seen(messages: &[Value]) -> bool {
+    messages.iter().any(|msg| {
+        msg.get("role").and_then(|v| v.as_str()) == Some("tool")
+            && msg
+                .get("content")
+                .and_then(|v| v.as_str())
+                .is_some_and(|content| content.contains("[auto-test] ✓ PASSED"))
+    })
+}
+
+fn path_literals_in_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in text.split_whitespace() {
+        let trimmed = token
+            .trim_matches(|c: char| {
+                (c.is_ascii_punctuation() && !matches!(c, '.' | '/' | '\\' | '_' | '-'))
+                    || matches!(
+                        c,
+                        '「' | '」'
+                            | '『'
+                            | '』'
+                            | '（'
+                            | '）'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '`'
+                            | '"'
+                            | '\''
+                    )
+            })
+            .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'))
+            .trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '「' | '」'
+                        | '『'
+                        | '』'
+                        | '（'
+                        | '）'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '`'
+                        | '"'
+                        | '\''
+                )
+            });
+        let has_path_sep = trimmed.contains('/') || trimmed.contains('\\');
+        let has_extension = trimmed
+            .split('/')
+            .next_back()
+            .is_some_and(|segment| segment.contains('.'));
+        if (has_path_sep || has_extension) && !trimmed.is_empty() {
+            let literal = trimmed.replace('\\', "/");
+            if !out.contains(&literal) {
+                out.push(literal);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enrich_text_final_handoff;
+    use serde_json::json;
+
+    #[test]
+    fn enriches_done_with_missing_successful_mutation_path() {
+        let messages = vec![
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_patch_src",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\"src/tui/agent/followup_requirements.rs\",\"search\":\"old\",\"replace\":\"new\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_src",
+                "content":"OK: patched 'src/tui/agent/followup_requirements.rs' (+1 lines, 25 total)"
+            }),
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_patch_eval",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\".obstral/runtime_eval.json\",\"search\":\"old\",\"replace\":\"new\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_eval",
+                "content":"OK: patched '.obstral/runtime_eval.json' (+1 lines, 14 total)\n[auto-test] ✓ PASSED (exit 0)"
+            }),
+        ];
+        let root = "Final answer must include `src/tui/agent/followup_requirements.rs`, `.obstral/runtime_eval.json`, and the verification command.";
+        let content = "[DONE]\nUpdated `src/tui/agent/followup_requirements.rs`.";
+
+        let enriched =
+            enrich_text_final_handoff(content, root, &messages, Some("cargo test -q demo 2>&1"))
+                .expect("enriched final");
+
+        assert!(enriched.contains(".obstral/runtime_eval.json"));
+        assert!(enriched.contains("cargo test -q demo 2>&1"));
+    }
+
+    #[test]
+    fn ignores_non_done_text() {
+        let enriched = enrich_text_final_handoff(
+            "still working",
+            "Final answer must include `src/lib.rs`.",
+            &[],
+            None,
+        );
+        assert!(enriched.is_none());
+    }
+}

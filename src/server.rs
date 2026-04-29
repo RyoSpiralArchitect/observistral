@@ -431,6 +431,13 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<()>
         ("POST", "/api/stat_path") => api_stat_path(&mut stream, state, &req.body).await,
         ("POST", "/api/rollback") => api_rollback(&mut stream, state, &req.body).await,
         ("GET", "/api/governor_contract") => api_governor_contract(&mut stream, state).await,
+        ("GET", "/api/merge_gate") => api_merge_gate(&mut stream, state).await,
+        ("POST", "/api/merge_gate/approve") => {
+            api_merge_gate_approve(&mut stream, state, &req.body).await
+        }
+        ("POST", "/api/merge_gate/hold") => {
+            api_merge_gate_hold(&mut stream, state, &req.body).await
+        }
         ("GET", "/api/harness_promotions") => api_harness_promotions(&mut stream, state).await,
         ("POST", "/api/harness_promotions/approve") => {
             api_harness_promotions_approve(&mut stream, state, &req.body).await
@@ -1547,6 +1554,92 @@ async fn api_harness_promotions(stream: &mut TcpStream, state: AppState) -> Resu
                 stream,
                 500,
                 "Internal Server Error",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn api_merge_gate(stream: &mut TcpStream, state: AppState) -> Result<()> {
+    match crate::merge_gate::load_board(&state.workspace_root) {
+        Ok(board) => write_json(stream, 200, "OK", &board).await,
+        Err(e) => {
+            write_json(
+                stream,
+                500,
+                "Internal Server Error",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn api_merge_gate_approve(
+    stream: &mut TcpStream,
+    state: AppState,
+    body: &[u8],
+) -> Result<()> {
+    api_merge_gate_action(stream, state, body, crate::merge_gate::approve).await
+}
+
+async fn api_merge_gate_hold(stream: &mut TcpStream, state: AppState, body: &[u8]) -> Result<()> {
+    api_merge_gate_action(stream, state, body, crate::merge_gate::hold).await
+}
+
+async fn api_merge_gate_action(
+    stream: &mut TcpStream,
+    state: AppState,
+    body: &[u8],
+    action: fn(
+        &std::path::Path,
+        &str,
+    ) -> anyhow::Result<crate::merge_gate::MergeGateActionResponse>,
+) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Req {
+        id: String,
+    }
+
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                "Bad Request",
+                &ApiError {
+                    error: e.to_string(),
+                },
+            )
+            .await;
+        }
+    };
+    let id = req.id.trim();
+    if id.is_empty() {
+        return write_json(
+            stream,
+            400,
+            "Bad Request",
+            &ApiError {
+                error: "id is required".into(),
+            },
+        )
+        .await;
+    }
+
+    match action(&state.workspace_root, id) {
+        Ok(response) => write_json(stream, 200, "OK", &response).await,
+        Err(e) => {
+            write_json(
+                stream,
+                400,
+                "Bad Request",
                 &ApiError {
                     error: e.to_string(),
                 },

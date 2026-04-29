@@ -2,6 +2,7 @@ mod agent_session;
 mod approvals;
 mod chatbot;
 mod config;
+mod eval_merge_gate;
 mod exec;
 mod file_tools;
 mod governor_contract;
@@ -9,6 +10,7 @@ mod harness_gate;
 mod harness_promotion;
 mod lang_detect;
 mod loop_detect;
+mod merge_gate;
 mod modes;
 mod observer;
 mod pending_commands;
@@ -75,6 +77,9 @@ enum Command {
 
     /// Run a fixture-driven runtime evaluation suite against the headless Coder
     Eval(EvalArgs),
+
+    /// Inspect the latest runtime eval merge gate and rollback preview
+    MergeGate(MergeGateArgs),
 
     /// Replay a deterministic TUI stuck-case and inspect Observer suggestion plumbing
     TuiReplay(TuiReplayArgs),
@@ -287,6 +292,29 @@ struct EvalArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+struct MergeGateArgs {
+    /// Directory to inspect (defaults to current directory)
+    #[arg(long, short = 'C', alias = "root")]
+    tool_root: Option<String>,
+
+    /// Explicit merge_gate.json path (defaults to latest .tmp/runtime_eval_*/merge_gate.json)
+    #[arg(long)]
+    gate: Option<PathBuf>,
+
+    /// Runtime eval report.json path; merge_gate.json is resolved next to it
+    #[arg(long)]
+    report: Option<PathBuf>,
+
+    /// Emit machine-readable JSON instead of plain text
+    #[arg(long)]
+    json: bool,
+
+    /// Exit non-zero unless the merge gate is ready and no rollback is required
+    #[arg(long)]
+    ci: bool,
+}
+
+#[derive(Args, Debug, Clone)]
 struct TuiReplayArgs {
     /// Directory to replay against (defaults to current directory)
     #[arg(long, short = 'C', alias = "root")]
@@ -379,6 +407,10 @@ const INVENTORY_CLI_COMMANDS: &[(&str, &str)] = &[
     ("chat", "one-shot chat prompt"),
     ("agent", "headless coding agent loop"),
     ("eval", "fixture-driven runtime eval harness"),
+    (
+        "merge-gate",
+        "inspect runtime eval merge readiness and rollback preview",
+    ),
     ("tui-replay", "deterministic TUI stuck-case replay"),
     ("inventory", "repo/runtime manifest and parity surfaces"),
     (
@@ -570,6 +602,7 @@ async fn main() -> Result<()> {
         Some(Command::Chat { prompt }) => run_chat(prompt, cli.common).await,
         Some(Command::Agent(args)) => run_agent(args, cli.common).await,
         Some(Command::Eval(args)) => run_eval(args, cli.common).await,
+        Some(Command::MergeGate(args)) => run_merge_gate(args).await,
         Some(Command::TuiReplay(args)) => tui_replay::run(args, cli.common).await,
         Some(Command::Inventory(args)) => run_inventory(args).await,
         Some(Command::PromoteHarness(args)) => run_promote_harness(args).await,
@@ -742,6 +775,110 @@ async fn run_promote_harness(args: PromoteHarnessArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_merge_gate(args: MergeGateArgs) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let root = args
+        .tool_root
+        .clone()
+        .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+    let root =
+        normalize_tool_root(Some(root)).unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+    let root_path = PathBuf::from(&root);
+    let gate_path = resolve_merge_gate_path(&args, &cwd, &root_path)?;
+    let gate = crate::eval_merge_gate::load_merge_gate_report(&gate_path)?;
+    let view = crate::eval_merge_gate::build_merge_gate_view(&gate, &gate_path);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&view)
+                .context("failed to serialize merge gate view json")?
+        );
+    } else {
+        print_merge_gate_view(&view);
+    }
+
+    if args.ci && !view.ci_ok {
+        anyhow::bail!(
+            "merge gate is not ready: status={} failed_cases={} rollback_required={}",
+            view.status,
+            view.failed_cases,
+            view.rollback_required
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_merge_gate_path(args: &MergeGateArgs, cwd: &Path, root: &Path) -> Result<PathBuf> {
+    if args.gate.is_some() && args.report.is_some() {
+        anyhow::bail!("use either --gate or --report, not both");
+    }
+
+    if let Some(path) = args.gate.clone() {
+        return Ok(resolve_promote_path(
+            path,
+            cwd,
+            Some(root.to_string_lossy().as_ref()),
+        ));
+    }
+
+    if let Some(path) = args.report.clone() {
+        let report_path = resolve_promote_path(path, cwd, Some(root.to_string_lossy().as_ref()));
+        return Ok(crate::eval_merge_gate::default_path_for_report(
+            &report_path,
+        ));
+    }
+
+    crate::eval_merge_gate::latest_path_for_root(root).with_context(|| {
+        format!(
+            "no merge_gate.json found under {}/.tmp/runtime_eval_*; run `obstral eval -C {} --spec .obstral/runtime_eval.json` first or pass --gate",
+            root.display(),
+            root.display()
+        )
+    })
+}
+
+fn print_merge_gate_view(view: &crate::eval_merge_gate::EvalMergeGateView) {
+    println!("merge gate: {}", view.status);
+    println!("gate: {}", view.gate_path);
+    println!("report: {}", view.report_path);
+    println!(
+        "summary: cases={} passed={} failed={} rollback_required={} promoted_overlays={}",
+        view.total_cases,
+        view.passed_cases,
+        view.failed_cases,
+        view.rollback_required,
+        view.promoted_overlay_count
+    );
+    println!("ci: {}", if view.ci_ok { "pass" } else { "fail" });
+
+    if !view.cases.is_empty() {
+        println!("cases:");
+        for case in &view.cases {
+            println!(
+                "- {} [{}] rollback={}",
+                case.id,
+                case.status,
+                case.rollback_status.label()
+            );
+            if let Some(path) = case.promoted_overlay_path.as_deref() {
+                println!("  promoted_overlay: {path}");
+            }
+            if let Some(command) = case.rollback_command.as_deref() {
+                println!("  rollback_preview: {command}");
+            }
+        }
+    }
+
+    if !view.recommended_actions.is_empty() {
+        println!("recommended:");
+        for action in &view.recommended_actions {
+            println!("- {action}");
+        }
+    }
 }
 
 fn enforce_inventory_ci(args: &InventoryArgs, value: &serde_json::Value) -> Result<()> {
@@ -3320,6 +3457,8 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
     );
 
     let mut reports: Vec<crate::runtime_eval::RuntimeEvalCaseReport> = Vec::new();
+    let mut promoted_overlays: std::collections::BTreeMap<String, std::path::PathBuf> =
+        std::collections::BTreeMap::new();
     for (idx, case) in selected.iter().enumerate() {
         let case_dir = out_dir.join(format!(
             "{:03}-{}",
@@ -3410,6 +3549,7 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
                     case.id,
                     path.display()
                 );
+                promoted_overlays.insert(case.id.clone(), path);
             }
         }
         let report = crate::runtime_eval::evaluate_case(
@@ -3449,12 +3589,23 @@ async fn run_eval(args: EvalArgs, common: CommonArgs) -> Result<()> {
 
     let report = crate::runtime_eval::build_report(spec_path.clone(), out_dir.clone(), reports);
     crate::runtime_eval::save_report(&report_path, &report)?;
+    let merge_gate_path = crate::eval_merge_gate::default_path_for_report(&report_path);
+    let merge_gate =
+        crate::eval_merge_gate::build_merge_gate_report(&report, &report_path, &promoted_overlays);
+    crate::eval_merge_gate::save_merge_gate_report(&merge_gate_path, &merge_gate)?;
 
     eprintln!(
         "[eval] summary: {}/{} passed, report={}",
         report.summary.passed,
         report.summary.total,
         report_path.display()
+    );
+    eprintln!(
+        "[eval] merge gate: ready={} rollback_required={} promoted_overlays={} path={}",
+        merge_gate.merge_ready,
+        merge_gate.rollback_required,
+        merge_gate.promoted_overlay_count,
+        merge_gate_path.display()
     );
 
     if report.summary.failed > 0 {
@@ -3541,7 +3692,9 @@ fn read_stdin_to_string() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_promote_path, CliProviderPreset, CommonArgs};
+    use super::{
+        resolve_merge_gate_path, resolve_promote_path, CliProviderPreset, CommonArgs, MergeGateArgs,
+    };
     use crate::config::ProviderKind;
     use std::path::{Path, PathBuf};
 
@@ -3592,6 +3745,43 @@ mod tests {
             resolved,
             Path::new(&root).join(".obstral/governor_contract.promotion.json")
         );
+    }
+
+    #[test]
+    fn resolve_merge_gate_path_derives_from_report_path() {
+        let cwd = temp_dir();
+        let root = cwd.join("tool_root");
+        let report = root.join(".tmp/runtime_eval_1/report.json");
+        std::fs::create_dir_all(report.parent().unwrap()).expect("create report parent");
+        std::fs::write(&report, b"{}").expect("write report");
+        let args = MergeGateArgs {
+            tool_root: Some(root.to_string_lossy().to_string()),
+            gate: None,
+            report: Some(PathBuf::from(".tmp/runtime_eval_1/report.json")),
+            json: false,
+            ci: false,
+        };
+
+        let resolved = resolve_merge_gate_path(&args, &cwd, &root).expect("resolve gate");
+
+        assert_eq!(resolved, root.join(".tmp/runtime_eval_1/merge_gate.json"));
+    }
+
+    #[test]
+    fn resolve_merge_gate_path_rejects_gate_and_report_together() {
+        let cwd = temp_dir();
+        let root = cwd.join("tool_root");
+        let args = MergeGateArgs {
+            tool_root: Some(root.to_string_lossy().to_string()),
+            gate: Some(PathBuf::from("merge_gate.json")),
+            report: Some(PathBuf::from("report.json")),
+            json: false,
+            ci: false,
+        };
+
+        let err = resolve_merge_gate_path(&args, &cwd, &root).expect_err("reject both");
+
+        assert!(err.to_string().contains("either --gate or --report"));
     }
 
     #[test]

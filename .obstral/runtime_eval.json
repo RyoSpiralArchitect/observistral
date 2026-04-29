@@ -206,6 +206,24 @@
       ]
     },
     {
+      "id": "self-fix-pr-ready-runtime-followup",
+      "tool_root": "tests/fixtures/runtime-self-fix-pr-ready",
+      "copy_tool_root": true,
+      "max_iters": 18,
+      "tags": ["action", "fix", "rust", "self", "runtime-eval", "pr-ready"],
+      "prompt": "Fix the existing TUI agent follow-up requirement module so `src/tui/agent/session_bridge.rs` is treated as PR-ready runtime-sensitive, using the smallest safe code change. Because PR-ready runtime paths are documented and benchmarked in this repo, update `docs/state-schema.md` and `.obstral/runtime_eval.json` to match. Run `cargo test -q tui::agent::followup_requirements::tests:: 2>&1 && bash scripts/pr-ready-smoke.sh` before you finish. Final answer must include the changed Rust file path, the docs file path, the runtime eval spec path, and the verification command.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "tool_call_seen", "name": "patch_file" },
+        { "kind": "assistant_contains", "value": "src/tui/agent/followup_requirements.rs" },
+        { "kind": "assistant_contains", "value": "docs/state-schema.md" },
+        { "kind": "assistant_contains", "value": ".obstral/runtime_eval.json" },
+        { "kind": "assistant_contains", "value": "cargo test -q tui::agent::followup_requirements::tests:: 2>&1 && bash scripts/pr-ready-smoke.sh" }
+      ]
+    },
+    {
       "id": "maze-game-rust-repo",
       "tool_root": "tests/fixtures/runtime-maze-game",
       "copy_tool_root": true,

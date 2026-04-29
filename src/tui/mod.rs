@@ -2,6 +2,7 @@ pub mod agent;
 pub mod app;
 pub mod events;
 pub mod intent;
+pub mod merge_gate;
 pub mod prefs;
 pub mod promotion_gate;
 pub mod suggestion;
@@ -264,6 +265,9 @@ Tip: you can still use Anthropic/HF for other panes via `--observer-provider` / 
     }
     if let Err(err) = promotion_gate::refresh_promotions(&mut app) {
         app.harness_promotions_status = Some(format!("promotions refresh failed: {err:#}"));
+    }
+    if let Err(err) = merge_gate::refresh_merge_gate(&mut app) {
+        app.merge_gate_status = Some(format!("merge gate refresh failed: {err:#}"));
     }
     let result = events::run_event_loop(&mut app, &mut terminal).await;
 

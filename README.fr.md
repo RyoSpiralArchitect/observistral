@@ -54,6 +54,8 @@ Le milestone actuel est simple mais important : OBSTRAL peut maintenant couvrir 
 - `maze-game-pygame-repo` montre que le meme chemin de closeout fonctionne aussi pour un repo non Rust, y compris avec une verification `pygame` headless.
 - `resume-session-bridge-fix` montre que le runtime peut reprendre un bugfix Rust dans un repo existant en combinant une memoire de session seedee et une memoire repo-locale `.obstral/progress.json`, puis pousser l'agent vers le plus petit patch sur.
 - Le stretch case medium+ de self-dogfood `self-fix-observer-repo-rules-review-panel` passe maintenant end-to-end : le runtime patche `src/observer/repo_rules.rs`, porte les follow-ups requis sur `docs/runtime-architecture.md` et `.obstral/tui_replay.json`, puis conclut avec la commande exacte de verification reussie dans le handoff final.
+- Le cas self-dogfood PR-ready `self-fix-pr-ready-runtime-followup` passe aussi end-to-end : le runtime patche `src/tui/agent/followup_requirements.rs`, porte les follow-ups requis sur `docs/state-schema.md` et `.obstral/runtime_eval.json`, puis repare le handoff final si un chemin d'artefact verifie risque d'etre omis. Dernier run vert : `.tmp/runtime_eval_1777229175/report.json` (`tools=7`, `messages=22`, environ `3.85k` tokens transcript), avec la readiness merge dans `.tmp/runtime_eval_1777229175/merge_gate.json`.
+- Le closeout `runtime_eval` ecrit maintenant un `merge_gate.json` genere a cote de `report.json`; `obstral merge-gate`, l'onglet Merge du TUI et le panneau merge-gate de la Web GUI peuvent lire la readiness, approuver les cas passants, mettre des cas en attente, et copier les previews rollback sans executer de rollback destructif.
 - Les rapports de benchmark portent maintenant le provider/modele ainsi qu'une telemetrie approximative des tokens du transcript, ce qui aide a comparer les runs sans pretendre fournir une facturation exacte.
 
 L'interet est la : on passe de « l'agent a produit un truc sympa une fois » a « le runtime peut reproduire un cas milestone et expliquer comment ».
@@ -66,7 +68,7 @@ La suite utile consiste moins a produire de plus jolies demos qu'a rendre le run
 
 - **Robustesse long-running** : la reprise de session est deja bien meilleure, et les snapshots repo-locaux de progression sont en place, mais le vrai travail sur plusieurs heures veut encore une compaction de contexte plus forte, des replans plus agressifs en cas de drift, et une recovery mieux branchee sur les checkpoints.
 - **Benchmarks plus varies** : les scaffolds de repo frais plus un bugfix sur repo existant sont un bon debut ; les prochains cas utiles sont de petites applis web, des refactors moyens, et des taches docs/config ou le bon niveau de verification est plus subtil.
-- **Benchmarks self-dogfood plus exigeants** : le chemin observer self-fix low-touch passe maintenant ; l'etape utile suivante est donc un benchmark qui exige un vrai change set `PR-ready` : fix code, mise a jour de docs owner, preuve replay/eval, puis handoff final qui cite le tout ensemble.
+- **Boucles self-dogfood merge-ready** : le travail PR-ready en fixture a maintenant une securite branch/checkpoint, un merge gate genere, un reader CLI, et un etat de revue humain partage TUI/GUI. La prochaine etape utile est de promouvoir l'etat approuve via replay/eval vers un workflow de merge PR-ready.
 - **Verification plus dure** : un test qui passe, c'est bien ; des boucles evaluateur adversarial, du rollback/checkpoint restore, et des checks orientes qualite releveraient nettement le niveau minimal.
 - **Telemetrie plus riche** : les estimations de tokens du transcript sont utiles pour comparer, mais une mesure provider-native et un historique d'evolution des benchmarks rendraient l'optimisation bien plus concrete.
 - **Evolution du harness mesuree** : overlay, candidate de promotion, et apply avec gate humain existent deja ; l'etape suivante est de mesurer quelles regles promues ameliorent vraiment les runs futurs et lesquelles ne font qu'alourdir le prompt.
@@ -411,7 +413,8 @@ bash ./scripts/run-tui.sh
 
 Comportement par defaut du TUI :
 - La langue de l'UI demarre en anglais (`/lang ja|en|fr` pour changer en cours de session).
-- Le panneau de droite s'ouvre sur `Chat`; utilisez `Ctrl+R` ou `/tab observer|chat|tasks` pour changer d'onglet.
+- Le panneau de droite s'ouvre sur `Chat`; utilisez `Ctrl+R` ou `/tab observer|chat|tasks|promotions|merge` pour changer d'onglet.
+- L'onglet `Merge` lit le dernier `merge_gate.json` de runtime eval ; `A` approuve un cas passant, `H` met un cas en attente, `R` rafraichit, et `Ctrl+Y` copie la preview rollback sans l'executer.
 - Lancez `/keys` pour voir quelle variable d'environnement ou option CLI chaque panneau attend pour la cle API.
 - Taper `/` dans le composeur affiche un petit picker de commandes slash.
 - Taper exactement `/provider` ou `/model` ouvre un picker au clavier (`↑/↓`, `Enter`). `/provider` propose des presets fournisseur (`openai`, `gemini`, `anthropic-compat`, `mistral`, `anthropic`, `hf`) et `/model` suit le preset courant, avec `other` pour une saisie manuelle.
@@ -434,6 +437,12 @@ obstral agent -C . --vibe --session
 
 # artefacts (trace JSONL + snapshot JSON final + graphe d'execution)
 obstral agent "fix the failing test" -C . --vibe --trace-out .tmp/obstral_trace.jsonl --json-out .tmp/obstral_final.json --graph-out .tmp/obstral_graph.json
+
+# lire la readiness du dernier runtime eval merge gate
+obstral merge-gate -C .
+obstral merge-gate -C . --json
+obstral merge-gate -C . --ci
+# la meme gate est visible dans le TUI `/tab merge`, ou dans Web GUI Settings -> Merge gate
 ```
 
 **Python Lite (WDAC / pas de binaire Rust)**

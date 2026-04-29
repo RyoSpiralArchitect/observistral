@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "paths": [
+    "src/tui/agent/task_harness.rs",
+    "src/tui/agent/done_gate.rs"
+  ],
+  "cases": [
+    {
+      "id": "self-fix-task-harness-anchor",
+      "prompt": "Fix the task harness anchor with docs and runtime eval proof."
+    }
+  ]
+}

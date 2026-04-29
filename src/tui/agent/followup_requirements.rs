@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 enum FollowupKind {
     Docs,
     TuiReplay,
+    RuntimeEval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +86,26 @@ pub(super) fn matches_required_existing_followup(
     }
 }
 
+pub(super) fn required_existing_followup_no_tool_hint(
+    messages: &[Value],
+    root_user_text: &str,
+) -> Option<String> {
+    let reads = successful_read_contents(messages);
+    let mutations = successful_literal_mutations(messages);
+    let requirement = next_followup_requirement(messages, root_user_text, &reads, &mutations)?;
+    let action = if reads.contains_key(requirement.file_path.as_str()) {
+        format!("patch_file(path={})", requirement.file_path)
+    } else {
+        format!("read_file(path={})", requirement.file_path)
+    };
+    Some(format!(
+        "Required follow-up edit is still pending for `{}`.\n\
+Next assistant turn must call `{}` before verification or done.\n\
+Do not run goal checks or finish until this follow-up path contains `{}`.",
+        requirement.file_path, action, requirement.missing_literal
+    ))
+}
+
 fn next_followup_requirement(
     messages: &[Value],
     root_user_text: &str,
@@ -93,6 +114,7 @@ fn next_followup_requirement(
 ) -> Option<FollowupRequirement> {
     let docs_path = docs_followup_path(root_user_text);
     let tui_replay_path = tui_replay_followup_path(root_user_text);
+    let runtime_eval_path = runtime_eval_followup_path(root_user_text);
     let mut pending = Vec::new();
     let prompt_missing_literal = target_src_literal(root_user_text);
 
@@ -121,11 +143,26 @@ fn next_followup_requirement(
                 },
             );
         }
+        if let (Some(file_path), Some(missing_literal)) =
+            (runtime_eval_path.as_ref(), prompt_missing_literal.as_ref())
+        {
+            push_unique_requirement(
+                &mut pending,
+                FollowupRequirement {
+                    file_path: file_path.clone(),
+                    missing_literal: missing_literal.clone(),
+                    kind: FollowupKind::RuntimeEval,
+                },
+            );
+        }
     }
 
-    for pending_requirement in
-        missing_followup_requirements(messages, docs_path.clone(), tui_replay_path.clone())
-    {
+    for pending_requirement in missing_followup_requirements(
+        messages,
+        docs_path.clone(),
+        tui_replay_path.clone(),
+        runtime_eval_path.clone(),
+    ) {
         push_unique_requirement(&mut pending, pending_requirement);
     }
 
@@ -156,6 +193,9 @@ fn synthesize_followup_patch(
         }
         FollowupKind::TuiReplay => {
             transform_tui_replay_followup(body, requirement.missing_literal.as_str())
+        }
+        FollowupKind::RuntimeEval => {
+            transform_runtime_eval_followup(body, requirement.missing_literal.as_str())
         }
     }?;
     Some(ToolCallData {
@@ -191,6 +231,14 @@ fn transform_markdown_followup(body: &str, missing_literal: &str) -> Option<Stri
 }
 
 fn transform_tui_replay_followup(body: &str, missing_literal: &str) -> Option<String> {
+    transform_json_paths_followup(body, missing_literal)
+}
+
+fn transform_runtime_eval_followup(body: &str, missing_literal: &str) -> Option<String> {
+    transform_json_paths_followup(body, missing_literal)
+}
+
+fn transform_json_paths_followup(body: &str, missing_literal: &str) -> Option<String> {
     let mut value = serde_json::from_str::<Value>(body).ok()?;
     let paths = value.get_mut("paths")?.as_array_mut()?;
     if paths
@@ -221,6 +269,14 @@ fn tui_replay_followup_path(root_user_text: &str) -> Option<String> {
         })
 }
 
+fn runtime_eval_followup_path(root_user_text: &str) -> Option<String> {
+    path_literals_in_text(root_user_text)
+        .into_iter()
+        .find(|path| {
+            path.ends_with(".obstral/runtime_eval.json") || path.ends_with("runtime_eval.json")
+        })
+}
+
 fn target_src_literal(root_user_text: &str) -> Option<String> {
     path_literals_in_text(root_user_text)
         .into_iter()
@@ -246,6 +302,7 @@ fn missing_followup_requirements(
     messages: &[Value],
     docs_path: Option<String>,
     tui_replay_path: Option<String>,
+    runtime_eval_path: Option<String>,
 ) -> Vec<FollowupRequirement> {
     let mut pending = Vec::new();
     for msg in messages.iter().rev() {
@@ -271,6 +328,16 @@ fn missing_followup_requirements(
                         file_path: file_path.clone(),
                         missing_literal: missing_literal.trim().to_string(),
                         kind: FollowupKind::TuiReplay,
+                    });
+                }
+            } else if let Some(missing_literal) =
+                trimmed.strip_prefix("missing runtime eval follow-up for ")
+            {
+                if let Some(file_path) = runtime_eval_path.as_ref() {
+                    pending.push(FollowupRequirement {
+                        file_path: file_path.clone(),
+                        missing_literal: missing_literal.trim().to_string(),
+                        kind: FollowupKind::RuntimeEval,
                     });
                 }
             }
@@ -486,7 +553,10 @@ fn path_literals_in_text(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{coerce_existing_followup_tool_call, matches_required_existing_followup};
+    use super::{
+        coerce_existing_followup_tool_call, matches_required_existing_followup,
+        required_existing_followup_no_tool_hint,
+    };
     use crate::streaming::ToolCallData;
     use serde_json::json;
 
@@ -554,6 +624,114 @@ mod tests {
             .contains("\"path\":\".obstral/tui_replay.json\""));
         assert!(rewritten.arguments.contains("src/tui/review_panel.rs"));
         assert!(coerced.starts_with("patch_file("));
+    }
+
+    #[test]
+    fn coerces_missing_runtime_eval_followup_to_read_spec_first() {
+        let messages = vec![json!({
+            "role": "tool",
+            "content": "[auto-test] ✗ FAILED (exit 1)\nmissing runtime eval follow-up for src/tui/agent/session_bridge.rs"
+        })];
+        let tc = ToolCallData {
+            id: "call_search".to_string(),
+            name: "search_files".to_string(),
+            arguments: json!({"pattern":"session_bridge"}).to_string(),
+        };
+
+        let (rewritten, _original, coerced) = coerce_existing_followup_tool_call(
+            &messages,
+            &tc,
+            "Update docs/state-schema.md and .obstral/runtime_eval.json to include `src/tui/agent/session_bridge.rs`.",
+        )
+        .expect("runtime eval followup coercion");
+
+        assert_eq!(rewritten.name, "read_file");
+        assert_eq!(coerced, "read_file(path=.obstral/runtime_eval.json)");
+    }
+
+    #[test]
+    fn coerces_missing_runtime_eval_followup_to_patch_after_read() {
+        let messages = vec![
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_read_eval",
+                    "type":"function",
+                    "function":{"name":"read_file","arguments":"{\"path\":\".obstral/runtime_eval.json\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_read_eval",
+                "content":"[.obstral/runtime_eval.json] (6 lines, 80 bytes)\n{\n  \"version\": 1,\n  \"paths\": [\n    \"src/tui/agent/task_harness.rs\"\n  ]\n}\n"
+            }),
+            json!({
+                "role":"tool",
+                "content":"[auto-test] ✗ FAILED (exit 1)\nmissing runtime eval follow-up for src/tui/agent/session_bridge.rs"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_exec".to_string(),
+            name: "exec".to_string(),
+            arguments: json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+
+        let (rewritten, _original, coerced) = coerce_existing_followup_tool_call(
+            &messages,
+            &tc,
+            "Update .obstral/runtime_eval.json to include `src/tui/agent/session_bridge.rs`.",
+        )
+        .expect("runtime eval patch followup");
+
+        assert_eq!(rewritten.name, "patch_file");
+        assert!(rewritten
+            .arguments
+            .contains("\"path\":\".obstral/runtime_eval.json\""));
+        assert!(rewritten
+            .arguments
+            .contains("src/tui/agent/session_bridge.rs"));
+        assert!(coerced.starts_with("patch_file("));
+    }
+
+    #[test]
+    fn no_tool_hint_blocks_done_when_runtime_eval_followup_was_only_read() {
+        let messages = vec![
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_patch_src",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\"src/tui/agent/followup_requirements.rs\",\"search\":\"old\",\"replace\":\"src/tui/agent/session_bridge.rs\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_src",
+                "content":"OK: patched 'src/tui/agent/followup_requirements.rs' (+1 lines, 25 total)"
+            }),
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_read_eval",
+                    "type":"function",
+                    "function":{"name":"read_file","arguments":"{\"path\":\".obstral/runtime_eval.json\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_read_eval",
+                "content":"[.obstral/runtime_eval.json] (6 lines, 80 bytes)\n{\n  \"version\": 1,\n  \"paths\": [\n    \"src/tui/agent/task_harness.rs\"\n  ]\n}\n"
+            }),
+        ];
+
+        let hint = required_existing_followup_no_tool_hint(
+            &messages,
+            "Update .obstral/runtime_eval.json to include `src/tui/agent/session_bridge.rs`.",
+        )
+        .expect("pending hint");
+
+        assert!(hint.contains("patch_file(path=.obstral/runtime_eval.json)"));
+        assert!(hint.contains("src/tui/agent/session_bridge.rs"));
     }
 
     #[test]

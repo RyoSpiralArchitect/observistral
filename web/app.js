@@ -68,11 +68,14 @@
       openRuntimeApprovals: "Open runtime approvals",
       harnessReviews: "Harness reviews",
       openHarnessReviews: "Open harness reviews",
+      mergeGateReviews: "Merge gate",
+      openMergeGateReviews: "Open merge gate",
       approve: "Approve",
       hold: "Hold",
       applyToContract: "Apply to contract",
       harnessPromotions: "Harness promotions",
       harnessReviewHint: "Eval-green policy promotions waiting for a human decision before they reach shared/governor_contract.json.",
+      mergeGateHint: "Runtime eval merge readiness with human approve/hold decisions and rollback previews. Rollback commands are never executed from this panel.",
       runtimeApprovalHint: "Pending edits and commands that need a human decision before execution can continue.",
       greenCases: "green case(s)",
       nothingPending: "Nothing pending.",
@@ -81,7 +84,12 @@
       applied: "applied",
       upToDate: "up to date",
       blocked: "blocked",
+      rollbackAvailable: "rollback available",
+      rollbackPreview: "rollback preview",
+      passed: "passed",
+      failed: "failed",
       promotionNone: "No promotion candidates yet.",
+      mergeGateNone: "No merge gate artifact yet.",
       reject: "Reject",
       send: "Send",
       stop: "Stop",
@@ -300,11 +308,14 @@
       openRuntimeApprovals: "ランタイム承認を開く",
       harnessReviews: "ハーネスレビュー",
       openHarnessReviews: "ハーネスレビューを開く",
+      mergeGateReviews: "マージゲート",
+      openMergeGateReviews: "マージゲートを開く",
       approve: "承認",
       hold: "保留",
       applyToContract: "contractへ反映",
       harnessPromotions: "ハーネス昇格候補",
       harnessReviewHint: "eval を通った policy 昇格候補を、人間の判断で shared/governor_contract.json に上げるための受け皿です。",
+      mergeGateHint: "runtime eval の merge 判定を、人間の approve / hold と rollback preview で確認します。この画面から rollback は実行しません。",
       runtimeApprovalHint: "実行継続の前に人間判断が必要な edits / commands をまとめています。",
       greenCases: "green case",
       nothingPending: "保留中の項目はありません。",
@@ -313,7 +324,12 @@
       applied: "反映済み",
       upToDate: "最新",
       blocked: "ブロック中",
+      rollbackAvailable: "rollback可能",
+      rollbackPreview: "rollback preview",
+      passed: "passed",
+      failed: "failed",
       promotionNone: "昇格候補はまだありません。",
+      mergeGateNone: "merge gate artifact はまだありません。",
       reject: "却下",
       metaDiagnose: "メタ診断",
       metaBadge: "META",
@@ -387,11 +403,14 @@
       openRuntimeApprovals: "Ouvrir les approbations runtime",
       harnessReviews: "Revues du harnais",
       openHarnessReviews: "Ouvrir les revues du harnais",
+      mergeGateReviews: "Gate de merge",
+      openMergeGateReviews: "Ouvrir la gate de merge",
       approve: "Approuver",
       hold: "Mettre en attente",
       applyToContract: "Appliquer au contrat",
       harnessPromotions: "Promotions du harnais",
       harnessReviewHint: "Promotions de policy passées au vert par l'eval et en attente d'une décision humaine avant d'atteindre shared/governor_contract.json.",
+      mergeGateHint: "État de merge des evals runtime avec décisions humaines approve/hold et aperçu rollback. Les commandes rollback ne sont jamais exécutées depuis ce panneau.",
       runtimeApprovalHint: "Éditions et commandes qui demandent une décision humaine avant la reprise de l'exécution.",
       greenCases: "cas verts",
       nothingPending: "Rien en attente.",
@@ -400,7 +419,12 @@
       applied: "appliqué",
       upToDate: "à jour",
       blocked: "bloqué",
+      rollbackAvailable: "rollback disponible",
+      rollbackPreview: "aperçu rollback",
+      passed: "passé",
+      failed: "échoué",
       promotionNone: "Aucun candidat de promotion pour le moment.",
+      mergeGateNone: "Aucun artifact merge gate pour le moment.",
       reject: "Rejeter",
       send: "Envoyer",
       stop: "Stop",
@@ -3761,6 +3785,9 @@
     const [harnessPromotions, setHarnessPromotions] = useState(null);
     const [promotionBusy, setPromotionBusy] = useState(false);
     const [promotionGateError, setPromotionGateError] = useState("");
+    const [mergeGate, setMergeGate] = useState(null);
+    const [mergeGateBusy, setMergeGateBusy] = useState(false);
+    const [mergeGateError, setMergeGateError] = useState("");
     const [metaBusy, setMetaBusy] = useState(false);
     const [observerSubTab, setObserverSubTab] = useState("analysis"); // "analysis" | "chat" | "meta"
     const [metaArtifacts, setMetaArtifacts] = useState([]);
@@ -3783,6 +3810,7 @@
     const projectScanRootRef = useRef("");
     const settingsPanelRef = useRef(null);
     const promotionsPanelRef = useRef(null);
+    const mergeGatePanelRef = useRef(null);
     const runtimeApprovalsRef = useRef(null);
     const [gitCheckpoint, setGitCheckpoint] = useState(null);
 
@@ -4124,10 +4152,12 @@
       refreshPendingEdits();
       refreshPendingCommands();
       refreshHarnessPromotions();
+      refreshMergeGate();
       const t = setInterval(() => {
         refreshPendingEdits();
         refreshPendingCommands();
         refreshHarnessPromotions();
+        refreshMergeGate();
       }, 3000);
       return () => clearInterval(t);
     }, []);
@@ -4229,11 +4259,28 @@
         });
     };
 
+    const refreshMergeGate = () => {
+      fetch("/api/merge_gate")
+        .then((r) => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+        .then((j) => {
+          setMergeGate(j && typeof j === "object" ? j : null);
+          setMergeGateError("");
+        })
+        .catch((err) => {
+          setMergeGateError(String((err && err.message) || err || ""));
+        });
+    };
+
     const promotionReviewCount = harnessPromotions && harnessPromotions.summary
       ? Number(harnessPromotions.summary.needs_review || 0)
       : 0;
     const promotionInboxCount = harnessPromotions && harnessPromotions.summary
       ? Number(harnessPromotions.summary.needs_review || 0) + Number(harnessPromotions.summary.approved || 0)
+      : 0;
+    const mergeGateActionCount = mergeGate && mergeGate.summary
+      ? Number(mergeGate.summary.needs_review || 0)
+        + Number(mergeGate.summary.rollback_available || 0)
+        + Number(mergeGate.summary.blocked || 0)
       : 0;
     const isPendingApprovalItem = (item) => String((item && item.status) || "").trim() === "pending";
     const pendingEditCount = Array.isArray(pendingEdits)
@@ -4257,6 +4304,7 @@
     };
 
     const jumpToHarnessReviews = () => scrollToPanel(promotionsPanelRef, settingsPanelRef);
+    const jumpToMergeGateReviews = () => scrollToPanel(mergeGatePanelRef, settingsPanelRef);
     const jumpToRuntimeApprovals = () => scrollToPanel(runtimeApprovalsRef, settingsPanelRef);
 
     useEffect(() => {
@@ -4349,6 +4397,31 @@
       } finally {
         setPromotionBusy(false);
         refreshHarnessPromotions();
+      }
+    };
+
+    const resolveMergeGate = async (id, action) => {
+      const gid = String(id || "").trim();
+      const act = String(action || "").trim().toLowerCase();
+      if (!gid || !act || mergeGateBusy) return;
+      const endpoint = act === "approve"
+        ? "/api/merge_gate/approve"
+        : act === "hold"
+        ? "/api/merge_gate/hold"
+        : "";
+      if (!endpoint) return;
+      setMergeGateBusy(true);
+      try {
+        const resp = await postJson(endpoint, { id: gid });
+        if (resp && resp.board) {
+          setMergeGate(resp.board);
+          setMergeGateError("");
+        }
+      } catch (err) {
+        setMergeGateError(String((err && err.message) || err || ""));
+      } finally {
+        setMergeGateBusy(false);
+        refreshMergeGate();
       }
     };
 
@@ -10102,6 +10175,45 @@ state: ${agentState}`);
         .filter((group) => group.entries.length > 0);
     })();
 
+    const mergeGateStatusLabel = (status) => {
+      const s = String(status || "").trim();
+      if (s === "needs_review") return tr(lang, "needsReview");
+      if (s === "approved") return tr(lang, "approved");
+      if (s === "held") return tr(lang, "held");
+      if (s === "rollback_available") return tr(lang, "rollbackAvailable");
+      if (s === "blocked") return tr(lang, "blocked");
+      if (s === "passed") return tr(lang, "passed");
+      if (s === "failed") return tr(lang, "failed");
+      return s || tr(lang, "mergeGateNone");
+    };
+
+    const mergeGateStatusKey = (entry) => {
+      const raw = String((entry && (entry.review_badge || entry.review_status)) || "").trim();
+      if (
+        raw === "needs_review"
+        || raw === "approved"
+        || raw === "held"
+        || raw === "rollback_available"
+        || raw === "blocked"
+      ) {
+        return raw;
+      }
+      return "blocked";
+    };
+
+    const groupedMergeGate = (() => {
+      const source = mergeGate && Array.isArray(mergeGate.entries) ? mergeGate.entries : [];
+      const order = ["needs_review", "rollback_available", "blocked", "approved", "held"];
+      const buckets = new Map(order.map((status) => [status, []]));
+      source.forEach((entry) => {
+        const status = mergeGateStatusKey(entry);
+        buckets.get(status).push(entry);
+      });
+      return order
+        .map((status) => ({ status, entries: buckets.get(status) || [] }))
+        .filter((group) => group.entries.length > 0);
+    })();
+
     const renderPromotionCard = (entry) => {
       const status = promotionStatusKey(entry);
       return e(
@@ -10180,6 +10292,77 @@ state: ${agentState}`);
           : null,
         entry.patch_path
           ? e("pre", { className: "review-card-path" }, String(entry.patch_path || ""))
+          : null
+      );
+    };
+
+    const renderMergeGateCard = (entry) => {
+      const status = mergeGateStatusKey(entry);
+      return e(
+        "div",
+        {
+          key: String(entry.id || `${status}-${entry.root || ""}`),
+          className: `review-card ${status}`,
+        },
+        e(
+          "div",
+          { className: "review-card-head" },
+          e(
+            "div",
+            { className: "review-card-copy" },
+            e("div", { className: "review-card-title" }, String(entry.id || "")),
+            e(
+              "div",
+              { className: "review-card-meta" },
+              e("span", { className: "pill" }, mergeGateStatusLabel(status)),
+              e("span", { className: "pill" }, mergeGateStatusLabel(entry.case_status)),
+              entry.promoted_overlay_path
+                ? e("span", { className: "pill" }, "overlay")
+                : null
+            ),
+            entry.root ? e("div", { className: "panel-subtitle" }, String(entry.root || "")) : null
+          ),
+          e(
+            "div",
+            { className: "review-card-actions" },
+            entry.can_approve
+              ? e(
+                  "button",
+                  {
+                    className: "btn btn-primary",
+                    type: "button",
+                    disabled: mergeGateBusy,
+                    onClick: () => resolveMergeGate(entry.id, "approve"),
+                  },
+                  tr(lang, "approve")
+                )
+              : null,
+            entry.can_hold
+              ? e(
+                  "button",
+                  {
+                    className: "btn btn-warn",
+                    type: "button",
+                    disabled: mergeGateBusy,
+                    onClick: () => resolveMergeGate(entry.id, "hold"),
+                  },
+                  tr(lang, "hold")
+                )
+              : null
+          )
+        ),
+        entry.rollback_command
+          ? e(
+              "div",
+              { className: "review-card-reasons" },
+              e("div", { className: "review-card-reason" }, tr(lang, "rollbackPreview") + " (not executed)")
+            )
+          : null,
+        entry.rollback_command
+          ? e("pre", { className: "review-card-path" }, String(entry.rollback_command || ""))
+          : null,
+        entry.promoted_overlay_path
+          ? e("pre", { className: "review-card-path" }, String(entry.promoted_overlay_path || ""))
           : null
       );
     };
@@ -10302,6 +10485,18 @@ state: ${agentState}`);
                     title: tr(lang, "openHarnessReviews"),
                   },
                   `${tr(lang, "harnessReviews")} ${promotionInboxCount}`
+                )
+              : null,
+            mergeGateActionCount
+              ? e(
+                  "button",
+                  {
+                    className: "btn btn-review approval-jump",
+                    onClick: jumpToMergeGateReviews,
+                    type: "button",
+                    title: tr(lang, "openMergeGateReviews"),
+                  },
+                  `${tr(lang, "mergeGateReviews")} ${mergeGateActionCount}`
                 )
               : null,
             runtimeApprovalCount
@@ -10504,6 +10699,79 @@ state: ${agentState}`);
                     )
                   )
                 : e("div", { className: "hint" }, tr(lang, "promotionNone"))
+            )
+          ),
+          e(
+            "div",
+            { className: "panel panel-review", ref: mergeGatePanelRef },
+            e(
+              "div",
+              { className: "panel-header" },
+              e(
+                "div",
+                { className: "panel-header-copy" },
+                e("h2", null, tr(lang, "mergeGateReviews")),
+                e("p", { className: "panel-subtitle" }, tr(lang, "mergeGateHint"))
+              ),
+              e(
+                "div",
+                { className: "review-summary" },
+                mergeGate && mergeGate.summary
+                  ? e("span", { className: "pill" }, `${tr(lang, "needsReview")}: ${Number(mergeGate.summary.needs_review || 0)}`)
+                  : null,
+                mergeGate && mergeGate.summary
+                  ? e("span", { className: "pill" }, `${tr(lang, "approved")}: ${Number(mergeGate.summary.approved || 0)}`)
+                  : null,
+                mergeGate && mergeGate.summary
+                  ? e("span", { className: "pill" }, `${tr(lang, "rollbackAvailable")}: ${Number(mergeGate.summary.rollback_available || 0)}`)
+                  : null,
+                mergeGate && mergeGate.summary
+                  ? e("span", { className: "pill" }, `${tr(lang, "blocked")}: ${Number(mergeGate.summary.blocked || 0)}`)
+                  : null,
+                e(
+                  "button",
+                  {
+                    className: "btn",
+                    type: "button",
+                    disabled: mergeGateBusy,
+                    onClick: refreshMergeGate,
+                  },
+                  tr(lang, "refresh")
+                )
+              )
+            ),
+            e(
+              "div",
+              { className: "panel-body" },
+              mergeGateError
+                ? e("div", { className: "hint", style: { color: "var(--warn)" } }, mergeGateError)
+                : null,
+              mergeGate && mergeGate.status_message
+                ? e("div", { className: "hint" }, String(mergeGate.status_message))
+                : null,
+              groupedMergeGate.length
+                ? e(
+                    "div",
+                    { className: "review-groups" },
+                    groupedMergeGate.map((group) =>
+                      e(
+                        "div",
+                        { key: group.status, className: "review-group" },
+                        e(
+                          "div",
+                          { className: "review-group-header" },
+                          e("div", { className: "review-group-title" }, mergeGateStatusLabel(group.status)),
+                          e("div", { className: "review-group-count" }, `${group.entries.length} / ${Number((mergeGate && mergeGate.summary && mergeGate.summary.total) || 0)}`)
+                        ),
+                        e(
+                          "div",
+                          { className: "review-card-list" },
+                          group.entries.map((entry) => renderMergeGateCard(entry))
+                        )
+                      )
+                    )
+                  )
+                : e("div", { className: "hint" }, tr(lang, "mergeGateNone"))
             )
           ),
           e(

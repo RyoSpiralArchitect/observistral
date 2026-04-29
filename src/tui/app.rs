@@ -3,6 +3,7 @@ use tui_textarea::TextArea;
 
 use crate::config::RunConfig;
 use crate::harness_gate::HarnessPromotionBoard;
+use crate::merge_gate::MergeGateBoard;
 use crate::streaming::{GovernorState, RealizeState};
 
 use super::agent::RealizePreset;
@@ -21,6 +22,7 @@ pub enum RightTab {
     Chat,
     Tasks,
     Promotions,
+    MergeGate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +252,9 @@ pub struct App {
     pub harness_promotions: HarnessPromotionBoard,
     pub harness_promotions_cursor: usize,
     pub harness_promotions_status: Option<String>,
+    pub merge_gate: MergeGateBoard,
+    pub merge_gate_cursor: usize,
+    pub merge_gate_status: Option<String>,
 }
 
 impl App {
@@ -321,6 +326,9 @@ impl App {
             harness_promotions: HarnessPromotionBoard::default(),
             harness_promotions_cursor: 0,
             harness_promotions_status: None,
+            merge_gate: MergeGateBoard::default(),
+            merge_gate_cursor: 0,
+            merge_gate_status: None,
         }
     }
 
@@ -331,7 +339,7 @@ impl App {
                 RightTab::Observer => &mut self.observer,
                 RightTab::Chat => &mut self.chat,
                 // Tasks tab is read-only; fall back to Observer for generic actions (copy, clear, etc.).
-                RightTab::Tasks | RightTab::Promotions => &mut self.observer,
+                RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => &mut self.observer,
             },
         }
     }
@@ -348,7 +356,8 @@ impl App {
             RightTab::Observer => RightTab::Chat,
             RightTab::Chat => RightTab::Tasks,
             RightTab::Tasks => RightTab::Promotions,
-            RightTab::Promotions => RightTab::Observer,
+            RightTab::Promotions => RightTab::MergeGate,
+            RightTab::MergeGate => RightTab::Observer,
         };
     }
 

@@ -20,6 +20,7 @@ use crate::types::{ChatMessage, ChatRequest};
 use super::agent;
 use super::app::{App, Focus, Message, RightTab, Role, Task, TaskPhase, TaskTarget};
 use super::intent;
+use super::merge_gate;
 use super::prefs;
 use super::promotion_gate;
 use super::suggestion;
@@ -173,6 +174,7 @@ fn right_tab_label(tab: RightTab) -> &'static str {
         RightTab::Chat => "chat",
         RightTab::Tasks => "tasks",
         RightTab::Promotions => "promotions",
+        RightTab::MergeGate => "merge-gate",
     }
 }
 
@@ -188,7 +190,7 @@ fn focused_pane_id(app: &App) -> PaneId {
         Focus::Right => match app.right_tab {
             RightTab::Observer => PaneId::Observer,
             RightTab::Chat => PaneId::Chat,
-            RightTab::Tasks | RightTab::Promotions => PaneId::Observer,
+            RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => PaneId::Observer,
         },
     }
 }
@@ -691,7 +693,7 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
         "/tab" => {
             if arg.is_empty() {
                 push!(format!(
-                    "right tab: {}  (usage: /tab <observer|chat|tasks|promotions|next>)",
+                    "right tab: {}  (usage: /tab <observer|chat|tasks|promotions|merge|next>)",
                     right_tab_label(app.right_tab)
                 ));
             } else {
@@ -700,12 +702,13 @@ fn handle_slash_command(text: &str, app: &mut App, pane: PaneId) -> bool {
                     "chat" => Some(RightTab::Chat),
                     "tasks" | "task" => Some(RightTab::Tasks),
                     "promotions" | "promotion" | "promote" => Some(RightTab::Promotions),
+                    "merge-gate" | "merge_gate" | "merge" | "gate" => Some(RightTab::MergeGate),
                     "next" => {
                         app.cycle_right_tab();
                         None
                     }
                     _ => {
-                        push!("usage: /tab <observer|chat|tasks|promotions|next>".to_string());
+                        push!("usage: /tab <observer|chat|tasks|promotions|merge|next>".to_string());
                         return true;
                     }
                 };
@@ -974,7 +977,7 @@ test_cmd: {test_cmd}
 /mode <name>        set mode\n\
 /temp <0.0-2.0>     set temperature\n\
 /lang <ja|en|fr>    set UI + prompt language\n\
-/tab <name>         switch right pane (observer|chat|tasks|promotions|next)\n\
+/tab <name>         switch right pane (observer|chat|tasks|promotions|merge|next)\n\
 /keys               show API key status and setup help\n\
 /model              exact `/model` opens vendor-aware model picker\n\
 /realize <mode>     set coder latent-plan mode (off|low|mid|high)\n\
@@ -1110,7 +1113,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     //   row 0-1    → header (2 rows)
     //   row 2..h-5 → body panes
     //   row h-5..h-1 → input + footer
-    // Horizontal: left 55 % = Coder, right 45 % = Right tab (Observer/Chat/Tasks/Promotions).
+    // Horizontal: left 55 % = Coder, right 45 % = Right tab.
     let coder_w = (term_w as u32 * 55 / 100) as u16;
     let body_start: u16 = 2;
     let body_end: u16 = term_h.saturating_sub(5);
@@ -1131,6 +1134,9 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                     RightTab::Promotions => {
                         app.harness_promotions_cursor =
                             app.harness_promotions_cursor.saturating_sub(1)
+                    }
+                    RightTab::MergeGate => {
+                        app.merge_gate_cursor = app.merge_gate_cursor.saturating_sub(1)
                     }
                 }
             }
@@ -1156,6 +1162,12 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                                 .min(app.harness_promotions.entries.len().saturating_sub(1));
                         }
                     }
+                    RightTab::MergeGate => {
+                        if !app.merge_gate.entries.is_empty() {
+                            app.merge_gate_cursor = (app.merge_gate_cursor + 1)
+                                .min(app.merge_gate.entries.len().saturating_sub(1));
+                        }
+                    }
                 }
             }
         }
@@ -1171,15 +1183,17 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 if mouse.column >= coder_w && mouse.row == body_start {
                     let right_width = term_w.saturating_sub(coder_w).max(1);
                     let rel = mouse.column.saturating_sub(coder_w);
-                    let quarter = (right_width / 4).max(1);
-                    app.right_tab = if rel < quarter {
+                    let fifth = (right_width / 5).max(1);
+                    app.right_tab = if rel < fifth {
                         RightTab::Observer
-                    } else if rel < quarter.saturating_mul(2) {
+                    } else if rel < fifth.saturating_mul(2) {
                         RightTab::Chat
-                    } else if rel < quarter.saturating_mul(3) {
+                    } else if rel < fifth.saturating_mul(3) {
                         RightTab::Tasks
-                    } else {
+                    } else if rel < fifth.saturating_mul(4) {
                         RightTab::Promotions
+                    } else {
+                        RightTab::MergeGate
                     };
                     let _ = save_current_tui_prefs(app);
                 } else if mouse.column >= coder_w && app.right_tab == RightTab::Promotions {
@@ -1199,13 +1213,24 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                             row_offset,
                         );
                     }
+                } else if mouse.column >= coder_w && app.right_tab == RightTab::MergeGate {
+                    let gate_block_top = body_start.saturating_add(1);
+                    let gate_inner_top = gate_block_top.saturating_add(1);
+                    let gate_inner_height =
+                        body_end.saturating_sub(gate_block_top).saturating_sub(2) as usize;
+                    if mouse.row >= gate_inner_top
+                        && ((mouse.row - gate_inner_top) as usize) < gate_inner_height
+                    {
+                        let row_offset = mouse.row.saturating_sub(gate_inner_top) as usize;
+                        let _ = merge_gate::select_visible_row(app, gate_inner_height, row_offset);
+                    }
                 }
                 match app.focus {
                     Focus::Coder => app.coder.welcome_dismissed = true,
                     Focus::Right => match app.right_tab {
                         RightTab::Observer => app.observer.welcome_dismissed = true,
                         RightTab::Chat => app.chat.welcome_dismissed = true,
-                        RightTab::Tasks | RightTab::Promotions => {}
+                        RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => {}
                     },
                 }
             } else if mouse.row >= input_start {
@@ -1219,7 +1244,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                     Focus::Right => match app.right_tab {
                         RightTab::Observer => app.observer.welcome_dismissed = true,
                         RightTab::Chat => app.chat.welcome_dismissed = true,
-                        RightTab::Tasks | RightTab::Promotions => {}
+                        RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => {}
                     },
                 }
             }
@@ -1257,7 +1282,7 @@ async fn handle_key(
         // Switch focus
         KeyCode::Tab => app.toggle_focus(),
 
-        // Cycle right-side tab (Observer/Chat/Tasks/Promotions)
+        // Cycle right-side tab (Observer/Chat/Tasks/Promotions/Merge)
         KeyCode::Char('r') if ctrl => {
             app.cycle_right_tab();
             let _ = save_current_tui_prefs(app);
@@ -1279,6 +1304,21 @@ async fn handle_key(
                 }
             }
         }
+        KeyCode::Char('y')
+            if ctrl && app.focus == Focus::Right && app.right_tab == RightTab::MergeGate =>
+        {
+            if let Some(text) = merge_gate::selected_entry_clipboard_text(app) {
+                if copy_to_clipboard(&text) {
+                    app.merge_gate_status =
+                        Some("merge gate summary copied to clipboard".to_string());
+                } else {
+                    app.merge_gate_status = Some(
+                        "clipboard copy failed (macOS: pbcopy / Linux: wl-copy|xclip|xsel)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         KeyCode::Char('y') if ctrl => {
             let content = {
                 let pane = match app.focus {
@@ -1286,7 +1326,9 @@ async fn handle_key(
                     Focus::Right => match app.right_tab {
                         RightTab::Observer => &app.observer,
                         RightTab::Chat => &app.chat,
-                        RightTab::Tasks | RightTab::Promotions => &app.observer,
+                        RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => {
+                            &app.observer
+                        }
                     },
                 };
                 pane.messages
@@ -1324,6 +1366,11 @@ async fn handle_key(
             if ctrl && app.focus == Focus::Right && app.right_tab == RightTab::Promotions =>
         {
             app.harness_promotions_status = None;
+        }
+        KeyCode::Char('l')
+            if ctrl && app.focus == Focus::Right && app.right_tab == RightTab::MergeGate =>
+        {
+            app.merge_gate_status = None;
         }
         KeyCode::Char('l') if ctrl => {
             let pane = app.focused_pane_mut();
@@ -1369,6 +1416,8 @@ async fn handle_key(
                 app.tasks_cursor = app.tasks_cursor.saturating_sub(5);
             } else if app.focus == Focus::Right && app.right_tab == RightTab::Promotions {
                 app.harness_promotions_cursor = app.harness_promotions_cursor.saturating_sub(5);
+            } else if app.focus == Focus::Right && app.right_tab == RightTab::MergeGate {
+                app.merge_gate_cursor = app.merge_gate_cursor.saturating_sub(5);
             } else {
                 app.focused_pane_mut().scroll = app.focused_pane_mut().scroll.saturating_add(5);
             }
@@ -1384,6 +1433,11 @@ async fn handle_key(
                     app.harness_promotions_cursor = (app.harness_promotions_cursor + 5)
                         .min(app.harness_promotions.entries.len().saturating_sub(1));
                 }
+            } else if app.focus == Focus::Right && app.right_tab == RightTab::MergeGate {
+                if !app.merge_gate.entries.is_empty() {
+                    app.merge_gate_cursor = (app.merge_gate_cursor + 5)
+                        .min(app.merge_gate.entries.len().saturating_sub(1));
+                }
             } else {
                 app.focused_pane_mut().scroll = app.focused_pane_mut().scroll.saturating_sub(5);
             }
@@ -1393,6 +1447,8 @@ async fn handle_key(
                 app.tasks_cursor = 0;
             } else if app.focus == Focus::Right && app.right_tab == RightTab::Promotions {
                 app.harness_promotions_cursor = 0;
+            } else if app.focus == Focus::Right && app.right_tab == RightTab::MergeGate {
+                app.merge_gate_cursor = 0;
             } else {
                 app.focused_pane_mut().scroll = usize::MAX; // jump to very top
             }
@@ -1406,6 +1462,10 @@ async fn handle_key(
                 if !app.harness_promotions.entries.is_empty() {
                     app.harness_promotions_cursor =
                         app.harness_promotions.entries.len().saturating_sub(1);
+                }
+            } else if app.focus == Focus::Right && app.right_tab == RightTab::MergeGate {
+                if !app.merge_gate.entries.is_empty() {
+                    app.merge_gate_cursor = app.merge_gate.entries.len().saturating_sub(1);
                 }
             } else {
                 app.focused_pane_mut().scroll = 0; // re-pin to bottom
@@ -1430,6 +1490,15 @@ async fn handle_key(
             if !app.harness_promotions.entries.is_empty() {
                 app.harness_promotions_cursor = (app.harness_promotions_cursor + 1)
                     .min(app.harness_promotions.entries.len().saturating_sub(1));
+            }
+        }
+        KeyCode::Up if app.focus == Focus::Right && app.right_tab == RightTab::MergeGate => {
+            app.merge_gate_cursor = app.merge_gate_cursor.saturating_sub(1);
+        }
+        KeyCode::Down if app.focus == Focus::Right && app.right_tab == RightTab::MergeGate => {
+            if !app.merge_gate.entries.is_empty() {
+                app.merge_gate_cursor =
+                    (app.merge_gate_cursor + 1).min(app.merge_gate.entries.len().saturating_sub(1));
             }
         }
         KeyCode::Char(' ') if app.focus == Focus::Right && app.right_tab == RightTab::Tasks => {
@@ -1473,6 +1542,27 @@ async fn handle_key(
             };
             app.harness_promotions_status = Some(msg);
         }
+        KeyCode::Char('a') if app.focus == Focus::Right && app.right_tab == RightTab::MergeGate => {
+            let msg = match merge_gate::approve_selected(app) {
+                Ok(msg) => msg,
+                Err(err) => format!("merge gate approve failed: {err:#}"),
+            };
+            app.merge_gate_status = Some(msg);
+        }
+        KeyCode::Char('h') if app.focus == Focus::Right && app.right_tab == RightTab::MergeGate => {
+            let msg = match merge_gate::hold_selected(app) {
+                Ok(msg) => msg,
+                Err(err) => format!("merge gate hold failed: {err:#}"),
+            };
+            app.merge_gate_status = Some(msg);
+        }
+        KeyCode::Char('r') if app.focus == Focus::Right && app.right_tab == RightTab::MergeGate => {
+            let msg = match merge_gate::refresh_merge_gate(app) {
+                Ok(msg) => msg,
+                Err(err) => format!("merge gate refresh failed: {err:#}"),
+            };
+            app.merge_gate_status = Some(msg);
+        }
 
         // Send message
         KeyCode::Enter if !shift && apply_inline_picker(app, active_pane) => {}
@@ -1489,6 +1579,13 @@ async fn handle_key(
                     };
                     app.harness_promotions_status = Some(msg);
                 }
+                RightTab::MergeGate => {
+                    let msg = match merge_gate::run_primary_action(app) {
+                        Ok(msg) => msg,
+                        Err(err) => format!("merge gate primary action blocked: {err:#}"),
+                    };
+                    app.merge_gate_status = Some(msg);
+                }
             },
         },
 
@@ -1498,7 +1595,7 @@ async fn handle_key(
             Focus::Right => match app.right_tab {
                 RightTab::Observer => app.observer.textarea.insert_newline(),
                 RightTab::Chat => app.chat.textarea.insert_newline(),
-                RightTab::Tasks | RightTab::Promotions => {}
+                RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => {}
             },
         },
 
@@ -1517,7 +1614,7 @@ async fn handle_key(
                     app.chat.welcome_dismissed = true;
                     app.chat.textarea.input(key);
                 }
-                RightTab::Tasks | RightTab::Promotions => {}
+                RightTab::Tasks | RightTab::Promotions | RightTab::MergeGate => {}
             },
         },
     }
@@ -3649,6 +3746,8 @@ mod tests {
             PaneId::Coder
         ));
         assert_eq!(app.right_tab, RightTab::Promotions);
+        assert!(handle_slash_command("/tab merge", &mut app, PaneId::Coder));
+        assert_eq!(app.right_tab, RightTab::MergeGate);
     }
 
     #[test]

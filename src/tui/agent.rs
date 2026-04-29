@@ -45,6 +45,7 @@ use std::path::Path;
 mod done_gate;
 mod evaluator_loop;
 mod failure_localization;
+mod final_handoff;
 mod followup_requirements;
 mod harness_evolution;
 mod memory;
@@ -66,8 +67,10 @@ use self::done_gate::{
 };
 use self::evaluator_loop::EvaluatorLoop;
 use self::failure_localization::interesting_failure_line;
+use self::final_handoff::enrich_text_final_handoff;
 use self::followup_requirements::{
     coerce_existing_followup_tool_call, matches_required_existing_followup,
+    required_existing_followup_no_tool_hint,
 };
 pub(crate) use self::harness_evolution::{
     overlay_path_for_root as harness_evolution_overlay_path_for_root,
@@ -8092,6 +8095,14 @@ fn parse_exec_tool_output_sections(tool_content: &str) -> (Option<i32>, String, 
 /// Create a git checkpoint commit in `root` (if it is a git repo).
 /// Returns the HEAD hash after the commit, or None if not a git repo / git unavailable.
 async fn git_create_checkpoint(root: &str) -> Option<String> {
+    // Only proceed if `root` itself is the git top-level. `git -C subdir`
+    // happily walks up to a parent repo; for copied eval sandboxes under
+    // `.tmp/`, that would create checkpoint commits in the real workspace.
+    let git_top = run_git_cmd(root, &["rev-parse", "--show-toplevel"]).await?;
+    if !git_checkpoint_root_matches_tool_root(root, git_top.as_str()) {
+        return None;
+    }
+
     // Only proceed if this is a git repo.
     let head = run_git_cmd(root, &["rev-parse", "HEAD"]).await;
     if head.is_none() {
@@ -8111,6 +8122,29 @@ async fn git_create_checkpoint(root: &str) -> Option<String> {
 
     // Return the new HEAD hash.
     run_git_cmd(root, &["rev-parse", "HEAD"]).await
+}
+
+fn git_checkpoint_root_matches_tool_root(root: &str, git_top_level: &str) -> bool {
+    let root_path = match std::fs::canonicalize(root) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    let top_path = match std::fs::canonicalize(git_top_level) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    normalize_checkpoint_path(&root_path) == normalize_checkpoint_path(&top_path)
+}
+
+fn normalize_checkpoint_path(path: &Path) -> String {
+    let mut out = path.to_string_lossy().replace('\\', "/");
+    while out.ends_with('/') && out.len() > 1 {
+        out.pop();
+    }
+    if cfg!(target_os = "windows") {
+        out = out.to_ascii_lowercase();
+    }
+    out
 }
 
 /// Run `git -C root <args>` with a 5-second timeout. Returns trimmed stdout or None.
@@ -8208,7 +8242,19 @@ fn goal_check_digest_line(digest: &str) -> String {
     }
 }
 
-fn goal_check_runner_command(level: VerificationLevel, cwd: &str) -> Option<String> {
+fn goal_check_runner_command(
+    level: VerificationLevel,
+    cwd: &str,
+    configured_test_cmd: Option<&str>,
+) -> Option<String> {
+    if matches!(level, VerificationLevel::Behavioral) {
+        if let Some(command) = configured_test_cmd
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+        {
+            return Some(command.to_string());
+        }
+    }
     governor_contract::verification()
         .goal_check_runners
         .iter()
@@ -8858,6 +8904,13 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
             last_verify_ok_step,
         ) {
             state = AgentState::Done;
+            let final_text = enrich_text_final_handoff(
+                final_text.as_str(),
+                &root_user_text,
+                &messages,
+                test_cmd.as_deref(),
+            )
+            .unwrap_or(final_text);
             messages.push(json!({"role": "assistant", "content": final_text.clone()}));
             autosave_best_effort(
                 &autosaver,
@@ -10675,6 +10728,13 @@ Execute only the new minimal action: {}",
                     &working_mem,
                 ) {
                     state = AgentState::Done;
+                    let final_text = enrich_text_final_handoff(
+                        final_text.as_str(),
+                        &root_user_text,
+                        &messages,
+                        test_cmd.as_deref(),
+                    )
+                    .unwrap_or(final_text);
                     messages.push(json!({"role": "assistant", "content": final_text.clone()}));
                     autosave_best_effort(
                         &autosaver,
@@ -11465,8 +11525,50 @@ Execute only the new minimal action: {}",
                     }
                 }
             }
+            if goal_wants_actions && iter + 1 < max_iters {
+                if let Some(hint) =
+                    required_existing_followup_no_tool_hint(&messages, &root_user_text)
+                {
+                    state = AgentState::Recovery;
+                    recovery.stage = Some(RecoveryStage::Fix);
+                    pending_system_hint = Some(hint.clone());
+                    let _ = tx
+                        .send(StreamToken::Delta(format!(
+                            "\n[task_harness] blocked text-only closeout; required follow-up remains\n{hint}\n"
+                        )))
+                        .await;
+                    autosave_best_effort(
+                        &autosaver,
+                        &tx,
+                        tool_root_abs.as_deref(),
+                        checkpoint.as_deref(),
+                        cur_cwd.as_deref(),
+                        &messages,
+                    )
+                    .await;
+                    let _ = tx
+                        .send(StreamToken::GovernorState(build_governor_state(
+                            state,
+                            &recovery,
+                            &mem,
+                            file_tool_consec_failures,
+                            last_mutation_step,
+                            last_verify_ok_step,
+                            last_reflection.as_ref(),
+                        )))
+                        .await;
+                    continue;
+                }
+            }
             if !assistant_text_clean.is_empty() {
-                messages.push(json!({"role": "assistant", "content": assistant_text_clean}));
+                let assistant_text_for_history = enrich_text_final_handoff(
+                    assistant_text_clean.as_str(),
+                    &root_user_text,
+                    &messages,
+                    test_cmd.as_deref(),
+                )
+                .unwrap_or_else(|| assistant_text_clean.clone());
+                messages.push(json!({"role": "assistant", "content": assistant_text_for_history}));
             }
             autosave_best_effort(
                 &autosaver,
@@ -12040,6 +12142,7 @@ Fix the path/permissions, or switch to explicit tools (write_file/read_file/patc
                                 let Some(command) = goal_check_runner_command(
                                     VerificationLevel::Behavioral,
                                     goal_root,
+                                    test_cmd.as_deref(),
                                 ) else {
                                     let summary =
                                         goal_check_runner_summary(VerificationLevel::Behavioral);
@@ -12131,9 +12234,11 @@ Fix the path/permissions, or switch to explicit tools (write_file/read_file/patc
                                 );
                             }
                             "build" => {
-                                let Some(command) =
-                                    goal_check_runner_command(VerificationLevel::Build, goal_root)
-                                else {
+                                let Some(command) = goal_check_runner_command(
+                                    VerificationLevel::Build,
+                                    goal_root,
+                                    None,
+                                ) else {
                                     let summary =
                                         goal_check_runner_summary(VerificationLevel::Build);
                                     let support_line = goal_check_support_line(
@@ -15070,6 +15175,13 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
         last_mutation_step,
         last_verify_ok_step,
     ) {
+        let final_text = enrich_text_final_handoff(
+            final_text.as_str(),
+            &root_user_text,
+            &messages,
+            test_cmd.as_deref(),
+        )
+        .unwrap_or(final_text);
         messages.push(json!({"role": "assistant", "content": final_text.clone()}));
         autosave_best_effort(
             &autosaver,
@@ -15183,6 +15295,23 @@ fn main() {}
         let msg = should_block_git_landmines("git init Foo", Some(root.as_ref()))
             .expect("expected block");
         assert!(msg.to_ascii_lowercase().contains("refusing"));
+    }
+
+    #[test]
+    fn git_checkpoint_requires_tool_root_to_be_git_top_level() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("repo");
+        let child = root.join(".tmp").join("case").join("tool_root");
+        std::fs::create_dir_all(&child).expect("mkdir child");
+
+        assert!(git_checkpoint_root_matches_tool_root(
+            root.to_string_lossy().as_ref(),
+            root.to_string_lossy().as_ref()
+        ));
+        assert!(!git_checkpoint_root_matches_tool_root(
+            child.to_string_lossy().as_ref(),
+            root.to_string_lossy().as_ref()
+        ));
     }
 
     #[test]
@@ -18467,9 +18596,32 @@ verify: exit code is zero\n\
         let cmd = goal_check_runner_command(
             VerificationLevel::Behavioral,
             td.path().to_string_lossy().as_ref(),
+            None,
         )
         .expect("runner command");
         assert_eq!(cmd, "cargo test -q");
+    }
+
+    #[test]
+    fn goal_check_runner_command_prefers_configured_test_cmd() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            td.path().join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.1.0'\n",
+        )
+        .expect("write cargo");
+
+        let cmd = goal_check_runner_command(
+            VerificationLevel::Behavioral,
+            td.path().to_string_lossy().as_ref(),
+            Some("cargo test -q demo::tests:: 2>&1 && bash scripts/smoke.sh"),
+        )
+        .expect("runner command");
+
+        assert_eq!(
+            cmd,
+            "cargo test -q demo::tests:: 2>&1 && bash scripts/smoke.sh"
+        );
     }
 
     #[test]

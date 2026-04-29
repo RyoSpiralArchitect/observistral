@@ -340,6 +340,11 @@ a {
   background: rgba(45, 212, 191, 0.08);
 }
 
+.review-card.rollback_available {
+  border-color: rgba(56, 189, 248, 0.42);
+  background: rgba(56, 189, 248, 0.08);
+}
+
 .review-card.blocked,
 .review-card.up_to_date {
   border-color: rgba(148, 163, 184, 0.28);

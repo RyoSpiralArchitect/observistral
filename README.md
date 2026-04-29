@@ -54,6 +54,8 @@ The current milestone is simple but important: OBSTRAL can now cover both fresh-
 - `maze-game-pygame-repo` proves the same closeout path works for a non-Rust repo, including a headless `pygame` verification command.
 - `resume-session-bridge-fix` shows the runtime can resume an existing Rust bugfix with both seeded session memory and repo-local `.obstral/progress.json` memory, then push the agent back toward the smallest safe patch.
 - The medium-plus self-dogfood stretch case `self-fix-observer-repo-rules-review-panel` now passes end-to-end: the runtime patches `src/observer/repo_rules.rs`, carries the required `docs/runtime-architecture.md` and `.obstral/tui_replay.json` follow-ups, and closes with the exact passing verification command in the final handoff.
+- The PR-ready self-dogfood case `self-fix-pr-ready-runtime-followup` now passes end-to-end too: the runtime patches `src/tui/agent/followup_requirements.rs`, carries the required `docs/state-schema.md` and `.obstral/runtime_eval.json` follow-ups, and repairs the final handoff when a verified artifact path would otherwise be omitted. Latest green run: `.tmp/runtime_eval_1777229175/report.json` (`tools=7`, `messages=22`, approx `3.85k` transcript tokens) with merge readiness captured in `.tmp/runtime_eval_1777229175/merge_gate.json`.
+- Runtime eval closeout now writes a generated `merge_gate.json` next to `report.json`; `obstral merge-gate`, the TUI Merge tab, and the Web GUI merge-gate panel can inspect readiness, approve passing cases, hold cases, and copy rollback previews without executing destructive rollback.
 - The benchmark reports now carry provider/model metadata plus approximate transcript token telemetry, which makes it easier to compare runs without pretending those numbers are billing-accurate.
 
 This matters because it turns "the agent made something cool once" into "the runtime can reproduce a milestone case and explain how it did it."
@@ -66,7 +68,7 @@ The next stretch is less about making prettier demos and more about making the r
 
 - **Long-running durability**: session resume is much better now, and repo-local progress snapshots are in place, but true multi-hour work still wants stronger context compaction, drift-triggered replanning, and more checkpoint-aware recovery.
 - **Broader benchmark mix**: fresh repo scaffolds plus one existing-repo bugfix are a good start; the next useful cases are small web apps, medium refactors, and docs/config tasks where the right verification floor is easier to get wrong.
-- **Higher-touch self-dogfood benchmarks**: the low-touch observer self-fix path now passes, so the next useful step is a benchmark that requires a real PR-ready change set: code fix, docs owner update, replay/eval proof, and a final handoff that cites all of them together.
+- **Merge-ready self-dogfood loops**: PR-ready fixture work now has branch/checkpoint safety, a generated merge gate, a CLI reader, and shared TUI/GUI human review state. The next useful step is replay/eval-backed promotion from approved gate state into a PR-ready merge workflow.
 - **Stronger verification pressure**: passing one test command is good, but adversarial evaluator loops, rollback/checkpoint restore, and quality-oriented checks would raise the floor a lot.
 - **Better telemetry**: transcript token estimates are useful for comparison, but provider-native usage accounting and benchmark trend history would make optimization much more concrete.
 - **Measured harness evolution**: the repo now has overlay, promotion candidate, and human-gated apply flow; the next step is learning which promoted rules actually improve future runs and which ones just add prompt weight.
@@ -432,7 +434,8 @@ bash ./scripts/run-tui.sh
 
 TUI defaults:
 - UI language starts in English (`/lang ja|en|fr` changes it mid-session).
-- The right pane opens on `Chat`; use `Ctrl+R` or `/tab observer|chat|tasks` to switch tabs.
+- The right pane opens on `Chat`; use `Ctrl+R` or `/tab observer|chat|tasks|promotions|merge` to switch tabs.
+- The `Merge` tab reads the latest runtime eval `merge_gate.json`; `A` approves a passing case, `H` holds a case, `R` refreshes, and `Ctrl+Y` copies the rollback preview without running it.
 - Run `/keys` to see which API key env var or CLI flag each pane expects.
 - Typing `/` in the composer shows a lightweight slash-command picker.
 - Typing exact `/provider` or `/model` opens an arrow-key picker (`Up/Down`, `Enter` to apply). `/provider` now exposes vendor presets such as `openai`, `gemini`, `anthropic-compat`, `mistral`, `anthropic`, and `hf`; `/model` follows the selected preset and still offers `other` for manual entry.
@@ -462,6 +465,12 @@ obstral agent "fix the failing test" -C . --vibe --trace-out .tmp/obstral_trace.
 # run the runtime eval harness against fixture cases
 obstral eval -C . --spec .obstral/runtime_eval.json
 obstral eval -C . --spec .obstral/runtime_eval.json --filter repo-map --continue-on-error
+
+# inspect merge readiness from the latest runtime eval merge gate
+obstral merge-gate -C .
+obstral merge-gate -C . --json
+obstral merge-gate -C . --ci
+# review the same gate in TUI/Web: TUI `/tab merge`, or Web GUI Settings -> Merge gate
 
 # inspect repo/runtime inventory surfaces
 obstral inventory health -C .

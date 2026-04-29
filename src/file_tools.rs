@@ -198,6 +198,10 @@ pub fn tool_patch_file(
 
     let count = content.matches(search).count();
     if count == 0 {
+        if let Some(new_content) = replace_loose_line_block_once(&content, search, replace) {
+            return write_patch_result(path, &abs_path, &content, &new_content);
+        }
+
         // Show a short preview so the model can self-correct.
         let preview: String = content.lines().take(8).collect::<Vec<_>>().join("\n");
         return (
@@ -221,12 +225,21 @@ pub fn tool_patch_file(
 
     let new_content = content.replacen(search, replace, 1);
 
+    write_patch_result(path, &abs_path, &content, &new_content)
+}
+
+fn write_patch_result(
+    path: &str,
+    abs_path: &Path,
+    old_content: &str,
+    new_content: &str,
+) -> (String, bool) {
     // Atomic write.
     let mut tmp_os = abs_path.as_os_str().to_owned();
     tmp_os.push(".__obstral_tmp");
     let tmp_path = PathBuf::from(tmp_os);
 
-    if let Err(e) = std::fs::write(&tmp_path, &new_content) {
+    if let Err(e) = std::fs::write(&tmp_path, new_content) {
         return (format!("ERROR writing temp file: {e}"), true);
     }
     if let Err(e) = std::fs::rename(&tmp_path, &abs_path) {
@@ -234,7 +247,7 @@ pub fn tool_patch_file(
         return (format!("ERROR finalizing patch to '{path}': {e}"), true);
     }
 
-    let old_lines = content.lines().count();
+    let old_lines = old_content.lines().count();
     let new_lines = new_content.lines().count();
     let delta = new_lines as i64 - old_lines as i64;
     let delta_str = if delta >= 0 {
@@ -247,6 +260,101 @@ pub fn tool_patch_file(
         format!("OK: patched '{path}' ({delta_str} lines, {new_lines} total)"),
         false,
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LineSpan<'a> {
+    text: &'a str,
+    start: usize,
+    end_with_newline: usize,
+}
+
+fn replace_loose_line_block_once(content: &str, search: &str, replace: &str) -> Option<String> {
+    let search_lines = search
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if search_lines.len() < 3 {
+        return None;
+    }
+
+    let lines = line_spans(content);
+    let mut matches = Vec::new();
+    for start_idx in 0..lines.len() {
+        let Some((start, end)) = loose_line_match_at(&lines, &search_lines, start_idx) else {
+            continue;
+        };
+        matches.push((start, end));
+        if matches.len() > 1 {
+            return None;
+        }
+    }
+
+    let (start, end) = matches.pop()?;
+    let mut adjusted_replace = replace.to_string();
+    if content[start..end].ends_with('\n') && !adjusted_replace.ends_with('\n') {
+        adjusted_replace.push('\n');
+    }
+    Some(format!(
+        "{}{}{}",
+        &content[..start],
+        adjusted_replace,
+        &content[end..]
+    ))
+}
+
+fn loose_line_match_at(
+    lines: &[LineSpan<'_>],
+    search_lines: &[&str],
+    start_idx: usize,
+) -> Option<(usize, usize)> {
+    let mut content_idx = start_idx;
+    let mut search_idx = 0;
+    let mut first_start = None;
+    let mut last_end = None;
+
+    while search_idx < search_lines.len() {
+        let line = *lines.get(content_idx)?;
+        let trimmed = line.text.trim();
+        content_idx += 1;
+
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed != search_lines[search_idx] {
+            return None;
+        }
+        first_start.get_or_insert(line.start);
+        last_end = Some(line.end_with_newline);
+        search_idx += 1;
+    }
+
+    Some((first_start?, last_end?))
+}
+
+fn line_spans(content: &str) -> Vec<LineSpan<'_>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for segment in content.split_inclusive('\n') {
+        let end = start + segment.len();
+        let text = segment.strip_suffix('\n').unwrap_or(segment);
+        out.push(LineSpan {
+            text,
+            start,
+            end_with_newline: end,
+        });
+        start = end;
+    }
+    if start < content.len() || content.is_empty() {
+        let text = &content[start..];
+        out.push(LineSpan {
+            text,
+            start,
+            end_with_newline: content.len(),
+        });
+    }
+    out
 }
 
 // ── search_files ──────────────────────────────────────────────────────────────
@@ -1108,6 +1216,57 @@ mod tests {
         assert!(err);
         assert!(r.contains("not found"));
         assert!(r.contains("hello world"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_repairs_indent_only_multiline_search_miss() {
+        let dir = std::env::temp_dir().join("obstral_test_patch_indent_fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("src"));
+        let content = r#"const PR_READY_RUNTIME_PATHS: &[&str] = &[
+    "src/tui/agent/task_harness.rs",
+    "src/tui/agent/done_gate.rs",
+];
+
+pub fn requires_pr_ready_handoff(path: &str) -> bool {
+    PR_READY_RUNTIME_PATHS.contains(&path)
+}
+"#;
+        let _ = std::fs::write(dir.join("src").join("followup.rs"), content);
+        let base = dir.to_string_lossy().into_owned();
+        let search = "const PR_READY_RUNTIME_PATHS: &[&str] = &[\n\"src/tui/agent/task_harness.rs\",\n\"src/tui/agent/done_gate.rs\",\n];\npub fn requires_pr_ready_handoff(path: &str) -> bool {\nPR_READY_RUNTIME_PATHS.contains(&path)\n}";
+        let replace = r#"const PR_READY_RUNTIME_PATHS: &[&str] = &[
+    "src/tui/agent/task_harness.rs",
+    "src/tui/agent/done_gate.rs",
+    "src/tui/agent/session_bridge.rs",
+];
+
+pub fn requires_pr_ready_handoff(path: &str) -> bool {
+    PR_READY_RUNTIME_PATHS.contains(&path)
+}
+"#;
+
+        let (r, err) = tool_patch_file("src/followup.rs", search, replace, Some(&base));
+        assert!(!err, "{r}");
+        let updated = std::fs::read_to_string(dir.join("src").join("followup.rs")).unwrap();
+        assert!(updated.contains("src/tui/agent/session_bridge.rs"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_keeps_short_search_misses_strict() {
+        let dir = std::env::temp_dir().join("obstral_test_patch_short_strict");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let base = dir.to_string_lossy().into_owned();
+
+        tool_write_file("f.txt", "    hello\n", Some(&base));
+        let (r, err) = tool_patch_file("f.txt", "hello\nmissing", "hi", Some(&base));
+        assert!(err, "{r}");
+        assert!(r.contains("not found"), "{r}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
