@@ -1171,6 +1171,87 @@ body.looping .bubble.assistant {
   flex-shrink: 0;
 }
 
+.diagnosticbox {
+  border-top: 1px solid rgba(163, 230, 53, 0.22);
+  border-bottom: 1px solid rgba(163, 230, 53, 0.10);
+  padding: 12px;
+  background:
+    radial-gradient(circle at top left, rgba(163, 230, 53, 0.13), transparent 34%),
+    rgba(0, 0, 0, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.diagnostic-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.diagnostic-sub {
+  margin-top: 3px;
+  font-size: 11px;
+  color: rgba(163, 230, 53, 0.82);
+  font-family: var(--mono);
+}
+
+.diagnostic-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.86);
+}
+
+.diagnostic-row code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diagnostic-label {
+  flex: 0 0 auto;
+  min-width: 76px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+  font-family: var(--mono);
+}
+
+.diagnostic-action {
+  margin: 2px 0 0 0;
+  padding: 9px;
+  border-radius: 12px;
+  border: 1px solid rgba(163, 230, 53, 0.16);
+  background: rgba(0, 0, 0, 0.28);
+  color: rgba(255, 255, 255, 0.82);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+}
+
+.benchmarkbox {
+  border-top-color: rgba(129, 140, 248, 0.28);
+  border-bottom-color: rgba(129, 140, 248, 0.12);
+  background:
+    radial-gradient(circle at top left, rgba(129, 140, 248, 0.14), transparent 34%),
+    rgba(0, 0, 0, 0.12);
+}
+
+.benchmark-sub {
+  color: rgba(165, 180, 252, 0.9);
+}
+
+.benchmark-action {
+  border-color: rgba(129, 140, 248, 0.20);
+}
+
 .proposal-list {
   display: flex;
   flex-direction: column;

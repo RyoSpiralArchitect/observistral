@@ -113,9 +113,11 @@ use self::session_bridge::SessionBridgeView;
 use self::task_harness::{
     allows_artifact_creation_during_diagnose, allows_artifact_creation_during_verify,
     build_fix_stage_progress_hint, build_progress_gate_block, coerce_artifact_creation_tool_call,
-    coerce_fix_existing_blocked_mutation_tool_call, coerce_fix_existing_literal_mutation_tool_call,
-    coerce_fix_existing_tool_call, coerce_repo_goal_completion_tool_call,
-    repair_fix_existing_mutation_tool_call, repair_repo_scaffold_write_tool_call, TaskHarness,
+    coerce_benchmark_plan_tool_call, coerce_fix_existing_blocked_mutation_tool_call,
+    coerce_fix_existing_literal_mutation_tool_call, coerce_fix_existing_tool_call,
+    coerce_repo_goal_completion_tool_call, repair_fix_existing_mutation_tool_call,
+    repair_repo_scaffold_write_tool_call, synthesize_fix_existing_no_tool_mutation_tool_call,
+    TaskHarness,
 };
 
 #[derive(Debug, Clone)]
@@ -5432,6 +5434,7 @@ fn collect_known_acceptance_commands(
 }
 
 fn maybe_build_verified_action_closeout_text(
+    root_user_text: &str,
     plan: Option<&PlanBlock>,
     messages: &[serde_json::Value],
     working_mem: &WorkingMemory,
@@ -5442,6 +5445,9 @@ fn maybe_build_verified_action_closeout_text(
     last_verify_ok_step: Option<usize>,
 ) -> Option<String> {
     if latest_assistant_message_is_done(messages) {
+        return None;
+    }
+    if required_existing_followup_no_tool_hint(messages, root_user_text).is_some() {
         return None;
     }
 
@@ -8894,6 +8900,7 @@ IMPORTANT: Each exec runs in a fresh process; `cd` does NOT persist unless the t
         .await;
 
         if let Some(final_text) = maybe_build_verified_action_closeout_text(
+            &root_user_text,
             active_plan.as_ref(),
             &messages,
             &working_mem,
@@ -9157,6 +9164,7 @@ This is the LAST model call for this run.\n\
             last_reflection.as_ref(),
             test_cmd.as_deref(),
             last_mutation_step,
+            file_tool_consec_failures,
         );
         if let Some(telemetry) = evaluator_loop.telemetry_payload(task_harness) {
             emit_telemetry_event(&tx, "evaluator_loop", telemetry).await;
@@ -9565,6 +9573,42 @@ This is the LAST model call for this run.\n\
             }
         }
 
+        if tool_calls.is_empty() {
+            if let Some(tc) = synthesize_fix_existing_no_tool_mutation_tool_call(
+                task_harness,
+                &messages,
+                &root_user_text,
+            ) {
+                let synthesized =
+                    canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "{}({})",
+                                tc.name,
+                                compact_one_line(tc.arguments.as_str(), 120)
+                            )
+                        });
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[task_harness] synthesized fix-existing mutation for stalled no-tool turn: {synthesized}\n"
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "task_harness_synthesized_tool_call",
+                    json!({
+                        "iter": iter,
+                        "lane": task_harness.lane_label(),
+                        "tool": tc.name,
+                        "synthetic": synthesized,
+                        "reason": "fix_existing_no_tool_mutation",
+                    }),
+                )
+                .await;
+                tool_calls.push(tc);
+            }
+        }
+
         if tool_calls.len() == 1 {
             if let Some((rewritten, original, repaired)) =
                 repair_truncated_patch_tool_call_from_recent_mismatch(
@@ -9933,6 +9977,36 @@ Execute only the new minimal action: {}",
                         "to": coerced,
                         "tool": rewritten.name,
                         "reason": "best_followup_read",
+                    }),
+                )
+                .await;
+                tool_call = Some(rewritten);
+            }
+        }
+
+        if let Some(tc) = tool_call.as_ref() {
+            if let Some((rewritten, original, coerced)) = coerce_benchmark_plan_tool_call(
+                task_harness,
+                &messages,
+                tc,
+                &root_user_text,
+                tool_root_abs.as_deref(),
+            ) {
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[task_harness] focused approved benchmark plan: {} -> {}\n",
+                        original, coerced
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "task_harness_tool_coercion",
+                    json!({
+                        "lane": task_harness.lane_label(),
+                        "from": original,
+                        "to": coerced,
+                        "tool": rewritten.name,
+                        "reason": "approved_benchmark_plan",
                     }),
                 )
                 .await;
@@ -11060,6 +11134,7 @@ Execute only the new minimal action: {}",
                 recovery.stage,
                 test_cmd.as_deref(),
                 last_mutation_step,
+                file_tool_consec_failures,
             ) {
                 state = AgentState::Recovery;
                 let _ = tx
@@ -15166,6 +15241,7 @@ Action: re-run from tool_root, avoid `cd ..` / absolute paths, and verify `pwd` 
     }
 
     if let Some(final_text) = maybe_build_verified_action_closeout_text(
+        &root_user_text,
         active_plan.as_ref(),
         &messages,
         &working_mem,
@@ -16468,6 +16544,7 @@ remaining_gap: still need to run cargo test\n\
         working_mem.remember_successful_verification(verify_command);
 
         let final_text = maybe_build_verified_action_closeout_text(
+            "Create a pygame maze game repo.",
             Some(&plan),
             &messages,
             &working_mem,
@@ -16483,6 +16560,56 @@ remaining_gap: still need to run cargo test\n\
         assert!(final_text.contains("maze_game_pygame/game.py"));
         assert!(final_text.contains("maze_game_pygame/main.py"));
         assert!(final_text.contains("SDL_VIDEODRIVER=dummy python3 -m unittest -q 2>&1"));
+    }
+
+    #[test]
+    fn maybe_build_verified_action_closeout_text_waits_for_required_followups() {
+        let plan = PlanBlock {
+            goal: "Fix the PR-ready merge approval handoff.".to_string(),
+            steps: vec![
+                "inspect merge approval code".to_string(),
+                "patch the smallest bug".to_string(),
+                "verify the configured smoke".to_string(),
+                "call done with handoff paths".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "the requested change is implemented".to_string(),
+                "the verification command passes".to_string(),
+            ],
+            risks: "missing follow-up paths".to_string(),
+            assumptions: "configured smoke is relevant".to_string(),
+        };
+        let messages = vec![
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_patch_merge",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\"src/tui/agent/merge_approval.rs\",\"search\":\"old\",\"replace\":\"new\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_merge",
+                "content":"OK: patched 'src/tui/agent/merge_approval.rs' (+1 lines, 99 total)\n[auto-test] ✓ PASSED (exit 0)"
+            }),
+        ];
+        let test_cmd =
+            "cargo test -q tui::agent::merge_approval::tests:: 2>&1 && bash scripts/pr-ready-smoke.sh";
+
+        let final_text = maybe_build_verified_action_closeout_text(
+            "Update `docs/state-schema.md` and `.obstral/runtime_eval.json` to include `src/tui/agent/merge_approval.rs`.",
+            Some(&plan),
+            &messages,
+            &WorkingMemory::default(),
+            &ObservationEvidence::default(),
+            VerificationLevel::Behavioral,
+            Some(test_cmd),
+            Some(1),
+            Some(1),
+        );
+
+        assert!(final_text.is_none());
     }
 
     #[test]

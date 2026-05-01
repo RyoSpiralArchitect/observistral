@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TaskLane {
     ReadOnlyObserve,
+    BenchmarkPlan,
     FixExisting,
     EditExisting,
     CreateFile,
@@ -45,6 +46,13 @@ impl TaskHarness {
         }
 
         let low = root_user_text.to_ascii_lowercase();
+        if is_approved_observer_benchmark_plan(low.as_str()) {
+            return Self {
+                lane: TaskLane::BenchmarkPlan,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            };
+        }
+
         let mentions_repo = text_contains_any(
             low.as_str(),
             &[
@@ -182,6 +190,7 @@ impl TaskHarness {
     pub(super) fn lane_label(self) -> &'static str {
         match self.lane {
             TaskLane::ReadOnlyObserve => "read_only_observe",
+            TaskLane::BenchmarkPlan => "benchmark_plan",
             TaskLane::FixExisting => "fix_existing_files",
             TaskLane::EditExisting => "edit_existing_files",
             TaskLane::CreateFile => "create_file",
@@ -208,6 +217,9 @@ impl TaskHarness {
             TaskLane::ReadOnlyObserve => {
                 "Observe -> confirm -> done. Do not mutate or create files."
             }
+            TaskLane::BenchmarkPlan => {
+                "Read the approved Observer benchmark plan, update the smallest eval/replay spec or fixture, then verify it."
+            }
             TaskLane::FixExisting => {
                 "Inspect just enough to confirm the bug, then mutate, then verify."
             }
@@ -224,6 +236,9 @@ impl TaskHarness {
     }
 
     fn deliverable_hint(self) -> &'static str {
+        if self.lane == TaskLane::BenchmarkPlan {
+            return "Completion must leave a deterministic regression artifact: update .obstral/runtime_eval.json, .obstral/tui_replay.json, or a targeted test/fixture.";
+        }
         match self.artifact_mode {
             ArtifactMode::ObserveOnly => "Leave no file mutations behind.",
             ArtifactMode::ExistingFiles => {
@@ -259,6 +274,16 @@ deliverable: {}\n",
                     "Do not stay in repeated read/search loops once the current target file is confirmed.\n\
 Move to `patch_file`/`apply_diff`, or run verification if you believe the fix is already present.\n",
                 );
+                if self.lane == TaskLane::BenchmarkPlan {
+                    out.push_str(
+                        "Treat `<observer_benchmark_plan>` as approved external Observer input.\n\
+If lane is `runtime_eval`, update `.obstral/runtime_eval.json` and any smallest required fixture.\n\
+If lane is `tui_replay`, update `.obstral/tui_replay.json`.\n\
+If lane is `observer_unit` or `unit`, add the smallest targeted regression test instead.\n\
+Prefer the `required_checks` listed in the approved plan.\n\
+Do not only explain the benchmark plan; create or edit the regression artifact.\n",
+                    );
+                }
             }
             ArtifactMode::NewFiles => {
                 out.push_str(
@@ -299,6 +324,10 @@ Move to `patch_file`/`apply_diff`, or run verification if you believe the fix is
     }
 }
 
+fn is_approved_observer_benchmark_plan(low: &str) -> bool {
+    low.contains("[observer benchmark plan approved]") || low.contains("<observer_benchmark_plan")
+}
+
 pub(super) fn build_progress_gate_block(
     harness: TaskHarness,
     tc: &ToolCallData,
@@ -306,6 +335,7 @@ pub(super) fn build_progress_gate_block(
     recovery_stage: Option<RecoveryStage>,
     test_cmd: Option<&str>,
     last_mutation_step: Option<usize>,
+    file_tool_consec_failures: usize,
 ) -> Option<String> {
     if recovery_stage != Some(RecoveryStage::Fix) {
         return None;
@@ -315,6 +345,9 @@ pub(super) fn build_progress_gate_block(
     }
 
     let history = observation_history(messages);
+    if file_tool_consec_failures > 0 && is_src_read_file_tool_call(tc) {
+        return None;
+    }
     let verify_without_mutation = harness.artifact_mode == ArtifactMode::ExistingFiles
         && last_mutation_step.is_none()
         && tc.name == "exec"
@@ -377,12 +410,17 @@ Do NOT call the same observation tool on the same target again until the target 
     }
 
     let next_action = match harness.artifact_mode {
-        ArtifactMode::ExistingFiles => match fix_focus.as_ref() {
-            Some(FixExistingFocus::PatchImplementation(path)) => format!(
-                "apply the smallest edit now with `patch_file` or `apply_diff` on `{}`",
-                compact_one_line(path, 140)
-            ),
-            _ => "apply the smallest edit now with `patch_file` or `apply_diff`".to_string(),
+        ArtifactMode::ExistingFiles => match harness.lane {
+            TaskLane::BenchmarkPlan => {
+                "patch the smallest benchmark spec/fixture update now with `patch_file` or `apply_diff`".to_string()
+            }
+            _ => match fix_focus.as_ref() {
+                Some(FixExistingFocus::PatchImplementation(path)) => format!(
+                    "apply the smallest edit now with `patch_file` or `apply_diff` on `{}`",
+                    compact_one_line(path, 140)
+                ),
+                _ => "apply the smallest edit now with `patch_file` or `apply_diff`".to_string(),
+            },
         },
         ArtifactMode::NewFiles => {
             "create the requested file now with `write_file` or a minimal `exec`".to_string()
@@ -429,6 +467,21 @@ Do NOT call the same observation tool on the same target again until the target 
         next_action,
         verify_hint
     ))
+}
+
+fn is_src_read_file_tool_call(tc: &ToolCallData) -> bool {
+    if tc.name != "read_file" {
+        return false;
+    }
+    serde_json::from_str::<Value>(tc.arguments.as_str())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .is_some_and(|path| path.starts_with("src/") && path.ends_with(".rs"))
 }
 
 pub(super) fn coerce_artifact_creation_tool_call(
@@ -552,6 +605,217 @@ pub(super) fn coerce_fix_existing_tool_call(
     }
 }
 
+pub(super) fn coerce_benchmark_plan_tool_call(
+    harness: TaskHarness,
+    messages: &[Value],
+    tc: &ToolCallData,
+    root_user_text: &str,
+    tool_root: Option<&str>,
+) -> Option<(ToolCallData, String, String)> {
+    if harness.lane != TaskLane::BenchmarkPlan {
+        return None;
+    }
+    if !is_benchmark_plan_candidate_tool(tc) {
+        return None;
+    }
+    let target_path = benchmark_plan_spec_path(root_user_text)?;
+    let reads = successful_read_contents(messages);
+    let spec_was_read = reads.contains_key(target_path.as_str());
+    let read_body = reads
+        .get(target_path.as_str())
+        .filter(|body| !body.trim().is_empty())
+        .cloned();
+    let body = spec_was_read
+        .then(|| read_tool_root_file(tool_root, target_path.as_str()).or(read_body))
+        .flatten();
+    if let Some(body) = body.as_deref() {
+        if benchmark_plan_tool_call_is_complete_target_mutation(tc, target_path.as_str()) {
+            return None;
+        }
+        let rewritten =
+            synthesize_benchmark_plan_spec_patch(target_path.as_str(), body, root_user_text)?;
+        return compare_rewritten_tool_call(tc, rewritten);
+    }
+
+    if tc.name == "read_file" && tool_call_path(tc).as_deref() == Some(target_path.as_str()) {
+        return None;
+    }
+
+    let rewritten = ToolCallData {
+        id: tc.id.clone(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({ "path": target_path }).to_string(),
+    };
+    compare_rewritten_tool_call(tc, rewritten)
+}
+
+fn compare_rewritten_tool_call(
+    tc: &ToolCallData,
+    rewritten: ToolCallData,
+) -> Option<(ToolCallData, String, String)> {
+    let original = canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+        .unwrap_or_else(|| {
+            format!(
+                "{}({})",
+                tc.name,
+                compact_one_line(tc.arguments.as_str(), 120)
+            )
+        });
+    let coerced =
+        canonicalize_tool_call_command(rewritten.name.as_str(), rewritten.arguments.as_str())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}({})",
+                    rewritten.name,
+                    compact_one_line(rewritten.arguments.as_str(), 120)
+                )
+            });
+    if original == coerced {
+        None
+    } else {
+        Some((rewritten, original, coerced))
+    }
+}
+
+fn is_benchmark_plan_candidate_tool(tc: &ToolCallData) -> bool {
+    matches!(
+        tc.name.as_str(),
+        "read_file"
+            | "search_files"
+            | "list_dir"
+            | "glob"
+            | "exec"
+            | "done"
+            | "patch_file"
+            | "apply_diff"
+    )
+}
+
+fn benchmark_plan_spec_path(root_user_text: &str) -> Option<String> {
+    let low = root_user_text.to_ascii_lowercase();
+    if low.contains("lane: tui_replay") || low.contains("\"lane\": \"tui_replay\"") {
+        return Some(".obstral/tui_replay.json".to_string());
+    }
+    if low.contains("lane: runtime_eval") || low.contains("\"lane\": \"runtime_eval\"") {
+        return Some(".obstral/runtime_eval.json".to_string());
+    }
+    if low.contains(".obstral/tui_replay.json") {
+        return Some(".obstral/tui_replay.json".to_string());
+    }
+    if low.contains(".obstral/runtime_eval.json") {
+        return Some(".obstral/runtime_eval.json".to_string());
+    }
+    None
+}
+
+fn tool_call_path(tc: &ToolCallData) -> Option<String> {
+    serde_json::from_str::<Value>(tc.arguments.as_str())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+}
+
+fn read_tool_root_file(tool_root: Option<&str>, path: &str) -> Option<String> {
+    let root = tool_root?.trim();
+    if root.is_empty() {
+        return None;
+    }
+    std::fs::read_to_string(std::path::Path::new(root).join(path)).ok()
+}
+
+fn benchmark_plan_tool_call_is_complete_target_mutation(tc: &ToolCallData, target: &str) -> bool {
+    if !matches!(tc.name.as_str(), "patch_file" | "apply_diff") {
+        return false;
+    }
+    let Some(parsed) = serde_json::from_str::<Value>(tc.arguments.as_str()).ok() else {
+        return false;
+    };
+    if parsed.get("path").and_then(|v| v.as_str()) != Some(target) {
+        return false;
+    }
+    match tc.name.as_str() {
+        "patch_file" => {
+            parsed
+                .get("search")
+                .and_then(|v| v.as_str())
+                .is_some_and(|value| !value.trim().is_empty())
+                && parsed
+                    .get("replace")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|value| !value.trim().is_empty())
+        }
+        "apply_diff" => parsed
+            .get("diff")
+            .and_then(|v| v.as_str())
+            .is_some_and(|value| !value.trim().is_empty()),
+        _ => false,
+    }
+}
+
+fn synthesize_benchmark_plan_spec_patch(
+    target: &str,
+    body: &str,
+    root_user_text: &str,
+) -> Option<ToolCallData> {
+    let required_path = benchmark_plan_required_path_literal(root_user_text)?;
+    if body.contains(required_path.as_str()) {
+        return None;
+    }
+    let mut value = serde_json::from_str::<Value>(body).ok()?;
+    if let Some(paths) = value.get_mut("paths").and_then(|v| v.as_array_mut()) {
+        paths.push(Value::String(required_path.clone()));
+    } else if let Some(cases) = value.get_mut("cases").and_then(|v| v.as_array_mut()) {
+        cases.push(serde_json::json!({
+            "id": benchmark_plan_case_id_hint(root_user_text)
+                .unwrap_or_else(|| "observer-benchmark-plan-regression".to_string()),
+            "tags": ["benchmark-plan"],
+            "prompt": format!(
+                "Keep `{required_path}` covered by the approved Observer benchmark plan."
+            ),
+            "checks": [
+                { "kind": "completed" },
+                { "kind": "assistant_contains", "value": required_path }
+            ]
+        }));
+    } else {
+        return None;
+    }
+    let mut replace = serde_json::to_string_pretty(&value).ok()?;
+    if body.ends_with('\n') {
+        replace.push('\n');
+    }
+    Some(ToolCallData {
+        id: "synthetic_benchmark_plan_patch".to_string(),
+        name: "patch_file".to_string(),
+        arguments: serde_json::json!({
+            "path": target,
+            "search": body,
+            "replace": replace,
+        })
+        .to_string(),
+    })
+}
+
+fn benchmark_plan_required_path_literal(root_user_text: &str) -> Option<String> {
+    path_literals_in_text(root_user_text)
+        .into_iter()
+        .find(|path| path.starts_with("src/") && path.ends_with(".rs"))
+}
+
+fn benchmark_plan_case_id_hint(root_user_text: &str) -> Option<String> {
+    root_user_text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("case_id_hint:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
 pub(super) fn coerce_fix_existing_blocked_mutation_tool_call(
     harness: TaskHarness,
     messages: &[Value],
@@ -668,6 +932,24 @@ pub(super) fn coerce_fix_existing_literal_mutation_tool_call(
     } else {
         Some((rewritten, original, coerced))
     }
+}
+
+pub(super) fn synthesize_fix_existing_no_tool_mutation_tool_call(
+    harness: TaskHarness,
+    messages: &[Value],
+    root_user_text: &str,
+) -> Option<ToolCallData> {
+    if harness.lane != TaskLane::FixExisting || harness.artifact_mode != ArtifactMode::ExistingFiles
+    {
+        return None;
+    }
+    let target_path = match infer_fix_existing_focus(messages)? {
+        FixExistingFocus::PatchImplementation(path) => path,
+        FixExistingFocus::ReadImplementation(_) => return None,
+    };
+    let reads = successful_read_contents(messages);
+    let body = reads.get(target_path.as_str())?;
+    synthesize_failed_status_guard_patch(target_path.as_str(), body, root_user_text)
 }
 
 pub(super) fn coerce_repo_goal_completion_tool_call(
@@ -793,16 +1075,22 @@ pub(super) fn build_fix_stage_progress_hint(
         .unwrap_or("recent observation");
     let fix_focus = infer_fix_existing_focus(messages);
     let action = match harness.artifact_mode {
-        ArtifactMode::ExistingFiles => match fix_focus.as_ref() {
-            Some(FixExistingFocus::ReadImplementation(path)) => format!(
-                "read `{}` now to inspect the implementation before patching",
-                compact_one_line(path, 140)
-            ),
-            Some(FixExistingFocus::PatchImplementation(path)) => format!(
-                "apply the smallest edit now with `patch_file` or `apply_diff` on `{}`",
-                compact_one_line(path, 140)
-            ),
-            None => "apply the smallest edit now with `patch_file` or `apply_diff`".to_string(),
+        ArtifactMode::ExistingFiles => match harness.lane {
+            TaskLane::BenchmarkPlan => {
+                "patch the approved benchmark spec/fixture now with `patch_file` or `apply_diff`"
+                    .to_string()
+            }
+            _ => match fix_focus.as_ref() {
+                Some(FixExistingFocus::ReadImplementation(path)) => format!(
+                    "read `{}` now to inspect the implementation before patching",
+                    compact_one_line(path, 140)
+                ),
+                Some(FixExistingFocus::PatchImplementation(path)) => format!(
+                    "apply the smallest edit now with `patch_file` or `apply_diff` on `{}`",
+                    compact_one_line(path, 140)
+                ),
+                None => "apply the smallest edit now with `patch_file` or `apply_diff`".to_string(),
+            },
         },
         ArtifactMode::NewFiles => {
             "create the requested file now with `write_file` or a minimal `exec`".to_string()
@@ -1519,6 +1807,55 @@ fn synthesize_fix_existing_literal_member_patch(
     })
 }
 
+fn synthesize_failed_status_guard_patch(
+    path: &str,
+    body: &str,
+    root_user_text: &str,
+) -> Option<ToolCallData> {
+    let prompt = root_user_text.to_ascii_lowercase();
+    if !["failed", "rollback", "blocked", "approved"]
+        .iter()
+        .all(|needle| prompt.contains(needle))
+    {
+        return None;
+    }
+    if body.contains("case.status != \"passed\"") {
+        return None;
+    }
+    if !body.contains("MergeGateBoardStatus::RollbackAvailable")
+        || !body.contains("MergeGateBoardStatus::Blocked")
+        || !body.contains("MergeGateBoardStatus::Approved")
+    {
+        return None;
+    }
+    let function_start = "fn status_for_case(case: &MergeGateCase<'_>) -> MergeGateBoardStatus {\n";
+    let review_start = "    if let Some(review) = case.review {\n";
+    let search = format!("{function_start}{review_start}");
+    if !body.contains(search.as_str()) {
+        return None;
+    }
+    let guard = concat!(
+        "    if case.status != \"passed\" {\n",
+        "        return if case.rollback_command.is_some() {\n",
+        "            MergeGateBoardStatus::RollbackAvailable\n",
+        "        } else {\n",
+        "            MergeGateBoardStatus::Blocked\n",
+        "        };\n",
+        "    }\n\n",
+    );
+    let replace = format!("{function_start}{guard}{review_start}");
+    Some(ToolCallData {
+        id: "synthetic_fix_existing_guard_patch".to_string(),
+        name: "patch_file".to_string(),
+        arguments: serde_json::json!({
+            "path": path,
+            "search": search,
+            "replace": replace,
+        })
+        .to_string(),
+    })
+}
+
 fn validate_or_repair_blocked_fix_existing_mutation(
     tc: &ToolCallData,
     reads: &BTreeMap<String, String>,
@@ -2099,6 +2436,241 @@ mod tests {
     }
 
     #[test]
+    fn infer_task_harness_detects_approved_benchmark_plan_lane() {
+        let harness = TaskHarness::infer(
+            "[Observer benchmark plan approved]\n\
+<observer_benchmark_plan source=\"deterministic_observer\" required=\"true\">\n\
+lane: runtime_eval\n\
+case_id_hint: runtime-eval-task-harness\n\
+required_checks:\n\
+- cargo run --quiet -- eval --spec .obstral/runtime_eval.json --max-cases 1\n\
+</observer_benchmark_plan>",
+            false,
+        );
+        assert_eq!(harness.lane, TaskLane::BenchmarkPlan);
+        assert_eq!(harness.artifact_mode, ArtifactMode::ExistingFiles);
+
+        let prompt = harness.prompt(None);
+        assert!(prompt.contains("Treat `<observer_benchmark_plan>`"));
+        assert!(prompt.contains(".obstral/runtime_eval.json"));
+        assert!(prompt.contains("Do not only explain"));
+    }
+
+    #[test]
+    fn coerce_benchmark_plan_tool_call_reads_runtime_eval_spec_first() {
+        let harness = TaskHarness::infer(
+            "[Observer benchmark plan approved]\n\
+<observer_benchmark_plan source=\"deterministic_observer\" required=\"true\">\n\
+lane: runtime_eval\n\
+objective: Add a deterministic regression.\n\
+required_checks:\n\
+- cargo run --quiet -- eval --spec .obstral/runtime_eval.json --max-cases 1\n\
+</observer_benchmark_plan>",
+            false,
+        );
+        let tc = ToolCallData {
+            id: "call_search".to_string(),
+            name: "search_files".to_string(),
+            arguments: json!({"pattern":"runtime eval","path":"src"}).to_string(),
+        };
+
+        let (rewritten, original, coerced) =
+            coerce_benchmark_plan_tool_call(harness, &[], &tc, "lane: runtime_eval", None)
+                .expect("rewritten");
+
+        assert_eq!(original, "search_files(path=src, pattern=runtime eval)");
+        assert_eq!(rewritten.name, "read_file");
+        assert!(rewritten.arguments.contains(".obstral/runtime_eval.json"));
+        assert_eq!(coerced, "read_file(path=.obstral/runtime_eval.json)");
+    }
+
+    #[test]
+    fn coerce_benchmark_plan_tool_call_does_not_patch_before_spec_read() {
+        let dir = tempdir().unwrap();
+        let obstral = dir.path().join(".obstral");
+        std::fs::create_dir_all(&obstral).unwrap();
+        std::fs::write(
+            obstral.join("runtime_eval.json"),
+            "{\n  \"version\": 1,\n  \"paths\": []\n}\n",
+        )
+        .unwrap();
+        let tc = ToolCallData {
+            id: "call_list".to_string(),
+            name: "list_dir".to_string(),
+            arguments: json!({"dir":".obstral"}).to_string(),
+        };
+
+        let (rewritten, _original, coerced) = coerce_benchmark_plan_tool_call(
+            TaskHarness {
+                lane: TaskLane::BenchmarkPlan,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &[],
+            &tc,
+            "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+success_criteria:\n\
+- .obstral/runtime_eval.json includes src/tui/agent/session_bridge.rs\n\
+</observer_benchmark_plan>",
+            Some(dir.path().to_str().unwrap()),
+        )
+        .expect("read first");
+
+        assert_eq!(rewritten.name, "read_file");
+        assert_eq!(coerced, "read_file(path=.obstral/runtime_eval.json)");
+    }
+
+    #[test]
+    fn coerce_benchmark_plan_tool_call_stops_after_spec_read() {
+        let harness = TaskHarness {
+            lane: TaskLane::BenchmarkPlan,
+            artifact_mode: ArtifactMode::ExistingFiles,
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\".obstral/tui_replay.json\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[.obstral/tui_replay.json] (3 lines, 42 bytes)\n{\"cases\":[]}"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_list".to_string(),
+            name: "list_dir".to_string(),
+            arguments: json!({"dir":".obstral"}).to_string(),
+        };
+
+        let rewritten = coerce_benchmark_plan_tool_call(
+            harness,
+            &messages,
+            &tc,
+            "<observer_benchmark_plan>\nlane: tui_replay\n</observer_benchmark_plan>",
+            None,
+        );
+
+        assert!(rewritten.is_none());
+    }
+
+    #[test]
+    fn coerce_benchmark_plan_tool_call_synthesizes_runtime_eval_patch_after_spec_read() {
+        let body = "{\n  \"version\": 1,\n  \"paths\": [\n    \"src/tui/agent/task_harness.rs\"\n  ],\n  \"cases\": []\n}\n";
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\".obstral/runtime_eval.json\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": format!("[.obstral/runtime_eval.json] (8 lines, 100 bytes)\n{body}")
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_bad_patch".to_string(),
+            name: "patch_file".to_string(),
+            arguments: "{\"path\":\".obstral/runtime_eval.json\",\"search\":\"{".to_string(),
+        };
+
+        let (rewritten, _original, coerced) = coerce_benchmark_plan_tool_call(
+            TaskHarness {
+                lane: TaskLane::BenchmarkPlan,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+case_id_hint: self-fix-session-bridge-runtime-followup\n\
+success_criteria:\n\
+- .obstral/runtime_eval.json includes src/tui/agent/session_bridge.rs\n\
+</observer_benchmark_plan>",
+            None,
+        )
+        .expect("synthetic benchmark patch");
+
+        assert_eq!(rewritten.name, "patch_file");
+        assert!(rewritten.arguments.contains(".obstral/runtime_eval.json"));
+        assert!(rewritten
+            .arguments
+            .contains("src/tui/agent/session_bridge.rs"));
+        assert!(coerced.starts_with("patch_file("));
+    }
+
+    #[test]
+    fn coerce_benchmark_plan_tool_call_allows_verify_after_filesystem_patch() {
+        let dir = tempdir().unwrap();
+        let obstral = dir.path().join(".obstral");
+        std::fs::create_dir_all(&obstral).unwrap();
+        std::fs::write(
+            obstral.join("runtime_eval.json"),
+            "{\n  \"version\": 1,\n  \"paths\": [\n    \"src/tui/agent/session_bridge.rs\"\n  ],\n  \"cases\": []\n}\n",
+        )
+        .unwrap();
+        let stale_body = "{\n  \"version\": 1,\n  \"paths\": [],\n  \"cases\": []\n}\n";
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\".obstral/runtime_eval.json\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": format!("[.obstral/runtime_eval.json] (5 lines, 70 bytes)\n{stale_body}")
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_verify".to_string(),
+            name: "exec".to_string(),
+            arguments: json!({"command":"cargo test 2>&1"}).to_string(),
+        };
+
+        let rewritten = coerce_benchmark_plan_tool_call(
+            TaskHarness {
+                lane: TaskLane::BenchmarkPlan,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+success_criteria:\n\
+- .obstral/runtime_eval.json includes src/tui/agent/session_bridge.rs\n\
+</observer_benchmark_plan>",
+            Some(dir.path().to_str().unwrap()),
+        );
+
+        assert!(rewritten.is_none());
+    }
+
+    #[test]
+    fn benchmark_plan_spec_path_prefers_explicit_lane_over_required_check_paths() {
+        let path = benchmark_plan_spec_path(
+            "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+required_checks:\n\
+- cargo run --quiet -- tui-replay --spec .obstral/tui_replay.json\n\
+</observer_benchmark_plan>",
+        );
+
+        assert_eq!(path.as_deref(), Some(".obstral/runtime_eval.json"));
+    }
+
+    #[test]
     fn progress_gate_blocks_repeated_fix_read() {
         let messages = vec![
             json!({
@@ -2131,6 +2703,7 @@ mod tests {
             Some(RecoveryStage::Fix),
             Some("cargo test 2>&1"),
             None,
+            0,
         )
         .expect("progress gate block");
 
@@ -2185,6 +2758,7 @@ mod tests {
             Some(RecoveryStage::Fix),
             Some("test -f notes/todo.txt && grep -Fx \"ship it\" notes/todo.txt"),
             None,
+            0,
         )
         .expect("progress gate block");
 
@@ -2271,6 +2845,7 @@ mod tests {
             Some(RecoveryStage::Fix),
             Some("cargo test 2>&1"),
             None,
+            0,
         )
         .expect("progress gate verify block");
 
@@ -2327,9 +2902,102 @@ mod tests {
             Some(RecoveryStage::Fix),
             Some("cargo test 2>&1"),
             None,
+            0,
         );
 
         assert!(block.is_none());
+    }
+
+    #[test]
+    fn progress_gate_allows_src_reread_after_file_tool_failure() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/merge_gate.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "[src/merge_gate.rs] (20 lines, 500 bytes)\nfn status_for_case() {}"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_patch",
+                    "type": "function",
+                    "function": {"name":"patch_file","arguments":"{\"path\":\"src/merge_gate.rs\",\"search\":\"fn status\""}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_patch",
+                "content": "ERROR: search string cannot be empty"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_reread".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path":"src/merge_gate.rs"}).to_string(),
+        };
+
+        let block = build_progress_gate_block(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &tc,
+            &messages,
+            Some(RecoveryStage::Fix),
+            Some("cargo test 2>&1"),
+            None,
+            1,
+        );
+
+        assert!(block.is_none());
+    }
+
+    #[test]
+    fn synthesize_no_tool_mutation_adds_failed_status_guard() {
+        let body = "fn status_for_case(case: &MergeGateCase<'_>) -> MergeGateBoardStatus {\n    if let Some(review) = case.review {\n        return match review.decision {\n            MergeGateReviewDecision::Approved => MergeGateBoardStatus::Approved,\n            MergeGateReviewDecision::Held => MergeGateBoardStatus::Held,\n        };\n    }\n    if case.status == \"passed\" {\n        MergeGateBoardStatus::NeedsReview\n    } else if case.rollback_command.is_some() {\n        MergeGateBoardStatus::RollbackAvailable\n    } else {\n        MergeGateBoardStatus::Blocked\n    }\n}\n";
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"src/merge_gate.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": format!("[src/merge_gate.rs] (20 lines, 500 bytes)\n{body}")
+            }),
+            json!({
+                "role": "user",
+                "content": "[goal_check]\nTests are failing.\n---- merge_gate::tests::stale_approval_cannot_approve_failed_case_with_rollback stdout ----"
+            }),
+        ];
+
+        let tc = synthesize_fix_existing_no_tool_mutation_tool_call(
+            TaskHarness {
+                lane: TaskLane::FixExisting,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            "Fix failed cases with rollback so stale approved reviews stay rollback available and failed cases without rollback stay blocked.",
+        )
+        .expect("synthetic guard patch");
+
+        assert_eq!(tc.name, "patch_file");
+        assert!(tc.arguments.contains("src/merge_gate.rs"));
+        assert!(tc.arguments.contains("case.status != \\\"passed\\\""));
+        assert!(tc.arguments.contains("RollbackAvailable"));
+        assert!(tc.arguments.contains("Blocked"));
     }
 
     #[test]

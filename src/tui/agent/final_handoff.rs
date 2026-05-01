@@ -52,6 +52,21 @@ pub(super) fn enrich_text_final_handoff(
         enriched.push_str("`\n");
     }
 
+    let mut missing_required_literals = required_non_command_final_literals(root_user_text)
+        .into_iter()
+        .filter(|literal| !content.contains(literal))
+        .collect::<Vec<_>>();
+    missing_required_literals.sort();
+    missing_required_literals.dedup();
+    if !missing_required_literals.is_empty() {
+        enriched.push_str("\nRequired final answer items:\n");
+        for literal in missing_required_literals {
+            enriched.push_str("- `");
+            enriched.push_str(literal.as_str());
+            enriched.push_str("`\n");
+        }
+    }
+
     (enriched != content).then_some(enriched)
 }
 
@@ -183,6 +198,57 @@ fn path_literals_in_text(text: &str) -> Vec<String> {
     out
 }
 
+fn required_non_command_final_literals(root_user_text: &str) -> Vec<String> {
+    if !root_user_text
+        .to_ascii_lowercase()
+        .contains("final answer must include")
+    {
+        return Vec::new();
+    }
+    backtick_literals(root_user_text)
+        .into_iter()
+        .filter(|literal| !looks_like_path_literal(literal))
+        .filter(|literal| !looks_like_command_literal(literal))
+        .collect()
+}
+
+fn backtick_literals(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some((_, after_open)) = rest.split_once('`') {
+        let Some((literal, after_close)) = after_open.split_once('`') else {
+            break;
+        };
+        let literal = literal.trim();
+        if !literal.is_empty() && !out.iter().any(|existing| existing == literal) {
+            out.push(literal.to_string());
+        }
+        rest = after_close;
+    }
+    out
+}
+
+fn looks_like_path_literal(literal: &str) -> bool {
+    let normalized = literal.replace('\\', "/");
+    normalized.contains('/')
+        || normalized
+            .split('/')
+            .next_back()
+            .is_some_and(|segment| segment.contains('.'))
+}
+
+fn looks_like_command_literal(literal: &str) -> bool {
+    let low = literal.trim().to_ascii_lowercase();
+    low.contains("&&")
+        || low.contains(" 2>&1")
+        || [
+            "cargo ", "bash ", "python", "pytest", "npm ", "pnpm ", "yarn ", "bun ", "go ",
+            "deno ", "test ", "cd ",
+        ]
+        .iter()
+        .any(|prefix| low.starts_with(prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::enrich_text_final_handoff;
@@ -238,5 +304,27 @@ mod tests {
             None,
         );
         assert!(enriched.is_none());
+    }
+
+    #[test]
+    fn enriches_done_with_required_status_label_literal() {
+        let content = "[DONE]\nUpdated `src/tui/agent/merge_approval.rs`.";
+        let root = "Final answer must include the changed Rust file path, the verification command, and the status label `PR-ready merge approved`.";
+
+        let enriched = enrich_text_final_handoff(content, root, &[], None).expect("enriched");
+
+        assert!(enriched.contains("PR-ready merge approved"));
+        assert!(enriched.contains("Required final answer items"));
+    }
+
+    #[test]
+    fn does_not_add_command_literals_without_verified_command_evidence() {
+        let content = "[DONE]\nUpdated `src/tui/agent/merge_approval.rs`.";
+        let root = "Final answer must include `cargo test -q demo::tests:: 2>&1 && bash scripts/smoke.sh` and `PR-ready merge approved`.";
+
+        let enriched = enrich_text_final_handoff(content, root, &[], None).expect("enriched");
+
+        assert!(enriched.contains("PR-ready merge approved"));
+        assert!(!enriched.contains("cargo test -q demo::tests::"));
     }
 }

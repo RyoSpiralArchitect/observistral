@@ -211,11 +211,68 @@
     };
   }
 
+  function parseJsonSection(text, markerName) {
+    const s = String(text || "");
+    const re = new RegExp("---\\s*" + String(markerName || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*---", "i");
+    const m = re.exec(s);
+    if (!m) return null;
+    const after = s.slice(m.index + m[0].length).trimStart();
+    const next = /\n\s*---\s*[-_\w]+\s*---/i.exec(after);
+    const raw = (next ? after.slice(0, next.index) : after).trim();
+    if (!raw || raw === "(unavailable)") return null;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function parseCoderDiagnostic(text) {
+    const d = parseJsonSection(text, "coder_diagnostic");
+    if (!d) return null;
+    const confidence = Number(d.confidence);
+    const followups = Array.isArray(d.required_followups) ? d.required_followups : [];
+    const literals = Array.isArray(d.final_handoff_literals) ? d.final_handoff_literals : [];
+    const evidence = Array.isArray(d.evidence) ? d.evidence : [];
+    return {
+      failureMode: String(d.failure_mode || "needs_coder_followup"),
+      confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(100, confidence)) : 50,
+      mutationAnchor: d.mutation_anchor && typeof d.mutation_anchor === "object" ? d.mutation_anchor : null,
+      requiredFollowups: followups,
+      verificationCmd: typeof d.verification_cmd === "string" ? d.verification_cmd : "",
+      finalHandoffLiterals: literals,
+      nextCoderAction: d.next_coder_action && typeof d.next_coder_action === "object" ? d.next_coder_action : null,
+      evidence,
+      raw: d,
+    };
+  }
+
+  function parseBenchmarkPlan(text) {
+    const d = parseJsonSection(text, "benchmark_plan");
+    if (!d) return null;
+    const confidence = Number(d.confidence);
+    return {
+      caseIdHint: String(d.case_id_hint || ""),
+      lane: String(d.lane || "none"),
+      objective: String(d.objective || ""),
+      reason: String(d.reason || ""),
+      confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(100, confidence)) : 50,
+      targetFiles: Array.isArray(d.target_files) ? d.target_files : [],
+      requiredChecks: Array.isArray(d.required_checks) ? d.required_checks : [],
+      successCriteria: Array.isArray(d.success_criteria) ? d.success_criteria : [],
+      triggeredBy: Array.isArray(d.triggered_by) ? d.triggered_by : [],
+      raw: d,
+    };
+  }
+
   function stripObserverMeta(text) {
     const s = String(text || "");
     const markers = [
       /---\s*phase\s*---/i,
       /---\s*proposals\s*---/i,
+      /---\s*coder_diagnostic\s*---/i,
+      /---\s*benchmark_plan\s*---/i,
       /---\s*critical_path\s*---/i,
       /---\s*health\s*---/i,
     ];
@@ -235,6 +292,8 @@
     parseProposals,
     parseCriticalPath,
     parseHealthScore,
+    parseCoderDiagnostic,
+    parseBenchmarkPlan,
     stripObserverMeta,
   };
 })();

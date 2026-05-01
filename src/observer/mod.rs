@@ -1,10 +1,14 @@
 pub mod analyzer;
+pub mod benchmark_plan;
+pub mod coder_diagnostic;
 pub mod detector;
 pub mod engine;
 pub mod memory;
 pub mod repo_rules;
 pub mod scorer;
 
+use crate::observer::benchmark_plan::BenchmarkPlan;
+use crate::observer::coder_diagnostic::CoderDiagnostic;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,4 +100,10 @@ pub struct Critique {
     pub phase: DevPhase,
     pub critical_path: String,
     pub health: HealthScore,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coder_diagnostic: Option<CoderDiagnostic>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_plan: Option<BenchmarkPlan>,
 }

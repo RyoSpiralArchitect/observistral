@@ -1,4 +1,5 @@
 use crate::observer::detector::{Event, FileScanTool};
+use crate::observer::memory;
 use crate::observer::repo_rules;
 use crate::observer::{Cost, DevPhase, Proposal, ProposalStatus, Risk, RiskAxis, Severity};
 use std::collections::{BTreeSet, HashSet};
@@ -507,6 +508,28 @@ pub fn generate_proposals(risks: &[Risk]) -> Vec<Proposal> {
                     .unwrap_or_else(|| "loop detected".to_string())
                     .chars()
                     .take(40)
+                    .collect(),
+                axis: Some(r.axis),
+            });
+            continue;
+        }
+
+        if memory::is_recurring_unresolved_proposal(r.description.as_str()) {
+            push(Proposal {
+                title: "Resolve recurring Observer finding".to_string(),
+                to_coder: "A previous Observer finding has appeared again. Treat it as blocking: explicitly accept, override, or defer it, then make the smallest concrete patch or verification follow-up that closes the repeated finding before moving on.".to_string(),
+                severity: r.severity,
+                score: 0,
+                phase: DevPhase::Core,
+                impact: "Repeated unresolved findings indicate the Coder/Observer loop is not converting critique into durable progress.".to_string(),
+                cost: Cost::Low,
+                status: ProposalStatus::New,
+                quote: r
+                    .evidence
+                    .clone()
+                    .unwrap_or_else(|| "recurring proposal".to_string())
+                    .chars()
+                    .take(60)
                     .collect(),
                 axis: Some(r.axis),
             });

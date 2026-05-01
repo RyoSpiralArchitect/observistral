@@ -88,14 +88,17 @@ Responsibilities:
 - append messages (OpenAI tool-call format)
 - execute tools and feed results back
 - carry required docs/replay/runtime-eval follow-up edits before verification
-- enrich verified final handoffs with requested artifact paths the model omitted
+- enrich verified final handoffs with requested artifact paths and non-command required literals the model omitted
 - prefer the fixture/project configured verification command during automatic goal checks
+- pause repeated-observation mutation pressure after a malformed file-tool patch so recovery can re-read the target snippet safely
+- synthesize a narrow fix-existing mutation when a no-tool turn stalls after enough implementation evidence is already present
 - stop conditions + goal checks
 
 Current code:
 - TUI/CLI agentic loop: `src/tui/agent.rs::run_agentic_json`
 - Required follow-up edit coercion: `src/tui/agent/followup_requirements.rs`
 - Final handoff artifact repair: `src/tui/agent/final_handoff.rs`
+- Evaluator/meta-harness pressure gates: `src/tui/agent/evaluator_loop.rs`, `src/tui/agent/harness_evolution.rs`, `src/tui/agent/task_harness.rs`
 - Streaming adapter: `src/streaming.rs`
 - Web longrun loop: `web/app.js::runCoderAgentic`
 
@@ -104,12 +107,23 @@ Current code:
 Responsibilities:
 - summarize transcript/tool risk after the coder loop
 - surface repo-rule follow-ups such as required docs or replay/eval proof
+- emit a typed Coder diagnostic packet with mutation anchor, required follow-ups, verification command, final-handoff literals, and one concrete next action
+- emit a typed benchmark plan packet with the next smallest regression lane, case id hint, checks, and success criteria
+- expose the same diagnostic packet to TUI and GUI so humans can approve sending it back to the Coder inside explicit `<observer_...>` handoff tags
+- route approved `<observer_benchmark_plan>` handoffs through the `benchmark_plan` Task Harness lane so runtime-eval and TUI-replay proposals first land on their matching `.obstral/*.json` spec before patch/verify
+- repair malformed benchmark-plan spec patches by synthesizing the smallest JSON update from `case_id_hint` and `src/...rs` evidence when the model drifts after reading the spec
+- keep UI proposal truncation separate from diagnostic generation so lower-displayed but required follow-ups do not disappear from the Coder packet
+- feed proposal recurrence memory into analyzer-stage risk generation so repeated unresolved findings become first-class risks, not just score bumps
 - keep "next improvement" suggestions small enough to feed back into dogfood work
 
 Current code:
 - deterministic critique engine: `src/observer/engine.rs`
+- Coder handoff diagnostic contract: `src/observer/coder_diagnostic.rs`
+- Benchmark planning contract: `src/observer/benchmark_plan.rs`
 - transcript/event analysis: `src/observer/detector.rs`, `src/observer/analyzer.rs`
+- recurring critique memory: `src/observer/memory.rs`
 - repo-rule follow-up heuristics: `src/observer/repo_rules.rs`
+- TUI/GUI rendering: `src/tui/ui.rs`, `web/observer/logic.js`, `web/app.js`
 
 ### 5) Safety Governor
 

@@ -1011,6 +1011,8 @@
   const parseProposals = OBSERVER.parseProposals;
   const parseCriticalPath = OBSERVER.parseCriticalPath;
   const parseHealthScore = OBSERVER.parseHealthScore;
+  const parseCoderDiagnostic = OBSERVER.parseCoderDiagnostic;
+  const parseBenchmarkPlan = OBSERVER.parseBenchmarkPlan;
   const stripObserverMeta = OBSERVER.stripObserverMeta;
   if (
     !normalizeForSim
@@ -1020,6 +1022,8 @@
     || !parseProposals
     || !parseCriticalPath
     || !parseHealthScore
+    || !parseCoderDiagnostic
+    || !parseBenchmarkPlan
     || !stripObserverMeta
   ) {
     throw new Error("OBSTRAL UI: missing observer helpers (observer/logic.js not loaded)");
@@ -9757,8 +9761,79 @@ state: ${agentState}`);
       const to = String(p.toCoder || "").trim();
       if (!to) return;
       const sev = String(p.severity || "info").trim();
-      const steer = `[Observer proposal approved]\nTitle: ${title}\nSeverity: ${sev}\n\n${to}\n`;
+      const steer = [
+        "[Observer proposal approved]",
+        '<observer_proposal source="external_observer" priority="' + sev + '">',
+        `Title: ${title}`,
+        `Severity: ${sev}`,
+        "",
+        to,
+        "",
+        "In your next <plan> or visible planning text, explicitly say whether you accept, override, or defer this Observer proposal.",
+        "</observer_proposal>",
+        "",
+      ].join("\n");
       sendCoder(steer);
+    };
+
+    const sendDiagnosticToCoder = (d) => {
+      if (!d) return;
+      const anchor = d.mutationAnchor && d.mutationAnchor.path ? String(d.mutationAnchor.path) : "";
+      const followups = Array.isArray(d.requiredFollowups)
+        ? d.requiredFollowups.map((f) => {
+            const path = String((f && f.path) || "").trim();
+            const lit = String((f && f.required_literal) || "").trim();
+            return lit ? `${path} (literal: ${lit})` : path;
+          }).filter(Boolean)
+        : [];
+      const action = d.nextCoderAction && typeof d.nextCoderAction === "object"
+        ? JSON.stringify(d.nextCoderAction, null, 2)
+        : "";
+      const literals = Array.isArray(d.finalHandoffLiterals)
+        ? d.finalHandoffLiterals.map((x) => String(x || "").trim()).filter(Boolean)
+        : [];
+      const lines = [
+        "[Observer coder diagnostic approved]",
+        '<observer_diagnostic source="deterministic_observer" required="true">',
+        `failure_mode: ${String(d.failureMode || "needs_coder_followup")}`,
+        anchor ? `mutation_anchor: ${anchor}` : "",
+        followups.length ? "required_followups:\n- " + followups.join("\n- ") : "",
+        d.verificationCmd ? `verification_cmd: ${d.verificationCmd}` : "",
+        action ? "next_coder_action:\n" + action : "",
+        literals.length ? "final_handoff_literals:\n- " + literals.join("\n- ") : "",
+        "",
+        "Use this packet as the next concrete Coder step. Prefer patch/verify over more broad reading.",
+        "In your next <plan> or visible planning text, explicitly say whether you accept, override, or defer this Observer diagnostic.",
+        "</observer_diagnostic>",
+      ].filter(Boolean);
+      sendCoder(lines.join("\n"));
+    };
+
+    const sendBenchmarkPlanToCoder = (p) => {
+      if (!p) return;
+      const checks = Array.isArray(p.requiredChecks)
+        ? p.requiredChecks.map((x) => String(x || "").trim()).filter(Boolean)
+        : [];
+      const targets = Array.isArray(p.targetFiles)
+        ? p.targetFiles.map((x) => String(x || "").trim()).filter(Boolean)
+        : [];
+      const criteria = Array.isArray(p.successCriteria)
+        ? p.successCriteria.map((x) => String(x || "").trim()).filter(Boolean)
+        : [];
+      const lines = [
+        "[Observer benchmark plan approved]",
+        '<observer_benchmark_plan source="deterministic_observer" required="true">',
+        `case_id_hint: ${String(p.caseIdHint || "")}`,
+        `lane: ${String(p.lane || "none")}`,
+        `objective: ${String(p.objective || "")}`,
+        targets.length ? "target_files:\n- " + targets.join("\n- ") : "",
+        checks.length ? "required_checks:\n- " + checks.join("\n- ") : "",
+        criteria.length ? "success_criteria:\n- " + criteria.join("\n- ") : "",
+        "Implement or update the smallest deterministic regression that proves this Observer finding.",
+        "In your next <plan> or visible planning text, explicitly say whether you accept, override, or defer this benchmark plan.",
+        "</observer_benchmark_plan>",
+      ].filter(Boolean);
+      sendCoder(lines.join("\n"));
     };
 
     const upsertTasksForThread = (threadId, items) => {
@@ -10054,6 +10129,8 @@ state: ${agentState}`);
     const observerProposals = parseProposals(lastObserverAsst ? lastObserverAsst.content : "");
     const criticalPath = parseCriticalPath(lastObserverAsst ? lastObserverAsst.content : "");
     const healthScore = parseHealthScore(lastObserverAsst ? lastObserverAsst.content : "");
+    const coderDiagnostic = parseCoderDiagnostic(lastObserverAsst ? lastObserverAsst.content : "");
+    const benchmarkPlan = parseBenchmarkPlan(lastObserverAsst ? lastObserverAsst.content : "");
 
     // Detect current development phase from the latest Observer message that contains one.
     const observerPhase = (() => {
@@ -12042,6 +12119,86 @@ state: ${agentState}`);
                           )
                         : observerMsgsView.map(renderMessage)
                   ),
+                  coderDiagnostic
+                    ? e("div", { className: "diagnosticbox" },
+                        e("div", { className: "diagnostic-head" },
+                          e("div", null,
+                            e("div", { className: "section-title", style: { margin: 0 } },
+                              lang === "en" ? "Coder diagnostic" : lang === "fr" ? "Diagnostic Coder" : "Coder診断"
+                            ),
+                            e("div", { className: "diagnostic-sub" },
+                              String(coderDiagnostic.failureMode || "needs_coder_followup") + " · " + String(coderDiagnostic.confidence || 0) + "%"
+                            )
+                          ),
+                          e("button", {
+                            className: "btn btn-primary",
+                            disabled: sendingCoder,
+                            onClick: () => sendDiagnosticToCoder(coderDiagnostic),
+                          }, tr(lang, "sendToCoder"))
+                        ),
+                        coderDiagnostic.mutationAnchor && coderDiagnostic.mutationAnchor.path
+                          ? e("div", { className: "diagnostic-row" },
+                              e("span", { className: "diagnostic-label" }, "anchor"),
+                              e("code", null, String(coderDiagnostic.mutationAnchor.path || ""))
+                            )
+                          : null,
+                        coderDiagnostic.requiredFollowups && coderDiagnostic.requiredFollowups.length
+                          ? e("div", { className: "diagnostic-row" },
+                              e("span", { className: "diagnostic-label" }, "follow-up"),
+                              e("span", null, coderDiagnostic.requiredFollowups.map((f) => String((f && f.path) || "")).filter(Boolean).join(", "))
+                            )
+                          : null,
+                        coderDiagnostic.verificationCmd
+                          ? e("div", { className: "diagnostic-row" },
+                              e("span", { className: "diagnostic-label" }, "verify"),
+                              e("code", null, String(coderDiagnostic.verificationCmd || ""))
+                            )
+                          : null,
+                        coderDiagnostic.nextCoderAction
+                          ? e("pre", { className: "diagnostic-action" }, JSON.stringify(coderDiagnostic.nextCoderAction, null, 2))
+                          : null
+                      )
+                    : null,
+                  benchmarkPlan
+                    ? e("div", { className: "diagnosticbox benchmarkbox" },
+                        e("div", { className: "diagnostic-head" },
+                          e("div", null,
+                            e("div", { className: "section-title", style: { margin: 0 } },
+                              lang === "en" ? "Benchmark plan" : lang === "fr" ? "Plan benchmark" : "ベンチ計画"
+                            ),
+                            e("div", { className: "diagnostic-sub benchmark-sub" },
+                              String(benchmarkPlan.lane || "none") + " · " + String(benchmarkPlan.confidence || 0) + "%"
+                            )
+                          ),
+                          e("button", {
+                            className: "btn btn-primary",
+                            disabled: sendingCoder,
+                            onClick: () => sendBenchmarkPlanToCoder(benchmarkPlan),
+                          }, tr(lang, "sendToCoder"))
+                        ),
+                        benchmarkPlan.caseIdHint
+                          ? e("div", { className: "diagnostic-row" },
+                              e("span", { className: "diagnostic-label" }, "case"),
+                              e("code", null, String(benchmarkPlan.caseIdHint || ""))
+                            )
+                          : null,
+                        benchmarkPlan.objective
+                          ? e("div", { className: "diagnostic-row" },
+                              e("span", { className: "diagnostic-label" }, "objective"),
+                              e("span", null, String(benchmarkPlan.objective || ""))
+                            )
+                          : null,
+                        benchmarkPlan.requiredChecks && benchmarkPlan.requiredChecks.length
+                          ? e("div", { className: "diagnostic-row" },
+                              e("span", { className: "diagnostic-label" }, "checks"),
+                              e("span", null, benchmarkPlan.requiredChecks.map((x) => String(x || "")).filter(Boolean).join(", "))
+                            )
+                          : null,
+                        benchmarkPlan.successCriteria && benchmarkPlan.successCriteria.length
+                          ? e("pre", { className: "diagnostic-action benchmark-action" }, benchmarkPlan.successCriteria.map((x) => "- " + String(x || "")).join("\n"))
+                          : null
+                      )
+                    : null,
                   criticalPath
                     ? e("div", { className: "critical-path-banner" },
                         e("span", { className: "critical-path-icon" }, "⚠"),

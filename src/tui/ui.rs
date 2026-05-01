@@ -27,6 +27,7 @@ const DANGER: Color = Color::Rgb(248, 113, 113); // red-400
 const SUCCESS: Color = Color::Rgb(74, 222, 128); // green-400
 const PROMO: Color = Color::Rgb(129, 140, 248); // indigo-400
 const MERGE: Color = Color::Rgb(56, 189, 248); // sky-400
+const ACTION: Color = Color::Rgb(163, 230, 53); // lime-400
 const MUTED: Color = Color::Rgb(100, 116, 139); // slate-500
 const TEXT_BODY: Color = Color::Rgb(226, 232, 240); // slate-200
 const BG_DARK: Color = Color::Rgb(15, 23, 42); // slate-950
@@ -1080,6 +1081,8 @@ fn render_welcome(frame: &mut Frame, area: Rect, app: &App, view: PaneView) {
 // Sections:
 //   --- phase ---         → ACCENT banner
 //   --- proposals ---     → OBS_MAG banner + card-like rendering
+//   --- coder_diagnostic --- → ACTION banner + JSON packet for Coder handoff
+//   --- benchmark_plan --- → PROMO banner + regression design packet
 //   --- critical_path --- → DANGER banner  (⚠ highlights)
 //   --- health ---        → health score bar
 
@@ -1088,6 +1091,8 @@ enum ObsSection {
     Body,
     Phase,
     Proposals,
+    CoderDiagnostic,
+    BenchmarkPlan,
     CriticalPath,
     Health,
 }
@@ -1121,6 +1126,16 @@ fn render_observer_content(content: &str) -> Vec<Line<'static>> {
                 lines.push(obs_section_header("PROPOSALS", OBS_MAG));
                 continue;
             }
+            "--- coder_diagnostic ---" => {
+                section = ObsSection::CoderDiagnostic;
+                lines.push(obs_section_header("CODER DIAGNOSTIC", ACTION));
+                continue;
+            }
+            "--- benchmark_plan ---" => {
+                section = ObsSection::BenchmarkPlan;
+                lines.push(obs_section_header("BENCHMARK PLAN", PROMO));
+                continue;
+            }
             "--- critical_path ---" => {
                 section = ObsSection::CriticalPath;
                 lines.push(obs_section_header("CRITICAL PATH", DANGER));
@@ -1150,6 +1165,8 @@ fn render_observer_content(content: &str) -> Vec<Line<'static>> {
                 ),
             ]),
             ObsSection::Proposals => proposal_line(trimmed),
+            ObsSection::CoderDiagnostic => coder_diagnostic_line(trimmed),
+            ObsSection::BenchmarkPlan => benchmark_plan_line(trimmed),
             ObsSection::CriticalPath => {
                 if trimmed.is_empty() {
                     Line::default()
@@ -1283,6 +1300,48 @@ fn proposal_line(trimmed: &str) -> Line<'static> {
         format!("  {trimmed}"),
         Style::default().fg(TEXT_BODY),
     ))
+}
+
+fn coder_diagnostic_line(trimmed: &str) -> Line<'static> {
+    if trimmed.is_empty() {
+        return Line::default();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let style = if lower.contains("\"failure_mode\"")
+        || lower.contains("\"mutation_anchor\"")
+        || lower.contains("\"next_coder_action\"")
+    {
+        Style::default().fg(ACTION).add_modifier(Modifier::BOLD)
+    } else if lower.contains("\"required_followups\"")
+        || lower.contains("\"verification_cmd\"")
+        || lower.contains("\"final_handoff_literals\"")
+    {
+        Style::default().fg(ACCENT)
+    } else {
+        Style::default().fg(TEXT_BODY)
+    };
+    Line::from(Span::styled(format!("  {trimmed}"), style))
+}
+
+fn benchmark_plan_line(trimmed: &str) -> Line<'static> {
+    if trimmed.is_empty() {
+        return Line::default();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let style = if lower.contains("\"lane\"")
+        || lower.contains("\"objective\"")
+        || lower.contains("\"case_id_hint\"")
+    {
+        Style::default().fg(PROMO).add_modifier(Modifier::BOLD)
+    } else if lower.contains("\"required_checks\"")
+        || lower.contains("\"success_criteria\"")
+        || lower.contains("\"target_files\"")
+    {
+        Style::default().fg(ACCENT)
+    } else {
+        Style::default().fg(TEXT_BODY)
+    };
+    Line::from(Span::styled(format!("  {trimmed}"), style))
 }
 
 fn health_line(trimmed: &str) -> Line<'static> {

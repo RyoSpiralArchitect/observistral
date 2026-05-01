@@ -224,6 +224,44 @@
       ]
     },
     {
+      "id": "self-fix-pr-ready-merge-approval",
+      "tool_root": "tests/fixtures/runtime-self-fix-pr-ready-merge-approval",
+      "copy_tool_root": true,
+      "max_iters": 20,
+      "tags": ["action", "fix", "rust", "self", "runtime-eval", "pr-ready", "merge-gate"],
+      "prompt": "Fix the existing TUI agent merge approval module so an approved passing merge gate review produces a PR-ready final handoff, missing approval stays human approval pending, and failed cases stay blocked, using the smallest safe code change. Because PR-ready merge approval paths are documented and benchmarked in this repo, update `docs/state-schema.md` and `.obstral/runtime_eval.json` to match. Run `cargo test -q tui::agent::merge_approval::tests:: 2>&1 && bash scripts/pr-ready-smoke.sh` before you finish. Final answer must include the changed Rust file path, the docs file path, the runtime eval spec path, the verification command, and the status label `PR-ready merge approved`.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "tool_call_seen", "name": "patch_file" },
+        { "kind": "assistant_contains", "value": "src/tui/agent/merge_approval.rs" },
+        { "kind": "assistant_contains", "value": "docs/state-schema.md" },
+        { "kind": "assistant_contains", "value": ".obstral/runtime_eval.json" },
+        { "kind": "assistant_contains", "value": "cargo test -q tui::agent::merge_approval::tests:: 2>&1 && bash scripts/pr-ready-smoke.sh" },
+        { "kind": "assistant_contains", "value": "PR-ready merge approved" }
+      ]
+    },
+    {
+      "id": "self-fix-merge-gate-rollback-guard",
+      "tool_root": "tests/fixtures/runtime-self-fix-merge-gate-rollback",
+      "copy_tool_root": true,
+      "max_iters": 22,
+      "tags": ["action", "fix", "rust", "self", "runtime-eval", "pr-ready", "merge-gate", "rollback"],
+      "prompt": "Fix the existing merge gate board module so stale approval records never approve failed cases: failed cases with a rollback command stay rollback available, failed cases without rollback stay blocked, and approved passing cases stay approved, using the smallest safe code change in `src/merge_gate.rs`. Because merge-gate rollback board semantics are documented and benchmarked in this repo, update `docs/state-schema.md` and `.obstral/runtime_eval.json` to include `src/merge_gate.rs`. Run `cargo test -q merge_gate::tests:: 2>&1 && bash scripts/merge-gate-smoke.sh` before you finish. Final answer must include the changed Rust file path, the docs file path, the runtime eval spec path, the verification command, and the status label `rollback guard enforced`.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "tool_call_seen", "name": "patch_file" },
+        { "kind": "assistant_contains", "value": "src/merge_gate.rs" },
+        { "kind": "assistant_contains", "value": "docs/state-schema.md" },
+        { "kind": "assistant_contains", "value": ".obstral/runtime_eval.json" },
+        { "kind": "assistant_contains", "value": "cargo test -q merge_gate::tests:: 2>&1 && bash scripts/merge-gate-smoke.sh" },
+        { "kind": "assistant_contains", "value": "rollback guard enforced" }
+      ]
+    },
+    {
       "id": "maze-game-rust-repo",
       "tool_root": "tests/fixtures/runtime-maze-game",
       "copy_tool_root": true,

@@ -294,7 +294,14 @@ fn tool_call_path(tc: &ToolCallData) -> Option<String> {
 fn is_followup_candidate_tool(tc: &ToolCallData) -> bool {
     matches!(
         tc.name.as_str(),
-        "read_file" | "search_files" | "list_dir" | "glob" | "exec" | "patch_file" | "apply_diff"
+        "read_file"
+            | "search_files"
+            | "list_dir"
+            | "glob"
+            | "exec"
+            | "patch_file"
+            | "apply_diff"
+            | "done"
     )
 }
 
@@ -1036,5 +1043,134 @@ mod tests {
             &tc,
             "Update docs/runtime-architecture.md and .obstral/tui_replay.json to include `src/tui/review_panel.rs`.",
         ));
+    }
+
+    #[test]
+    fn pr_ready_merge_prompt_requires_docs_followup_after_source_patch() {
+        let messages = vec![
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_patch_merge",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\"src/tui/agent/merge_approval.rs\",\"search\":\"old\",\"replace\":\"new\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_merge",
+                "content":"OK: patched 'src/tui/agent/merge_approval.rs' (+1 lines, 99 total)\n[auto-test] ✓ PASSED (exit 0)"
+            }),
+        ];
+
+        let hint = required_existing_followup_no_tool_hint(
+            &messages,
+            "Because PR-ready merge approval paths are documented and benchmarked in this repo, update `docs/state-schema.md` and `.obstral/runtime_eval.json` to match. Final answer must include `src/tui/agent/merge_approval.rs`.",
+        )
+        .expect("docs followup should be pending");
+
+        assert!(hint.contains("read_file(path=docs/state-schema.md)"));
+        assert!(hint.contains("src/tui/agent/merge_approval.rs"));
+    }
+
+    #[test]
+    fn pr_ready_merge_done_tool_is_redirected_to_docs_followup() {
+        let messages = vec![
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_patch_merge",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\"src/tui/agent/merge_approval.rs\",\"search\":\"old\",\"replace\":\"new\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_merge",
+                "content":"OK: patched 'src/tui/agent/merge_approval.rs' (+1 lines, 99 total)\n[auto-test] ✓ PASSED (exit 0)"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_done".to_string(),
+            name: "done".to_string(),
+            arguments: json!({
+                "summary":"done",
+                "completed_acceptance":[],
+                "remaining_acceptance":[],
+                "acceptance_evidence":[]
+            })
+            .to_string(),
+        };
+
+        let (rewritten, original, coerced) = coerce_existing_followup_tool_call(
+            &messages,
+            &tc,
+            "Because PR-ready merge approval paths are documented and benchmarked in this repo, update `docs/state-schema.md` and `.obstral/runtime_eval.json` to match. Final answer must include `src/tui/agent/merge_approval.rs`.",
+        )
+        .expect("done should be redirected to pending followup");
+
+        assert!(original.starts_with("done("));
+        assert_eq!(rewritten.name, "read_file");
+        assert_eq!(coerced, "read_file(path=docs/state-schema.md)");
+    }
+
+    #[test]
+    fn pr_ready_merge_advances_from_docs_to_runtime_eval_followup() {
+        let messages = vec![
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_patch_merge",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\"src/tui/agent/merge_approval.rs\",\"search\":\"old\",\"replace\":\"new\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_merge",
+                "content":"OK: patched 'src/tui/agent/merge_approval.rs' (+1 lines, 99 total)"
+            }),
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_read_docs",
+                    "type":"function",
+                    "function":{"name":"read_file","arguments":"{\"path\":\"docs/state-schema.md\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_read_docs",
+                "content":"[docs/state-schema.md] (4 lines, 80 bytes)\n# State schema\n\n- `src/tui/agent/session_bridge.rs`\n"
+            }),
+            json!({
+                "role":"assistant",
+                "tool_calls":[{
+                    "id":"call_patch_docs",
+                    "type":"function",
+                    "function":{"name":"patch_file","arguments":"{\"path\":\"docs/state-schema.md\",\"search\":\"- `src/tui/agent/session_bridge.rs`\\n\",\"replace\":\"- `src/tui/agent/session_bridge.rs`\\n- `src/tui/agent/merge_approval.rs`\\n\"}"}
+                }]
+            }),
+            json!({
+                "role":"tool",
+                "tool_call_id":"call_patch_docs",
+                "content":"OK: patched 'docs/state-schema.md' (+1 lines, 5 total)"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_exec".to_string(),
+            name: "exec".to_string(),
+            arguments: json!({"command":"cargo test -q tui::agent::merge_approval::tests:: 2>&1 && bash scripts/pr-ready-smoke.sh"}).to_string(),
+        };
+
+        let (rewritten, _original, coerced) = coerce_existing_followup_tool_call(
+            &messages,
+            &tc,
+            "Because PR-ready merge approval paths are documented and benchmarked in this repo, update `docs/state-schema.md` and `.obstral/runtime_eval.json` to match. Final answer must include `src/tui/agent/merge_approval.rs`.",
+        )
+        .expect("runtime eval followup should be next");
+
+        assert_eq!(rewritten.name, "read_file");
+        assert_eq!(coerced, "read_file(path=.obstral/runtime_eval.json)");
     }
 }

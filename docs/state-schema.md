@@ -21,6 +21,9 @@ store state without first choosing the correct owner.
 | Project-local contract promotion review gate | `src/harness_gate.rs` | cross-session | `.obstral/governor_contract.promotion_gate.json` | human review decisions like approved/held/applied, GUI/TUI gate state for source-contract updates |
 | Runtime eval merge gate | `src/eval_merge_gate.rs` | generated artifact | `.tmp/runtime_eval_*/merge_gate.json` | merge readiness, rollback availability, promoted overlay paths, checkpoint status |
 | Project-local merge gate review state | `src/merge_gate.rs` | cross-session | `.obstral/runtime_eval.merge_gate_review.json` | human approve/hold decisions for latest runtime eval merge-gate cases, shared by TUI and GUI |
+| Observer/Coder diagnostic contract | `src/observer/coder_diagnostic.rs` | per Observer run | API/formatted Observer output | `CoderDiagnostic`, `MutationAnchor`, required follow-ups, verification command, next Coder action |
+| Observer benchmark plan contract | `src/observer/benchmark_plan.rs` | per Observer run | API/formatted Observer output | `BenchmarkPlan`, case id hint, lane, required checks, success criteria |
+| Observer critique memory | `src/observer/memory.rs` | per Observer thread / API caller | request/response payload, Web thread state | `CritiqueMemory`, proposal recurrence counts, analyzer-stage recurring risk bias |
 | In-memory orchestration state | `src/tui/app.rs` + `src/tui/agent/task_harness.rs` + `src/tui/agent/meta_harness.rs` + `src/tui/agent/evaluator_loop.rs` | live TUI session / live coder loop | memory only | `App`, `pending_auto_fix`, `TaskHarness`, `TaskLane`, `ArtifactMode`, `MetaHarness`, `FailurePattern`, `PolicyDelta`, `EvaluatorLoop`, `EvaluatorFinding`, `PolicyPatch` |
 | Intent state | `src/tui/intent.rs` | live session, optionally persisted later | memory only today | `IntentAnchor`, `IntentUpdateKind`, normalized constraints/success criteria |
 | Replay/eval fixtures | `.obstral/*.json` + `src/runtime_eval.rs` + `src/tui_replay.rs` | versioned test input/output | repo files + `.tmp/` artifacts | runtime eval spec, TUI replay spec, reports |
@@ -165,6 +168,29 @@ This layer is intentionally bias-only memory:
 - it should not be treated as proof
 - it must yield to current tool output when contradicted
 
+### 4b. Observer critique memory
+
+Code:
+
+- `src/observer/memory.rs`
+- `src/observer/engine.rs`
+
+Owns:
+
+- per-thread Observer proposal recurrence counts
+- proposal status escalation (`new`, `[UNRESOLVED]`, `[ESCALATED]`)
+- analyzer-stage bias risks for findings that appear again
+
+Examples:
+
+- `CritiqueMemory`
+- `proposal_counts`
+- `Recurring unresolved Observer proposal`
+
+This memory is intentionally narrow. It can make repeated critique louder and
+convert recurrence into a risk, but current transcript/tool evidence remains the
+source of truth.
+
 ### 5. In-memory orchestration state
 
 Code:
@@ -188,7 +214,7 @@ Examples:
 - `coder_realize_state`
 - running task handles
 - `TaskHarness`
-- `TaskLane`
+- `TaskLane` (`benchmark_plan` is used for approved Observer benchmark handoffs)
 - `ArtifactMode`
 - `MetaHarness`
 - `FailurePattern`
@@ -200,7 +226,61 @@ Examples:
 This layer should stay transient. If a field must survive restart/resume, it
 likely belongs in prefs or session persistence instead.
 
-### 5b. Project-local harness evolution queue
+### 5a. Observer/Coder diagnostic contract
+
+Code:
+
+- `src/observer/coder_diagnostic.rs`
+- `src/observer/engine.rs`
+
+Owns:
+
+- per-run Observer diagnosis that is safe to display in TUI/GUI
+- the Coder-facing mutation anchor chosen from observed edits
+- required docs/replay/runtime-eval follow-up paths
+- suggested verification command and final-handoff literals
+- one concrete next Coder action (`read_file` or `exec`) derived from evidence
+- full-proposal diagnostic input before the UI trims displayed proposal cards
+
+Examples:
+
+- `CoderDiagnostic`
+- `MutationAnchor`
+- `RequiredFollowup`
+- `CoderAction`
+
+This is a transient typed contract, not persistent memory. If a diagnostic needs
+to affect later runs, promote the underlying rule through the harness evolution
+queue or store resumable facts in `AgentSession`.
+
+### 5b. Observer benchmark plan contract
+
+Code:
+
+- `src/observer/benchmark_plan.rs`
+- `src/observer/engine.rs`
+
+Owns:
+
+- the next smallest deterministic regression suggested by Observer output
+- benchmark lane selection (`runtime_eval`, `tui_replay`, `observer_unit`, etc.)
+- case id hints, target files, required checks, and success criteria
+- trigger evidence such as recurring findings or missing follow-up diagnostics
+
+Examples:
+
+- `BenchmarkPlan`
+- `case_id_hint`
+- `required_checks`
+- `success_criteria`
+
+This is a planning contract, not an executable command queue by itself. When a
+human approves the TUI/GUI handoff, the Coder receives
+`<observer_benchmark_plan>` and `TaskHarness` classifies it as the
+`benchmark_plan` lane, which focuses runtime-eval and TUI-replay plans onto the
+matching `.obstral/*.json` spec before mutation.
+
+### 5c. Project-local harness evolution queue
 
 Code:
 
@@ -227,7 +307,7 @@ Important rule:
 - it must not directly rewrite `shared/governor_contract.json` during a normal run
 - promotion into a source contract should stay gated by replay/eval health
 
-### 5c. Project-local promoted governor overlay
+### 5d. Project-local promoted governor overlay
 
 Code:
 
@@ -248,7 +328,7 @@ Important rule:
 - this layer is stronger than the raw patch queue, but still weaker than current contradictory tool output
 - it is the bridge between runtime-learned policy and eventual source-contract promotion
 
-### 5d. Project-local contract promotion candidate
+### 5e. Project-local contract promotion candidate
 
 Code:
 
@@ -269,7 +349,7 @@ Important rule:
 - this file is candidate output, not live runtime policy
 - it may be regenerated at any time from the promoted overlay plus the current source contract
 
-### 5e. Project-local contract promotion review gate
+### 5f. Project-local contract promotion review gate
 
 Code:
 
@@ -290,7 +370,7 @@ Important rule:
 - this file may authorize source-contract updates, but it does not replace the candidate artifact itself
 - runtime overlays and promotion candidates should remain derivable even if this review gate is reset
 
-### 5f. Runtime eval merge gate
+### 5g. Runtime eval merge gate
 
 Code:
 
@@ -313,7 +393,7 @@ Important rules:
 - rollback commands are advisory and human-gated; the eval runner must not run destructive restore commands by itself
 - copied eval tool roots under `.tmp/` must not create checkpoint commits in the parent repo
 
-### 5g. Project-local merge gate review state
+### 5h. Project-local merge gate review state
 
 Code:
 

@@ -2938,11 +2938,13 @@ fn build_observer_suggestion_soft_hint(
         primary.reason.as_str()
     };
     Some(format!(
-        "[Observer advisory — soft hint only]\n\
+        "<observer_advisory priority=\"soft\" source=\"external_observer\">\n\
+[Observer advisory — soft hint only]\n\
 Stay within the current intent anchor and task scope.\n\
 If you are still stuck, prefer this next step before widening search:\n\
 {action}\n\
-Why: {reason}"
+Why: {reason}\n\
+</observer_advisory>"
     ))
 }
 
@@ -2989,18 +2991,21 @@ fn build_observer_response_contract_message(
         env.response_contract.note.clone()
     };
     format!(
-        "[Observer response contract]\n\
+        "<observer_response_contract required=\"true\" source=\"external_observer\">\n\
+[Observer response contract]\n\
 On this coder turn, explicitly address the latest high-confidence observer suggestion before finishing.\n\
 Choose one: accept | override | defer.\n\
 If you accept, follow this next step: {quickest}\n\
 If you override, justify the divergence briefly and keep scope narrow.\n\
 If you defer, explain what missing evidence blocks action.\n\
+In your next <plan> or visible planning text, name how you will handle this Observer input.\n\
 Focus axes: {focus}\n\
 Note: {note}\n\
 Suggested plain-text block:\n\
 [Observer response]\n\
 decision: accept|override|defer\n\
-reason: short justification"
+reason: short justification\n\
+</observer_response_contract>"
     )
 }
 
@@ -3615,12 +3620,15 @@ mod tests {
             fallback: String::new(),
         };
         let hint = build_observer_suggestion_soft_hint(&high).expect("high-confidence hint");
+        assert!(hint.contains("<observer_advisory"));
         assert!(hint.contains("[Observer advisory"));
         assert!(hint.contains("read_file(path=src/tui/prefs.rs)"));
         let contract = build_observer_response_contract(&high).expect("contract");
         let contract_msg = build_observer_response_contract_message(&contract);
+        assert!(contract_msg.contains("<observer_response_contract"));
         assert!(contract_msg.contains("[Observer response contract]"));
         assert!(contract_msg.contains("accept | override | defer"));
+        assert!(contract_msg.contains("next <plan>"));
     }
 
     #[test]

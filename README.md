@@ -55,6 +55,8 @@ The current milestone is simple but important: OBSTRAL can now cover both fresh-
 - `resume-session-bridge-fix` shows the runtime can resume an existing Rust bugfix with both seeded session memory and repo-local `.obstral/progress.json` memory, then push the agent back toward the smallest safe patch.
 - The medium-plus self-dogfood stretch case `self-fix-observer-repo-rules-review-panel` now passes end-to-end: the runtime patches `src/observer/repo_rules.rs`, carries the required `docs/runtime-architecture.md` and `.obstral/tui_replay.json` follow-ups, and closes with the exact passing verification command in the final handoff.
 - The PR-ready self-dogfood case `self-fix-pr-ready-runtime-followup` now passes end-to-end too: the runtime patches `src/tui/agent/followup_requirements.rs`, carries the required `docs/state-schema.md` and `.obstral/runtime_eval.json` follow-ups, and repairs the final handoff when a verified artifact path would otherwise be omitted. Latest green run: `.tmp/runtime_eval_1777229175/report.json` (`tools=7`, `messages=22`, approx `3.85k` transcript tokens) with merge readiness captured in `.tmp/runtime_eval_1777229175/merge_gate.json`.
+- The merge-approval self-dogfood case `self-fix-pr-ready-merge-approval` now exercises a fuller PR-ready change set: code fix, docs follow-up, runtime-eval follow-up, exact configured smoke command, and a final handoff that includes the required status label `PR-ready merge approved`. Latest green run: `.tmp/runtime_eval_1777491446/report.json` (`tools=9`, `messages=28`, approx `4.40k` transcript tokens) with merge readiness captured in `.tmp/runtime_eval_1777491446/merge_gate.json`.
+- The rollback-guard stretch case `self-fix-merge-gate-rollback-guard` raises the self-dogfood difficulty again: after a source read, the runtime can synthesize the smallest safe mutation for a stalled no-tool turn, carry docs/runtime-eval follow-ups, and close with the required `rollback guard enforced` handoff. Latest green run: `.tmp/runtime_eval_1777493520/report.json` (`tools=6`, `messages=20`, approx `3.83k` transcript tokens) with merge readiness captured in `.tmp/runtime_eval_1777493520/merge_gate.json`.
 - Runtime eval closeout now writes a generated `merge_gate.json` next to `report.json`; `obstral merge-gate`, the TUI Merge tab, and the Web GUI merge-gate panel can inspect readiness, approve passing cases, hold cases, and copy rollback previews without executing destructive rollback.
 - The benchmark reports now carry provider/model metadata plus approximate transcript token telemetry, which makes it easier to compare runs without pretending those numbers are billing-accurate.
 
@@ -68,8 +70,9 @@ The next stretch is less about making prettier demos and more about making the r
 
 - **Long-running durability**: session resume is much better now, and repo-local progress snapshots are in place, but true multi-hour work still wants stronger context compaction, drift-triggered replanning, and more checkpoint-aware recovery.
 - **Broader benchmark mix**: fresh repo scaffolds plus one existing-repo bugfix are a good start; the next useful cases are small web apps, medium refactors, and docs/config tasks where the right verification floor is easier to get wrong.
-- **Merge-ready self-dogfood loops**: PR-ready fixture work now has branch/checkpoint safety, a generated merge gate, a CLI reader, and shared TUI/GUI human review state. The next useful step is replay/eval-backed promotion from approved gate state into a PR-ready merge workflow.
+- **Merge-ready self-dogfood loops**: PR-ready fixture work now has branch/checkpoint safety, a generated merge gate, shared TUI/GUI human review state, and a green merge-approval handoff benchmark. The next useful step is replay/eval-backed promotion from approved gate state into an actual PR-ready merge workflow.
 - **Stronger verification pressure**: passing one test command is good, but adversarial evaluator loops, rollback/checkpoint restore, and quality-oriented checks would raise the floor a lot.
+- **Patch recovery under pressure**: malformed or truncated patches now stop overpowering the evaluator loop, but the next step is a stronger exact-snippet repair path so retries recover faster instead of relying on another model turn.
 - **Better telemetry**: transcript token estimates are useful for comparison, but provider-native usage accounting and benchmark trend history would make optimization much more concrete.
 - **Measured harness evolution**: the repo now has overlay, promotion candidate, and human-gated apply flow; the next step is learning which promoted rules actually improve future runs and which ones just add prompt weight.
 
@@ -172,6 +175,8 @@ new  →  [UNRESOLVED] +10pts  →  [ESCALATED] +20pts, pinned to top
 ```
 
 The Observer remembers what it said. If you ignore a `critical` warning twice, it becomes the loudest card on the board.
+
+Repeated findings also become analyzer-visible risk. That means recurrence can influence `critical_path` and the deterministic `coder_diagnostic`, instead of living only as a UI score bump.
 
 ### Error Classification, Not Just Exit Codes
 
@@ -375,6 +380,25 @@ cost: low
 impact: prevents crash on malformed input
 quote: user_input = input()
 
+--- coder_diagnostic ---
+{
+  "failure_mode": "missing_required_followup",
+  "confidence": 90,
+  "mutation_anchor": { "path": "src/tui/agent/task_harness.rs", "reason": "latest source file edited by the coder" },
+  "required_followups": [{ "path": ".obstral/runtime_eval.json", "required_literal": "eval --spec .obstral/runtime_eval.json", "reason": "coder-loop changes need runtime eval proof before closeout" }],
+  "verification_cmd": "cargo run --quiet -- eval --spec .obstral/runtime_eval.json --max-cases 1",
+  "next_coder_action": { "tool": "exec", "args": { "command": "cargo run --quiet -- eval --spec .obstral/runtime_eval.json --max-cases 1" }, "reason": "produce the required replay/eval proof before closeout" }
+}
+
+--- benchmark_plan ---
+{
+  "case_id_hint": "runtime-eval-task-harness",
+  "lane": "runtime_eval",
+  "objective": "Add a runtime_eval regression for missing_required_followup so the Coder must mutate, verify, and close out with required artifacts.",
+  "required_checks": ["cargo test -q tui::agent::tests::", "cargo run --quiet -- eval --spec .obstral/runtime_eval.json --max-cases 1"],
+  "success_criteria": ["runtime eval fails on the old behavior and passes after the harness fix"]
+}
+
 --- critical_path ---
 Fix input validation before adding any new features.
 
@@ -382,7 +406,11 @@ Fix input validation before adding any new features.
 score: 41  rationale: core logic works but injection surface is wide open
 ```
 
-Every field is intentional. `quote` pins the exact offending line to the card. `cost` tells you how hard the fix is before you read the details. `phase` controls visibility.
+Every field is intentional. `quote` pins the exact offending line to the card. `cost` tells you how hard the fix is before you read the details. `phase` controls visibility. `coder_diagnostic` is generated from the full proposal set even when the UI displays only the top cards, so required docs/replay/eval follow-ups do not disappear behind truncation.
+
+When a human sends an Observer proposal or diagnostic back to the Coder, the UI wraps it in an explicit `<observer_...>` handoff tag and asks the Coder to state accept / override / defer in the next plan. That keeps the external critic's voice distinct from ordinary user instructions.
+
+`benchmark_plan` is the Observer's next-step testing instinct: it names the smallest regression lane and checks that should make the finding repeatable. When a human approves it from the TUI/GUI, the Coder receives it inside `<observer_benchmark_plan>` and the Task Harness switches to a dedicated `benchmark_plan` lane, first reading the matching `.obstral/runtime_eval.json` or `.obstral/tui_replay.json` spec before patching the smallest regression artifact. If the model emits a malformed spec patch after that read, the harness can synthesize the minimal JSON update from the approved `case_id_hint` and `src/...rs` evidence.
 
 ---
 

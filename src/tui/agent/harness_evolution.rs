@@ -780,6 +780,7 @@ mod tests {
             None,
             Some("cargo test 2>&1"),
             None,
+            0,
         );
         ContractPatchProposal::from_signals(fix_task_harness(), &meta, &evaluator)
             .expect("fix proposal")
@@ -801,6 +802,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         ContractPatchProposal::from_signals(init_repo_harness(), &meta, &evaluator)
             .expect("repo proposal")

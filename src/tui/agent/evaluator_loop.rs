@@ -71,10 +71,17 @@ impl EvaluatorLoop {
         last_reflection: Option<&ReflectionBlock>,
         test_cmd: Option<&str>,
         last_mutation_step: Option<usize>,
+        file_tool_consec_failures: usize,
     ) -> Self {
         let Some(policy) = meta_harness.policy().cloned() else {
             return Self::default();
         };
+        if policy.pattern == FailurePattern::RepeatedObservationLoop
+            && last_mutation_step.is_none()
+            && file_tool_consec_failures > 0
+        {
+            return Self::default();
+        }
 
         let patch = build_policy_patch(&policy, test_cmd, last_mutation_step);
         let support_note = related_reflection_memory(
@@ -536,6 +543,7 @@ mod tests {
             None,
             Some("cargo test 2>&1"),
             None,
+            0,
         );
 
         let prompt = evaluator.prompt().expect("prompt");
@@ -568,6 +576,7 @@ mod tests {
             None,
             Some("cargo test 2>&1"),
             None,
+            0,
         );
         let repeated = ToolCallData {
             id: "call_repeat".to_string(),
@@ -608,6 +617,7 @@ mod tests {
                 "test -d demo_repo/.git && test -f demo_repo/README.md && test -f demo_repo/.gitignore",
             ),
             None,
+            0,
         );
         let tc = ToolCallData {
             id: "call_list".to_string(),
@@ -639,6 +649,7 @@ mod tests {
             }),
             Some("cargo test 2>&1"),
             None,
+            0,
         );
 
         let prompt = evaluator.prompt().expect("prompt");
@@ -664,6 +675,7 @@ mod tests {
             None,
             Some("cargo test 2>&1"),
             None,
+            0,
         );
 
         let prompt = evaluator.prompt().expect("prompt");
@@ -683,6 +695,7 @@ mod tests {
             None,
             Some("cargo test 2>&1"),
             None,
+            0,
         );
         let tc = ToolCallData {
             id: "call_verify".to_string(),
@@ -710,6 +723,7 @@ mod tests {
             None,
             Some("cargo test 2>&1"),
             Some(5),
+            0,
         );
         let tc = ToolCallData {
             id: "call_verify".to_string(),
@@ -718,5 +732,24 @@ mod tests {
         };
 
         assert!(evaluator.build_violation_block(&tc).is_none());
+    }
+
+    #[test]
+    fn evaluator_loop_pauses_observation_policy_after_file_tool_failure() {
+        let reflection_ledger = crate::reflection_ledger::ReflectionLedger::default();
+        let evaluator = EvaluatorLoop::analyze(
+            TaskHarness {
+                lane: super::task_harness::TaskLane::FixExisting,
+                artifact_mode: super::task_harness::ArtifactMode::ExistingFiles,
+            },
+            &base_fix_meta_harness(),
+            &reflection_ledger,
+            None,
+            Some("cargo test 2>&1"),
+            None,
+            1,
+        );
+
+        assert!(evaluator.prompt().is_none());
     }
 }

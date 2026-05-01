@@ -1,9 +1,15 @@
 use crate::observer::analyzer;
+use crate::observer::benchmark_plan;
+use crate::observer::coder_diagnostic;
 use crate::observer::detector;
 use crate::observer::memory::{self, CritiqueMemory};
 use crate::observer::scorer;
-use crate::observer::{Critique, DevPhase, HealthScore, Proposal, ProposalStatus, RiskAxis};
+use crate::observer::{
+    Critique, DevPhase, HealthScore, Proposal, ProposalStatus, RiskAxis, Severity,
+};
 use serde_json::Value;
+
+const MAX_DISPLAY_PROPOSALS: usize = 5;
 
 fn status_rank(s: ProposalStatus) -> u8 {
     match s {
@@ -11,6 +17,23 @@ fn status_rank(s: ProposalStatus) -> u8 {
         ProposalStatus::Unresolved => 1,
         ProposalStatus::New => 2,
         ProposalStatus::Addressed => 3,
+    }
+}
+
+fn severity_rank(s: Severity) -> u8 {
+    match s {
+        Severity::Crit => 0,
+        Severity::Warn => 1,
+        Severity::Info => 2,
+    }
+}
+
+fn phase_rank(p: DevPhase) -> u8 {
+    match p {
+        DevPhase::Core => 0,
+        DevPhase::Feature => 1,
+        DevPhase::Any => 2,
+        DevPhase::Polish => 3,
     }
 }
 
@@ -119,14 +142,62 @@ fn summarize(
 }
 
 fn critical_path_from_proposals(ps: &[Proposal]) -> String {
-    let Some(top) = ps.first() else {
+    let blockers: Vec<&Proposal> = ps
+        .iter()
+        .filter(|p| {
+            p.status != ProposalStatus::Addressed
+                && (p.severity == Severity::Crit
+                    || p.score >= 80
+                    || p.status == ProposalStatus::Escalated
+                    || p.status == ProposalStatus::Unresolved)
+        })
+        .take(2)
+        .collect();
+    if !blockers.is_empty() {
+        return blockers
+            .iter()
+            .map(|p| proposal_critical_fragment(p))
+            .collect::<Vec<_>>()
+            .join("; then ");
+    }
+
+    let Some(top) = ps
+        .iter()
+        .find(|p| p.status != ProposalStatus::Addressed)
+        .or_else(|| ps.first())
+    else {
         return "none".to_string();
     };
-    if top.impact.trim().is_empty() {
-        top.title.trim().to_string()
+    proposal_critical_fragment(top)
+}
+
+fn proposal_critical_fragment(p: &Proposal) -> String {
+    if p.impact.trim().is_empty() {
+        p.title.trim().to_string()
     } else {
-        format!("{} — {}", top.title.trim(), top.impact.trim())
+        format!("{} — {}", p.title.trim(), p.impact.trim())
     }
+}
+
+fn sort_proposals_for_display(proposals: &mut [Proposal]) {
+    proposals.sort_by(|a, b| {
+        status_rank(a.status)
+            .cmp(&status_rank(b.status))
+            .then(severity_rank(a.severity).cmp(&severity_rank(b.severity)))
+            .then(b.score.cmp(&a.score))
+            .then(phase_rank(a.phase).cmp(&phase_rank(b.phase)))
+            .then_with(|| {
+                a.title
+                    .to_ascii_lowercase()
+                    .cmp(&b.title.to_ascii_lowercase())
+            })
+    });
+}
+
+fn select_display_proposals(mut proposals: Vec<Proposal>) -> Vec<Proposal> {
+    sort_proposals_for_display(&mut proposals);
+    proposals.truncate(MAX_DISPLAY_PROPOSALS);
+    proposals
 }
 
 fn health_from_proposals(
@@ -162,30 +233,28 @@ fn run_from_events(
     tool_results_count: usize,
     memory_opt: Option<&mut CritiqueMemory>,
 ) -> Critique {
-    let risks = analyzer::analyze(&events);
+    let mut memory_opt = memory_opt;
+    let mut risks = analyzer::analyze(&events);
+    if let Some(mem) = memory_opt.as_deref() {
+        let candidate_proposals = analyzer::generate_proposals(&risks);
+        risks.extend(memory::recurring_unresolved_risks(
+            mem,
+            &candidate_proposals,
+        ));
+    }
+
     let mut proposals = analyzer::generate_proposals(&risks);
 
     for p in &mut proposals {
         scorer::score_proposal(p);
     }
 
-    if let Some(mem) = memory_opt {
+    if let Some(mem) = memory_opt.as_deref_mut() {
         memory::apply_memory(mem, &mut proposals);
     }
 
-    proposals.sort_by(|a, b| {
-        let ra = status_rank(a.status);
-        let rb = status_rank(b.status);
-        match ra.cmp(&rb) {
-            std::cmp::Ordering::Equal => b.score.cmp(&a.score),
-            other => other,
-        }
-    });
-
-    // Keep the output small and UI-friendly by default.
-    if proposals.len() > 5 {
-        proposals.truncate(5);
-    }
+    sort_proposals_for_display(&mut proposals);
+    let full_proposals = proposals.clone();
 
     let failures = events
         .iter()
@@ -196,18 +265,35 @@ fn run_from_events(
         .filter(|e| matches!(e, detector::Event::FileWritten { .. }))
         .count();
 
-    let phase = phase_from_proposals(&proposals);
-    let critical_path = critical_path_from_proposals(&proposals);
+    let phase = phase_from_proposals(&full_proposals);
+    let critical_path = critical_path_from_proposals(&full_proposals);
     let top_axis = risks.first().map(|r| r.axis);
-    let health = health_from_proposals(&proposals, failures, top_axis);
+    let health = health_from_proposals(&full_proposals, failures, top_axis);
+    let summary = summarize(&events, tool_results_count, failures, files_written);
+
+    let full_critique = Critique {
+        summary: summary.clone(),
+        risks: risks.clone(),
+        proposals: full_proposals.clone(),
+        phase,
+        critical_path: critical_path.clone(),
+        health: health.clone(),
+        coder_diagnostic: None,
+        benchmark_plan: None,
+    };
+    let mut full_critique = full_critique;
+    full_critique.coder_diagnostic = coder_diagnostic::diagnose(&events, &full_critique);
+    let benchmark_plan = benchmark_plan::plan(&full_critique);
 
     Critique {
-        summary: summarize(&events, tool_results_count, failures, files_written),
+        summary,
         risks,
-        proposals,
+        proposals: select_display_proposals(full_proposals),
         phase,
         critical_path,
         health,
+        coder_diagnostic: full_critique.coder_diagnostic,
+        benchmark_plan,
     }
 }
 
@@ -293,6 +379,24 @@ pub fn format_critique_as_observer_blocks(c: &Critique) -> String {
         }
     }
 
+    if let Some(diagnostic) = &c.coder_diagnostic {
+        out.push_str("--- coder_diagnostic ---\n");
+        match serde_json::to_string_pretty(diagnostic) {
+            Ok(json) => out.push_str(json.trim_end()),
+            Err(_) => out.push_str("(unavailable)"),
+        }
+        out.push_str("\n\n");
+    }
+
+    if let Some(plan) = &c.benchmark_plan {
+        out.push_str("--- benchmark_plan ---\n");
+        match serde_json::to_string_pretty(plan) {
+            Ok(json) => out.push_str(json.trim_end()),
+            Err(_) => out.push_str("(unavailable)"),
+        }
+        out.push_str("\n\n");
+    }
+
     out.push_str("--- critical_path ---\n");
     let cp = c.critical_path.trim();
     out.push_str(if cp.is_empty() { "none" } else { cp });
@@ -307,6 +411,27 @@ pub fn format_critique_as_observer_blocks(c: &Critique) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proposal(
+        title: &str,
+        severity: Severity,
+        score: u32,
+        status: ProposalStatus,
+        impact: &str,
+    ) -> Proposal {
+        Proposal {
+            title: title.to_string(),
+            to_coder: format!("Fix {title}."),
+            severity,
+            score,
+            phase: DevPhase::Core,
+            impact: impact.to_string(),
+            cost: crate::observer::Cost::Low,
+            status,
+            quote: "n/a".to_string(),
+            axis: Some(RiskAxis::Reliability),
+        }
+    }
 
     #[test]
     fn observer_transcript_surfaces_repo_rule_followups_for_tui_state_change() {
@@ -342,5 +467,107 @@ exit: 0
 
         assert!(formatted.contains("Refresh runtime eval proof"));
         assert!(formatted.contains(".obstral/runtime_eval.json"));
+        assert!(formatted.contains("--- coder_diagnostic ---"));
+        assert!(formatted.contains("--- benchmark_plan ---"));
+        assert!(formatted.contains("\"failure_mode\": \"missing_required_followup\""));
+        assert!(formatted.contains("\"mutation_anchor\""));
+        assert!(formatted.contains("cargo run --quiet -- eval --spec .obstral/runtime_eval.json"));
+        assert!(formatted.contains("\"lane\": \"runtime_eval\""));
+    }
+
+    #[test]
+    fn display_proposals_keep_highest_priority_items_explicitly() {
+        let proposals = vec![
+            proposal("low info", Severity::Info, 100, ProposalStatus::New, ""),
+            proposal("warn one", Severity::Warn, 70, ProposalStatus::New, ""),
+            proposal("crit one", Severity::Crit, 75, ProposalStatus::New, ""),
+            proposal(
+                "escalated",
+                Severity::Warn,
+                60,
+                ProposalStatus::Escalated,
+                "",
+            ),
+            proposal(
+                "unresolved",
+                Severity::Warn,
+                65,
+                ProposalStatus::Unresolved,
+                "",
+            ),
+            proposal(
+                "addressed crit",
+                Severity::Crit,
+                100,
+                ProposalStatus::Addressed,
+                "",
+            ),
+        ];
+
+        let selected = select_display_proposals(proposals);
+        let titles = selected
+            .iter()
+            .map(|p| p.title.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected.len(), MAX_DISPLAY_PROPOSALS);
+        assert_eq!(titles[0], "escalated");
+        assert_eq!(titles[1], "unresolved");
+        assert!(titles.contains(&"crit one"));
+        assert!(!titles.contains(&"addressed crit"));
+    }
+
+    #[test]
+    fn critical_path_can_include_parallel_top_blockers() {
+        let proposals = vec![
+            proposal(
+                "Fix verification gate",
+                Severity::Crit,
+                90,
+                ProposalStatus::New,
+                "done can pass without proof",
+            ),
+            proposal(
+                "Refresh runtime eval proof",
+                Severity::Warn,
+                85,
+                ProposalStatus::Unresolved,
+                "self-dogfood regression is unbounded",
+            ),
+        ];
+
+        let critical_path = critical_path_from_proposals(&proposals);
+
+        assert!(critical_path.contains("Fix verification gate"));
+        assert!(critical_path.contains("Refresh runtime eval proof"));
+        assert!(critical_path.contains("; then "));
+    }
+
+    #[test]
+    fn observer_memory_becomes_analyzer_risk_for_recurring_findings() {
+        let transcript = r#"
+✎ patch_file: src/tui/agent/task_harness.rs
+```bash
+$ cargo test -q tui::agent::tests::
+exit: 0
+```
+"#;
+        let mut mem = CritiqueMemory::default();
+
+        let first = run_observer_from_transcript(transcript, Some(&mut mem));
+        assert!(!first
+            .risks
+            .iter()
+            .any(|r| memory::is_recurring_unresolved_proposal(r.description.as_str())));
+
+        let second = run_observer_from_transcript(transcript, Some(&mut mem));
+        let formatted = format_critique_as_observer_blocks(&second);
+
+        assert!(second
+            .risks
+            .iter()
+            .any(|r| memory::is_recurring_unresolved_proposal(r.description.as_str())));
+        assert!(formatted.contains("Resolve recurring Observer finding"));
+        assert!(formatted.contains("Refresh runtime eval proof"));
     }
 }
