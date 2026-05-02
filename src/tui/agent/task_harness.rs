@@ -618,35 +618,78 @@ pub(super) fn coerce_benchmark_plan_tool_call(
     if !is_benchmark_plan_candidate_tool(tc) {
         return None;
     }
-    let target_path = benchmark_plan_spec_path(root_user_text)?;
     let reads = successful_read_contents(messages);
-    let spec_was_read = reads.contains_key(target_path.as_str());
-    let read_body = reads
-        .get(target_path.as_str())
-        .filter(|body| !body.trim().is_empty())
-        .cloned();
-    let body = spec_was_read
-        .then(|| read_tool_root_file(tool_root, target_path.as_str()).or(read_body))
-        .flatten();
-    if let Some(body) = body.as_deref() {
-        if benchmark_plan_tool_call_is_complete_target_mutation(tc, target_path.as_str()) {
+    for target_path in benchmark_plan_target_paths(root_user_text) {
+        let target_was_read = reads.contains_key(target_path.as_str());
+        let read_body = reads
+            .get(target_path.as_str())
+            .filter(|body| !body.trim().is_empty())
+            .cloned();
+        let body = target_was_read
+            .then(|| read_tool_root_file(tool_root, target_path.as_str()).or(read_body))
+            .flatten();
+        if let Some(body) = body.as_deref() {
+            if benchmark_plan_target_is_satisfied(target_path.as_str(), body, root_user_text) {
+                continue;
+            }
+            if benchmark_plan_tool_call_is_complete_target_mutation(tc, target_path.as_str()) {
+                return None;
+            }
+            let rewritten =
+                synthesize_benchmark_plan_target_patch(target_path.as_str(), body, root_user_text)?;
+            return compare_rewritten_tool_call(tc, rewritten);
+        }
+
+        if tc.name == "read_file" && tool_call_path(tc).as_deref() == Some(target_path.as_str()) {
             return None;
         }
-        let rewritten =
-            synthesize_benchmark_plan_spec_patch(target_path.as_str(), body, root_user_text)?;
+
+        let rewritten = ToolCallData {
+            id: tc.id.clone(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({ "path": target_path }).to_string(),
+        };
         return compare_rewritten_tool_call(tc, rewritten);
     }
 
-    if tc.name == "read_file" && tool_call_path(tc).as_deref() == Some(target_path.as_str()) {
-        return None;
+    None
+}
+
+pub(super) fn allows_benchmark_plan_followup_during_verify(
+    harness: TaskHarness,
+    messages: &[Value],
+    tc: &ToolCallData,
+    root_user_text: &str,
+    tool_root: Option<&str>,
+) -> bool {
+    if harness.lane != TaskLane::BenchmarkPlan {
+        return false;
+    }
+    let Some(tc_path) = tool_call_path(tc) else {
+        return false;
+    };
+    let reads = successful_read_contents(messages);
+    for target_path in benchmark_plan_target_paths(root_user_text) {
+        let target_was_read = reads.contains_key(target_path.as_str());
+        let read_body = reads
+            .get(target_path.as_str())
+            .filter(|body| !body.trim().is_empty())
+            .cloned();
+        let body = target_was_read
+            .then(|| read_tool_root_file(tool_root, target_path.as_str()).or(read_body))
+            .flatten();
+        if let Some(body) = body.as_deref() {
+            if benchmark_plan_target_is_satisfied(target_path.as_str(), body, root_user_text) {
+                continue;
+            }
+            return tc_path == target_path
+                && benchmark_plan_tool_call_is_complete_target_mutation(tc, target_path.as_str());
+        }
+
+        return tc.name == "read_file" && tc_path == target_path;
     }
 
-    let rewritten = ToolCallData {
-        id: tc.id.clone(),
-        name: "read_file".to_string(),
-        arguments: serde_json::json!({ "path": target_path }).to_string(),
-    };
-    compare_rewritten_tool_call(tc, rewritten)
+    false
 }
 
 fn compare_rewritten_tool_call(
@@ -708,6 +751,33 @@ fn benchmark_plan_spec_path(root_user_text: &str) -> Option<String> {
     None
 }
 
+fn benchmark_plan_target_paths(root_user_text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(path) = benchmark_plan_spec_path(root_user_text) {
+        push_unique_path(&mut out, path);
+    }
+    for path in path_literals_in_text(root_user_text) {
+        if is_benchmark_plan_target_path(path.as_str()) {
+            push_unique_path(&mut out, path);
+        }
+    }
+    out
+}
+
+fn is_benchmark_plan_target_path(path: &str) -> bool {
+    path.starts_with("docs/") && path.ends_with(".md")
+        || path == ".obstral/runtime_eval.json"
+        || path == ".obstral/tui_replay.json"
+        || path.ends_with("/.obstral/runtime_eval.json")
+        || path.ends_with("/.obstral/tui_replay.json")
+}
+
+fn push_unique_path(out: &mut Vec<String>, path: String) {
+    if !out.contains(&path) {
+        out.push(path);
+    }
+}
+
 fn tool_call_path(tc: &ToolCallData) -> Option<String> {
     serde_json::from_str::<Value>(tc.arguments.as_str())
         .ok()
@@ -756,7 +826,12 @@ fn benchmark_plan_tool_call_is_complete_target_mutation(tc: &ToolCallData, targe
     }
 }
 
-fn synthesize_benchmark_plan_spec_patch(
+fn benchmark_plan_target_is_satisfied(_target: &str, body: &str, root_user_text: &str) -> bool {
+    benchmark_plan_required_path_literal(root_user_text)
+        .is_some_and(|required_path| body.contains(required_path.as_str()))
+}
+
+fn synthesize_benchmark_plan_target_patch(
     target: &str,
     body: &str,
     root_user_text: &str,
@@ -765,9 +840,33 @@ fn synthesize_benchmark_plan_spec_patch(
     if body.contains(required_path.as_str()) {
         return None;
     }
+    let replace = if target.ends_with(".json") {
+        synthesize_benchmark_plan_json_body(body, required_path.as_str(), root_user_text)?
+    } else if target.starts_with("docs/") && target.ends_with(".md") {
+        synthesize_benchmark_plan_markdown_body(body, required_path.as_str())
+    } else {
+        return None;
+    };
+    Some(ToolCallData {
+        id: "synthetic_benchmark_plan_patch".to_string(),
+        name: "patch_file".to_string(),
+        arguments: serde_json::json!({
+            "path": target,
+            "search": body,
+            "replace": replace,
+        })
+        .to_string(),
+    })
+}
+
+fn synthesize_benchmark_plan_json_body(
+    body: &str,
+    required_path: &str,
+    root_user_text: &str,
+) -> Option<String> {
     let mut value = serde_json::from_str::<Value>(body).ok()?;
     if let Some(paths) = value.get_mut("paths").and_then(|v| v.as_array_mut()) {
-        paths.push(Value::String(required_path.clone()));
+        paths.push(Value::String(required_path.to_string()));
     } else if let Some(cases) = value.get_mut("cases").and_then(|v| v.as_array_mut()) {
         cases.push(serde_json::json!({
             "id": benchmark_plan_case_id_hint(root_user_text)
@@ -788,16 +887,22 @@ fn synthesize_benchmark_plan_spec_patch(
     if body.ends_with('\n') {
         replace.push('\n');
     }
-    Some(ToolCallData {
-        id: "synthetic_benchmark_plan_patch".to_string(),
-        name: "patch_file".to_string(),
-        arguments: serde_json::json!({
-            "path": target,
-            "search": body,
-            "replace": replace,
-        })
-        .to_string(),
-    })
+    Some(replace)
+}
+
+fn synthesize_benchmark_plan_markdown_body(body: &str, required_path: &str) -> String {
+    let mut out = body.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str("## Observer Benchmark Plan Coverage\n\n");
+    out.push_str("- `");
+    out.push_str(required_path);
+    out.push_str("` must stay covered by approved Observer benchmark plans.\n");
+    if body.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 fn benchmark_plan_required_path_literal(root_user_text: &str) -> Option<String> {
@@ -2655,6 +2760,358 @@ success_criteria:\n\
         );
 
         assert!(rewritten.is_none());
+    }
+
+    #[test]
+    fn coerce_benchmark_plan_tool_call_reads_docs_after_spec_is_satisfied() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obstral")).unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(
+            dir.path().join(".obstral/runtime_eval.json"),
+            "{\n  \"version\": 1,\n  \"paths\": [\n    \"src/tui/agent/session_bridge.rs\"\n  ],\n  \"cases\": []\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("docs/runtime-architecture.md"),
+            "# Runtime\n",
+        )
+        .unwrap();
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_spec",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\".obstral/runtime_eval.json\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_spec",
+                "content": "[.obstral/runtime_eval.json] (5 lines, 70 bytes)\n{\"paths\":[]}"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_verify".to_string(),
+            name: "exec".to_string(),
+            arguments: json!({"command":"grep -q session_bridge .obstral/runtime_eval.json"})
+                .to_string(),
+        };
+
+        let (rewritten, _original, coerced) = coerce_benchmark_plan_tool_call(
+            TaskHarness {
+                lane: TaskLane::BenchmarkPlan,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+target_files:\n\
+- .obstral/runtime_eval.json\n\
+- docs/runtime-architecture.md\n\
+success_criteria:\n\
+- both files include src/tui/agent/session_bridge.rs\n\
+</observer_benchmark_plan>",
+            Some(dir.path().to_str().unwrap()),
+        )
+        .expect("docs read");
+
+        assert_eq!(rewritten.name, "read_file");
+        assert!(rewritten.arguments.contains("docs/runtime-architecture.md"));
+        assert_eq!(coerced, "read_file(path=docs/runtime-architecture.md)");
+    }
+
+    #[test]
+    fn coerce_benchmark_plan_tool_call_synthesizes_docs_patch_after_docs_read() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_spec",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\".obstral/runtime_eval.json\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_spec",
+                "content": "[.obstral/runtime_eval.json] (5 lines, 70 bytes)\n{\"paths\":[\"src/tui/agent/session_bridge.rs\"]}"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_docs",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"docs/runtime-architecture.md\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_docs",
+                "content": "[docs/runtime-architecture.md] (1 lines, 10 bytes)\n# Runtime\n"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_done".to_string(),
+            name: "done".to_string(),
+            arguments: json!({"summary":"done"}).to_string(),
+        };
+
+        let (rewritten, _original, coerced) = coerce_benchmark_plan_tool_call(
+            TaskHarness {
+                lane: TaskLane::BenchmarkPlan,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+target_files:\n\
+- .obstral/runtime_eval.json\n\
+- docs/runtime-architecture.md\n\
+success_criteria:\n\
+- both files include src/tui/agent/session_bridge.rs\n\
+</observer_benchmark_plan>",
+            None,
+        )
+        .expect("docs patch");
+
+        assert_eq!(rewritten.name, "patch_file");
+        assert!(rewritten.arguments.contains("docs/runtime-architecture.md"));
+        assert!(rewritten
+            .arguments
+            .contains("src/tui/agent/session_bridge.rs"));
+        assert!(coerced.starts_with("patch_file("));
+    }
+
+    #[test]
+    fn coerce_benchmark_plan_tool_call_allows_verify_after_spec_and_docs_patch() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obstral")).unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(
+            dir.path().join(".obstral/runtime_eval.json"),
+            "{\n  \"paths\": [\"src/tui/agent/session_bridge.rs\"]\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("docs/runtime-architecture.md"),
+            "- `src/tui/agent/session_bridge.rs`\n",
+        )
+        .unwrap();
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_spec",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\".obstral/runtime_eval.json\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_spec",
+                "content": "[.obstral/runtime_eval.json] (2 lines, 20 bytes)\n{\"paths\":[]}"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_docs",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"docs/runtime-architecture.md\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_docs",
+                "content": "[docs/runtime-architecture.md] (1 lines, 10 bytes)\n# Runtime\n"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_verify".to_string(),
+            name: "exec".to_string(),
+            arguments: json!({"command":"grep -q session_bridge docs/runtime-architecture.md"})
+                .to_string(),
+        };
+
+        let rewritten = coerce_benchmark_plan_tool_call(
+            TaskHarness {
+                lane: TaskLane::BenchmarkPlan,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+target_files:\n\
+- .obstral/runtime_eval.json\n\
+- docs/runtime-architecture.md\n\
+success_criteria:\n\
+- both files include src/tui/agent/session_bridge.rs\n\
+</observer_benchmark_plan>",
+            Some(dir.path().to_str().unwrap()),
+        );
+
+        assert!(rewritten.is_none());
+    }
+
+    #[test]
+    fn allows_benchmark_plan_followup_during_verify_reads_next_unsatisfied_target() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obstral")).unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(
+            dir.path().join(".obstral/runtime_eval.json"),
+            "{\n  \"paths\": [\"src/tui/agent/session_bridge.rs\"]\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("docs/runtime-architecture.md"),
+            "# Runtime\n",
+        )
+        .unwrap();
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_spec",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\".obstral/runtime_eval.json\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_spec",
+                "content": "[.obstral/runtime_eval.json] (2 lines, 20 bytes)\n{\"paths\":[]}"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_read_docs".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path":"docs/runtime-architecture.md"}).to_string(),
+        };
+
+        assert!(allows_benchmark_plan_followup_during_verify(
+            TaskHarness {
+                lane: TaskLane::BenchmarkPlan,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+target_files:\n\
+- .obstral/runtime_eval.json\n\
+- docs/runtime-architecture.md\n\
+success_criteria:\n\
+- both files include src/tui/agent/session_bridge.rs\n\
+</observer_benchmark_plan>",
+            Some(dir.path().to_str().unwrap()),
+        ));
+    }
+
+    #[test]
+    fn allows_benchmark_plan_followup_during_verify_allows_target_patch_after_read() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_spec",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\".obstral/runtime_eval.json\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_spec",
+                "content": "[.obstral/runtime_eval.json] (2 lines, 20 bytes)\n{\"paths\":[\"src/tui/agent/session_bridge.rs\"]}"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_docs",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"docs/runtime-architecture.md\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_docs",
+                "content": "[docs/runtime-architecture.md] (1 lines, 10 bytes)\n# Runtime\n"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_patch_docs".to_string(),
+            name: "patch_file".to_string(),
+            arguments: json!({
+                "path": "docs/runtime-architecture.md",
+                "search": "# Runtime\n",
+                "replace": "# Runtime\n\n- `src/tui/agent/session_bridge.rs` is covered.\n"
+            })
+            .to_string(),
+        };
+
+        assert!(allows_benchmark_plan_followup_during_verify(
+            TaskHarness {
+                lane: TaskLane::BenchmarkPlan,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+target_files:\n\
+- .obstral/runtime_eval.json\n\
+- docs/runtime-architecture.md\n\
+success_criteria:\n\
+- both files include src/tui/agent/session_bridge.rs\n\
+</observer_benchmark_plan>",
+            None,
+        ));
+    }
+
+    #[test]
+    fn allows_benchmark_plan_followup_during_verify_rejects_wrong_target() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_spec",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\".obstral/runtime_eval.json\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_spec",
+                "content": "[.obstral/runtime_eval.json] (2 lines, 20 bytes)\n{\"paths\":[\"src/tui/agent/session_bridge.rs\"]}"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_read_readme".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path":"README.md"}).to_string(),
+        };
+
+        assert!(!allows_benchmark_plan_followup_during_verify(
+            TaskHarness {
+                lane: TaskLane::BenchmarkPlan,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+target_files:\n\
+- .obstral/runtime_eval.json\n\
+- docs/runtime-architecture.md\n\
+success_criteria:\n\
+- both files include src/tui/agent/session_bridge.rs\n\
+</observer_benchmark_plan>",
+            None,
+        ));
     }
 
     #[test]

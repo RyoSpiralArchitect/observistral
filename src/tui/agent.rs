@@ -112,12 +112,12 @@ use self::read_only::{
 use self::session_bridge::SessionBridgeView;
 use self::task_harness::{
     allows_artifact_creation_during_diagnose, allows_artifact_creation_during_verify,
-    build_fix_stage_progress_hint, build_progress_gate_block, coerce_artifact_creation_tool_call,
-    coerce_benchmark_plan_tool_call, coerce_fix_existing_blocked_mutation_tool_call,
-    coerce_fix_existing_literal_mutation_tool_call, coerce_fix_existing_tool_call,
-    coerce_repo_goal_completion_tool_call, repair_fix_existing_mutation_tool_call,
-    repair_repo_scaffold_write_tool_call, synthesize_fix_existing_no_tool_mutation_tool_call,
-    TaskHarness,
+    allows_benchmark_plan_followup_during_verify, build_fix_stage_progress_hint,
+    build_progress_gate_block, coerce_artifact_creation_tool_call, coerce_benchmark_plan_tool_call,
+    coerce_fix_existing_blocked_mutation_tool_call, coerce_fix_existing_literal_mutation_tool_call,
+    coerce_fix_existing_tool_call, coerce_repo_goal_completion_tool_call,
+    repair_fix_existing_mutation_tool_call, repair_repo_scaffold_write_tool_call,
+    synthesize_fix_existing_no_tool_mutation_tool_call, TaskHarness,
 };
 
 #[derive(Debug, Clone)]
@@ -13352,11 +13352,18 @@ Required now: {}",
         // Diagnose -> Fix -> Verify workflow to prevent phase drift.
         let allow_existing_followup_verify =
             matches_required_existing_followup(&messages, &tc, &root_user_text);
+        let allow_benchmark_plan_followup_verify = allows_benchmark_plan_followup_during_verify(
+            task_harness,
+            &messages,
+            &tc,
+            &root_user_text,
+            tool_root_abs.as_deref(),
+        );
         if let Some(block) = recovery.maybe_block_tool(
             &tc,
             test_cmd.as_deref(),
             task_harness,
-            allow_existing_followup_verify,
+            allow_existing_followup_verify || allow_benchmark_plan_followup_verify,
         ) {
             state = AgentState::Recovery;
             let _ = tx

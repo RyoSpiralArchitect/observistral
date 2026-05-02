@@ -414,6 +414,8 @@ When a human sends an Observer proposal or diagnostic back to the Coder, the UI 
 
 Runtime eval now has smoke cases for both approved `runtime_eval` and `tui_replay` benchmark plans. Those cases assert the copied tool-root spec actually contains the expected source path, so the dogfood loop proves artifact mutation instead of only checking the final assistant summary.
 
+The harder `approved-benchmark-plan-docs-runtime-eval-smoke` case requires the same approved plan to update both a regression spec and a docs file. This keeps the dogfood loop honest for PR-ready change sets where code/spec/docs need to land together.
+
 ---
 
 ## Quickstart

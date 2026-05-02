@@ -296,6 +296,25 @@
       ]
     },
     {
+      "id": "approved-benchmark-plan-docs-runtime-eval-smoke",
+      "tool_root": "tests/fixtures/runtime-benchmark-plan-docs-runtime-eval",
+      "copy_tool_root": true,
+      "max_iters": 16,
+      "tags": ["action", "benchmark-plan", "runtime-eval", "observer", "docs", "smoke"],
+      "prompt": "[Observer benchmark plan approved]\n<observer_benchmark_plan source=\"deterministic_observer\" required=\"true\">\nlane: runtime_eval\ncase_id_hint: self-fix-session-bridge-runtime-followup-docs\nobjective: Add the smallest runtime_eval regression and docs note proving src/tui/agent/session_bridge.rs is treated as PR-ready runtime-sensitive.\ntarget_files:\n- .obstral/runtime_eval.json\n- docs/runtime-architecture.md\nrequired_checks:\n- grep -q \"src/tui/agent/session_bridge.rs\" .obstral/runtime_eval.json && grep -q \"src/tui/agent/session_bridge.rs\" docs/runtime-architecture.md\nsuccess_criteria:\n- .obstral/runtime_eval.json includes src/tui/agent/session_bridge.rs or a case that would force that follow-up.\n- docs/runtime-architecture.md includes src/tui/agent/session_bridge.rs as benchmark-plan coverage.\n</observer_benchmark_plan>\nImplement or update the smallest deterministic regression and docs artifacts. Final answer must include .obstral/runtime_eval.json and docs/runtime-architecture.md.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "tool_call_min", "name": "patch_file", "min": 2 },
+        { "kind": "assistant_contains", "value": ".obstral/runtime_eval.json" },
+        { "kind": "assistant_contains", "value": "docs/runtime-architecture.md" },
+        { "kind": "trace_event_seen", "event": "task_harness" },
+        { "kind": "tool_root_file_contains", "path": ".obstral/runtime_eval.json", "value": "src/tui/agent/session_bridge.rs" },
+        { "kind": "tool_root_file_contains", "path": "docs/runtime-architecture.md", "value": "src/tui/agent/session_bridge.rs" }
+      ]
+    },
+    {
       "id": "maze-game-rust-repo",
       "tool_root": "tests/fixtures/runtime-maze-game",
       "copy_tool_root": true,
