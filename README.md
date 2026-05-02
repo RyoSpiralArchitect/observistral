@@ -412,6 +412,8 @@ When a human sends an Observer proposal or diagnostic back to the Coder, the UI 
 
 `benchmark_plan` is the Observer's next-step testing instinct: it names the smallest regression lane and checks that should make the finding repeatable. When a human approves it from the TUI/GUI, the Coder receives it inside `<observer_benchmark_plan>` and the Task Harness switches to a dedicated `benchmark_plan` lane, first reading the matching `.obstral/runtime_eval.json` or `.obstral/tui_replay.json` spec before patching the smallest regression artifact. If the model emits a malformed spec patch after that read, the harness can synthesize the minimal JSON update from the approved `case_id_hint` and `src/...rs` evidence.
 
+Runtime eval now has smoke cases for both approved `runtime_eval` and `tui_replay` benchmark plans. Those cases assert the copied tool-root spec actually contains the expected source path, so the dogfood loop proves artifact mutation instead of only checking the final assistant summary.
+
 ---
 
 ## Quickstart

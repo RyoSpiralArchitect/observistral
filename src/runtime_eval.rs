@@ -65,6 +65,7 @@ pub enum RuntimeEvalCheck {
     ToolCallMin { name: String, min: usize },
     TraceEventSeen { event: String },
     ToolRootFileExists { path: String },
+    ToolRootFileContains { path: String, value: String },
     MessagesMin { min: usize },
     GraphNodesMin { min: usize },
 }
@@ -871,6 +872,32 @@ fn evaluate_check(
                 detail: format!("resolved={} exists={exists}", resolved.display()),
             }
         }
+        RuntimeEvalCheck::ToolRootFileContains { path, value } => {
+            let resolved = {
+                let raw = PathBuf::from(path);
+                if raw.is_absolute() {
+                    raw
+                } else {
+                    Path::new(root).join(raw)
+                }
+            };
+            let content = std::fs::read_to_string(&resolved);
+            let ok = content
+                .as_ref()
+                .is_ok_and(|body| body.contains(value.as_str()));
+            RuntimeEvalCheckResult {
+                label: format!("tool_root_file_contains:{path}:{value}"),
+                ok,
+                detail: match content {
+                    Ok(body) => format!(
+                        "resolved={} bytes={} matched={ok}",
+                        resolved.display(),
+                        body.len()
+                    ),
+                    Err(err) => format!("resolved={} error={err}", resolved.display()),
+                },
+            }
+        }
         RuntimeEvalCheck::MessagesMin { min } => RuntimeEvalCheckResult {
             label: format!("messages_min:{min}"),
             ok: metrics.messages_len >= *min,
@@ -1014,6 +1041,10 @@ mod tests {
                 },
                 RuntimeEvalCheck::ToolRootFileExists {
                     path: "created.flag".to_string(),
+                },
+                RuntimeEvalCheck::ToolRootFileContains {
+                    path: "created.flag".to_string(),
+                    value: "ok".to_string(),
                 },
                 RuntimeEvalCheck::MessagesMin { min: 2 },
                 RuntimeEvalCheck::GraphNodesMin { min: 2 },

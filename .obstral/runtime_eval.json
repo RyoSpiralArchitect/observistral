@@ -262,6 +262,40 @@
       ]
     },
     {
+      "id": "approved-benchmark-plan-runtime-eval-smoke",
+      "tool_root": "tests/fixtures/runtime-benchmark-plan-runtime-eval",
+      "copy_tool_root": true,
+      "max_iters": 10,
+      "tags": ["action", "benchmark-plan", "runtime-eval", "observer", "smoke"],
+      "prompt": "[Observer benchmark plan approved]\n<observer_benchmark_plan source=\"deterministic_observer\" required=\"true\">\nlane: runtime_eval\ncase_id_hint: self-fix-session-bridge-runtime-followup\nobjective: Add the smallest runtime_eval regression proving src/tui/agent/session_bridge.rs is treated as PR-ready runtime-sensitive.\ntarget_files:\n- .obstral/runtime_eval.json\nrequired_checks:\n- grep -q \"src/tui/agent/session_bridge.rs\" .obstral/runtime_eval.json\nsuccess_criteria:\n- .obstral/runtime_eval.json includes src/tui/agent/session_bridge.rs or a case that would force that follow-up.\n</observer_benchmark_plan>\nImplement or update the smallest deterministic regression artifact. Final answer must include .obstral/runtime_eval.json.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "tool_call_seen", "name": "patch_file" },
+        { "kind": "assistant_contains", "value": ".obstral/runtime_eval.json" },
+        { "kind": "trace_event_seen", "event": "task_harness" },
+        { "kind": "tool_root_file_contains", "path": ".obstral/runtime_eval.json", "value": "src/tui/agent/session_bridge.rs" }
+      ]
+    },
+    {
+      "id": "approved-benchmark-plan-tui-replay-smoke",
+      "tool_root": "tests/fixtures/runtime-benchmark-plan-tui-replay",
+      "copy_tool_root": true,
+      "max_iters": 12,
+      "tags": ["action", "benchmark-plan", "tui-replay", "observer", "smoke"],
+      "prompt": "[Observer benchmark plan approved]\n<observer_benchmark_plan source=\"deterministic_observer\" required=\"true\">\nlane: tui_replay\ncase_id_hint: review-panel-replay-sensitive\nobjective: Add the smallest TUI replay regression proving src/tui/review_panel.rs is replay-sensitive.\ntarget_files:\n- .obstral/tui_replay.json\nrequired_checks:\n- grep -q \"src/tui/review_panel.rs\" .obstral/tui_replay.json\nsuccess_criteria:\n- .obstral/tui_replay.json includes src/tui/review_panel.rs or a case that would force that follow-up.\n</observer_benchmark_plan>\nImplement or update the smallest deterministic replay regression artifact. Final answer must include .obstral/tui_replay.json.",
+      "checks": [
+        { "kind": "completed" },
+        { "kind": "error_free" },
+        { "kind": "tool_call_seen", "name": "read_file" },
+        { "kind": "tool_call_seen", "name": "patch_file" },
+        { "kind": "assistant_contains", "value": ".obstral/tui_replay.json" },
+        { "kind": "trace_event_seen", "event": "task_harness" },
+        { "kind": "tool_root_file_contains", "path": ".obstral/tui_replay.json", "value": "src/tui/review_panel.rs" }
+      ]
+    },
+    {
       "id": "maze-game-rust-repo",
       "tool_root": "tests/fixtures/runtime-maze-game",
       "copy_tool_root": true,
