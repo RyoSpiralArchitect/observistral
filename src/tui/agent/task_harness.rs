@@ -923,81 +923,101 @@ fn benchmark_plan_required_check_was_executed(messages: &[Value], command: &str)
         .any(|actual| commands_match(actual.as_str(), command))
 }
 
-fn successful_exec_commands(messages: &[Value]) -> Vec<String> {
-    let mut pending: BTreeMap<String, String> = BTreeMap::new();
-    let mut out = Vec::new();
-    for msg in messages {
-        match msg.get("role").and_then(|v| v.as_str()) {
-            Some("assistant") => {
-                let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
-                    continue;
-                };
-                for tc in tool_calls {
-                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
-                    let name = tc
-                        .get("function")
-                        .and_then(|v| v.get("name"))
+pub(crate) mod transcript_signals {
+    use super::*;
+
+    pub(crate) fn successful_exec_commands(messages: &[Value]) -> Vec<String> {
+        let mut pending: BTreeMap<String, String> = BTreeMap::new();
+        let mut out = Vec::new();
+        for msg in messages {
+            match msg.get("role").and_then(|v| v.as_str()) {
+                Some("assistant") => {
+                    let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                        continue;
+                    };
+                    for tc in tool_calls {
+                        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                        let name = tc
+                            .get("function")
+                            .and_then(|v| v.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        if id.is_empty() || name != "exec" {
+                            continue;
+                        }
+                        let command = tc
+                            .get("function")
+                            .and_then(|v| v.get("arguments"))
+                            .and_then(|v| v.as_str())
+                            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                            .and_then(|value| {
+                                value
+                                    .get("command")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_default();
+                        if !command.trim().is_empty() {
+                            pending.insert(id.to_string(), command);
+                        }
+                    }
+                }
+                Some("tool") => {
+                    let tool_call_id = msg
+                        .get("tool_call_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .trim();
-                    if id.is_empty() || name != "exec" {
+                    let Some(command) = pending.remove(tool_call_id) else {
                         continue;
-                    }
-                    let command = tc
-                        .get("function")
-                        .and_then(|v| v.get("arguments"))
-                        .and_then(|v| v.as_str())
-                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                        .and_then(|value| {
-                            value
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_string)
-                        })
-                        .unwrap_or_default();
-                    if !command.trim().is_empty() {
-                        pending.insert(id.to_string(), command);
+                    };
+                    let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    if exec_tool_content_succeeded(content) {
+                        out.push(command);
                     }
                 }
+                _ => {}
             }
-            Some("tool") => {
-                let tool_call_id = msg
-                    .get("tool_call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                let Some(command) = pending.remove(tool_call_id) else {
-                    continue;
-                };
-                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                if exec_tool_content_succeeded(content) {
-                    out.push(command);
-                }
-            }
-            _ => {}
         }
+        out
     }
-    out
+
+    pub(crate) fn exec_tool_content_succeeded(content: &str) -> bool {
+        let text = content.trim();
+        !text.is_empty()
+            && (text.contains("exit_code: 0")
+                || text.contains("OK (exit 0)")
+                || text.starts_with("OK:"))
+            && !text.contains("GOVERNOR BLOCKED")
+            && !text.contains("FAILED")
+    }
+
+    pub(crate) fn commands_match(left: &str, right: &str) -> bool {
+        let left = command_signature(left);
+        let right = command_signature(right);
+        !left.is_empty() && left == right
+    }
+
+    pub(crate) fn command_signature(command: &str) -> String {
+        command.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+}
+
+fn successful_exec_commands(messages: &[Value]) -> Vec<String> {
+    transcript_signals::successful_exec_commands(messages)
 }
 
 fn exec_tool_content_succeeded(content: &str) -> bool {
-    let text = content.trim();
-    !text.is_empty()
-        && (text.contains("exit_code: 0")
-            || text.contains("OK (exit 0)")
-            || text.starts_with("OK:"))
-        && !text.contains("GOVERNOR BLOCKED")
-        && !text.contains("FAILED")
+    transcript_signals::exec_tool_content_succeeded(content)
 }
 
 fn commands_match(left: &str, right: &str) -> bool {
-    let left = command_signature(left);
-    let right = command_signature(right);
-    !left.is_empty() && left == right
+    transcript_signals::commands_match(left, right)
 }
 
 fn command_signature(command: &str) -> String {
-    command.split_whitespace().collect::<Vec<_>>().join(" ")
+    transcript_signals::command_signature(command)
 }
 
 fn tool_call_path(tc: &ToolCallData) -> Option<String> {
