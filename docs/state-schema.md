@@ -462,6 +462,7 @@ Owns:
 - diagnostics and artifact capture
 - per-case copied worktrees for mutation-oriented eval runs
 - merge-gate reports that connect pass/fail outcomes to rollback and promotion evidence
+- proof checks such as `verified_command_seen` and `auto_test_passed`, which keep eval cases accountable to actual verification evidence
 - quality gates for changes to agent behavior
 
 This layer should never become a substitute for runtime state. It is the place

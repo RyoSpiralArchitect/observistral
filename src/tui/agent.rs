@@ -112,12 +112,14 @@ use self::read_only::{
 use self::session_bridge::SessionBridgeView;
 use self::task_harness::{
     allows_artifact_creation_during_diagnose, allows_artifact_creation_during_verify,
-    allows_benchmark_plan_followup_during_verify, build_fix_stage_progress_hint,
+    allows_benchmark_plan_followup_during_verify, benchmark_plan_missing_required_exec_proof,
+    benchmark_plan_pending_required_exec_command, build_fix_stage_progress_hint,
     build_progress_gate_block, coerce_artifact_creation_tool_call, coerce_benchmark_plan_tool_call,
     coerce_fix_existing_blocked_mutation_tool_call, coerce_fix_existing_literal_mutation_tool_call,
     coerce_fix_existing_tool_call, coerce_repo_goal_completion_tool_call,
     repair_fix_existing_mutation_tool_call, repair_repo_scaffold_write_tool_call,
-    synthesize_fix_existing_no_tool_mutation_tool_call, TaskHarness,
+    synthesize_benchmark_plan_no_tool_call, synthesize_fix_existing_no_tool_mutation_tool_call,
+    TaskHarness,
 };
 
 #[derive(Debug, Clone)]
@@ -5450,6 +5452,9 @@ fn maybe_build_verified_action_closeout_text(
     if required_existing_followup_no_tool_hint(messages, root_user_text).is_some() {
         return None;
     }
+    if benchmark_plan_missing_required_exec_proof(root_user_text, messages) {
+        return None;
+    }
 
     let known_acceptance_commands = canonicalize_known_acceptance_commands(
         &collect_known_acceptance_commands(messages, working_mem, test_cmd),
@@ -9609,6 +9614,43 @@ This is the LAST model call for this run.\n\
             }
         }
 
+        if tool_calls.is_empty() {
+            if let Some(tc) = synthesize_benchmark_plan_no_tool_call(
+                task_harness,
+                &messages,
+                &root_user_text,
+                tool_root_abs.as_deref(),
+            ) {
+                let synthesized =
+                    canonicalize_tool_call_command(tc.name.as_str(), tc.arguments.as_str())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "{}({})",
+                                tc.name,
+                                compact_one_line(tc.arguments.as_str(), 120)
+                            )
+                        });
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "\n[task_harness] synthesized benchmark-plan follow-up for stalled no-tool turn: {synthesized}\n"
+                    )))
+                    .await;
+                emit_telemetry_event(
+                    &tx,
+                    "task_harness_synthesized_tool_call",
+                    json!({
+                        "iter": iter,
+                        "lane": task_harness.lane_label(),
+                        "tool": tc.name,
+                        "synthetic": synthesized,
+                        "reason": "benchmark_plan_no_tool_followup",
+                    }),
+                )
+                .await;
+                tool_calls.push(tc);
+            }
+        }
+
         if tool_calls.len() == 1 {
             if let Some((rewritten, original, repaired)) =
                 repair_truncated_patch_tool_call_from_recent_mismatch(
@@ -10844,15 +10886,17 @@ Execute only the new minimal action: {}",
                 &collect_known_acceptance_commands(&messages, &working_mem, test_cmd.as_deref()),
                 &observation_evidence,
             );
-            if should_prefer_done_after_verified_action(
-                tc,
-                &candidate_plan,
-                &known_acceptance_commands,
-                required_verification,
-                test_cmd.as_deref(),
-                last_mutation_step,
-                last_verify_ok_step,
-            ) {
+            if benchmark_plan_pending_required_exec_command(&root_user_text, &messages).is_none()
+                && should_prefer_done_after_verified_action(
+                    tc,
+                    &candidate_plan,
+                    &known_acceptance_commands,
+                    required_verification,
+                    test_cmd.as_deref(),
+                    last_mutation_step,
+                    last_verify_ok_step,
+                )
+            {
                 if let Some(final_text) = maybe_build_verified_action_auto_final_answer(
                     Some(&candidate_plan),
                     &messages,
@@ -13063,6 +13107,55 @@ Last mutation step: {last_mutation}\n\
 Last verification step: {last_verify_ok}\n\
 Required now: {}",
                     verification_requirement_hint(required_verification, test_cmd.as_deref())
+                );
+
+                let _ = tx
+                    .send(StreamToken::Delta(format!(
+                        "[RESULT][Recovery] GOVERNOR BLOCK\n{block}\n"
+                    )))
+                    .await;
+
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": format!(
+                        "GOVERNOR BLOCKED\n\n{block}\n\ntool:\n{}\narguments:\n{}",
+                        tc.name, tc.arguments
+                    ),
+                }));
+                autosave_best_effort(
+                    &autosaver,
+                    &tx,
+                    tool_root_abs.as_deref(),
+                    checkpoint.as_deref(),
+                    cur_cwd.as_deref(),
+                    &messages,
+                )
+                .await;
+
+                pending_system_hint = Some(block);
+                let _ = tx
+                    .send(StreamToken::GovernorState(build_governor_state(
+                        state,
+                        &recovery,
+                        &mem,
+                        file_tool_consec_failures,
+                        last_mutation_step,
+                        last_verify_ok_step,
+                        last_reflection.as_ref(),
+                    )))
+                    .await;
+                continue;
+            }
+
+            if let Some(command) =
+                benchmark_plan_pending_required_exec_command(&root_user_text, &messages)
+            {
+                state = AgentState::Recovery;
+                recovery.stage = Some(RecoveryStage::Verify);
+                let block = format!(
+                    "[Done Gate] Approved benchmark plan requires explicit verification proof before `done`.\n\
+Required now: run `{command}`."
                 );
 
                 let _ = tx
