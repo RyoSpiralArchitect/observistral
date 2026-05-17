@@ -652,7 +652,37 @@ pub(super) fn coerce_benchmark_plan_tool_call(
         return compare_rewritten_tool_call(tc, rewritten);
     }
 
+    if let Some(command) = pending_benchmark_plan_required_check_exec(messages, root_user_text) {
+        if benchmark_plan_tool_call_is_required_check_exec(tc, command.as_str()) {
+            return None;
+        }
+        let rewritten = ToolCallData {
+            id: tc.id.clone(),
+            name: "exec".to_string(),
+            arguments: serde_json::json!({ "command": command }).to_string(),
+        };
+        return compare_rewritten_tool_call(tc, rewritten);
+    }
+
     None
+}
+
+pub(super) fn synthesize_benchmark_plan_no_tool_call(
+    harness: TaskHarness,
+    messages: &[Value],
+    root_user_text: &str,
+    tool_root: Option<&str>,
+) -> Option<ToolCallData> {
+    let fallback = ToolCallData {
+        id: "synthetic_benchmark_plan_no_tool".to_string(),
+        name: "done".to_string(),
+        arguments: serde_json::json!({
+            "summary": "benchmark plan follow-up pending"
+        })
+        .to_string(),
+    };
+    coerce_benchmark_plan_tool_call(harness, messages, &fallback, root_user_text, tool_root)
+        .map(|(rewritten, _original, _coerced)| rewritten)
 }
 
 pub(super) fn allows_benchmark_plan_followup_during_verify(
@@ -664,6 +694,13 @@ pub(super) fn allows_benchmark_plan_followup_during_verify(
 ) -> bool {
     if harness.lane != TaskLane::BenchmarkPlan {
         return false;
+    }
+    if benchmark_plan_targets_satisfied(messages, root_user_text, tool_root)
+        && benchmark_plan_required_check_command(root_user_text).is_some_and(|command| {
+            benchmark_plan_tool_call_is_required_check_exec(tc, command.as_str())
+        })
+    {
+        return true;
     }
     let Some(tc_path) = tool_call_path(tc) else {
         return false;
@@ -690,6 +727,23 @@ pub(super) fn allows_benchmark_plan_followup_during_verify(
     }
 
     false
+}
+
+pub(super) fn benchmark_plan_pending_required_exec_command(
+    root_user_text: &str,
+    messages: &[Value],
+) -> Option<String> {
+    root_user_text
+        .contains("<observer_benchmark_plan")
+        .then(|| pending_benchmark_plan_required_check_exec(messages, root_user_text))
+        .flatten()
+}
+
+pub(super) fn benchmark_plan_missing_required_exec_proof(
+    root_user_text: &str,
+    messages: &[Value],
+) -> bool {
+    benchmark_plan_pending_required_exec_command(root_user_text, messages).is_some()
 }
 
 fn compare_rewritten_tool_call(
@@ -776,6 +830,174 @@ fn push_unique_path(out: &mut Vec<String>, path: String) {
     if !out.contains(&path) {
         out.push(path);
     }
+}
+
+fn pending_benchmark_plan_required_check_exec(
+    messages: &[Value],
+    root_user_text: &str,
+) -> Option<String> {
+    let command = benchmark_plan_required_check_command(root_user_text)?;
+    if benchmark_plan_required_check_was_executed(messages, command.as_str()) {
+        None
+    } else {
+        Some(command)
+    }
+}
+
+fn benchmark_plan_required_check_command(root_user_text: &str) -> Option<String> {
+    let mut in_required_checks = false;
+    for line in root_user_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("required_checks:") {
+            in_required_checks = true;
+            continue;
+        }
+        if !in_required_checks {
+            continue;
+        }
+        if let Some(item) = trimmed.strip_prefix('-') {
+            let command = trim_benchmark_plan_command_literal(item);
+            if !command.is_empty() {
+                return Some(command);
+            }
+            continue;
+        }
+        if !trimmed.is_empty() && trimmed.ends_with(':') {
+            break;
+        }
+    }
+    None
+}
+
+fn trim_benchmark_plan_command_literal(raw: &str) -> String {
+    let mut command = raw.trim();
+    if command.starts_with('`') && command.ends_with('`') && command.len() >= 2 {
+        command = &command[1..command.len() - 1];
+    }
+    command.trim().to_string()
+}
+
+fn benchmark_plan_targets_satisfied(
+    messages: &[Value],
+    root_user_text: &str,
+    tool_root: Option<&str>,
+) -> bool {
+    let targets = benchmark_plan_target_paths(root_user_text);
+    if targets.is_empty() {
+        return false;
+    }
+    let reads = successful_read_contents(messages);
+    targets.into_iter().all(|target_path| {
+        let target_was_read = reads.contains_key(target_path.as_str());
+        let read_body = reads
+            .get(target_path.as_str())
+            .filter(|body| !body.trim().is_empty())
+            .cloned();
+        let body = target_was_read
+            .then(|| read_tool_root_file(tool_root, target_path.as_str()).or(read_body))
+            .flatten();
+        body.as_deref().is_some_and(|body| {
+            benchmark_plan_target_is_satisfied(target_path.as_str(), body, root_user_text)
+        })
+    })
+}
+
+fn benchmark_plan_tool_call_is_required_check_exec(tc: &ToolCallData, command: &str) -> bool {
+    if tc.name != "exec" {
+        return false;
+    }
+    serde_json::from_str::<Value>(tc.arguments.as_str())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .is_some_and(|actual| commands_match(actual.as_str(), command))
+}
+
+fn benchmark_plan_required_check_was_executed(messages: &[Value], command: &str) -> bool {
+    successful_exec_commands(messages)
+        .iter()
+        .any(|actual| commands_match(actual.as_str(), command))
+}
+
+fn successful_exec_commands(messages: &[Value]) -> Vec<String> {
+    let mut pending: BTreeMap<String, String> = BTreeMap::new();
+    let mut out = Vec::new();
+    for msg in messages {
+        match msg.get("role").and_then(|v| v.as_str()) {
+            Some("assistant") => {
+                let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for tc in tool_calls {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let name = tc
+                        .get("function")
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if id.is_empty() || name != "exec" {
+                        continue;
+                    }
+                    let command = tc
+                        .get("function")
+                        .and_then(|v| v.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .and_then(|value| {
+                            value
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    if !command.trim().is_empty() {
+                        pending.insert(id.to_string(), command);
+                    }
+                }
+            }
+            Some("tool") => {
+                let tool_call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let Some(command) = pending.remove(tool_call_id) else {
+                    continue;
+                };
+                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if exec_tool_content_succeeded(content) {
+                    out.push(command);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn exec_tool_content_succeeded(content: &str) -> bool {
+    let text = content.trim();
+    !text.is_empty()
+        && (text.contains("exit_code: 0")
+            || text.contains("OK (exit 0)")
+            || text.starts_with("OK:"))
+        && !text.contains("GOVERNOR BLOCKED")
+        && !text.contains("FAILED")
+}
+
+fn commands_match(left: &str, right: &str) -> bool {
+    let left = command_signature(left);
+    let right = command_signature(right);
+    !left.is_empty() && left == right
+}
+
+fn command_signature(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn tool_call_path(tc: &ToolCallData) -> Option<String> {
@@ -3111,6 +3333,181 @@ success_criteria:\n\
 - both files include src/tui/agent/session_bridge.rs\n\
 </observer_benchmark_plan>",
             None,
+        ));
+    }
+
+    #[test]
+    fn coerce_benchmark_plan_tool_call_runs_required_check_after_targets_satisfied() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obstral")).unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(
+            dir.path().join(".obstral/runtime_eval.json"),
+            "{\n  \"paths\": [\"src/tui/agent/session_bridge.rs\"]\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("docs/runtime-architecture.md"),
+            "- `src/tui/agent/session_bridge.rs`\n",
+        )
+        .unwrap();
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_spec",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\".obstral/runtime_eval.json\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_spec",
+                "content": "[.obstral/runtime_eval.json] (2 lines, 20 bytes)\n{\"paths\":[]}"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_docs",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"docs/runtime-architecture.md\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_docs",
+                "content": "[docs/runtime-architecture.md] (1 lines, 10 bytes)\n# Runtime\n"
+            }),
+        ];
+        let tc = ToolCallData {
+            id: "call_done".to_string(),
+            name: "done".to_string(),
+            arguments: json!({"summary":"done"}).to_string(),
+        };
+
+        let (rewritten, _original, coerced) = coerce_benchmark_plan_tool_call(
+            TaskHarness {
+                lane: TaskLane::BenchmarkPlan,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            &tc,
+            "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+target_files:\n\
+- .obstral/runtime_eval.json\n\
+- docs/runtime-architecture.md\n\
+required_checks:\n\
+- grep -q \"src/tui/agent/session_bridge.rs\" .obstral/runtime_eval.json && grep -q \"src/tui/agent/session_bridge.rs\" docs/runtime-architecture.md\n\
+success_criteria:\n\
+- both files include src/tui/agent/session_bridge.rs\n\
+</observer_benchmark_plan>",
+            Some(dir.path().to_str().unwrap()),
+        )
+        .expect("required check exec");
+
+        assert_eq!(rewritten.name, "exec");
+        assert!(rewritten
+            .arguments
+            .contains("grep -q \\\"src/tui/agent/session_bridge.rs\\\""));
+        assert!(coerced.contains("grep -q"));
+    }
+
+    #[test]
+    fn synthesize_benchmark_plan_no_tool_call_patches_pending_docs_target() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_spec",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\".obstral/runtime_eval.json\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_spec",
+                "content": "[.obstral/runtime_eval.json] (2 lines, 20 bytes)\n{\"paths\":[\"src/tui/agent/session_bridge.rs\"]}"
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_read_docs",
+                    "type": "function",
+                    "function": {"name":"read_file","arguments":"{\"path\":\"docs/runtime-architecture.md\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_read_docs",
+                "content": "[docs/runtime-architecture.md] (1 lines, 10 bytes)\n# Runtime\n"
+            }),
+        ];
+
+        let synthesized = synthesize_benchmark_plan_no_tool_call(
+            TaskHarness {
+                lane: TaskLane::BenchmarkPlan,
+                artifact_mode: ArtifactMode::ExistingFiles,
+            },
+            &messages,
+            "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+target_files:\n\
+- .obstral/runtime_eval.json\n\
+- docs/runtime-architecture.md\n\
+required_checks:\n\
+- grep -q \"src/tui/agent/session_bridge.rs\" .obstral/runtime_eval.json && grep -q \"src/tui/agent/session_bridge.rs\" docs/runtime-architecture.md\n\
+success_criteria:\n\
+- both files include src/tui/agent/session_bridge.rs\n\
+</observer_benchmark_plan>",
+            None,
+        )
+        .expect("synthetic docs patch");
+
+        assert_eq!(synthesized.name, "patch_file");
+        assert!(synthesized
+            .arguments
+            .contains("docs/runtime-architecture.md"));
+        assert!(synthesized
+            .arguments
+            .contains("src/tui/agent/session_bridge.rs"));
+    }
+
+    #[test]
+    fn benchmark_plan_missing_required_exec_proof_clears_after_successful_exec() {
+        let root_user_text = "<observer_benchmark_plan>\n\
+lane: runtime_eval\n\
+target_files:\n\
+- .obstral/runtime_eval.json\n\
+required_checks:\n\
+- grep -q \"src/tui/agent/session_bridge.rs\" .obstral/runtime_eval.json\n\
+</observer_benchmark_plan>";
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_exec",
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "arguments": "{\"command\":\"grep -q \\\"src/tui/agent/session_bridge.rs\\\" .obstral/runtime_eval.json\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_exec",
+                "content": "OK (exit_code: 0)\nstdout:\n"
+            }),
+        ];
+
+        assert!(benchmark_plan_missing_required_exec_proof(
+            root_user_text,
+            &[]
+        ));
+        assert!(!benchmark_plan_missing_required_exec_proof(
+            root_user_text,
+            &messages
         ));
     }
 

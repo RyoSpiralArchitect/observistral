@@ -59,15 +59,42 @@ pub struct RuntimeEvalCase {
 pub enum RuntimeEvalCheck {
     Completed,
     ErrorFree,
-    AssistantContains { value: String },
-    AssistantNotContains { value: String },
-    ToolCallSeen { name: String },
-    ToolCallMin { name: String, min: usize },
-    TraceEventSeen { event: String },
-    ToolRootFileExists { path: String },
-    ToolRootFileContains { path: String, value: String },
-    MessagesMin { min: usize },
-    GraphNodesMin { min: usize },
+    AssistantContains {
+        value: String,
+    },
+    AssistantNotContains {
+        value: String,
+    },
+    ToolCallSeen {
+        name: String,
+    },
+    ToolCallMin {
+        name: String,
+        min: usize,
+    },
+    TraceEventSeen {
+        event: String,
+    },
+    VerifiedCommandSeen {
+        command: String,
+    },
+    AutoTestPassed {
+        #[serde(default)]
+        command: Option<String>,
+    },
+    ToolRootFileExists {
+        path: String,
+    },
+    ToolRootFileContains {
+        path: String,
+        value: String,
+    },
+    MessagesMin {
+        min: usize,
+    },
+    GraphNodesMin {
+        min: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +113,8 @@ pub struct RuntimeEvalMetrics {
     pub tool_call_count: usize,
     pub unique_tool_calls: Vec<String>,
     pub tool_call_histogram: BTreeMap<String, usize>,
+    pub successful_exec_commands: Vec<String>,
+    pub auto_test_pass_count: usize,
     pub trace_events: BTreeMap<String, usize>,
     pub iteration_count: usize,
     pub max_iteration: usize,
@@ -621,6 +650,8 @@ fn collect_metrics(
     if let Some(messages) = session_value.get("messages").and_then(|v| v.as_array()) {
         metrics.messages_len = messages.len();
         metrics.last_assistant = select_terminal_assistant_message(messages);
+        metrics.successful_exec_commands = collect_successful_exec_commands(messages);
+        metrics.auto_test_pass_count = count_auto_test_passes(messages);
         let token_estimates = estimate_transcript_tokens(messages);
         metrics.transcript_input_tokens_est = token_estimates.input;
         metrics.transcript_output_tokens_est = token_estimates.output;
@@ -642,6 +673,94 @@ fn collect_metrics(
         .unwrap_or(0);
 
     Ok(metrics)
+}
+
+fn collect_successful_exec_commands(messages: &[Value]) -> Vec<String> {
+    let mut pending: BTreeMap<String, String> = BTreeMap::new();
+    let mut out = Vec::new();
+
+    for msg in messages {
+        match msg.get("role").and_then(|v| v.as_str()) {
+            Some("assistant") => {
+                let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for tc in tool_calls {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let name = tc
+                        .get("function")
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if id.is_empty() || name != "exec" {
+                        continue;
+                    }
+                    let command = tc
+                        .get("function")
+                        .and_then(|v| v.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .and_then(|value| {
+                            value
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    if !command.trim().is_empty() {
+                        pending.insert(id.to_string(), command);
+                    }
+                }
+            }
+            Some("tool") => {
+                let tool_call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let Some(command) = pending.remove(tool_call_id) else {
+                    continue;
+                };
+                let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if exec_tool_content_succeeded(content) {
+                    out.push(command);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn exec_tool_content_succeeded(content: &str) -> bool {
+    let text = content.trim();
+    !text.is_empty()
+        && (text.contains("exit_code: 0")
+            || text.contains("OK (exit 0)")
+            || text.starts_with("OK:"))
+        && !text.contains("GOVERNOR BLOCKED")
+        && !text.contains("FAILED")
+}
+
+fn count_auto_test_passes(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .filter(|msg| msg.get("role").and_then(|v| v.as_str()) == Some("tool"))
+        .filter_map(|msg| msg.get("content").and_then(|v| v.as_str()))
+        .filter(|content| content.contains("[auto-test]") && content.contains("PASSED (exit 0)"))
+        .count()
+}
+
+fn command_sig_for_eval(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn command_matches_for_eval(left: &str, right: &str) -> bool {
+    let left = command_sig_for_eval(left);
+    let right = command_sig_for_eval(right);
+    !left.is_empty() && left == right
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -856,6 +975,43 @@ fn evaluate_check(
                 detail: format!("count={count}"),
             }
         }
+        RuntimeEvalCheck::VerifiedCommandSeen { command } => {
+            let ok = metrics
+                .successful_exec_commands
+                .iter()
+                .any(|seen| command_matches_for_eval(seen, command));
+            RuntimeEvalCheckResult {
+                label: format!("verified_command_seen:{command}"),
+                ok,
+                detail: format!(
+                    "successful_exec_commands={:?}",
+                    metrics.successful_exec_commands
+                ),
+            }
+        }
+        RuntimeEvalCheck::AutoTestPassed { command } => {
+            let command_ok = command.as_ref().is_none_or(|command| {
+                metrics
+                    .last_assistant
+                    .as_deref()
+                    .is_some_and(|message| message.contains(command.as_str()))
+                    || metrics
+                        .successful_exec_commands
+                        .iter()
+                        .any(|seen| command_matches_for_eval(seen, command))
+            });
+            RuntimeEvalCheckResult {
+                label: match command {
+                    Some(command) => format!("auto_test_passed:{command}"),
+                    None => "auto_test_passed".to_string(),
+                },
+                ok: metrics.auto_test_pass_count > 0 && command_ok,
+                detail: format!(
+                    "auto_test_pass_count={} command_ok={command_ok}",
+                    metrics.auto_test_pass_count
+                ),
+            }
+        }
         RuntimeEvalCheck::ToolRootFileExists { path } => {
             let resolved = {
                 let raw = PathBuf::from(path);
@@ -996,7 +1152,42 @@ mod tests {
             &serde_json::json!({
                 "messages": [
                     {"role": "system", "content": "sys"},
-                    {"role": "assistant", "content": "Found it in src/tui/events.rs"}
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_exec",
+                            "type": "function",
+                            "function": {
+                                "name": "exec",
+                                "arguments": "{\"command\":\"grep -q ok created.flag\"}"
+                            }
+                        }]
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_exec",
+                        "content": "OK (exit_code: 0)\nstdout:\nok"
+                    },
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_patch",
+                            "type": "function",
+                            "function": {
+                                "name": "patch_file",
+                                "arguments": "{\"path\":\"created.flag\",\"search\":\"ok\",\"replace\":\"ok\"}"
+                            }
+                        }]
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_patch",
+                        "content": "OK: patched 'created.flag'\n[auto-test] ✓ PASSED (exit 0)"
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "[DONE]\nFound it in src/tui/events.rs and verified with `grep -q ok created.flag`."
+                    }
                 ]
             }),
         );
@@ -1039,6 +1230,10 @@ mod tests {
                     name: "search_files".to_string(),
                     min: 1,
                 },
+                RuntimeEvalCheck::VerifiedCommandSeen {
+                    command: "grep -q ok created.flag".to_string(),
+                },
+                RuntimeEvalCheck::AutoTestPassed { command: None },
                 RuntimeEvalCheck::ToolRootFileExists {
                     path: "created.flag".to_string(),
                 },
@@ -1078,7 +1273,12 @@ mod tests {
         assert_eq!(report.agent.max_iters, Some(14));
         assert_eq!(report.metrics.tool_call_count, 2);
         assert_eq!(report.metrics.graph_nodes, 2);
-        assert_eq!(report.metrics.messages_len, 2);
+        assert_eq!(report.metrics.messages_len, 6);
+        assert_eq!(
+            report.metrics.successful_exec_commands,
+            vec!["grep -q ok created.flag".to_string()]
+        );
+        assert_eq!(report.metrics.auto_test_pass_count, 1);
         assert!(report.metrics.transcript_input_tokens_est > 0);
         assert!(report.metrics.transcript_output_tokens_est > 0);
         assert_eq!(

@@ -416,6 +416,8 @@ Runtime eval now has smoke cases for both approved `runtime_eval` and `tui_repla
 
 The harder `approved-benchmark-plan-docs-runtime-eval-smoke` case requires the same approved plan to update both a regression spec and a docs file. This keeps the dogfood loop honest for PR-ready change sets where code/spec/docs need to land together.
 
+Benchmark-plan proof gates now require successful explicit verification commands via `verified_command_seen` and can assert patch-time auto-test evidence with `auto_test_passed`. After all approved benchmark-plan target files are satisfied, the Task Harness steers the Coder to the plan's `required_checks` command before allowing closeout; the approved benchmark-plan smoke lane now checks that proof for runtime-eval, TUI-replay, and compound docs+spec cases.
+
 ---
 
 ## Quickstart
